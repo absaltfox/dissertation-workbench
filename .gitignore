@@ -1,0 +1,11 @@
+node_modules/
+
+# Local runtime/cache artifacts
+data/
+output/
+
+# Local tooling state
+.claude/
+
+# OS/editor noise
+.DS_Store

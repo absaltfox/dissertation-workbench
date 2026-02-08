@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>UBC Dissertation Intelligence</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="bg-shape s1"></div>
+    <div class="bg-shape s2"></div>
+
+    <main class="page">
+      <header class="hero reveal">
+        <p class="eyebrow">UBC Open Collections</p>
+        <h1>Dissertation Intelligence Workbench</h1>
+        <p class="subtitle">Explore dissertation records, inspect related themes, and run new Open Collections queries from one interface.</p>
+      </header>
+
+      <section class="status-wrap reveal">
+        <div id="status" class="status">
+          <span id="statusText">Ready.</span>
+          <span id="spinner" class="spinner" hidden></span>
+        </div>
+      </section>
+
+      <nav class="tabs reveal" role="tablist" aria-label="Views">
+        <button class="tab-btn active" data-tab="records" role="tab" aria-selected="true">Document Explorer</button>
+        <button class="tab-btn" data-tab="analytics" role="tab" aria-selected="false">Analytics Dashboard</button>
+        <button class="tab-btn" data-tab="admin" role="tab" aria-selected="false">Admin</button>
+      </nav>
+
+      <!-- Document Explorer -->
+      <section id="tab-records" class="tab-panel reveal active" role="tabpanel">
+        <article class="panel">
+          <h2>Retrieved Documents</h2>
+          <input id="docFilter" class="doc-filter" type="search" placeholder="Filter by title, author, degree..." />
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th class="sortable" data-sort-key="title">Title</th>
+                  <th class="sortable" data-sort-key="author">Author</th>
+                  <th class="sortable" data-sort-key="year">Year</th>
+                  <th class="sortable" data-sort-key="degree">Degree</th>
+                  <th class="sortable" data-sort-key="pages">Pages</th>
+                  <th class="sortable" data-sort-key="wordCount">Words</th>
+                </tr>
+              </thead>
+              <tbody id="documentsTable"></tbody>
+            </table>
+          </div>
+        </article>
+      </section>
+
+      <!-- Document detail modal -->
+      <div id="docModalOverlay" class="doc-modal-overlay" hidden>
+        <div class="doc-modal panel">
+          <button id="docModalClose" class="doc-modal-close" aria-label="Close">&times;</button>
+          <h2>Document Details</h2>
+          <div id="docDetails" class="detail-body"></div>
+        </div>
+      </div>
+
+      <!-- Analytics Dashboard -->
+      <section id="tab-analytics" class="tab-panel reveal" role="tabpanel">
+        <section id="kpis" class="kpis"></section>
+
+        <div class="analytics-grid">
+          <div class="analytics-left">
+            <article class="panel">
+              <h2>Average Page Length by Year</h2>
+              <svg id="pagesByYearChart" viewBox="0 0 940 360" role="img" aria-label="Average pages by year"></svg>
+            </article>
+
+            <article class="panel">
+              <h2>Dissertations by Year</h2>
+              <svg id="dissertationsByYearChart" viewBox="0 0 940 360" role="img" aria-label="Dissertations by year"></svg>
+            </article>
+
+            <article class="panel">
+              <h2>Mean Word Count by Year</h2>
+              <svg id="wordsByYearChart" viewBox="0 0 940 360" role="img" aria-label="Mean word count by year"></svg>
+            </article>
+          </div>
+
+          <article class="panel word-cloud-panel">
+            <h2>Word Cloud (Themes)</h2>
+            <div id="wordCloud" class="word-cloud"></div>
+            <div id="themeResults" class="theme-results"></div>
+          </article>
+        </div>
+
+        <div class="analytics-grid">
+          <article class="panel">
+            <h2>Dissertation Length Trend (Median Pages by Year)</h2>
+            <svg id="pageTrendChart" viewBox="0 0 940 360" role="img" aria-label="Median pages by year with min/max band"></svg>
+          </article>
+
+          <article class="panel word-cloud-panel">
+            <h2>Bigram / Trigram Cloud</h2>
+            <div id="ngramCloud" class="word-cloud"></div>
+          </article>
+        </div>
+
+        <div class="analytics-grid">
+          <article class="panel">
+            <h2>Methodology Detection</h2>
+            <div id="methodologyBars" class="bars"></div>
+          </article>
+
+          <article class="panel">
+            <h2>Co-occurring Terms</h2>
+            <div id="cooccurrenceBars" class="bars"></div>
+          </article>
+        </div>
+
+        <article class="panel">
+          <h2>Supervisor &ndash; Topic Heatmap</h2>
+          <div id="supervisorHeatmap" class="table-wrap"></div>
+        </article>
+
+        <article class="panel">
+          <h2>Mean Word Count by Subject</h2>
+          <div id="subjectBars" class="bars"></div>
+        </article>
+      </section>
+
+      <!-- Admin Panel -->
+      <section id="tab-admin" class="tab-panel reveal" role="tabpanel">
+        <!-- Login gate (shown when not authenticated) -->
+        <div id="loginGate" class="panel login-panel">
+          <h2>Admin Login</h2>
+          <p class="meta">Sign in to access administration features.</p>
+          <form id="loginForm" class="login-form">
+            <label>
+              <span>Username</span>
+              <input id="loginUsername" type="text" autocomplete="username" required />
+            </label>
+            <label>
+              <span>Password</span>
+              <input id="loginPassword" type="password" autocomplete="current-password" required />
+            </label>
+            <div id="loginError" class="form-error" hidden></div>
+            <button type="submit" class="btn">Sign In</button>
+          </form>
+        </div>
+
+        <!-- Admin content (shown when authenticated) -->
+        <div id="adminContent" hidden>
+          <div class="admin-header">
+            <span id="adminUserLabel" class="admin-user-label"></span>
+            <button id="logoutBtn" class="btn ghost btn-sm">Sign Out</button>
+          </div>
+
+          <div class="admin-tabs">
+            <button class="admin-tab-btn active" data-admin-tab="settings">Settings</button>
+            <button class="admin-tab-btn" data-admin-tab="users">Users</button>
+            <button class="admin-tab-btn" data-admin-tab="cache">Cache</button>
+            <button class="admin-tab-btn" data-admin-tab="runs">Run History</button>
+          </div>
+
+          <!-- Settings -->
+          <div id="admin-settings" class="admin-panel-section active">
+            <article class="panel">
+              <h2>Query Configuration</h2>
+              <form id="settingsForm" class="query-grid">
+                <label>
+                  <span>Index</span>
+                  <input id="s-index" type="text" value="24" />
+                </label>
+                <label>
+                  <span>Query (<code>q</code>)</span>
+                  <input id="s-query" type="text" value="" placeholder="Optional full-text query" />
+                </label>
+                <label class="full">
+                  <span>Term Filter</span>
+                  <input id="s-term" type="text" value="degree.raw,Doctor of Education - EdD" />
+                </label>
+                <label class="full">
+                  <span>Source Fields</span>
+                  <input
+                    id="s-source"
+                    type="text"
+                    value="title,author,ubc_date_sort,uri,creator,supervisor,description,genre,date_available,rights,doi,affiliation,degree_theses,program_theses,scholarly_level,campus,degree,program,subject"
+                  />
+                </label>
+                <label>
+                  <span>Max Records</span>
+                  <input id="s-maxRecords" type="number" value="200" min="1" max="2000" step="20" />
+                </label>
+                <label>
+                  <span>Page Size</span>
+                  <input id="s-pageSize" type="number" value="20" min="1" max="100" step="5" />
+                </label>
+                <label>
+                  <span>Scan Limit</span>
+                  <input id="s-scanLimit" type="number" value="1000" min="1" max="50000" step="100" />
+                </label>
+                <label>
+                  <span>Subject Limit</span>
+                  <input id="s-subjectLimit" type="number" value="20" min="1" max="100" step="1" />
+                </label>
+                <label>
+                  <span>API Key (optional)</span>
+                  <input id="s-apiKey" type="password" autocomplete="off" />
+                </label>
+                <label>
+                  <span>Download Source Files</span>
+                  <select id="s-downloadFiles">
+                    <option value="1">Yes (count from downloaded docs)</option>
+                    <option value="0" selected>No (metadata only, faster)</option>
+                  </select>
+                </label>
+                <label>
+                  <span>Update From Local PDF Cache</span>
+                  <select id="s-recomputeFromCache">
+                    <option value="0" selected>No</option>
+                    <option value="1">Yes (recompute without redownload)</option>
+                  </select>
+                </label>
+
+                <div class="actions full">
+                  <button type="submit" id="loadBtn" class="btn">Run Query</button>
+                  <button type="button" id="refreshBtn" class="btn ghost">Force Refresh</button>
+                  <button type="button" id="saveSettingsBtn" class="btn ghost">Save Settings</button>
+                </div>
+              </form>
+            </article>
+          </div>
+
+          <!-- Users -->
+          <div id="admin-users" class="admin-panel-section">
+            <article class="panel">
+              <h2>Admin Users</h2>
+              <div id="usersContent"></div>
+              <hr class="section-rule" />
+              <h3>Create User</h3>
+              <form id="createUserForm" class="create-user-form">
+                <label>
+                  <span>Username</span>
+                  <input id="newUsername" type="text" required minlength="3" maxlength="50" />
+                </label>
+                <label>
+                  <span>Password</span>
+                  <input id="newPassword" type="password" required minlength="8" />
+                </label>
+                <div id="createUserError" class="form-error" hidden></div>
+                <button type="submit" class="btn btn-sm">Create User</button>
+              </form>
+            </article>
+          </div>
+
+          <!-- Cache -->
+          <div id="admin-cache" class="admin-panel-section">
+            <article class="panel">
+              <h2>PDF Cache</h2>
+              <div id="cacheStats" class="cache-stats"></div>
+              <div class="actions" style="margin:0.5rem 0">
+                <button id="refreshCacheBtn" class="btn ghost btn-sm">Refresh Cache</button>
+                <button id="reparseAllBtn" class="btn ghost btn-sm">Reparse All PDFs</button>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Doc ID</th>
+                      <th>Status</th>
+                      <th>Size</th>
+                      <th>Pages</th>
+                      <th>Words</th>
+                      <th>Updated</th>
+                      <th></th>
+                    </tr>
+                  </thead>
+                  <tbody id="cacheTable"></tbody>
+                </table>
+              </div>
+            </article>
+          </div>
+
+          <!-- Run History -->
+          <div id="admin-runs" class="admin-panel-section">
+            <article class="panel">
+              <h2>Recent Metric Runs</h2>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>Run Key</th>
+                      <th>Created</th>
+                      <th>Summary</th>
+                    </tr>
+                  </thead>
+                  <tbody id="runsTable"></tbody>
+                </table>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

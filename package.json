@@ -1,0 +1,14 @@
+{
+  "name": "ubc-theses-metrics",
+  "version": "2.0.0",
+  "description": "Web dashboard for UBC thesis/dissertation metrics from Open Collections API",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "reset-admin": "node scripts/reset-admin.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,0 +1,1265 @@
+// --- DOM references ---
+const statusTextEl = document.getElementById('statusText');
+const spinnerEl = document.getElementById('spinner');
+const statusEl = document.getElementById('status');
+const documentsTableEl = document.getElementById('documentsTable');
+const docFilterEl = document.getElementById('docFilter');
+const docTheadRow = document.querySelector('#tab-records thead tr');
+const docDetailsEl = document.getElementById('docDetails');
+const kpisEl = document.getElementById('kpis');
+const pagesByYearChartEl = document.getElementById('pagesByYearChart');
+const wordCloudEl = document.getElementById('wordCloud');
+const themeResultsEl = document.getElementById('themeResults');
+const subjectBarsEl = document.getElementById('subjectBars');
+const dissertationsByYearChartEl = document.getElementById('dissertationsByYearChart');
+const wordsByYearChartEl = document.getElementById('wordsByYearChart');
+const pageTrendChartEl = document.getElementById('pageTrendChart');
+const ngramCloudEl = document.getElementById('ngramCloud');
+const methodologyBarsEl = document.getElementById('methodologyBars');
+const cooccurrenceBarsEl = document.getElementById('cooccurrenceBars');
+const supervisorHeatmapEl = document.getElementById('supervisorHeatmap');
+const settingsForm = document.getElementById('settingsForm');
+const loadBtn = document.getElementById('loadBtn');
+const refreshBtn = document.getElementById('refreshBtn');
+const saveSettingsBtn = document.getElementById('saveSettingsBtn');
+const tabButtons = Array.from(document.querySelectorAll('.tab-btn'));
+const tabPanels = Array.from(document.querySelectorAll('.tab-panel'));
+
+// Modal elements
+const docModalOverlay = document.getElementById('docModalOverlay');
+const docModalCloseBtn = document.getElementById('docModalClose');
+
+// Admin elements
+const loginGate = document.getElementById('loginGate');
+const adminContent = document.getElementById('adminContent');
+const loginForm = document.getElementById('loginForm');
+const loginError = document.getElementById('loginError');
+const adminUserLabel = document.getElementById('adminUserLabel');
+const logoutBtn = document.getElementById('logoutBtn');
+const adminTabButtons = Array.from(document.querySelectorAll('.admin-tab-btn'));
+const createUserForm = document.getElementById('createUserForm');
+const createUserError = document.getElementById('createUserError');
+const refreshCacheBtn = document.getElementById('refreshCacheBtn');
+const reparseAllBtn = document.getElementById('reparseAllBtn');
+
+// --- State ---
+const state = {
+  payload: null,
+  selectedDocId: null,
+  selectedTheme: null,
+  loading: false,
+  user: null, // { username } or null
+  sortKey: null,   // 'title' | 'author' | 'year' | 'degree' | 'pages' | null
+  sortDir: 'asc',  // 'asc' | 'desc'
+  filterText: '',
+};
+
+// --- Utilities ---
+
+function formatNum(value) {
+  if (value === null || value === undefined) return '-';
+  return new Intl.NumberFormat('en-US', { maximumFractionDigits: 0 }).format(value);
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return '-';
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function escapeHtml(text) {
+  return String(text || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function setStatus(message, isError = false) {
+  statusTextEl.textContent = message;
+  statusEl.classList.toggle('error', isError);
+}
+
+function showSpinner(show) {
+  spinnerEl.hidden = !show;
+}
+
+// --- Tab navigation ---
+
+function setActiveTab(tabName) {
+  for (const btn of tabButtons) {
+    const isActive = btn.dataset.tab === tabName;
+    btn.classList.toggle('active', isActive);
+    btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+  }
+  for (const panel of tabPanels) {
+    panel.classList.toggle('active', panel.id === `tab-${tabName}`);
+  }
+}
+
+function setActiveAdminTab(tabName) {
+  for (const btn of adminTabButtons) {
+    btn.classList.toggle('active', btn.dataset.adminTab === tabName);
+  }
+  for (const section of document.querySelectorAll('.admin-panel-section')) {
+    section.classList.toggle('active', section.id === `admin-${tabName}`);
+  }
+}
+
+// --- Query params ---
+
+function getCurrentParams() {
+  return {
+    index: document.getElementById('s-index').value.trim(),
+    query: document.getElementById('s-query').value.trim(),
+    term: document.getElementById('s-term').value.trim(),
+    source: document.getElementById('s-source').value.trim(),
+    maxRecords: document.getElementById('s-maxRecords').value,
+    pageSize: document.getElementById('s-pageSize').value,
+    scanLimit: document.getElementById('s-scanLimit').value,
+    subjectLimit: document.getElementById('s-subjectLimit').value,
+    apiKey: document.getElementById('s-apiKey').value.trim(),
+    downloadFiles: document.getElementById('s-downloadFiles').value,
+    recomputeFromCache: document.getElementById('s-recomputeFromCache').value
+  };
+}
+
+// --- Document rendering ---
+
+function intersectionCount(a, b) {
+  const setB = new Set(b);
+  let count = 0;
+  for (const x of a) {
+    if (setB.has(x)) count += 1;
+  }
+  return count;
+}
+
+function relatedDocuments(doc, allDocs, limit = 6) {
+  const docThemes = doc.themes || [];
+  return allDocs
+    .filter((candidate) => candidate.id !== doc.id)
+    .map((candidate) => {
+      const overlap = intersectionCount(docThemes, candidate.themes || []);
+      return {
+        ...candidate,
+        overlap,
+        sharedThemes: (candidate.themes || []).filter((t) => docThemes.includes(t)).slice(0, 4)
+      };
+    })
+    .filter((item) => item.overlap > 0)
+    .sort((a, b) => b.overlap - a.overlap || (b.year || 0) - (a.year || 0))
+    .slice(0, limit);
+}
+
+function openRecord(docId, focusTab = 'records') {
+  state.selectedDocId = docId;
+  renderDocuments();
+  renderDetails();
+  docModalOverlay.hidden = false;
+  setActiveTab(focusTab);
+}
+
+function closeDocModal() {
+  docModalOverlay.hidden = true;
+}
+
+function docsForTheme(theme) {
+  const docs = state.payload?.documents || [];
+  const normalized = String(theme || '').toLowerCase();
+  return docs.filter((doc) => (doc.themes || []).some((t) => t.toLowerCase() === normalized));
+}
+
+function docSortValue(doc, key) {
+  switch (key) {
+    case 'title': return (doc.title || '').toLowerCase();
+    case 'author': return (doc.author || '').toLowerCase();
+    case 'year': return doc.year || 0;
+    case 'degree': return (doc.degree || doc.type || '').toLowerCase();
+    case 'pages': return doc.pages || 0;
+    case 'wordCount': return doc.wordCount || 0;
+    default: return '';
+  }
+}
+
+function getFilteredSortedDocs() {
+  let docs = state.payload?.documents || [];
+
+  if (state.filterText) {
+    const q = state.filterText.toLowerCase();
+    docs = docs.filter((doc) =>
+      (doc.title || '').toLowerCase().includes(q) ||
+      (doc.author || '').toLowerCase().includes(q) ||
+      (doc.degree || '').toLowerCase().includes(q) ||
+      (doc.program || '').toLowerCase().includes(q) ||
+      String(doc.year || '').includes(q)
+    );
+  }
+
+  if (state.sortKey) {
+    const dir = state.sortDir === 'asc' ? 1 : -1;
+    docs = [...docs].sort((a, b) => {
+      const av = docSortValue(a, state.sortKey);
+      const bv = docSortValue(b, state.sortKey);
+      if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * dir;
+      if (av < bv) return -1 * dir;
+      if (av > bv) return 1 * dir;
+      return 0;
+    });
+  }
+
+  return docs;
+}
+
+function updateSortHeaders() {
+  for (const th of docTheadRow.querySelectorAll('th.sortable')) {
+    th.classList.remove('sort-asc', 'sort-desc');
+    if (th.dataset.sortKey === state.sortKey) {
+      th.classList.add(state.sortDir === 'asc' ? 'sort-asc' : 'sort-desc');
+    }
+  }
+}
+
+function renderDocuments() {
+  const docs = getFilteredSortedDocs();
+
+  documentsTableEl.innerHTML = docs
+    .map((doc) => {
+      const active = doc.id === state.selectedDocId ? ' active' : '';
+      return `
+        <tr class="doc-row${active}" data-doc-id="${escapeHtml(doc.id)}">
+          <td>${escapeHtml(doc.title || '(Untitled)')}</td>
+          <td>${escapeHtml(doc.author || '')}</td>
+          <td>${doc.year || '-'}</td>
+          <td>${escapeHtml(doc.degree || doc.type || '-')}</td>
+          <td>${formatNum(doc.pages)}</td>
+          <td>${formatNum(doc.wordCount)}</td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  for (const row of documentsTableEl.querySelectorAll('.doc-row')) {
+    row.addEventListener('click', () => {
+      openRecord(row.dataset.docId, 'records');
+    });
+  }
+
+  updateSortHeaders();
+}
+
+function renderDetails() {
+  const docs = state.payload?.documents || [];
+  if (!docs.length) {
+    docDetailsEl.textContent = 'No documents in current result set.';
+    return;
+  }
+
+  let doc = docs.find((d) => d.id === state.selectedDocId);
+  if (!doc) {
+    doc = docs[0];
+    state.selectedDocId = doc.id;
+  }
+
+  const related = relatedDocuments(doc, docs);
+  const abstract = doc.abstract
+    ? doc.abstract.split(/\n{2,}|\r?\n/).map((p) => `<p>${escapeHtml(p.trim())}</p>`).join('')
+    : '<p>No abstract provided.</p>';
+  const themes = doc.themes?.length
+    ? doc.themes.map((t) => `<span class="token">${escapeHtml(t)}</span>`).join('')
+    : '<span class="token">No themes</span>';
+
+  const relatedHtml = related.length
+    ? related
+        .map(
+          (r) => `
+          <div class="related-item" data-related-id="${escapeHtml(r.id)}">
+            <strong>${escapeHtml(r.title || '(Untitled)')}</strong>
+            <p>${escapeHtml(r.author || 'Unknown')} &middot; ${formatNum(r.year)} &middot; Shared themes: ${escapeHtml(r.sharedThemes.join(', '))}</p>
+          </div>
+        `
+        )
+        .join('')
+    : '<p class="meta">No related documents identified from overlapping themes.</p>';
+
+  // Committee members display
+  let committeeHtml = '';
+  if (doc.committee?.length) {
+    const grouped = {};
+    for (const m of doc.committee) {
+      const role = m.role || 'Committee Member';
+      if (!grouped[role]) grouped[role] = [];
+      grouped[role].push(m);
+    }
+    committeeHtml = Object.entries(grouped).map(([role, members]) =>
+      members.map((m) =>
+        `<p><strong>${escapeHtml(role)}:</strong> ${escapeHtml(m.name)}${m.affiliation ? ` (${escapeHtml(m.affiliation)})` : ''}</p>`
+      ).join('')
+    ).join('');
+  }
+
+  // Works cited section (lazy loaded)
+  const citationCount = doc.citationCount || 0;
+  const citationsHtml = citationCount > 0
+    ? `<details class="citations-details" data-doc-id="${escapeHtml(doc.id)}">
+        <summary>Works Cited (${formatNum(citationCount)} references)</summary>
+        <div class="citations-content"><p class="meta">Loading...</p></div>
+      </details>`
+    : '';
+
+  docDetailsEl.innerHTML = `
+    <div class="meta">
+      <p><strong>Title:</strong> ${escapeHtml(doc.title || '(Untitled)')}</p>
+      <p><strong>Author:</strong> ${escapeHtml(doc.author || 'Unknown')}</p>
+      <p><strong>Date:</strong> ${escapeHtml(doc.date || '-')}</p>
+      <p><strong>Degree:</strong> ${escapeHtml(doc.degree || '-')}</p>
+      <p><strong>Program:</strong> ${escapeHtml(doc.program || '-')}</p>
+      ${doc.supervisors?.length ? `<p><strong>Supervisor:</strong> ${escapeHtml(doc.supervisors.join('; '))}</p>` : ''}
+      ${committeeHtml}
+      <p><strong>Pages:</strong> ${formatNum(doc.pages)} (${escapeHtml(doc.pagesSource)})</p>
+      <p><strong>Word Count:</strong> ${formatNum(doc.wordCount)} (${escapeHtml(doc.wordCountSource || 'unknown')})</p>
+      <p><strong>Download:</strong> ${escapeHtml(doc.downloadStatus || 'unknown')}</p>
+      ${doc.downloadUrl ? `<p><strong>File URL:</strong> <a href="${escapeHtml(doc.downloadUrl)}" target="_blank" rel="noreferrer">Open file</a></p>` : ''}
+      ${doc.downloadError ? `<p><strong>Download Note:</strong> ${escapeHtml(doc.downloadError)}</p>` : ''}
+      ${doc.uri ? `<p><strong>Link:</strong> <a href="${escapeHtml(doc.uri)}" target="_blank" rel="noreferrer">Open record</a></p>` : ''}
+    </div>
+    <div>
+      <p class="detail-section-title">Abstract</p>
+      <div class="detail-abstract">${abstract}</div>
+    </div>
+    <div>
+      <p class="detail-section-title">Key Themes</p>
+      <div class="token-list">${themes}</div>
+    </div>
+    <div>
+      <p class="detail-section-title">Related Documents</p>
+      <div class="related-list">${relatedHtml}</div>
+    </div>
+    ${citationsHtml}
+  `;
+
+  for (const item of docDetailsEl.querySelectorAll('.related-item[data-related-id]')) {
+    item.addEventListener('click', () => {
+      const targetId = item.getAttribute('data-related-id');
+      if (targetId) openRecord(targetId, 'records');
+    });
+  }
+
+  // Lazy-load citations on toggle
+  const citationsDetails = docDetailsEl.querySelector('.citations-details[data-doc-id]');
+  if (citationsDetails) {
+    citationsDetails.addEventListener('toggle', async () => {
+      if (!citationsDetails.open) return;
+      const contentEl = citationsDetails.querySelector('.citations-content');
+      if (contentEl.dataset.loaded) return;
+      contentEl.dataset.loaded = '1';
+      try {
+        const docId = citationsDetails.dataset.docId;
+        const res = await fetch(`/api/documents/${encodeURIComponent(docId)}/citations`);
+        if (!res.ok) {
+          contentEl.innerHTML = '<p class="meta">Failed to load citations.</p>';
+          return;
+        }
+        const data = await res.json();
+        if (!data.citations?.length) {
+          contentEl.innerHTML = '<p class="meta">No citations found.</p>';
+          return;
+        }
+        contentEl.innerHTML = data.citations.map((c) =>
+          `<p class="citation-entry">${escapeHtml(c.citation_text)}</p>`
+        ).join('');
+      } catch {
+        contentEl.innerHTML = '<p class="meta">Connection error.</p>';
+      }
+    });
+  }
+}
+
+// --- Analytics rendering ---
+
+function renderKpis() {
+  const metrics = state.payload?.metrics;
+  if (!metrics) {
+    kpisEl.innerHTML = '';
+    return;
+  }
+
+  const cards = [
+    { label: 'Retrieved Records', value: metrics.recordCount },
+    { label: 'Mean Pages', value: metrics.overallPageCount.mean },
+    { label: 'Mean Words', value: metrics.overallWordCount.mean },
+    { label: 'Max Pages', value: metrics.overallPageCount.max },
+    { label: 'Min Pages', value: metrics.overallPageCount.min },
+    { label: 'Min Words', value: metrics.overallWordCount.min }
+  ];
+
+  kpisEl.innerHTML = cards
+    .map(
+      (card) => `
+      <article class="kpi">
+        <p>${card.label}</p>
+        <strong>${formatNum(card.value)}</strong>
+      </article>
+    `
+    )
+    .join('');
+}
+
+function renderPagesByYear() {
+  const rows = state.payload?.metrics?.avgPagesByYear || [];
+  if (!rows.length) {
+    pagesByYearChartEl.innerHTML = '<text x="16" y="40">No year/page data available.</text>';
+    return;
+  }
+
+  const width = 940;
+  const height = 360;
+  const pad = { t: 20, r: 20, b: 40, l: 58 };
+  const xs = rows.map((d) => d.year);
+  const ys = rows.map((d) => d.mean || 0);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const maxY = Math.max(...ys, 1);
+
+  const x = (v) => pad.l + ((v - minX) / Math.max(maxX - minX, 1)) * (width - pad.l - pad.r);
+  const y = (v) => height - pad.b - (v / maxY) * (height - pad.t - pad.b);
+
+  const points = rows.map((d) => `${x(d.year)},${y(d.mean || 0)}`).join(' ');
+
+  const yTicks = Array.from({ length: 6 }, (_, i) => {
+    const val = (maxY / 5) * i;
+    return { val, y: y(val) };
+  });
+
+  pagesByYearChartEl.innerHTML = `
+    ${yTicks
+      .map(
+        (tick) => `
+      <line x1="${pad.l}" y1="${tick.y}" x2="${width - pad.r}" y2="${tick.y}" stroke="rgba(8,90,99,0.12)"/>
+      <text class="axis" x="${pad.l - 8}" y="${tick.y + 4}" text-anchor="end">${formatNum(tick.val)}</text>
+    `
+      )
+      .join('')}
+    <polyline points="${points}" fill="none" stroke="#085a63" stroke-width="3" />
+    ${rows
+      .filter((_, i) => i % Math.ceil(rows.length / 12) === 0)
+      .map((row) => `<text class="axis" x="${x(row.year)}" y="${height - 10}" text-anchor="middle">${row.year}</text>`)
+      .join('')}
+  `;
+}
+
+function renderDissertationsByYear() {
+  const rows = state.payload?.metrics?.byYear || [];
+  if (!rows.length) {
+    dissertationsByYearChartEl.innerHTML = '<text x="16" y="40">No year data available.</text>';
+    return;
+  }
+
+  const width = 940;
+  const height = 360;
+  const pad = { t: 20, r: 20, b: 40, l: 58 };
+  const xs = rows.map((d) => d.year);
+  const ys = rows.map((d) => d.count || 0);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const maxY = Math.max(...ys, 1);
+  const barWidth = Math.max(4, ((width - pad.l - pad.r) / Math.max(rows.length, 1)) * 0.7);
+  const barGap = (width - pad.l - pad.r) / Math.max(rows.length, 1);
+
+  const x = (i) => pad.l + i * barGap + (barGap - barWidth) / 2;
+  const y = (v) => height - pad.b - (v / maxY) * (height - pad.t - pad.b);
+
+  const yTicks = Array.from({ length: 6 }, (_, i) => {
+    const val = (maxY / 5) * i;
+    return { val, y: y(val) };
+  });
+
+  dissertationsByYearChartEl.innerHTML = `
+    ${yTicks
+      .map(
+        (tick) => `
+      <line x1="${pad.l}" y1="${tick.y}" x2="${width - pad.r}" y2="${tick.y}" stroke="rgba(8,90,99,0.12)"/>
+      <text class="axis" x="${pad.l - 8}" y="${tick.y + 4}" text-anchor="end">${formatNum(tick.val)}</text>
+    `
+      )
+      .join('')}
+    ${rows
+      .map(
+        (row, i) => `<rect x="${x(i)}" y="${y(row.count)}" width="${barWidth}" height="${height - pad.b - y(row.count)}" fill="var(--accent-2)" rx="2" />`
+      )
+      .join('')}
+    ${rows
+      .filter((_, i) => i % Math.ceil(rows.length / 12) === 0)
+      .map((row, _, arr) => {
+        const idx = rows.indexOf(row);
+        return `<text class="axis" x="${x(idx) + barWidth / 2}" y="${height - 10}" text-anchor="middle">${row.year}</text>`;
+      })
+      .join('')}
+  `;
+}
+
+function renderWordsByYear() {
+  const rows = state.payload?.metrics?.byYear || [];
+  if (!rows.length) {
+    wordsByYearChartEl.innerHTML = '<text x="16" y="40">No year/word data available.</text>';
+    return;
+  }
+
+  const width = 940;
+  const height = 360;
+  const pad = { t: 20, r: 20, b: 40, l: 58 };
+  const xs = rows.map((d) => d.year);
+  const ys = rows.map((d) => d.mean || 0);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const maxY = Math.max(...ys, 1);
+
+  const x = (v) => pad.l + ((v - minX) / Math.max(maxX - minX, 1)) * (width - pad.l - pad.r);
+  const y = (v) => height - pad.b - (v / maxY) * (height - pad.t - pad.b);
+
+  const points = rows.map((d) => `${x(d.year)},${y(d.mean || 0)}`).join(' ');
+
+  const yTicks = Array.from({ length: 6 }, (_, i) => {
+    const val = (maxY / 5) * i;
+    return { val, y: y(val) };
+  });
+
+  wordsByYearChartEl.innerHTML = `
+    ${yTicks
+      .map(
+        (tick) => `
+      <line x1="${pad.l}" y1="${tick.y}" x2="${width - pad.r}" y2="${tick.y}" stroke="rgba(8,90,99,0.12)"/>
+      <text class="axis" x="${pad.l - 8}" y="${tick.y + 4}" text-anchor="end">${formatNum(tick.val)}</text>
+    `
+      )
+      .join('')}
+    <polyline points="${points}" fill="none" stroke="var(--accent-3)" stroke-width="3" />
+    ${rows
+      .filter((_, i) => i % Math.ceil(rows.length / 12) === 0)
+      .map((row) => `<text class="axis" x="${x(row.year)}" y="${height - 10}" text-anchor="middle">${row.year}</text>`)
+      .join('')}
+  `;
+}
+
+function renderWordCloud() {
+  const words = state.payload?.wordCloud || [];
+  if (!words.length) {
+    wordCloudEl.innerHTML = '<span>No theme terms available.</span>';
+    themeResultsEl.innerHTML = '';
+    return;
+  }
+
+  const max = Math.max(...words.map((w) => w.count), 1);
+  wordCloudEl.innerHTML = words
+    .map((word) => {
+      const ratio = word.count / max;
+      const size = 0.8 + ratio * 1.7;
+      const hue = 190 - Math.round(ratio * 70);
+      const active = state.selectedTheme && state.selectedTheme.toLowerCase() === word.term.toLowerCase();
+      return `<button class="cloud-term${active ? ' active' : ''}" data-theme="${escapeHtml(word.term)}" style="font-size:${size}rem;color:hsl(${hue} 58% 28%)">${escapeHtml(word.term)}</button>`;
+    })
+    .join('');
+
+  for (const node of wordCloudEl.querySelectorAll('.cloud-term[data-theme]')) {
+    node.addEventListener('click', () => {
+      state.selectedTheme = node.getAttribute('data-theme');
+      renderWordCloud();
+      renderThemeResults();
+    });
+  }
+
+  renderThemeResults();
+}
+
+function renderThemeResults() {
+  if (!state.selectedTheme) {
+    themeResultsEl.innerHTML = '<p>Select a theme to view tagged dissertations.</p>';
+    return;
+  }
+
+  const matches = docsForTheme(state.selectedTheme);
+  if (!matches.length) {
+    themeResultsEl.innerHTML = `<p>No dissertations tagged with <strong>${escapeHtml(state.selectedTheme)}</strong>.</p>`;
+    return;
+  }
+
+  themeResultsEl.innerHTML = `
+    <p><strong>${escapeHtml(state.selectedTheme)}</strong> &middot; ${formatNum(matches.length)} dissertation(s)</p>
+    <div class="related-list">
+      ${matches
+        .map(
+          (doc) => `
+          <div class="related-item" data-related-id="${escapeHtml(doc.id)}">
+            <strong>${escapeHtml(doc.title || '(Untitled)')}</strong>
+            <p>${escapeHtml(doc.author || 'Unknown')} &middot; ${formatNum(doc.year)} &middot; ${escapeHtml(doc.degree || '-')}</p>
+          </div>
+        `
+        )
+        .join('')}
+    </div>
+  `;
+
+  for (const item of themeResultsEl.querySelectorAll('.related-item[data-related-id]')) {
+    item.addEventListener('click', () => {
+      const targetId = item.getAttribute('data-related-id');
+      if (targetId) openRecord(targetId, 'records');
+    });
+  }
+}
+
+function renderSubjectBars() {
+  const bySubject = state.payload?.metrics?.bySubject || [];
+  const maxMean = Math.max(...bySubject.map((s) => s.mean || 0), 1);
+
+  subjectBarsEl.innerHTML = bySubject
+    .slice(0, 14)
+    .map((entry) => {
+      const widthPct = ((entry.mean || 0) / maxMean) * 100;
+      return `
+        <div class="bar-row">
+          <span class="bar-label" title="${escapeHtml(entry.subject)}">${escapeHtml(entry.subject)}</span>
+          <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
+          <span class="bar-value">${formatNum(entry.mean)}</span>
+        </div>
+      `;
+    })
+    .join('');
+}
+
+function renderPageTrend() {
+  const rows = state.payload?.metrics?.pageTrend || [];
+  if (!rows.length) {
+    pageTrendChartEl.innerHTML = '<text x="16" y="40">No page trend data available.</text>';
+    return;
+  }
+
+  const width = 940;
+  const height = 360;
+  const pad = { t: 20, r: 20, b: 40, l: 58 };
+  const xs = rows.map((d) => d.year);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const maxY = Math.max(...rows.map((d) => d.max), 1);
+
+  const x = (v) => pad.l + ((v - minX) / Math.max(maxX - minX, 1)) * (width - pad.l - pad.r);
+  const y = (v) => height - pad.b - (v / maxY) * (height - pad.t - pad.b);
+
+  // Min/max band polygon: go forward along max, then backward along min
+  const bandTop = rows.map((d) => `${x(d.year)},${y(d.max)}`).join(' ');
+  const bandBot = [...rows].reverse().map((d) => `${x(d.year)},${y(d.min)}`).join(' ');
+  const bandPoints = `${bandTop} ${bandBot}`;
+
+  const medianPoints = rows.map((d) => `${x(d.year)},${y(d.median)}`).join(' ');
+
+  const yTicks = Array.from({ length: 6 }, (_, i) => {
+    const val = (maxY / 5) * i;
+    return { val, y: y(val) };
+  });
+
+  pageTrendChartEl.innerHTML = `
+    ${yTicks
+      .map(
+        (tick) => `
+      <line x1="${pad.l}" y1="${tick.y}" x2="${width - pad.r}" y2="${tick.y}" stroke="rgba(8,90,99,0.12)"/>
+      <text class="axis" x="${pad.l - 8}" y="${tick.y + 4}" text-anchor="end">${formatNum(tick.val)}</text>
+    `
+      )
+      .join('')}
+    <polygon points="${bandPoints}" fill="rgba(8,90,99,0.12)" />
+    <polyline points="${medianPoints}" fill="none" stroke="#085a63" stroke-width="3" />
+    ${rows
+      .filter((_, i) => i % Math.ceil(rows.length / 12) === 0)
+      .map((row) => `<text class="axis" x="${x(row.year)}" y="${height - 10}" text-anchor="middle">${row.year}</text>`)
+      .join('')}
+  `;
+}
+
+function renderNgramCloud() {
+  const words = state.payload?.ngramCloud || [];
+  if (!words.length) {
+    ngramCloudEl.innerHTML = '<span>No n-gram data available.</span>';
+    return;
+  }
+
+  const max = Math.max(...words.map((w) => w.count), 1);
+  ngramCloudEl.innerHTML = words
+    .map((word) => {
+      const ratio = word.count / max;
+      const size = 0.8 + ratio * 1.4;
+      const hue = 20 + Math.round(ratio * 40);
+      return `<button class="cloud-term" style="font-size:${size}rem;color:hsl(${hue} 68% 35%)">${escapeHtml(word.term)} <sup style="font-size:0.6em;opacity:0.6">${word.count}</sup></button>`;
+    })
+    .join('');
+}
+
+function renderMethodologies() {
+  const items = state.payload?.methodologies || [];
+  if (!items.length) {
+    methodologyBarsEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No methodology signals detected.</p>';
+    return;
+  }
+
+  const maxCount = Math.max(...items.map((m) => m.count), 1);
+  methodologyBarsEl.innerHTML = items
+    .map((entry) => {
+      const widthPct = (entry.count / maxCount) * 100;
+      return `
+        <div class="bar-row">
+          <span class="bar-label" title="${escapeHtml(entry.methodology)}">${escapeHtml(entry.methodology)}</span>
+          <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
+          <span class="bar-value">${formatNum(entry.count)}</span>
+        </div>
+      `;
+    })
+    .join('');
+}
+
+function renderCooccurrence() {
+  const pairs = state.payload?.termCooccurrence || [];
+  if (!pairs.length) {
+    cooccurrenceBarsEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No co-occurring term pairs found.</p>';
+    return;
+  }
+
+  const maxCount = Math.max(...pairs.map((p) => p.count), 1);
+  cooccurrenceBarsEl.innerHTML = pairs
+    .map((entry) => {
+      const widthPct = (entry.count / maxCount) * 100;
+      const label = `${entry.termA} + ${entry.termB}`;
+      return `
+        <div class="bar-row">
+          <span class="bar-label" title="${escapeHtml(label)}">${escapeHtml(label)}</span>
+          <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
+          <span class="bar-value">${formatNum(entry.count)}</span>
+        </div>
+      `;
+    })
+    .join('');
+}
+
+function renderSupervisorHeatmap() {
+  const data = state.payload?.supervisorNgramMatrix;
+  if (!data || !data.supervisors.length || !data.ngrams.length) {
+    supervisorHeatmapEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No supervisor-term data available.</p>';
+    return;
+  }
+
+  const maxVal = Math.max(...data.matrix.flat(), 1);
+
+  const headerCells = data.ngrams
+    .map((s) => `<th class="heatmap-header">${escapeHtml(s)}</th>`)
+    .join('');
+
+  const bodyRows = data.supervisors
+    .map((sup, si) => {
+      const cells = data.ngrams
+        .map((_, nj) => {
+          const val = data.matrix[si][nj];
+          const lightness = val > 0 ? 95 - Math.round((val / maxVal) * 65) : 97;
+          const textColor = lightness < 55 ? '#fff' : 'var(--ink)';
+          return `<td class="heatmap-cell" style="background:hsl(190 58% ${lightness}%);color:${textColor}">${val > 0 ? val : ''}</td>`;
+        })
+        .join('');
+      return `<tr><td class="heatmap-label" title="${escapeHtml(sup)}">${escapeHtml(sup)}</td>${cells}</tr>`;
+    })
+    .join('');
+
+  supervisorHeatmapEl.innerHTML = `
+    <table class="heatmap-table">
+      <thead><tr><th></th>${headerCells}</tr></thead>
+      <tbody>${bodyRows}</tbody>
+    </table>
+  `;
+}
+
+function renderAll() {
+  renderDocuments();
+  renderKpis();
+  renderPagesByYear();
+  renderDissertationsByYear();
+  renderWordsByYear();
+  renderWordCloud();
+  renderSubjectBars();
+  renderPageTrend();
+  renderNgramCloud();
+  renderMethodologies();
+  renderCooccurrence();
+  renderSupervisorHeatmap();
+}
+
+// --- Data loading ---
+
+async function loadData({ refresh = false } = {}) {
+  if (state.loading) return;
+  state.loading = true;
+  loadBtn.disabled = true;
+  refreshBtn.disabled = true;
+  showSpinner(true);
+
+  const params = getCurrentParams();
+  if (refresh) params.refresh = '1';
+
+  setStatus('Loading records from UBC Open Collections...');
+
+  try {
+    const query = new URLSearchParams(params);
+    const res = await fetch(`/api/metrics?${query.toString()}`);
+    if (!res.ok) {
+      const err = await res.json();
+      throw new Error(err.message || err.error || `Request failed with ${res.status}`);
+    }
+
+    state.payload = await res.json();
+    state.selectedDocId = state.payload.documents?.[0]?.id || null;
+    state.selectedTheme = null;
+    state.sortKey = null;
+    state.sortDir = 'asc';
+    state.filterText = '';
+    docFilterEl.value = '';
+    renderAll();
+
+    const docs = state.payload.documents || [];
+    const statusCounts = docs.reduce((acc, doc) => {
+      const key = doc.downloadStatus || 'unknown';
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {});
+
+    const parts = [];
+    if (statusCounts.cached) parts.push(`${statusCounts.cached} cached`);
+    if (statusCounts.downloaded) parts.push(`${statusCounts.downloaded} downloaded`);
+    if (statusCounts.not_found) parts.push(`${statusCounts.not_found} not found`);
+    if (statusCounts.skipped) parts.push(`${statusCounts.skipped} skipped`);
+    const otherCount = docs.length - parts.reduce((s, p) => s + parseInt(p), 0);
+    if (otherCount > 0 && parts.length) parts.push(`${otherCount} other`);
+
+    const summary = parts.length ? ` (${parts.join(', ')})` : '';
+    const time = new Date(state.payload.generatedAt).toLocaleString();
+    setStatus(`${formatNum(state.payload.metrics.recordCount)} documents loaded${summary}. Generated ${time}.`);
+  } catch (error) {
+    setStatus(`Failed to load data: ${error.message}`, true);
+  } finally {
+    state.loading = false;
+    loadBtn.disabled = false;
+    refreshBtn.disabled = false;
+    showSpinner(false);
+  }
+}
+
+// --- Auth ---
+
+async function checkSession() {
+  try {
+    const res = await fetch('/api/auth/session');
+    if (res.ok) {
+      const data = await res.json();
+      state.user = { username: data.username };
+      showAdminContent();
+    } else {
+      state.user = null;
+      showLoginGate();
+    }
+  } catch {
+    state.user = null;
+    showLoginGate();
+  }
+}
+
+function showLoginGate() {
+  loginGate.hidden = false;
+  adminContent.hidden = true;
+}
+
+function showAdminContent() {
+  loginGate.hidden = true;
+  adminContent.hidden = false;
+  adminUserLabel.textContent = `Signed in as ${state.user.username}`;
+  loadAdminData();
+}
+
+async function handleLogin(e) {
+  e.preventDefault();
+  const username = document.getElementById('loginUsername').value.trim();
+  const password = document.getElementById('loginPassword').value;
+
+  loginError.hidden = true;
+
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      loginError.textContent = data.error || 'Login failed';
+      loginError.hidden = false;
+      return;
+    }
+    state.user = { username: data.username };
+    loginForm.reset();
+    showAdminContent();
+  } catch (err) {
+    loginError.textContent = 'Connection error';
+    loginError.hidden = false;
+  }
+}
+
+async function handleLogout() {
+  try {
+    await fetch('/api/auth/logout', { method: 'POST' });
+  } catch { /* ignore */ }
+  state.user = null;
+  showLoginGate();
+}
+
+// --- Admin data loading ---
+
+async function loadAdminData() {
+  await Promise.all([loadUsers(), loadCache(), loadRuns(), loadSettings()]);
+}
+
+async function loadUsers() {
+  try {
+    const res = await fetch('/api/admin/users');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderUsers(data.users);
+  } catch { /* ignore */ }
+}
+
+function renderUsers(users) {
+  const el = document.getElementById('usersContent');
+  if (!users?.length) {
+    el.innerHTML = '<p class="meta">No users found.</p>';
+    return;
+  }
+  el.innerHTML = `
+    <table>
+      <thead><tr><th>Username</th><th>Created</th><th></th></tr></thead>
+      <tbody>
+        ${users.map((u) => `
+          <tr>
+            <td>${escapeHtml(u.username)}</td>
+            <td>${new Date(u.created_at).toLocaleString()}</td>
+            <td><button class="btn danger btn-sm" data-delete-user="${escapeHtml(u.username)}">Delete</button></td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>
+  `;
+  for (const btn of el.querySelectorAll('[data-delete-user]')) {
+    btn.addEventListener('click', async () => {
+      const username = btn.dataset.deleteUser;
+      if (!confirm(`Delete user "${username}"?`)) return;
+      try {
+        const res = await fetch(`/api/admin/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.error || 'Delete failed');
+          return;
+        }
+        await loadUsers();
+      } catch { alert('Connection error'); }
+    });
+  }
+}
+
+async function handleCreateUser(e) {
+  e.preventDefault();
+  const username = document.getElementById('newUsername').value.trim();
+  const password = document.getElementById('newPassword').value;
+  createUserError.hidden = true;
+
+  try {
+    const res = await fetch('/api/admin/users', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      createUserError.textContent = data.errors ? data.errors.join(' ') : data.error || 'Create failed';
+      createUserError.hidden = false;
+      return;
+    }
+    createUserForm.reset();
+    await loadUsers();
+  } catch {
+    createUserError.textContent = 'Connection error';
+    createUserError.hidden = false;
+  }
+}
+
+async function loadSettings() {
+  try {
+    const res = await fetch('/api/admin/settings');
+    if (!res.ok) return;
+    const data = await res.json();
+    const s = data.settings || {};
+    if (s.index) document.getElementById('s-index').value = s.index;
+    if (s.query) document.getElementById('s-query').value = s.query;
+    if (s.term) document.getElementById('s-term').value = s.term;
+    if (s.source) document.getElementById('s-source').value = s.source;
+    if (s.maxRecords) document.getElementById('s-maxRecords').value = s.maxRecords;
+    if (s.pageSize) document.getElementById('s-pageSize').value = s.pageSize;
+    if (s.scanLimit) document.getElementById('s-scanLimit').value = s.scanLimit;
+    if (s.subjectLimit) document.getElementById('s-subjectLimit').value = s.subjectLimit;
+    if (s.apiKey) document.getElementById('s-apiKey').value = s.apiKey;
+    if (s.downloadFiles) document.getElementById('s-downloadFiles').value = s.downloadFiles;
+    if (s.recomputeFromCache) document.getElementById('s-recomputeFromCache').value = s.recomputeFromCache;
+  } catch { /* ignore */ }
+}
+
+async function handleSaveSettings() {
+  const params = getCurrentParams();
+  try {
+    const res = await fetch('/api/admin/settings', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(params)
+    });
+    if (res.ok) {
+      setStatus('Settings saved.');
+    }
+  } catch { /* ignore */ }
+}
+
+async function loadCache() {
+  try {
+    const [entriesRes, statsRes] = await Promise.all([
+      fetch('/api/admin/cache'),
+      fetch('/api/admin/cache/stats')
+    ]);
+    if (!entriesRes.ok || !statsRes.ok) return;
+    const entriesData = await entriesRes.json();
+    const statsData = await statsRes.json();
+    renderCacheStats(statsData.stats);
+    renderCache(entriesData.entries);
+  } catch { /* ignore */ }
+}
+
+function renderCacheStats(stats) {
+  const el = document.getElementById('cacheStats');
+  if (!stats) {
+    el.innerHTML = '';
+    return;
+  }
+  el.innerHTML = `
+    Total entries: <strong>${formatNum(stats.total)}</strong> &middot;
+    With PDF: <strong>${formatNum(stats.with_pdf)}</strong> &middot;
+    Failed: <strong>${formatNum(stats.failed)}</strong> &middot;
+    Total size: <strong>${formatBytes(stats.total_bytes)}</strong>
+  `;
+}
+
+function renderCache(entries) {
+  const el = document.getElementById('cacheTable');
+  if (!entries?.length) {
+    el.innerHTML = '<tr><td colspan="7">No cache entries.</td></tr>';
+    return;
+  }
+  el.innerHTML = entries.slice(0, 200).map((e) => `
+    <tr>
+      <td title="${escapeHtml(e.doc_id)}">${escapeHtml(String(e.doc_id).slice(0, 30))}</td>
+      <td>${escapeHtml(e.status || '-')}</td>
+      <td>${formatBytes(e.file_bytes)}</td>
+      <td>${formatNum(e.page_count)}</td>
+      <td>${formatNum(e.word_count)}</td>
+      <td>${e.updated_at ? new Date(e.updated_at).toLocaleDateString() : '-'}</td>
+      <td>
+        <button class="btn ghost btn-sm" data-refresh-cache="${escapeHtml(e.doc_id)}">Refresh</button>
+        <button class="btn danger btn-sm" data-delete-cache="${escapeHtml(e.doc_id)}">Del</button>
+      </td>
+    </tr>
+  `).join('');
+
+  for (const btn of el.querySelectorAll('[data-refresh-cache]')) {
+    btn.addEventListener('click', async () => {
+      const docId = btn.dataset.refreshCache;
+      btn.disabled = true;
+      btn.textContent = '...';
+      try {
+        const res = await fetch(`/api/admin/cache/${encodeURIComponent(docId)}/refresh`, { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.error || 'Refresh failed');
+          return;
+        }
+        // Update in-memory document state so Explorer reflects new metrics
+        const localDoc = (state.payload?.documents || []).find((d) => d.id === docId);
+        if (localDoc) {
+          if (data.pages != null) { localDoc.pages = data.pages; localDoc.pagesSource = data.pagesSource; }
+          if (data.wordCount != null) { localDoc.wordCount = data.wordCount; localDoc.wordCountSource = data.wordCountSource; }
+          localDoc.fileBytes = data.fileBytes ?? localDoc.fileBytes;
+          localDoc.downloadUrl = data.downloadUrl ?? localDoc.downloadUrl;
+          localDoc.downloadStatus = data.status;
+          localDoc.downloadError = data.downloadError ?? null;
+          renderDocuments();
+        }
+        setStatus(`PDF refreshed for ${docId} (${data.status})`);
+        await loadCache();
+      } catch {
+        alert('Connection error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Refresh';
+      }
+    });
+  }
+
+  for (const btn of el.querySelectorAll('[data-delete-cache]')) {
+    btn.addEventListener('click', async () => {
+      const docId = btn.dataset.deleteCache;
+      try {
+        const res = await fetch(`/api/admin/cache/${encodeURIComponent(docId)}`, { method: 'DELETE' });
+        if (res.ok) await loadCache();
+      } catch { /* ignore */ }
+    });
+  }
+}
+
+async function handleRefreshCache() {
+  try {
+    await fetch('/api/admin/cache/refresh', { method: 'POST' });
+    setStatus('In-memory cache cleared. Next query will re-fetch.');
+  } catch { /* ignore */ }
+}
+
+async function handleReparseAll() {
+  reparseAllBtn.disabled = true;
+  reparseAllBtn.textContent = 'Reparsing...';
+  try {
+    const res = await fetch('/api/admin/reparse-all', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || 'Reparse failed');
+      return;
+    }
+    setStatus(`Reparsed ${data.processed} PDFs. Found committees in ${data.committees}, citations in ${data.citations}.`);
+  } catch {
+    alert('Connection error');
+  } finally {
+    reparseAllBtn.disabled = false;
+    reparseAllBtn.textContent = 'Reparse All PDFs';
+  }
+}
+
+async function loadRuns() {
+  try {
+    const res = await fetch('/api/admin/runs');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderRuns(data.runs);
+  } catch { /* ignore */ }
+}
+
+function renderRuns(runs) {
+  const el = document.getElementById('runsTable');
+  if (!runs?.length) {
+    el.innerHTML = '<tr><td colspan="4">No runs recorded.</td></tr>';
+    return;
+  }
+  el.innerHTML = runs.slice(0, 50).map((r) => {
+    let summary = '-';
+    try {
+      const s = JSON.parse(r.source_json);
+      summary = `index=${s.index || s.requestedIndex || '?'}, max=${s.maxRecords || '?'}`;
+      if (s.term) summary += `, term=${String(s.term).slice(0, 40)}`;
+    } catch { /* ignore */ }
+    return `
+      <tr>
+        <td>${r.id}</td>
+        <td title="${escapeHtml(r.run_key)}">${escapeHtml(String(r.run_key).slice(0, 12))}...</td>
+        <td>${new Date(r.created_at).toLocaleString()}</td>
+        <td>${escapeHtml(summary)}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
+// --- Event bindings ---
+
+settingsForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  loadData();
+  setActiveTab('records');
+});
+
+refreshBtn.addEventListener('click', () => {
+  loadData({ refresh: true });
+});
+
+saveSettingsBtn.addEventListener('click', handleSaveSettings);
+
+for (const btn of tabButtons) {
+  btn.addEventListener('click', () => {
+    setActiveTab(btn.dataset.tab);
+    if (btn.dataset.tab === 'admin') checkSession();
+  });
+}
+
+for (const btn of adminTabButtons) {
+  btn.addEventListener('click', () => setActiveAdminTab(btn.dataset.adminTab));
+}
+
+// Sort headers
+for (const th of docTheadRow.querySelectorAll('th.sortable')) {
+  th.addEventListener('click', () => {
+    const key = th.dataset.sortKey;
+    if (state.sortKey === key) {
+      state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      state.sortKey = key;
+      state.sortDir = 'asc';
+    }
+    renderDocuments();
+  });
+}
+
+// Filter input
+docFilterEl.addEventListener('input', () => {
+  state.filterText = docFilterEl.value.trim();
+  renderDocuments();
+});
+
+docModalCloseBtn.addEventListener('click', closeDocModal);
+docModalOverlay.addEventListener('click', (e) => {
+  if (e.target === docModalOverlay) closeDocModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !docModalOverlay.hidden) closeDocModal();
+});
+
+loginForm.addEventListener('submit', handleLogin);
+logoutBtn.addEventListener('click', handleLogout);
+createUserForm.addEventListener('submit', handleCreateUser);
+refreshCacheBtn.addEventListener('click', handleRefreshCache);
+reparseAllBtn.addEventListener('click', handleReparseAll);
+
+// Keyboard navigation for document table
+documentsTableEl.addEventListener('keydown', (e) => {
+  if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+  e.preventDefault();
+  const docs = state.payload?.documents || [];
+  if (!docs.length) return;
+  const currentIndex = docs.findIndex((d) => d.id === state.selectedDocId);
+  let nextIndex = currentIndex;
+  if (e.key === 'ArrowDown') nextIndex = Math.min(currentIndex + 1, docs.length - 1);
+  if (e.key === 'ArrowUp') nextIndex = Math.max(currentIndex - 1, 0);
+  if (nextIndex !== currentIndex) {
+    openRecord(docs[nextIndex].id, 'records');
+    const row = documentsTableEl.querySelector(`[data-doc-id="${CSS.escape(docs[nextIndex].id)}"]`);
+    row?.scrollIntoView({ block: 'nearest' });
+  }
+});
+
+// Staggered reveal animation
+for (const [idx, node] of document.querySelectorAll('.reveal').entries()) {
+  node.style.animationDelay = `${idx * 70}ms`;
+}
+
+// Initial load
+loadData();
