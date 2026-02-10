@@ -3,12 +3,17 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { collectMetrics } from './metrics.js';
-import { PORT, CACHE_TTL_MS } from './config.js';
-import { ensureStorage, getDb, listUsers, listFileMetrics, getFileMetricsStats, deleteFileMetric, listRecentRuns, getAllSettings, setSetting, loadDocumentMetadata } from './db.js';
+import {
+  PORT, CACHE_TTL_MS, LOGIN_WINDOW_MS, LOGIN_BLOCK_MS, LOGIN_MAX_ATTEMPTS_IP,
+  LOGIN_MAX_ATTEMPTS_USER, LOGIN_FAILURE_DELAY_MS, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT,
+  ALLOW_PUBLIC_DOWNLOADS, ALLOW_PUBLIC_REFRESH, ALLOW_PUBLIC_RECOMPUTE, EXPOSE_ERROR_DETAILS
+} from './config.js';
+import { ensureStorage, getDb, listUsers, listFileMetrics, getFileMetricsStats, deleteFileMetric, listRecentRuns, getAllSettings, getSetting, setSetting, loadDocumentMetadata } from './db.js';
 import { authenticate, requireAdmin, login, destroySession, setSessionCookie, clearSessionCookie, ensureDefaultAdmin, createPasswordHash } from './auth.js';
-import { createUser, deleteUser, countUsers, findUserByUsername, checkCacheIntegrity, logCacheStats, saveCommitteeMembers, saveCitations, loadDocumentCitations } from './db.js';
+import { createUser, deleteUser, countUsers, findUserByUsername, checkCacheIntegrity, logCacheStats, loadDocumentCitations } from './db.js';
 import { validateMetricsParams, validateAdminUser, parseNumberParam, parseBooleanParam } from './validate.js';
-import { deleteCachedPdf, analyzeDocumentFile, analyzePdfAtPath, parseCommittee, parseBibliography, normalizeCitation } from './pdf.js';
+import { deleteCachedPdf, analyzeDocumentFile, analyzePdfAtPath, extractAndSaveParsedData } from './pdf.js';
+import { getConceptPipelineStatus, rebuildConceptDictionary, scheduleDailyConceptRebuild } from './conceptsPipeline.js';
 import { logger } from './logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -16,6 +21,9 @@ const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, '..', 'public');
 
 const metricsCache = new Map();
+const failedLoginsByIp = new Map();
+const failedLoginsByUser = new Map();
+let stopDailyConceptScheduler = null;
 
 const mimeTypes = {
   '.html': 'text/html; charset=utf-8',
@@ -25,9 +33,35 @@ const mimeTypes = {
   '.svg': 'image/svg+xml; charset=utf-8'
 };
 
+const securityHeaders = {
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'no-referrer',
+  'permissions-policy': 'geolocation=(), camera=(), microphone=()',
+  'content-security-policy': [
+    "default-src 'self'",
+    "base-uri 'self'",
+    "object-src 'none'",
+    "frame-ancestors 'none'",
+    "form-action 'self'",
+    "connect-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+    "font-src 'self' https://fonts.gstatic.com",
+    "img-src 'self' data: https:"
+  ].join('; ')
+};
+
 // --- Helpers ---
 
+function applySecurityHeaders(res) {
+  for (const [name, value] of Object.entries(securityHeaders)) {
+    res.setHeader(name, value);
+  }
+}
+
 function sendJson(res, status, data) {
+  applySecurityHeaders(res);
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(data));
 }
@@ -45,6 +79,7 @@ async function serveStatic(reqPath, res) {
   try {
     const data = await fs.readFile(filePath);
     const ext = path.extname(filePath).toLowerCase();
+    applySecurityHeaders(res);
     res.writeHead(200, { 'content-type': mimeTypes[ext] || 'application/octet-stream' });
     res.end(data);
   } catch {
@@ -81,6 +116,68 @@ function getClientIp(req) {
   return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
 }
 
+function getPublicAdminSettings() {
+  const settings = getAllSettings();
+  const apiKey = getSetting('apiKey') || process.env.UBC_API_KEY;
+  delete settings.apiKey;
+  return {
+    ...settings,
+    apiKeyConfigured: Boolean(apiKey)
+  };
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function pruneAttempts(entry, now) {
+  entry.attempts = entry.attempts.filter((ts) => now - ts <= LOGIN_WINDOW_MS);
+}
+
+function getOrInitLimiter(map, key) {
+  const existing = map.get(key);
+  if (existing) return existing;
+  const created = { attempts: [], blockedUntil: 0 };
+  map.set(key, created);
+  return created;
+}
+
+function isBlocked(map, key, now) {
+  const entry = map.get(key);
+  if (!entry) return false;
+  if (entry.blockedUntil <= now) return false;
+  return true;
+}
+
+function recordFailedLogin(map, key, limit, now) {
+  const entry = getOrInitLimiter(map, key);
+  pruneAttempts(entry, now);
+  entry.attempts.push(now);
+  if (entry.attempts.length >= limit) {
+    entry.blockedUntil = now + LOGIN_BLOCK_MS;
+    entry.attempts = [];
+  }
+}
+
+function clearFailedLogins(map, key) {
+  map.delete(key);
+}
+
+function cleanupLimiterMap(map, now) {
+  for (const [key, entry] of map.entries()) {
+    pruneAttempts(entry, now);
+    if (!entry.attempts.length && entry.blockedUntil <= now) {
+      map.delete(key);
+    }
+  }
+}
+
+setInterval(() => {
+  const now = Date.now();
+  cleanupLimiterMap(failedLoginsByIp, now);
+  cleanupLimiterMap(failedLoginsByUser, now);
+}, Math.max(60_000, Math.floor(LOGIN_WINDOW_MS / 2)));
+
 // --- Server ---
 
 const server = http.createServer(async (req, res) => {
@@ -101,16 +198,33 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/auth/login' && method === 'POST') {
       const body = await readBody(req);
       const { username, password } = body;
+      const userKey = String(username || '').trim().toLowerCase();
+      const now = Date.now();
+      const blockedByIp = isBlocked(failedLoginsByIp, ip, now);
+      const blockedByUser = userKey ? isBlocked(failedLoginsByUser, userKey, now) : false;
+      if (blockedByIp || blockedByUser) {
+        await sleep(LOGIN_FAILURE_DELAY_MS);
+        sendJson(res, 429, { error: 'Too many login attempts. Please try again later.' });
+        return;
+      }
       if (!username || !password) {
+        recordFailedLogin(failedLoginsByIp, ip, LOGIN_MAX_ATTEMPTS_IP, now);
+        if (userKey) recordFailedLogin(failedLoginsByUser, userKey, LOGIN_MAX_ATTEMPTS_USER, now);
+        await sleep(LOGIN_FAILURE_DELAY_MS);
         sendJson(res, 400, { error: 'Username and password required' });
         return;
       }
       const token = login(username, password);
       if (!token) {
+        recordFailedLogin(failedLoginsByIp, ip, LOGIN_MAX_ATTEMPTS_IP, now);
+        if (userKey) recordFailedLogin(failedLoginsByUser, userKey, LOGIN_MAX_ATTEMPTS_USER, now);
+        await sleep(LOGIN_FAILURE_DELAY_MS);
         sendJson(res, 401, { error: 'Invalid credentials' });
         return;
       }
-      setSessionCookie(res, token);
+      clearFailedLogins(failedLoginsByIp, ip);
+      if (userKey) clearFailedLogins(failedLoginsByUser, userKey);
+      setSessionCookie(res, token, req);
       sendJson(res, 200, { ok: true, username });
       return;
     }
@@ -118,7 +232,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/auth/logout' && method === 'POST') {
       const user = authenticate(req);
       if (user) destroySession(user.token);
-      clearSessionCookie(res);
+      clearSessionCookie(res, req);
       sendJson(res, 200, { ok: true });
       return;
     }
@@ -175,7 +289,25 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === '/api/admin/settings' && method === 'GET') {
       if (!requireAdmin(req, res)) return;
-      sendJson(res, 200, { settings: getAllSettings() });
+      sendJson(res, 200, { settings: getPublicAdminSettings() });
+      return;
+    }
+
+    if (url.pathname === '/api/admin/concepts/status' && method === 'GET') {
+      if (!requireAdmin(req, res)) return;
+      const status = await getConceptPipelineStatus();
+      sendJson(res, 200, { status });
+      return;
+    }
+
+    if (url.pathname === '/api/admin/concepts/rebuild' && method === 'POST') {
+      if (!requireAdmin(req, res)) return;
+      const result = await rebuildConceptDictionary({ trigger: 'manual' });
+      if (!result.ok) {
+        sendJson(res, 409, { ok: false, error: result.error || 'Rebuild failed' });
+        return;
+      }
+      sendJson(res, 200, { ok: true, stats: result.artifact?.stats || null });
       return;
     }
 
@@ -183,9 +315,16 @@ const server = http.createServer(async (req, res) => {
       if (!requireAdmin(req, res)) return;
       const body = await readBody(req);
       for (const [key, value] of Object.entries(body)) {
+        if (key === 'apiKey') continue;
         setSetting(key, String(value));
       }
-      sendJson(res, 200, { ok: true, settings: getAllSettings() });
+      if (Object.prototype.hasOwnProperty.call(body, 'apiKey')) {
+        const nextApiKey = String(body.apiKey || '').trim();
+        if (nextApiKey) {
+          setSetting('apiKey', nextApiKey);
+        }
+      }
+      sendJson(res, 200, { ok: true, settings: getPublicAdminSettings() });
       return;
     }
 
@@ -256,17 +395,10 @@ const server = http.createServer(async (req, res) => {
           if (!analysis.fullText) continue;
           processed++;
 
-          const committee = parseCommittee(analysis.fullText);
-          if (committee.length) {
-            saveCommitteeMembers(entry.doc_id, committee, 'pdf');
-            withCommittee++;
-          }
-
-          const citations = parseBibliography(analysis.fullText);
-          if (citations.length) {
-            saveCitations(entry.doc_id, citations, normalizeCitation);
-            totalCitations += citations.length;
-          }
+          const doc = loadDocumentMetadata(entry.doc_id) || { id: entry.doc_id, supervisors: [] };
+          extractAndSaveParsedData(doc, analysis.fullText);
+          if (doc.committee?.length) withCommittee++;
+          if (doc.citationCount) totalCitations += Number(doc.citationCount);
         } catch (err) {
           logger.warn('Reparse failed for doc', { docId: entry.doc_id, error: err.message });
         }
@@ -319,16 +451,33 @@ const server = http.createServer(async (req, res) => {
       const query = url.searchParams.get('query') || undefined;
       const term = url.searchParams.get('term') || undefined;
       const source = url.searchParams.get('source') || undefined;
-      const apiKey = url.searchParams.get('apiKey') || undefined;
+      const configuredApiKey = getSetting('apiKey') || process.env.UBC_API_KEY;
+      const apiKey = configuredApiKey || undefined;
       const downloadFiles = parseBooleanParam(url.searchParams.get('downloadFiles'), true);
       const recomputeFromCache = parseBooleanParam(url.searchParams.get('recomputeFromCache'), false);
       const refresh = url.searchParams.get('refresh') === '1';
+      const user = authenticate(req);
+      const isAdminRequest = Boolean(user);
+      if (!isAdminRequest && downloadFiles && !ALLOW_PUBLIC_DOWNLOADS) {
+        sendJson(res, 403, { error: 'downloadFiles is restricted to authenticated admin sessions.' });
+        return;
+      }
+      if (!isAdminRequest && refresh && !ALLOW_PUBLIC_REFRESH) {
+        sendJson(res, 403, { error: 'refresh is restricted to authenticated admin sessions.' });
+        return;
+      }
+      if (!isAdminRequest && recomputeFromCache && !ALLOW_PUBLIC_RECOMPUTE) {
+        sendJson(res, 403, { error: 'recomputeFromCache is restricted to authenticated admin sessions.' });
+        return;
+      }
+      const effectiveMaxRecords = isAdminRequest ? maxRecords : Math.min(maxRecords, PUBLIC_MAX_RECORDS);
+      const effectiveScanLimit = isAdminRequest ? scanLimit : Math.min(scanLimit, PUBLIC_SCAN_LIMIT);
 
       const cacheKey = JSON.stringify({
-        maxRecords, pageSize, scanLimit, subjectLimit,
+        maxRecords: effectiveMaxRecords, pageSize, scanLimit: effectiveScanLimit, subjectLimit,
         index, query, term, source,
         hasApiKey: Boolean(apiKey),
-        downloadFiles, recomputeFromCache
+        downloadFiles, recomputeFromCache, refresh, isAdminRequest
       });
 
       if (!refresh && !recomputeFromCache) {
@@ -340,7 +489,7 @@ const server = http.createServer(async (req, res) => {
       }
 
       const payload = await collectMetrics({
-        maxRecords, pageSize, scanLimit, subjectLimit,
+        maxRecords: effectiveMaxRecords, pageSize, scanLimit: effectiveScanLimit, subjectLimit,
         index, query, term, source, apiKey,
         downloadFiles,
         forceDownload: refresh,
@@ -358,7 +507,7 @@ const server = http.createServer(async (req, res) => {
     logger.error('Request error', { path: url.pathname, error: error.message });
     sendJson(res, 500, {
       error: 'Internal server error',
-      message: error instanceof Error ? error.message : String(error)
+      message: EXPOSE_ERROR_DETAILS && error instanceof Error ? error.message : 'Unexpected error'
     });
   }
 });
@@ -380,6 +529,15 @@ async function start() {
   server.listen(PORT, () => {
     logger.info(`UBC Dissertation Intelligence Workbench running at http://localhost:${PORT}`);
   });
+
+  stopDailyConceptScheduler = scheduleDailyConceptRebuild();
+  logger.info('Scheduled daily concept rebuild job', { hourLocal: 2 });
+  const conceptStatus = await getConceptPipelineStatus();
+  if (!conceptStatus?.lastSuccessAt) {
+    rebuildConceptDictionary({ trigger: 'startup' }).catch((error) => {
+      logger.error('Startup concept rebuild failed', { error: error?.message || String(error) });
+    });
+  }
 }
 
 start();

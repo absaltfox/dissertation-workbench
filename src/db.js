@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { SQLITE_PATH, PDF_CACHE_DIR } from './config.js';
 import { logger } from './logger.js';
+import { normalizePersonName, supervisorNameKey } from './supervisors.js';
 
 let db;
 
@@ -104,6 +105,17 @@ export function loadDocumentMetadata(docId) {
   const row = getDb().prepare('SELECT metadata_json FROM documents WHERE doc_id = ?').get(docId);
   if (!row) return null;
   try { return JSON.parse(row.metadata_json); } catch { return null; }
+}
+
+export function listAllDocumentMetadata() {
+  const rows = getDb().prepare('SELECT doc_id, metadata_json FROM documents').all();
+  return rows.map((row) => {
+    try {
+      return { docId: row.doc_id, metadata: JSON.parse(row.metadata_json) };
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
 }
 
 // --- File metric functions ---
@@ -279,13 +291,46 @@ export function saveCommitteeMembers(docId, members, source) {
     INSERT INTO committee_members (doc_id, name, role, affiliation, source, updated_at)
     VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(doc_id, name, role) DO UPDATE SET
-      affiliation = excluded.affiliation,
-      source = excluded.source,
-      updated_at = excluded.updated_at
+      affiliation = CASE
+        WHEN committee_members.source = 'api' AND excluded.source <> 'api'
+          THEN committee_members.affiliation
+        ELSE excluded.affiliation
+      END,
+      source = CASE
+        WHEN committee_members.source = 'api' AND excluded.source <> 'api'
+          THEN committee_members.source
+        ELSE excluded.source
+      END,
+      updated_at = CASE
+        WHEN committee_members.source = 'api' AND excluded.source <> 'api'
+          THEN committee_members.updated_at
+        ELSE excluded.updated_at
+      END
   `);
-  for (const member of members) {
-    stmt.run(docId, member.name, member.role || null, member.affiliation || null, source, now);
+  const seen = new Set();
+  for (const member of members || []) {
+    const role = member.role || null;
+    const normalizedName = normalizePersonName(member.name);
+    if (!normalizedName) continue;
+    const key = `${String(role || '')}:::${supervisorNameKey(normalizedName) || normalizedName.toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    stmt.run(docId, normalizedName, role, member.affiliation || null, source, now);
   }
+}
+
+export function deleteCommitteeMembersByRoles(docId, roles, source = null) {
+  const cleanedRoles = Array.from(new Set((roles || []).map((r) => String(r || '').trim()).filter(Boolean)));
+  if (!cleanedRoles.length) return 0;
+  const placeholders = cleanedRoles.map(() => '?').join(', ');
+  const params = [docId, ...cleanedRoles];
+  let sql = `DELETE FROM committee_members WHERE doc_id = ? AND role IN (${placeholders})`;
+  if (source) {
+    sql += ' AND source = ?';
+    params.push(source);
+  }
+  const result = getDb().prepare(sql).run(...params);
+  return result.changes || 0;
 }
 
 export function loadCommitteeMembers(docId) {

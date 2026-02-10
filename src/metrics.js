@@ -1,11 +1,18 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   DEFAULT_BASE_URL, DEFAULT_INDEX, DEFAULT_API_KEY, DEFAULT_QUERY,
-  DEFAULT_TERM, DEFAULT_SOURCE, DEFAULT_DOWNLOAD_FILES, PDF_CACHE_DIR, SQLITE_PATH
+  DEFAULT_TERM, DEFAULT_SOURCE, DEFAULT_DOWNLOAD_FILES, PDF_CACHE_DIR, SQLITE_PATH, DATA_DIR
 } from './config.js';
 import { ensureStorage, getDb, saveRunMetrics } from './db.js';
-import { toArray, flattenText, extractYear, parsePageCount, topTermsFromText, buildWordCloud, buildNgramCloud, buildMethodologyStats, extractNgrams } from './nlp.js';
+import {
+  toArray, flattenText, extractYear, parsePageCount, topTermsFromText, buildWordCloud,
+  buildMethodologyStats, extractNgrams, detectMethodologies, isLowSignalConceptPhrase
+} from './nlp.js';
 import { fetchPage, extractHits, resolveIndexName, collectCandidateUrls } from './api.js';
 import { enrichDocumentsWithFileAnalysis } from './pdf.js';
+import { dedupeSupervisorNames } from './supervisors.js';
+import { canonicalizeDomainText } from './domainDictionary.js';
 
 function average(values) {
   if (!values.length) return null;
@@ -41,11 +48,42 @@ function unique(values) {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
-function normalizeRecord(doc) {
-  const id = flattenText(firstPresent(doc, ['_id', 'id', 'identifier', 'Identifier'])) || '';
+function extractOcId(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+
+  const directId = text.match(/^\d+\.\d+$/);
+  if (directId) return directId[0];
+
+  const itemMatch = text.match(/\/items\/(\d+\.\d+)(?:[/?#]|$)/i);
+  if (itemMatch) return itemMatch[1];
+
+  const pdfMatch = text.match(/\/pdf\/\d+\/(\d+\.\d+)(?:[/?#]|$)/i);
+  if (pdfMatch) return pdfMatch[1];
+
+  return null;
+}
+
+function ensureSourceFields(sourceValue) {
+  const parts = String(sourceValue || '')
+    .split(',')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  const seen = new Set(parts.map((part) => part.toLowerCase()));
+  for (const field of ['id', 'identifier', 'uri']) {
+    if (!seen.has(field)) {
+      parts.push(field);
+      seen.add(field);
+    }
+  }
+  return parts.join(',');
+}
+
+function normalizeRecord(doc, dict = null) {
+  const rawId = flattenText(firstPresent(doc, ['_id', 'id', 'identifier', 'Identifier'])) || '';
   const title = flattenText(firstPresent(doc, ['title', 'Title', 'name', 'Name']));
   const creators = toArray(firstPresent(doc, ['creator', 'Creator', 'author', 'Author']));
-  const supervisors = toArray(firstPresent(doc, ['supervisor', 'Supervisor']));
+  const supervisors = dedupeSupervisorNames(toArray(firstPresent(doc, ['supervisor', 'Supervisor'])));
   const affiliation = toArray(firstPresent(doc, ['affiliation', 'Affiliation']));
   const dateRaw = firstPresent(doc, [
     'date_available', 'DateAvailable', 'dateAvailable',
@@ -69,6 +107,9 @@ function normalizeRecord(doc) {
   const doi = flattenText(firstPresent(doc, ['doi', 'DOI']));
   const campus = flattenText(firstPresent(doc, ['campus', 'Campus']));
   const scholarlyLevel = flattenText(firstPresent(doc, ['scholarly_level', 'scholarlyLevel', 'ScholarlyLevel']));
+  const downloadCandidates = collectCandidateUrls(doc, rawId, doi);
+  const derivedId = extractOcId(rawId) || extractOcId(uri) || downloadCandidates.map(extractOcId).find(Boolean);
+  const stableId = derivedId || `${title}:${creators[0] || ''}`;
 
   const textForLength = fullText || description;
   const cleaned = String(textForLength).replace(/\s+/g, ' ').trim();
@@ -78,13 +119,16 @@ function normalizeRecord(doc) {
 
   const themeText = [title, description, subjects.join(' '), program.join(' '), degree.join(' ')].join(' ');
   const themes = topTermsFromText(themeText, 12);
+  const methodologies = detectMethodologies([title, description, subjects.join(' ')].join(' '));
+  const conceptTerms = docConceptTerms({ title, abstract: description, subjects }, 12, dict);
 
   return {
-    id: id || `${title}:${creators[0] || ''}`,
+    id: stableId,
     title,
     authors: creators,
     author: creators[0] || 'Unknown',
     supervisors,
+    supervisorsSource: supervisors.length ? 'api' : null,
     affiliation,
     date: dateRaw ? String(dateRaw) : '',
     year: extractYear(dateRaw),
@@ -104,8 +148,10 @@ function normalizeRecord(doc) {
     wordCountSource: 'metadata_text',
     charCount: cleaned.length,
     themes,
+    methodologies,
+    conceptTerms,
     uri,
-    downloadCandidates: collectCandidateUrls(doc, id, doi),
+    downloadCandidates,
     downloadUrl: null,
     downloadStatus: 'not_attempted',
     downloadError: null,
@@ -114,14 +160,23 @@ function normalizeRecord(doc) {
 }
 
 function buildMetrics(records, subjectLimit) {
-  const subjectWords = new Map();
+  const conceptWords = new Map();
   const yearWords = new Map();
   const yearPages = new Map();
 
   for (const rec of records) {
-    for (const subject of rec.subjects) {
-      if (!subjectWords.has(subject)) subjectWords.set(subject, []);
-      subjectWords.get(subject).push(rec.wordCount);
+    const concepts = Array.from(new Set((rec.conceptTerms || []).filter(Boolean)));
+    if (concepts.length) {
+      const weight = 1 / concepts.length;
+      for (const concept of concepts) {
+        if (!conceptWords.has(concept)) {
+          conceptWords.set(concept, { weightedWordSum: 0, weightSum: 0, docCount: 0 });
+        }
+        const entry = conceptWords.get(concept);
+        entry.weightedWordSum += rec.wordCount * weight;
+        entry.weightSum += weight;
+        entry.docCount += 1;
+      }
     }
 
     if (rec.year) {
@@ -132,9 +187,14 @@ function buildMetrics(records, subjectLimit) {
     }
   }
 
-  const bySubject = Array.from(subjectWords.entries())
-    .map(([subject, values]) => ({ subject, ...stats(values) }))
-    .sort((a, b) => b.count - a.count)
+  const byConcept = Array.from(conceptWords.entries())
+    .map(([concept, values]) => ({
+      concept,
+      docCount: values.docCount,
+      weightedDocEquivalent: values.weightSum,
+      weightedMean: values.weightSum ? (values.weightedWordSum / values.weightSum) : null
+    }))
+    .sort((a, b) => b.docCount - a.docCount || (b.weightedMean || 0) - (a.weightedMean || 0))
     .slice(0, subjectLimit);
 
   const byYear = Array.from(yearWords.entries())
@@ -160,7 +220,7 @@ function buildMetrics(records, subjectLimit) {
     overallWordCount: stats(records.map((r) => r.wordCount)),
     overallPageCount: stats(records.map((r) => r.pages)),
     overallCharCount: stats(records.map((r) => r.charCount)),
-    bySubject,
+    byConcept,
     byYear,
     avgPagesByYear,
     pageTrend
@@ -170,32 +230,104 @@ function buildMetrics(records, subjectLimit) {
 function docNgrams(rec, limit = 8) {
   const text = [rec.title, rec.abstract, rec.subjects.join(' ')].join(' ');
   const counts = new Map();
+  for (const n of [2, 3, 4]) {
+    for (const ng of extractNgrams(text, n)) {
+      const normalized = canonicalizeDomainText(ng);
+      if (!normalized || isLowSignalConceptPhrase(normalized)) continue;
+      counts.set(normalized, (counts.get(normalized) || 0) + 1);
+    }
+  }
+  const entries = Array.from(counts.entries())
+    .map(([term, count]) => ({ term, count, tokens: term.split(' ') }))
+    .sort((a, b) => b.tokens.length - a.tokens.length || b.count - a.count);
+  const kept = [];
+  for (const entry of entries) {
+    const isSubphrase = kept.some((longer) => {
+      if (longer.tokens.length <= entry.tokens.length) return false;
+      const maxStart = longer.tokens.length - entry.tokens.length;
+      for (let start = 0; start <= maxStart; start++) {
+        let ok = true;
+        for (let i = 0; i < entry.tokens.length; i++) {
+          if (longer.tokens[start + i] !== entry.tokens[i]) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) return true;
+      }
+      return false;
+    });
+    if (!isSubphrase) kept.push(entry);
+  }
+
+  return kept
+    .filter((entry) => entry.tokens.length <= 3)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, limit)
+    .map((entry) => entry.term);
+}
+
+function loadConceptDictionary() {
+  try {
+    const raw = fs.readFileSync(path.join(DATA_DIR, 'concepts', 'latest.json'), 'utf-8');
+    const parsed = JSON.parse(raw);
+    const canonicalSet = new Set((parsed.concepts || []).map((c) => c.canonical));
+    const variantMap = parsed.variantToCanonical || {};
+    return { canonicalSet, variantMap };
+  } catch {
+    return { canonicalSet: new Set(), variantMap: {} };
+  }
+}
+
+function docConceptTerms(rec, limit = 12, dict = null) {
+  const { canonicalSet, variantMap } = dict || loadConceptDictionary();
+  const text = [rec.title, rec.abstract, rec.subjects.join(' ')].join(' ');
+  const seen = new Set();
+  const result = [];
   for (const n of [2, 3]) {
     for (const ng of extractNgrams(text, n)) {
-      counts.set(ng, (counts.get(ng) || 0) + 1);
+      const term = canonicalizeDomainText(ng);
+      if (!term) continue;
+      const canonical = variantMap[term] || (canonicalSet.has(term) ? term : null);
+      if (!canonical || seen.has(canonical)) continue;
+      seen.add(canonical);
+      result.push(canonical);
+      if (result.length >= limit) return result;
+    }
+  }
+  return result;
+}
+
+function buildConceptCloud(records, maxTerms = 60) {
+  const counts = new Map();
+  for (const rec of records) {
+    for (const term of (rec.conceptTerms || [])) {
+      counts.set(term, (counts.get(term) || 0) + 1);
     }
   }
   return Array.from(counts.entries())
     .sort((a, b) => b[1] - a[1])
-    .slice(0, limit)
-    .map(([term]) => term);
+    .slice(0, maxTerms)
+    .map(([term, count]) => ({ term, count }));
 }
 
 function buildSupervisorNgramMatrix(records, topN = 12, topM = 10) {
+  const dict = loadConceptDictionary();
   const supervisorCounts = new Map();
-  const docNgramCache = new Map();
-  // Only count ngrams from records that have supervisors for better signal
+  const docConceptCache = new Map();
+  // Only count concepts from records that have supervisors for better signal
   const supNgramCounts = new Map();
 
   for (const rec of records) {
-    const ngrams = docNgrams(rec, 10);
-    docNgramCache.set(rec.id, ngrams);
+    const terms = docConceptTerms(rec, 10, dict);
+    const concepts = terms.map((label) => `c:${label.replace(/\s+/g, '_')}`);
+    docConceptCache.set(rec.id, { concepts, labels: terms });
     const hasSup = rec.supervisors.length > 0;
     for (const sup of rec.supervisors) {
       supervisorCounts.set(sup, (supervisorCounts.get(sup) || 0) + 1);
     }
     if (hasSup) {
-      for (const ng of ngrams) {
+      for (const ng of concepts) {
         supNgramCounts.set(ng, (supNgramCounts.get(ng) || 0) + 1);
       }
     }
@@ -208,7 +340,7 @@ function buildSupervisorNgramMatrix(records, topN = 12, topM = 10) {
   const topNgrams = Array.from(supNgramCounts.entries())
     .sort((a, b) => b[1] - a[1])
     .slice(0, topM)
-    .map(([name]) => name);
+    .map(([conceptId]) => conceptId);
 
   const supSet = new Set(topSupervisors);
   const ngSet = new Set(topNgrams);
@@ -217,7 +349,7 @@ function buildSupervisorNgramMatrix(records, topN = 12, topM = 10) {
   for (const rec of records) {
     const recSups = rec.supervisors.filter((s) => supSet.has(s));
     if (!recSups.length) continue;
-    const recNgrams = (docNgramCache.get(rec.id) || []).filter((ng) => ngSet.has(ng));
+    const recNgrams = (docConceptCache.get(rec.id)?.concepts || []).filter((ng) => ngSet.has(ng));
     for (const sup of recSups) {
       const si = topSupervisors.indexOf(sup);
       for (const ng of recNgrams) {
@@ -227,15 +359,28 @@ function buildSupervisorNgramMatrix(records, topN = 12, topM = 10) {
     }
   }
 
-  return { supervisors: topSupervisors, ngrams: topNgrams, matrix };
+  const conceptIdToLabel = new Map();
+  for (const { concepts, labels } of docConceptCache.values()) {
+    for (let k = 0; k < concepts.length; k++) {
+      conceptIdToLabel.set(concepts[k], labels[k]);
+    }
+  }
+
+  return {
+    supervisors: topSupervisors,
+    ngrams: topNgrams.map((id) => conceptIdToLabel.get(id) || id),
+    conceptIds: topNgrams,
+    matrix
+  };
 }
 
 function buildTermCooccurrence(records, topN = 20) {
+  const dict = loadConceptDictionary();
   const pairCounts = new Map();
   for (const rec of records) {
-    const ngrams = docNgrams(rec, 8);
-    if (ngrams.length < 2) continue;
-    const sorted = [...ngrams].sort();
+    const concepts = docConceptTerms(rec, 15, dict);
+    if (concepts.length < 2) continue;
+    const sorted = [...concepts].sort();
     for (let i = 0; i < sorted.length; i++) {
       for (let j = i + 1; j < sorted.length; j++) {
         const key = `${sorted[i]}|||${sorted[j]}`;
@@ -248,7 +393,13 @@ function buildTermCooccurrence(records, topN = 20) {
     .slice(0, topN)
     .map(([key, count]) => {
       const [termA, termB] = key.split('|||');
-      return { termA, termB, count };
+      return {
+        conceptIdA: `c:${termA.replace(/\s+/g, '_')}`,
+        conceptIdB: `c:${termB.replace(/\s+/g, '_')}`,
+        termA,
+        termB,
+        count
+      };
     });
 }
 
@@ -265,12 +416,13 @@ export async function collectMetrics(options = {}) {
   const apiKey = options.apiKey || DEFAULT_API_KEY;
   const query = options.query === undefined ? DEFAULT_QUERY : options.query;
   const term = options.term === undefined ? DEFAULT_TERM : options.term;
-  const source = options.source === undefined ? DEFAULT_SOURCE : options.source;
+  const source = ensureSourceFields(options.source === undefined ? DEFAULT_SOURCE : options.source);
   const downloadFiles = options.downloadFiles === undefined ? DEFAULT_DOWNLOAD_FILES : Boolean(options.downloadFiles);
   const forceDownload = Boolean(options.forceDownload);
   const recomputeFromCache = Boolean(options.recomputeFromCache);
 
   const index = await resolveIndexName(baseUrl, requestedIndex, apiKey);
+  const conceptDict = loadConceptDictionary();
   const records = [];
 
   for (let from = 0; from < scanLimit; from += pageSize) {
@@ -278,7 +430,7 @@ export async function collectMetrics(options = {}) {
     const docs = extractHits(payload);
     if (!docs.length) break;
 
-    records.push(...docs.map(normalizeRecord));
+    records.push(...docs.map((doc) => normalizeRecord(doc, conceptDict)));
 
     if (docs.length < pageSize) break;
     if (records.length >= maxRecords) break;
@@ -324,7 +476,7 @@ export async function collectMetrics(options = {}) {
     metrics,
     documents: normalizedRecords,
     wordCloud: buildWordCloud(normalizedRecords),
-    ngramCloud: buildNgramCloud(normalizedRecords),
+    ngramCloud: buildConceptCloud(normalizedRecords),
     methodologies: buildMethodologyStats(normalizedRecords),
     supervisorNgramMatrix: buildSupervisorNgramMatrix(normalizedRecords),
     termCooccurrence: buildTermCooccurrence(normalizedRecords)

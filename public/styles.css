@@ -476,6 +476,11 @@ tbody tr:nth-child(even) {
   flex-direction: column;
   gap: 0.75rem;
 }
+.analytics-right {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
 
 .axis {
   font-size: 11px;
@@ -558,9 +563,19 @@ tbody tr:nth-child(even) {
 }
 
 .bar-value {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 0;
   font-family: var(--sans);
   font-size: 0.78rem;
   color: var(--ink-soft);
+  cursor: pointer;
+}
+
+.bar-value:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.12em;
 }
 
 /* --- Heatmap --- */
@@ -604,6 +619,20 @@ tbody tr:nth-child(even) {
   min-width: 2rem;
   font-size: 0.72rem;
   font-weight: 600;
+}
+
+.heatmap-cell-btn {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+}
+
+.heatmap-cell-btn:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.12em;
 }
 
 /* --- Forms --- */

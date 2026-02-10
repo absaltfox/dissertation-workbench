@@ -6,7 +6,8 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "reset-admin": "node scripts/reset-admin.js"
+    "reset-admin": "node scripts/reset-admin.js",
+    "rebuild-concepts": "node scripts/rebuild-concepts.js"
   },
   "engines": {
     "node": ">=18"

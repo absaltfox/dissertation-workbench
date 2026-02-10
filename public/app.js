@@ -22,6 +22,8 @@ const settingsForm = document.getElementById('settingsForm');
 const loadBtn = document.getElementById('loadBtn');
 const refreshBtn = document.getElementById('refreshBtn');
 const saveSettingsBtn = document.getElementById('saveSettingsBtn');
+const rebuildConceptsBtn = document.getElementById('rebuildConceptsBtn');
+const conceptPipelineStatusEl = document.getElementById('conceptPipelineStatus');
 const tabButtons = Array.from(document.querySelectorAll('.tab-btn'));
 const tabPanels = Array.from(document.querySelectorAll('.tab-panel'));
 
@@ -110,8 +112,8 @@ function setActiveAdminTab(tabName) {
 
 // --- Query params ---
 
-function getCurrentParams() {
-  return {
+function getCurrentParams({ includeApiKey = false } = {}) {
+  const params = {
     index: document.getElementById('s-index').value.trim(),
     query: document.getElementById('s-query').value.trim(),
     term: document.getElementById('s-term').value.trim(),
@@ -120,10 +122,13 @@ function getCurrentParams() {
     pageSize: document.getElementById('s-pageSize').value,
     scanLimit: document.getElementById('s-scanLimit').value,
     subjectLimit: document.getElementById('s-subjectLimit').value,
-    apiKey: document.getElementById('s-apiKey').value.trim(),
     downloadFiles: document.getElementById('s-downloadFiles').value,
     recomputeFromCache: document.getElementById('s-recomputeFromCache').value
   };
+  if (includeApiKey) {
+    params.apiKey = document.getElementById('s-apiKey').value.trim();
+  }
+  return params;
 }
 
 // --- Document rendering ---
@@ -172,6 +177,77 @@ function docsForTheme(theme) {
   return docs.filter((doc) => (doc.themes || []).some((t) => t.toLowerCase() === normalized));
 }
 
+function docsForConceptTerm(term) {
+  const docs = state.payload?.documents || [];
+  const normalized = String(term || '').toLowerCase();
+  return docs.filter((doc) => (doc.conceptTerms || []).some((t) => String(t || '').toLowerCase() === normalized));
+}
+
+function docsForMethodology(methodology) {
+  const docs = state.payload?.documents || [];
+  const normalized = String(methodology || '').toLowerCase();
+  return docs.filter((doc) => (doc.methodologies || []).some((m) => String(m || '').toLowerCase() === normalized));
+}
+
+function docsForCooccurrence(termA, termB) {
+  const a = String(termA || '').toLowerCase();
+  const b = String(termB || '').toLowerCase();
+  if (!a || !b) return [];
+  const docs = state.payload?.documents || [];
+  return docs.filter((doc) => {
+    const terms = new Set((doc.conceptTerms || []).map((t) => String(t || '').toLowerCase()));
+    return terms.has(a) && terms.has(b);
+  });
+}
+
+function docsForSupervisorConcept(supervisor, concept) {
+  const sup = String(supervisor || '').toLowerCase();
+  const conceptNorm = String(concept || '').toLowerCase();
+  const docs = state.payload?.documents || [];
+  return docs.filter((doc) => {
+    const hasSup = (doc.supervisors || []).some((s) => String(s || '').toLowerCase() === sup);
+    if (!hasSup) return false;
+    const terms = new Set((doc.conceptTerms || []).map((t) => String(t || '').toLowerCase()));
+    return terms.has(conceptNorm);
+  });
+}
+
+function openMatchesModal(title, matches) {
+  const list = matches || [];
+  const body = list.length
+    ? `
+      <div class="related-list">
+        ${list
+          .map(
+            (doc) => `
+            <div class="related-item" data-related-id="${escapeHtml(doc.id)}">
+              <strong>${escapeHtml(doc.title || '(Untitled)')}</strong>
+              <p>${escapeHtml(doc.author || 'Unknown')} &middot; ${formatNum(doc.year)} &middot; ${escapeHtml(doc.degree || '-')}</p>
+            </div>
+          `
+          )
+          .join('')}
+      </div>
+    `
+    : '<p class="meta">No matching dissertations found in the current result set.</p>';
+
+  docDetailsEl.innerHTML = `
+    <div class="meta">
+      <p><strong>${escapeHtml(title)}</strong></p>
+      <p>${formatNum(list.length)} dissertation(s)</p>
+    </div>
+    ${body}
+  `;
+
+  for (const item of docDetailsEl.querySelectorAll('.related-item[data-related-id]')) {
+    item.addEventListener('click', () => {
+      const targetId = item.getAttribute('data-related-id');
+      if (targetId) openRecord(targetId, 'records');
+    });
+  }
+  docModalOverlay.hidden = false;
+}
+
 function docSortValue(doc, key) {
   switch (key) {
     case 'title': return (doc.title || '').toLowerCase();
@@ -192,6 +268,7 @@ function getFilteredSortedDocs() {
     docs = docs.filter((doc) =>
       (doc.title || '').toLowerCase().includes(q) ||
       (doc.author || '').toLowerCase().includes(q) ||
+      (doc.supervisors || []).some((name) => String(name || '').toLowerCase().includes(q)) ||
       (doc.degree || '').toLowerCase().includes(q) ||
       (doc.program || '').toLowerCase().includes(q) ||
       String(doc.year || '').includes(q)
@@ -270,6 +347,9 @@ function renderDetails() {
   const themes = doc.themes?.length
     ? doc.themes.map((t) => `<span class="token">${escapeHtml(t)}</span>`).join('')
     : '<span class="token">No themes</span>';
+  const concepts = doc.conceptTerms?.length
+    ? doc.conceptTerms.map((t) => `<span class="token">${escapeHtml(t)}</span>`).join('')
+    : '<span class="token">No concepts</span>';
 
   const relatedHtml = related.length
     ? related
@@ -284,12 +364,15 @@ function renderDetails() {
         .join('')
     : '<p class="meta">No related documents identified from overlapping themes.</p>';
 
-  // Committee members display
+  // Committee members display (skip supervisor roles if already shown in Supervisor line)
   let committeeHtml = '';
+  const hasSupervisorsShown = doc.supervisors?.length > 0;
+  const supervisorRoles = new Set(['Supervisor', 'Co-Supervisor']);
   if (doc.committee?.length) {
     const grouped = {};
     for (const m of doc.committee) {
       const role = m.role || 'Committee Member';
+      if (hasSupervisorsShown && supervisorRoles.has(role)) continue;
       if (!grouped[role]) grouped[role] = [];
       grouped[role].push(m);
     }
@@ -332,6 +415,10 @@ function renderDetails() {
     <div>
       <p class="detail-section-title">Key Themes</p>
       <div class="token-list">${themes}</div>
+    </div>
+    <div>
+      <p class="detail-section-title">Concepts</p>
+      <div class="token-list">${concepts}</div>
     </div>
     <div>
       <p class="detail-section-title">Related Documents</p>
@@ -567,6 +654,7 @@ function renderWordCloud() {
       state.selectedTheme = node.getAttribute('data-theme');
       renderWordCloud();
       renderThemeResults();
+      openMatchesModal(`Theme: ${state.selectedTheme}`, docsForTheme(state.selectedTheme));
     });
   }
 
@@ -610,18 +698,23 @@ function renderThemeResults() {
 }
 
 function renderSubjectBars() {
-  const bySubject = state.payload?.metrics?.bySubject || [];
-  const maxMean = Math.max(...bySubject.map((s) => s.mean || 0), 1);
+  const byConcept = state.payload?.metrics?.byConcept || [];
+  if (!byConcept.length) {
+    subjectBarsEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No concept length data available.</p>';
+    return;
+  }
+  const maxMean = Math.max(...byConcept.map((s) => s.weightedMean || 0), 1);
 
-  subjectBarsEl.innerHTML = bySubject
+  subjectBarsEl.innerHTML = byConcept
     .slice(0, 14)
     .map((entry) => {
-      const widthPct = ((entry.mean || 0) / maxMean) * 100;
+      const widthPct = ((entry.weightedMean || 0) / maxMean) * 100;
+      const label = `${entry.concept} (n=${formatNum(entry.docCount)})`;
       return `
         <div class="bar-row">
-          <span class="bar-label" title="${escapeHtml(entry.subject)}">${escapeHtml(entry.subject)}</span>
+          <span class="bar-label" title="${escapeHtml(label)}">${escapeHtml(label)}</span>
           <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
-          <span class="bar-value">${formatNum(entry.mean)}</span>
+          <span class="bar-value">${formatNum(entry.weightedMean)}</span>
         </div>
       `;
     })
@@ -689,9 +782,16 @@ function renderNgramCloud() {
       const ratio = word.count / max;
       const size = 0.8 + ratio * 1.4;
       const hue = 20 + Math.round(ratio * 40);
-      return `<button class="cloud-term" style="font-size:${size}rem;color:hsl(${hue} 68% 35%)">${escapeHtml(word.term)} <sup style="font-size:0.6em;opacity:0.6">${word.count}</sup></button>`;
+      return `<button class="cloud-term" data-ngram-term="${escapeHtml(word.term)}" style="font-size:${size}rem;color:hsl(${hue} 68% 35%)">${escapeHtml(word.term)} <sup style="font-size:0.6em;opacity:0.6">${word.count}</sup></button>`;
     })
     .join('');
+
+  for (const node of ngramCloudEl.querySelectorAll('.cloud-term[data-ngram-term]')) {
+    node.addEventListener('click', () => {
+      const term = node.getAttribute('data-ngram-term');
+      openMatchesModal(`Concept: ${term}`, docsForConceptTerm(term));
+    });
+  }
 }
 
 function renderMethodologies() {
@@ -709,11 +809,18 @@ function renderMethodologies() {
         <div class="bar-row">
           <span class="bar-label" title="${escapeHtml(entry.methodology)}">${escapeHtml(entry.methodology)}</span>
           <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
-          <span class="bar-value">${formatNum(entry.count)}</span>
+          <button class="bar-value" data-methodology="${escapeHtml(entry.methodology)}">${formatNum(entry.count)}</button>
         </div>
       `;
     })
     .join('');
+
+  for (const node of methodologyBarsEl.querySelectorAll('[data-methodology]')) {
+    node.addEventListener('click', () => {
+      const methodology = node.getAttribute('data-methodology');
+      openMatchesModal(`Methodology: ${methodology}`, docsForMethodology(methodology));
+    });
+  }
 }
 
 function renderCooccurrence() {
@@ -732,11 +839,19 @@ function renderCooccurrence() {
         <div class="bar-row">
           <span class="bar-label" title="${escapeHtml(label)}">${escapeHtml(label)}</span>
           <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
-          <span class="bar-value">${formatNum(entry.count)}</span>
+          <button class="bar-value" data-co-term-a="${escapeHtml(entry.termA)}" data-co-term-b="${escapeHtml(entry.termB)}">${formatNum(entry.count)}</button>
         </div>
       `;
     })
     .join('');
+
+  for (const node of cooccurrenceBarsEl.querySelectorAll('[data-co-term-a][data-co-term-b]')) {
+    node.addEventListener('click', () => {
+      const termA = node.getAttribute('data-co-term-a');
+      const termB = node.getAttribute('data-co-term-b');
+      openMatchesModal(`Co-occurrence: ${termA} + ${termB}`, docsForCooccurrence(termA, termB));
+    });
+  }
 }
 
 function renderSupervisorHeatmap() {
@@ -755,11 +870,14 @@ function renderSupervisorHeatmap() {
   const bodyRows = data.supervisors
     .map((sup, si) => {
       const cells = data.ngrams
-        .map((_, nj) => {
+        .map((concept, nj) => {
           const val = data.matrix[si][nj];
           const lightness = val > 0 ? 95 - Math.round((val / maxVal) * 65) : 97;
           const textColor = lightness < 55 ? '#fff' : 'var(--ink)';
-          return `<td class="heatmap-cell" style="background:hsl(190 58% ${lightness}%);color:${textColor}">${val > 0 ? val : ''}</td>`;
+          const content = val > 0
+            ? `<button class="heatmap-cell-btn" data-heatmap-sup="${escapeHtml(sup)}" data-heatmap-concept="${escapeHtml(concept)}" style="color:${textColor}">${val}</button>`
+            : '';
+          return `<td class="heatmap-cell" style="background:hsl(190 58% ${lightness}%);color:${textColor}">${content}</td>`;
         })
         .join('');
       return `<tr><td class="heatmap-label" title="${escapeHtml(sup)}">${escapeHtml(sup)}</td>${cells}</tr>`;
@@ -772,6 +890,14 @@ function renderSupervisorHeatmap() {
       <tbody>${bodyRows}</tbody>
     </table>
   `;
+
+  for (const node of supervisorHeatmapEl.querySelectorAll('[data-heatmap-sup][data-heatmap-concept]')) {
+    node.addEventListener('click', () => {
+      const sup = node.getAttribute('data-heatmap-sup');
+      const concept = node.getAttribute('data-heatmap-concept');
+      openMatchesModal(`Supervisor + Concept: ${sup} + ${concept}`, docsForSupervisorConcept(sup, concept));
+    });
+  }
 }
 
 function renderAll() {
@@ -918,7 +1044,7 @@ async function handleLogout() {
 // --- Admin data loading ---
 
 async function loadAdminData() {
-  await Promise.all([loadUsers(), loadCache(), loadRuns(), loadSettings()]);
+  await Promise.all([loadUsers(), loadCache(), loadRuns(), loadSettings(), loadConceptPipelineStatus()]);
 }
 
 async function loadUsers() {
@@ -1007,14 +1133,19 @@ async function loadSettings() {
     if (s.pageSize) document.getElementById('s-pageSize').value = s.pageSize;
     if (s.scanLimit) document.getElementById('s-scanLimit').value = s.scanLimit;
     if (s.subjectLimit) document.getElementById('s-subjectLimit').value = s.subjectLimit;
-    if (s.apiKey) document.getElementById('s-apiKey').value = s.apiKey;
+    const apiKeyInput = document.getElementById('s-apiKey');
+    apiKeyInput.value = '';
+    apiKeyInput.placeholder = s.apiKeyConfigured
+      ? 'Stored on server (enter a new key to replace)'
+      : 'No API key saved (optional)';
     if (s.downloadFiles) document.getElementById('s-downloadFiles').value = s.downloadFiles;
     if (s.recomputeFromCache) document.getElementById('s-recomputeFromCache').value = s.recomputeFromCache;
   } catch { /* ignore */ }
 }
 
 async function handleSaveSettings() {
-  const params = getCurrentParams();
+  const params = getCurrentParams({ includeApiKey: true });
+  if (!params.apiKey) delete params.apiKey;
   try {
     const res = await fetch('/api/admin/settings', {
       method: 'PUT',
@@ -1025,6 +1156,49 @@ async function handleSaveSettings() {
       setStatus('Settings saved.');
     }
   } catch { /* ignore */ }
+}
+
+function renderConceptPipelineStatus(status) {
+  if (!conceptPipelineStatusEl) return;
+  if (!status) {
+    conceptPipelineStatusEl.textContent = 'Concept pipeline status unavailable.';
+    return;
+  }
+  const stateLabel = status.status || 'idle';
+  const updated = status.lastSuccessAt ? new Date(status.lastSuccessAt).toLocaleString() : 'never';
+  const message = status.message || '';
+  conceptPipelineStatusEl.textContent = `Concept Pipeline: ${stateLabel}. Last success: ${updated}. ${message}`.trim();
+}
+
+async function loadConceptPipelineStatus() {
+  try {
+    const res = await fetch('/api/admin/concepts/status');
+    if (!res.ok) return;
+    const data = await res.json();
+    renderConceptPipelineStatus(data.status);
+  } catch { /* ignore */ }
+}
+
+async function handleRebuildConcepts() {
+  if (!rebuildConceptsBtn) return;
+  rebuildConceptsBtn.disabled = true;
+  rebuildConceptsBtn.textContent = 'Rebuilding...';
+  try {
+    const res = await fetch('/api/admin/concepts/rebuild', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || 'Concept rebuild failed');
+      return;
+    }
+    const aliases = data.stats?.aliases ?? '?';
+    setStatus(`Concept rebuild complete (${aliases} aliases).`);
+    await loadConceptPipelineStatus();
+  } catch {
+    alert('Connection error');
+  } finally {
+    rebuildConceptsBtn.disabled = false;
+    rebuildConceptsBtn.textContent = 'Rebuild Concepts';
+  }
 }
 
 async function loadCache() {
@@ -1193,6 +1367,7 @@ refreshBtn.addEventListener('click', () => {
 });
 
 saveSettingsBtn.addEventListener('click', handleSaveSettings);
+rebuildConceptsBtn.addEventListener('click', handleRebuildConcepts);
 
 for (const btn of tabButtons) {
   btn.addEventListener('click', () => {

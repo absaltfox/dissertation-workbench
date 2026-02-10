@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { findUserByUsername, createUser, countUsers } from './db.js';
 import { logger } from './logger.js';
+import { SESSION_COOKIE_SECURE, TRUST_PROXY } from './config.js';
 
 const ITERATIONS = 100_000;
 const KEY_LEN = 64;
@@ -82,12 +83,25 @@ export function requireAdmin(req, res) {
   return user;
 }
 
-export function setSessionCookie(res, token) {
-  res.setHeader('Set-Cookie', `session=${token}; HttpOnly; SameSite=Strict; Path=/`);
+function isSecureRequest(req) {
+  if (req?.socket?.encrypted) return true;
+  if (!TRUST_PROXY) return false;
+  const proto = String(req?.headers?.['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  return proto === 'https';
 }
 
-export function clearSessionCookie(res) {
-  res.setHeader('Set-Cookie', 'session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+export function setSessionCookie(res, token, req) {
+  const secure = SESSION_COOKIE_SECURE || isSecureRequest(req);
+  const attrs = ['HttpOnly', 'SameSite=Strict', 'Path=/'];
+  if (secure) attrs.push('Secure');
+  res.setHeader('Set-Cookie', `session=${token}; ${attrs.join('; ')}`);
+}
+
+export function clearSessionCookie(res, req) {
+  const secure = SESSION_COOKIE_SECURE || isSecureRequest(req);
+  const attrs = ['HttpOnly', 'SameSite=Strict', 'Path=/', 'Max-Age=0'];
+  if (secure) attrs.push('Secure');
+  res.setHeader('Set-Cookie', `session=; ${attrs.join('; ')}`);
 }
 
 export function ensureDefaultAdmin() {

@@ -4,8 +4,12 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { PDF_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS } from './config.js';
-import { loadStoredFileMetric, saveFileMetric, saveDocumentMetadata, saveCommitteeMembers, loadCommitteeMembers, saveCitations, loadDocumentCitations } from './db.js';
+import {
+  loadStoredFileMetric, saveFileMetric, saveDocumentMetadata, saveCommitteeMembers,
+  loadCommitteeMembers, saveCitations, loadDocumentCitations, deleteCommitteeMembersByRoles
+} from './db.js';
 import { logger } from './logger.js';
+import { dedupeSupervisorNames } from './supervisors.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -104,6 +108,7 @@ const ROLE_PATTERNS = [
   { pattern: /\buniversity examiner\b/i, role: 'University Examiner' },
   { pattern: /\bexternal examiner\b/i, role: 'External Examiner' },
 ];
+const SUPERVISOR_ROLES = new Set(['Supervisor', 'Co-Supervisor']);
 
 export function parseCommittee(fullText) {
   if (!fullText) return [];
@@ -223,6 +228,18 @@ export function normalizeCitation(text) {
   return crypto.createHash('sha1').update(normalized).digest('hex');
 }
 
+function supervisorsFromCommittee(committee) {
+  return dedupeSupervisorNames(
+    (committee || [])
+      .filter((member) => SUPERVISOR_ROLES.has(member.role))
+      .map((member) => member.name)
+  );
+}
+
+function hasApiSupervisors(doc) {
+  return dedupeSupervisorNames(doc?.supervisors || []).length > 0;
+}
+
 async function resolveDownloadUrl(candidateUrl) {
   try {
     const controller = new AbortController();
@@ -283,20 +300,55 @@ async function resolveDownloadUrl(candidateUrl) {
   }
 }
 
-function extractAndSaveParsedData(doc, fullText) {
+export function extractAndSaveParsedData(doc, fullText) {
   if (!fullText) return;
   try {
     const committee = parseCommittee(fullText);
-    if (committee.length) {
-      saveCommitteeMembers(doc.id, committee, 'pdf');
+
+    if (hasApiSupervisors(doc)) {
+      const apiSupervisors = dedupeSupervisorNames(doc.supervisors || []);
+      const nonSupervisorCommittee = committee.filter((member) => !SUPERVISOR_ROLES.has(member.role));
+      if (nonSupervisorCommittee.length) {
+        saveCommitteeMembers(doc.id, nonSupervisorCommittee, 'pdf');
+      }
+      deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'pdf');
+      saveCommitteeMembers(
+        doc.id,
+        apiSupervisors.map((name) => ({ name, role: 'Supervisor', affiliation: null })),
+        'api'
+      );
+      doc.supervisors = apiSupervisors;
+      doc.supervisorsSource = 'api';
+    } else {
+      if (committee.length) {
+        saveCommitteeMembers(doc.id, committee, 'pdf');
+      }
+      const parsedSupervisors = supervisorsFromCommittee(committee);
+      if (parsedSupervisors.length) {
+        doc.supervisors = parsedSupervisors;
+        doc.supervisorsSource = 'pdf_fallback';
+      }
     }
-    doc.committee = committee.length ? committee : loadCommitteeMembers(doc.id);
+    doc.committee = loadCommitteeMembers(doc.id);
+
+    if ((!doc.supervisors || !doc.supervisors.length) && doc.committee.length) {
+      const storedSupervisors = supervisorsFromCommittee(doc.committee);
+      if (storedSupervisors.length) {
+        doc.supervisors = storedSupervisors;
+        doc.supervisorsSource = doc.committee.some((member) =>
+          SUPERVISOR_ROLES.has(member.role) && member.source === 'api'
+        )
+          ? 'api'
+          : 'pdf_fallback';
+      }
+    }
 
     const citations = parseBibliography(fullText);
     if (citations.length) {
       saveCitations(doc.id, citations, normalizeCitation);
     }
     doc.citationCount = citations.length || loadDocumentCitations(doc.id).length;
+    saveDocumentMetadata(doc);
   } catch (err) {
     logger.warn('Failed to extract committee/citations from PDF', { docId: doc.id, error: err.message });
   }
@@ -306,6 +358,17 @@ function loadStoredParsedData(doc) {
   try {
     doc.committee = loadCommitteeMembers(doc.id);
     doc.citationCount = loadDocumentCitations(doc.id).length;
+    if ((!doc.supervisors || !doc.supervisors.length) && doc.committee.length) {
+      const storedSupervisors = supervisorsFromCommittee(doc.committee);
+      if (storedSupervisors.length) {
+        doc.supervisors = storedSupervisors;
+        doc.supervisorsSource = doc.committee.some((member) =>
+          SUPERVISOR_ROLES.has(member.role) && member.source === 'api'
+        )
+          ? 'api'
+          : 'pdf_fallback';
+      }
+    }
   } catch {
     doc.committee = [];
     doc.citationCount = 0;
@@ -468,6 +531,7 @@ export async function enrichDocumentsWithFileAnalysis(documents, options) {
       const idx = cursor;
       cursor += 1;
       await analyzeDocumentFile(documents[idx], options);
+      saveDocumentMetadata(documents[idx]);
     }
   });
 

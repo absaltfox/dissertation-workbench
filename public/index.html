@@ -37,7 +37,7 @@
       <section id="tab-records" class="tab-panel reveal active" role="tabpanel">
         <article class="panel">
           <h2>Retrieved Documents</h2>
-          <input id="docFilter" class="doc-filter" type="search" placeholder="Filter by title, author, degree..." />
+          <input id="docFilter" class="doc-filter" type="search" placeholder="Filter by title, author, supervisor, degree..." />
           <div class="table-wrap">
             <table>
               <thead>
@@ -85,46 +85,44 @@
               <h2>Mean Word Count by Year</h2>
               <svg id="wordsByYearChart" viewBox="0 0 940 360" role="img" aria-label="Mean word count by year"></svg>
             </article>
+
+            <article class="panel">
+              <h2>Dissertation Length Trend (Median Pages by Year)</h2>
+              <svg id="pageTrendChart" viewBox="0 0 940 360" role="img" aria-label="Median pages by year with min/max band"></svg>
+            </article>
           </div>
 
-          <article class="panel word-cloud-panel">
-            <h2>Word Cloud (Themes)</h2>
-            <div id="wordCloud" class="word-cloud"></div>
-            <div id="themeResults" class="theme-results"></div>
-          </article>
-        </div>
+          <div class="analytics-right">
+            <article class="panel word-cloud-panel">
+              <h2>Word Cloud (Themes)</h2>
+              <div id="wordCloud" class="word-cloud"></div>
+              <div id="themeResults" class="theme-results"></div>
+            </article>
 
-        <div class="analytics-grid">
-          <article class="panel">
-            <h2>Dissertation Length Trend (Median Pages by Year)</h2>
-            <svg id="pageTrendChart" viewBox="0 0 940 360" role="img" aria-label="Median pages by year with min/max band"></svg>
-          </article>
-
-          <article class="panel word-cloud-panel">
-            <h2>Bigram / Trigram Cloud</h2>
-            <div id="ngramCloud" class="word-cloud"></div>
-          </article>
-        </div>
-
-        <div class="analytics-grid">
-          <article class="panel">
-            <h2>Methodology Detection</h2>
-            <div id="methodologyBars" class="bars"></div>
-          </article>
-
-          <article class="panel">
-            <h2>Co-occurring Terms</h2>
-            <div id="cooccurrenceBars" class="bars"></div>
-          </article>
+            <article class="panel word-cloud-panel">
+              <h2>Concept Cloud</h2>
+              <div id="ngramCloud" class="word-cloud"></div>
+            </article>
+          </div>
         </div>
 
         <article class="panel">
-          <h2>Supervisor &ndash; Topic Heatmap</h2>
+          <h2>Methodology Detection</h2>
+          <div id="methodologyBars" class="bars"></div>
+        </article>
+
+        <article class="panel">
+          <h2>Co-occurring Concepts</h2>
+          <div id="cooccurrenceBars" class="bars"></div>
+        </article>
+
+        <article class="panel">
+          <h2>Supervisor &ndash; Concept Heatmap</h2>
           <div id="supervisorHeatmap" class="table-wrap"></div>
         </article>
 
         <article class="panel">
-          <h2>Mean Word Count by Subject</h2>
+          <h2>Weighted Mean Word Count by Concept</h2>
           <div id="subjectBars" class="bars"></div>
         </article>
       </section>
@@ -185,7 +183,7 @@
                   <input
                     id="s-source"
                     type="text"
-                    value="title,author,ubc_date_sort,uri,creator,supervisor,description,genre,date_available,rights,doi,affiliation,degree_theses,program_theses,scholarly_level,campus,degree,program,subject"
+                    value="title,author,ubc_date_sort,uri,creator,supervisor,description,genre,date_available,rights,doi,affiliation,degree_theses,program_theses,scholarly_level,campus,degree,program,extent,identifier,id,subject"
                   />
                 </label>
                 <label>
@@ -205,7 +203,7 @@
                   <input id="s-subjectLimit" type="number" value="20" min="1" max="100" step="1" />
                 </label>
                 <label>
-                  <span>API Key (optional)</span>
+                  <span>API Key (server-side, optional)</span>
                   <input id="s-apiKey" type="password" autocomplete="off" />
                 </label>
                 <label>
@@ -227,7 +225,9 @@
                   <button type="submit" id="loadBtn" class="btn">Run Query</button>
                   <button type="button" id="refreshBtn" class="btn ghost">Force Refresh</button>
                   <button type="button" id="saveSettingsBtn" class="btn ghost">Save Settings</button>
+                  <button type="button" id="rebuildConceptsBtn" class="btn ghost">Rebuild Concepts</button>
                 </div>
+                <p id="conceptPipelineStatus" class="meta"></p>
               </form>
             </article>
           </div>
