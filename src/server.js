@@ -10,10 +10,11 @@ import {
 } from './config.js';
 import { ensureStorage, getDb, listUsers, listFileMetrics, getFileMetricsStats, deleteFileMetric, listRecentRuns, getAllSettings, getSetting, setSetting, loadDocumentMetadata } from './db.js';
 import { authenticate, requireAdmin, login, destroySession, setSessionCookie, clearSessionCookie, ensureDefaultAdmin, createPasswordHash } from './auth.js';
-import { createUser, deleteUser, countUsers, findUserByUsername, checkCacheIntegrity, logCacheStats, loadDocumentCitations } from './db.js';
+import { createUser, deleteUser, countUsers, findUserByUsername, checkCacheIntegrity, logCacheStats, loadDocumentCitationsWithSharing, loadDocsByCitation, clearAllCitations, saveCatalogueLookup, getCatalogueLookupStats, listPendingLookups } from './db.js';
 import { validateMetricsParams, validateAdminUser, parseNumberParam, parseBooleanParam } from './validate.js';
 import { deleteCachedPdf, analyzeDocumentFile, analyzePdfAtPath, extractAndSaveParsedData } from './pdf.js';
 import { getConceptPipelineStatus, rebuildConceptDictionary, scheduleDailyConceptRebuild } from './conceptsPipeline.js';
+import { lookupCitation, extractSearchTerms, checkYazAvailability } from './catalogue.js';
 import { logger } from './logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -311,6 +312,54 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (url.pathname === '/api/admin/catalogue-lookup/stats' && method === 'GET') {
+      if (!requireAdmin(req, res)) return;
+      const stats = getCatalogueLookupStats();
+      sendJson(res, 200, { stats });
+      return;
+    }
+
+    if (url.pathname === '/api/admin/catalogue-lookup' && method === 'POST') {
+      if (!requireAdmin(req, res)) return;
+      const limit = parseNumberParam(url.searchParams.get('limit'), 100);
+      const dryRun = parseBooleanParam(url.searchParams.get('dryRun'), false);
+
+      const pending = listPendingLookups(limit);
+      if (!pending.length) {
+        sendJson(res, 200, { ok: true, processed: 0, found: 0, notFound: 0, skipped: 0, message: 'No pending citations to look up.' });
+        return;
+      }
+
+      if (dryRun) {
+        const previews = pending.map((row) => ({
+          citationId: row.id,
+          citationText: row.citation_text,
+          ...extractSearchTerms(row.citation_text),
+        }));
+        sendJson(res, 200, { ok: true, dryRun: true, total: previews.length, previews });
+        return;
+      }
+
+      let found = 0;
+      let notFound = 0;
+      let skipped = 0;
+
+      for (const row of pending) {
+        const result = await lookupCitation(row.citation_text);
+        saveCatalogueLookup(row.id, {
+          hits: result.hits,
+          queryAuthor: result.author,
+          queryTitle: result.title,
+        });
+        if (result.found === true) found++;
+        else if (result.found === false) notFound++;
+        else skipped++;
+      }
+
+      sendJson(res, 200, { ok: true, processed: pending.length, found, notFound, skipped });
+      return;
+    }
+
     if (url.pathname === '/api/admin/settings' && method === 'PUT') {
       if (!requireAdmin(req, res)) return;
       const body = await readBody(req);
@@ -384,6 +433,7 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === '/api/admin/reparse-all' && method === 'POST') {
       if (!requireAdmin(req, res)) return;
+      clearAllCitations();
       const entries = listFileMetrics().filter((e) => e.pdf_path);
       let processed = 0;
       let withCommittee = 0;
@@ -419,8 +469,20 @@ const server = http.createServer(async (req, res) => {
     // --- Document citations (public) ---
     if (url.pathname.startsWith('/api/documents/') && url.pathname.endsWith('/citations') && method === 'GET') {
       const docId = decodeURIComponent(url.pathname.slice('/api/documents/'.length, -'/citations'.length));
-      const citations = loadDocumentCitations(docId);
+      const citations = loadDocumentCitationsWithSharing(docId);
       sendJson(res, 200, { citations });
+      return;
+    }
+
+    // --- Citation → documents lookup (public) ---
+    if (url.pathname.startsWith('/api/citations/') && url.pathname.endsWith('/documents') && method === 'GET') {
+      const citationId = Number(url.pathname.slice('/api/citations/'.length, -'/documents'.length));
+      if (!Number.isFinite(citationId) || citationId <= 0) {
+        sendJson(res, 400, { error: 'Invalid citation ID' });
+        return;
+      }
+      const documents = loadDocsByCitation(citationId);
+      sendJson(res, 200, { documents });
       return;
     }
 

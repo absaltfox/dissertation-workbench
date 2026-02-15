@@ -44,6 +44,17 @@ const createUserError = document.getElementById('createUserError');
 const refreshCacheBtn = document.getElementById('refreshCacheBtn');
 const reparseAllBtn = document.getElementById('reparseAllBtn');
 
+// Citation Explorer elements
+const citationDocsTableEl = document.getElementById('citationDocsTable');
+const citationDocFilterEl = document.getElementById('citationDocFilter');
+const citationGraphEl = document.getElementById('citationGraph');
+const citationGraphTitleEl = document.getElementById('citationGraphTitle');
+const citationListTitleEl = document.getElementById('citationListTitle');
+const citationEntriesEl = document.getElementById('citationEntries');
+const citationZoomInBtn = document.getElementById('citationZoomInBtn');
+const citationZoomOutBtn = document.getElementById('citationZoomOutBtn');
+const citationZoomResetBtn = document.getElementById('citationZoomResetBtn');
+
 // --- State ---
 const state = {
   payload: null,
@@ -54,6 +65,16 @@ const state = {
   sortKey: null,   // 'title' | 'author' | 'year' | 'degree' | 'pages' | null
   sortDir: 'asc',  // 'asc' | 'desc'
   filterText: '',
+  citationDocId: null,
+  citationFilterText: '',
+  citationGraphView: {
+    scale: 1,
+    translateX: 0,
+    translateY: 0,
+    minScale: 0.6,
+    maxScale: 3,
+  },
+  citationRequestToken: 0,
 };
 
 // --- Utilities ---
@@ -98,6 +119,9 @@ function setActiveTab(tabName) {
   }
   for (const panel of tabPanels) {
     panel.classList.toggle('active', panel.id === `tab-${tabName}`);
+  }
+  if (tabName === 'citations' && state.payload) {
+    renderCitationDocs();
   }
 }
 
@@ -455,7 +479,7 @@ function renderDetails() {
           return;
         }
         contentEl.innerHTML = data.citations.map((c) =>
-          `<p class="citation-entry">${escapeHtml(c.citation_text)}</p>`
+          `<p class="citation-entry">${escapeHtml(c.citation_text)}${catalogueBadge(c)}</p>`
         ).join('');
       } catch {
         contentEl.innerHTML = '<p class="meta">Connection error.</p>';
@@ -897,6 +921,352 @@ function renderSupervisorHeatmap() {
       const concept = node.getAttribute('data-heatmap-concept');
       openMatchesModal(`Supervisor + Concept: ${sup} + ${concept}`, docsForSupervisorConcept(sup, concept));
     });
+  }
+}
+
+// --- Citation Explorer ---
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function applyCitationGraphTransform() {
+  const viewport = citationGraphEl.querySelector('#citationGraphViewport');
+  if (!viewport) return;
+  const { scale, translateX, translateY } = state.citationGraphView;
+  viewport.setAttribute('transform', `translate(${translateX} ${translateY}) scale(${scale})`);
+}
+
+function resetCitationGraphView() {
+  state.citationGraphView.scale = 1;
+  state.citationGraphView.translateX = 0;
+  state.citationGraphView.translateY = 0;
+  applyCitationGraphTransform();
+}
+
+function zoomCitationGraph(factor) {
+  const view = state.citationGraphView;
+  view.scale = clamp(view.scale * factor, view.minScale, view.maxScale);
+  applyCitationGraphTransform();
+}
+
+function setupCitationGraphInteractions() {
+  if (citationGraphEl.dataset.zoomReady === '1') return;
+  citationGraphEl.dataset.zoomReady = '1';
+
+  let dragging = null;
+
+  citationGraphEl.addEventListener('wheel', (event) => {
+    if (!citationGraphEl.querySelector('#citationGraphViewport')) return;
+    event.preventDefault();
+    zoomCitationGraph(event.deltaY < 0 ? 1.12 : 0.88);
+  }, { passive: false });
+
+  citationGraphEl.addEventListener('pointerdown', (event) => {
+    if (event.button !== 0) return;
+    if (!citationGraphEl.querySelector('#citationGraphViewport')) return;
+    if (event.target?.closest?.('.cite-node')) return;
+    dragging = { x: event.clientX, y: event.clientY, pointerId: event.pointerId };
+    citationGraphEl.setPointerCapture(event.pointerId);
+    citationGraphEl.classList.add('dragging');
+  });
+
+  citationGraphEl.addEventListener('pointermove', (event) => {
+    if (!dragging) return;
+    const vb = citationGraphEl.viewBox.baseVal;
+    const sx = vb?.width && citationGraphEl.clientWidth ? vb.width / citationGraphEl.clientWidth : 1;
+    const sy = vb?.height && citationGraphEl.clientHeight ? vb.height / citationGraphEl.clientHeight : 1;
+    const dx = (event.clientX - dragging.x) * sx;
+    const dy = (event.clientY - dragging.y) * sy;
+    dragging.x = event.clientX;
+    dragging.y = event.clientY;
+    state.citationGraphView.translateX += dx;
+    state.citationGraphView.translateY += dy;
+    applyCitationGraphTransform();
+  });
+
+  citationGraphEl.addEventListener('pointerup', (event) => {
+    if (dragging) {
+      citationGraphEl.releasePointerCapture(event.pointerId);
+      dragging = null;
+      citationGraphEl.classList.remove('dragging');
+    }
+  });
+
+  citationGraphEl.addEventListener('pointercancel', () => {
+    dragging = null;
+    citationGraphEl.classList.remove('dragging');
+  });
+
+  citationZoomInBtn?.addEventListener('click', () => zoomCitationGraph(1.18));
+  citationZoomOutBtn?.addEventListener('click', () => zoomCitationGraph(0.84));
+  citationZoomResetBtn?.addEventListener('click', resetCitationGraphView);
+}
+
+function compactCitationLabel(text, limit = 18) {
+  const label = parseCitationLabel(text);
+  return label.length > limit ? `${label.slice(0, limit)}...` : label;
+}
+
+function renderCitationDocs() {
+  let docs = state.payload?.documents || [];
+  if (state.citationFilterText) {
+    const q = state.citationFilterText.toLowerCase();
+    docs = docs.filter((doc) =>
+      (doc.title || '').toLowerCase().includes(q) ||
+      (doc.author || '').toLowerCase().includes(q) ||
+      String(doc.year || '').includes(q)
+    );
+  }
+
+  // Sort docs with citations to top, then by citation count descending
+  docs = [...docs].sort((a, b) => (b.citationCount || 0) - (a.citationCount || 0));
+
+  const withCitations = docs.filter((d) => d.citationCount > 0).length;
+  const headerEl = citationDocsTableEl.closest('.panel')?.querySelector('h2');
+  if (headerEl) headerEl.textContent = `Dissertations (${withCitations} with parsed citations)`;
+
+  citationDocsTableEl.innerHTML = docs
+    .map((doc) => {
+      const count = doc.citationCount || 0;
+      const active = doc.id === state.citationDocId ? ' active' : '';
+      const greyed = count === 0 ? ' greyed' : '';
+      return `
+        <tr class="citation-doc-row${active}${greyed}" data-cite-doc-id="${escapeHtml(doc.id)}">
+          <td>${escapeHtml(doc.title || '(Untitled)')}</td>
+          <td>${escapeHtml(doc.author || '')}</td>
+          <td>${doc.year || '-'}</td>
+          <td>${formatNum(count)}</td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  for (const row of citationDocsTableEl.querySelectorAll('.citation-doc-row')) {
+    row.addEventListener('click', () => {
+      selectCitationDoc(row.dataset.citeDocId);
+    });
+  }
+}
+
+async function selectCitationDoc(docId) {
+  const requestToken = ++state.citationRequestToken;
+  state.citationDocId = docId;
+  renderCitationDocs();
+
+  const doc = (state.payload?.documents || []).find((d) => d.id === docId);
+  const shortTitle = (doc?.title || '(Untitled)').slice(0, 60);
+  citationGraphTitleEl.textContent = `Citations: ${shortTitle}`;
+  citationListTitleEl.textContent = 'Works Cited';
+  citationEntriesEl.innerHTML = '<p class="meta">Loading citations...</p>';
+  citationGraphEl.innerHTML = '<text class="axis" x="400" y="300" text-anchor="middle">Loading citation map...</text>';
+
+  try {
+    const res = await fetch(`/api/documents/${encodeURIComponent(docId)}/citations`);
+    if (requestToken !== state.citationRequestToken) return;
+    if (!res.ok) {
+      citationEntriesEl.innerHTML = '<p class="meta">Failed to load citations.</p>';
+      citationGraphEl.innerHTML = '';
+      return;
+    }
+    const data = await res.json();
+    if (requestToken !== state.citationRequestToken) return;
+    const citations = data.citations || [];
+    if (!citations.length) {
+      citationGraphEl.innerHTML = '<text class="axis" x="400" y="300" text-anchor="middle">No parsed citations for this dissertation.</text>';
+      citationEntriesEl.innerHTML = '<p class="meta">No citations found.</p>';
+      citationListTitleEl.textContent = 'Works Cited';
+      return;
+    }
+    citationListTitleEl.textContent = `Works Cited (${citations.length})`;
+    renderCitationGraph(citations, doc);
+    renderCitationList(citations);
+  } catch {
+    if (requestToken !== state.citationRequestToken) return;
+    citationEntriesEl.innerHTML = '<p class="meta">Connection error.</p>';
+    citationGraphEl.innerHTML = '';
+  }
+}
+
+function parseCitationLabel(text) {
+  const trimmed = String(text || '').replace(/\s+/g, ' ').trim();
+  const authorMatch = trimmed.match(/^([A-Za-z\u00C0-\u024F'\u2019.\-]+(?:\s+[A-Za-z\u00C0-\u024F'\u2019.\-]+){0,2})/);
+  const yearMatch = trimmed.match(/\b(19|20)\d{2}\b/);
+  if (authorMatch && yearMatch) return `${authorMatch[1]} (${yearMatch[0]})`;
+  return trimmed.length > 34 ? `${trimmed.slice(0, 34)}...` : trimmed;
+}
+
+function citationNodeRadius(citation) {
+  const totalDocs = Math.max(1, Number(citation?.total_docs) || 1);
+  return 5 + Math.min(20, Math.log2(totalDocs + 1) * 4);
+}
+
+function renderCitationGraph(citations, doc) {
+  const W = 1000, H = 760;
+  const cx = W / 2, cy = H / 2;
+  const shared = citations.filter((c) => c.total_docs > 1);
+  const unique = citations.filter((c) => c.total_docs <= 1);
+  const maxInner = 18;
+  const maxOuter = 36;
+  const displayShared = shared.slice(0, maxInner);
+  const displayUnique = unique.slice(0, maxOuter);
+  const innerR = Math.min(260, 210 + Math.min(displayShared.length, 18) * 2.4);
+  const outerR = Math.min(350, 300 + Math.min(displayUnique.length, 36) * 1.8);
+  const uniqueOverflow = unique.length - maxOuter;
+  const sharedOverflow = shared.length - maxInner;
+  const innerLabelStep = displayShared.length > 12 ? 2 : 1;
+
+  let body = '';
+
+  // Lines first (behind nodes)
+  // Inner ring lines
+  displayShared.forEach((c, i) => {
+    const angle = (2 * Math.PI * i) / Math.max(displayShared.length, 1) - Math.PI / 2;
+    const nx = cx + innerR * Math.cos(angle);
+    const ny = cy + innerR * Math.sin(angle);
+    body += `<line x1="${cx}" y1="${cy}" x2="${nx}" y2="${ny}" stroke="rgba(8,90,99,0.18)" stroke-width="1.5"/>`;
+  });
+  // Outer ring lines
+  displayUnique.forEach((c, i) => {
+    const angle = (2 * Math.PI * i) / Math.max(displayUnique.length, 1) - Math.PI / 2;
+    const nx = cx + outerR * Math.cos(angle);
+    const ny = cy + outerR * Math.sin(angle);
+    body += `<line x1="${cx}" y1="${cy}" x2="${nx}" y2="${ny}" stroke="rgba(47,155,125,0.12)" stroke-width="1"/>`;
+  });
+
+  // Center node
+  const centerLabel = (doc?.title || '').slice(0, 30) || 'Selected';
+  body += `<g class="cite-node" data-cite-doc-center="1">`;
+  body += `<circle cx="${cx}" cy="${cy}" r="34" fill="var(--accent)" opacity="0.92"/>`;
+  body += `<text class="cite-label" x="${cx}" y="${cy + 4}" text-anchor="middle" fill="#fff" font-size="9">${escapeHtml(centerLabel)}</text>`;
+  body += `<title>${escapeHtml(doc?.title || '(Untitled)')}</title>`;
+  body += `</g>`;
+
+  // Inner ring (shared)
+  displayShared.forEach((c, i) => {
+    const angle = (2 * Math.PI * i) / Math.max(displayShared.length, 1) - Math.PI / 2;
+    const nx = cx + innerR * Math.cos(angle);
+    const ny = cy + innerR * Math.sin(angle);
+    const r = citationNodeRadius(c);
+    const citeCount = Math.max(1, Number(c.total_docs) || 1);
+    const label = compactCitationLabel(c.citation_text, 13);
+    body += `<g class="cite-node" data-citation-id="${c.id}" data-citation-text="${escapeHtml(c.citation_text)}" data-citation-count="${citeCount}">`;
+    body += `<circle cx="${nx}" cy="${ny}" r="${r}" fill="var(--accent-2)" opacity="0.85"/>`;
+    if (i % innerLabelStep === 0) {
+      body += `<text class="cite-label" x="${nx}" y="${ny + r + 13}" text-anchor="middle" fill="var(--ink-soft)" font-size="8">${escapeHtml(label)} (${formatNum(citeCount)})</text>`;
+    }
+    body += `<title>${escapeHtml(c.citation_text)} | Linked dissertations: ${formatNum(citeCount)}</title>`;
+    body += `</g>`;
+  });
+
+  // Outer ring (unique, capped)
+  displayUnique.forEach((c, i) => {
+    const angle = (2 * Math.PI * i) / Math.max(displayUnique.length, 1) - Math.PI / 2;
+    const nx = cx + outerR * Math.cos(angle);
+    const ny = cy + outerR * Math.sin(angle);
+    const r = citationNodeRadius(c);
+    const citeCount = Math.max(1, Number(c.total_docs) || 1);
+    body += `<g class="cite-node" data-citation-id="${c.id}" data-citation-text="${escapeHtml(c.citation_text)}" data-citation-count="${citeCount}">`;
+    body += `<circle cx="${nx}" cy="${ny}" r="${r}" fill="var(--accent-3)" opacity="0.55"/>`;
+    body += `<title>${escapeHtml(c.citation_text)} | Linked dissertations: ${formatNum(citeCount)}</title>`;
+    body += `</g>`;
+  });
+
+  if (uniqueOverflow > 0) {
+    body += `<text class="cite-label" x="${W - 20}" y="${H - 12}" text-anchor="end" fill="var(--ink-soft)" font-size="10">+${uniqueOverflow} more unique</text>`;
+  }
+  if (sharedOverflow > 0) {
+    body += `<text class="cite-label" x="20" y="${H - 12}" text-anchor="start" fill="var(--ink-soft)" font-size="10">+${sharedOverflow} more shared</text>`;
+  }
+
+  citationGraphEl.innerHTML = `<g id="citationGraphViewport">${body}</g>`;
+  resetCitationGraphView();
+
+  // Attach click handlers to citation nodes
+  for (const node of citationGraphEl.querySelectorAll('.cite-node[data-citation-id]')) {
+    node.addEventListener('click', () => {
+      const citationId = node.dataset.citationId;
+      const citationText = node.dataset.citationText;
+      const citationCount = Number(node.dataset.citationCount || 1);
+      showCitingDissertations(citationId, citationText, citationCount);
+    });
+  }
+}
+
+function catalogueBadge(citation) {
+  if (citation.catalogue_hits == null) return '';
+  if (citation.catalogue_hits > 0) {
+    return `<span class="catalogue-badge held" title="Found in UBC Library (${citation.catalogue_hits} hit${citation.catalogue_hits !== 1 ? 's' : ''})">UBC Library</span>`;
+  }
+  return `<span class="catalogue-badge not-held" title="Not found in UBC Library catalogue">Not in UBC Library</span>`;
+}
+
+function renderCitationList(citations) {
+  citationEntriesEl.innerHTML = citations
+    .map((c) => {
+      const citeCount = Math.max(1, Number(c.total_docs) || 1);
+      const badge = `<span class="citation-count">${formatNum(citeCount)}</span>`;
+      return `<div class="citation-entry" title="${escapeHtml(c.citation_text)}" data-citation-id="${c.id}" data-citation-text="${escapeHtml(c.citation_text)}" data-citation-count="${citeCount}">${escapeHtml(c.citation_text)}${badge}${catalogueBadge(c)}</div>`;
+    })
+    .join('');
+
+  for (const entry of citationEntriesEl.querySelectorAll('.citation-entry[data-citation-id]')) {
+    entry.addEventListener('click', () => {
+      showCitingDissertations(
+        entry.dataset.citationId,
+        entry.dataset.citationText,
+        Number(entry.dataset.citationCount || 1)
+      );
+    });
+  }
+}
+
+async function showCitingDissertations(citationId, citationText, totalDocs = null) {
+  try {
+    const res = await fetch(`/api/citations/${encodeURIComponent(citationId)}/documents`);
+    if (!res.ok) return;
+    const data = await res.json();
+    const docs = (data.documents || []).map((d) => ({
+      id: d.id,
+      title: d.title || '(Untitled)',
+      author: d.author || 'Unknown',
+    }));
+
+    const shortText = citationText.length > 140 ? citationText.slice(0, 140) + '...' : citationText;
+    const linkedCount = totalDocs === null ? docs.length : totalDocs;
+    const list = docs.length
+      ? `<div class="related-list">
+          ${docs.map((d) => `
+            <div class="related-item" data-cite-nav-id="${escapeHtml(d.id)}">
+              <strong>${escapeHtml(d.title)}</strong>
+              <p>${escapeHtml(d.author)}</p>
+            </div>
+          `).join('')}
+        </div>`
+      : '<p class="meta">No dissertations found for this citation.</p>';
+
+    docDetailsEl.innerHTML = `
+      <div class="meta">
+        <p><strong>Citation:</strong> ${escapeHtml(shortText)}</p>
+        <p><strong>Linked dissertations:</strong> ${formatNum(linkedCount)}</p>
+        <p>${formatNum(docs.length)} dissertation(s) loaded from index</p>
+      </div>
+      ${list}
+    `;
+
+    for (const item of docDetailsEl.querySelectorAll('.related-item[data-cite-nav-id]')) {
+      item.addEventListener('click', () => {
+        const targetId = item.getAttribute('data-cite-nav-id');
+        if (targetId) {
+          closeDocModal();
+          setActiveTab('citations');
+          selectCitationDoc(targetId);
+        }
+      });
+    }
+    docModalOverlay.hidden = false;
+  } catch {
+    // silently fail
   }
 }
 
@@ -1400,6 +1770,11 @@ docFilterEl.addEventListener('input', () => {
   renderDocuments();
 });
 
+citationDocFilterEl.addEventListener('input', () => {
+  state.citationFilterText = citationDocFilterEl.value.trim();
+  renderCitationDocs();
+});
+
 docModalCloseBtn.addEventListener('click', closeDocModal);
 docModalOverlay.addEventListener('click', (e) => {
   if (e.target === docModalOverlay) closeDocModal();
@@ -1435,6 +1810,8 @@ documentsTableEl.addEventListener('keydown', (e) => {
 for (const [idx, node] of document.querySelectorAll('.reveal').entries()) {
   node.style.animationDelay = `${idx * 70}ms`;
 }
+
+setupCitationGraphInteractions();
 
 // Initial load
 loadData();

@@ -84,6 +84,15 @@ export function getDb() {
       PRIMARY KEY (doc_id, citation_id),
       FOREIGN KEY (citation_id) REFERENCES citations(id)
     );
+
+    CREATE TABLE IF NOT EXISTS catalogue_lookups (
+      citation_id INTEGER PRIMARY KEY,
+      hits INTEGER,
+      query_author TEXT,
+      query_title TEXT,
+      looked_up_at TEXT NOT NULL,
+      FOREIGN KEY (citation_id) REFERENCES citations(id)
+    );
   `);
   return db;
 }
@@ -380,6 +389,38 @@ export function loadDocumentCitations(docId) {
   `).all(docId);
 }
 
+export function loadDocumentCitationsWithSharing(docId) {
+  return getDb().prepare(`
+    SELECT c.id, c.citation_hash, c.citation_text,
+      (SELECT COUNT(*) FROM document_citations dc2 WHERE dc2.citation_id = c.id) as total_docs,
+      cl.hits AS catalogue_hits,
+      cl.query_author AS catalogue_query_author,
+      cl.query_title AS catalogue_query_title,
+      cl.looked_up_at AS catalogue_looked_up_at
+    FROM citations c
+    JOIN document_citations dc ON dc.citation_id = c.id
+    LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
+    WHERE dc.doc_id = ?
+    ORDER BY total_docs DESC, c.citation_text
+  `).all(docId);
+}
+
+export function loadDocsByCitation(citationId) {
+  return getDb().prepare(`
+    SELECT d.doc_id as id, json_extract(d.metadata_json, '$.title') as title,
+      json_extract(d.metadata_json, '$.author') as author
+    FROM document_citations dc
+    JOIN documents d ON d.doc_id = dc.doc_id
+    WHERE dc.citation_id = ?
+    ORDER BY title
+  `).all(citationId);
+}
+
+export function clearAllCitations() {
+  getDb().exec('DELETE FROM document_citations');
+  getDb().exec('DELETE FROM citations');
+}
+
 export function getCitationStats() {
   const row = getDb().prepare(`
     SELECT
@@ -387,6 +428,50 @@ export function getCitationStats() {
       (SELECT COUNT(*) FROM document_citations) AS total_links
   `).get();
   return row;
+}
+
+// --- Catalogue lookup functions ---
+
+export function saveCatalogueLookup(citationId, { hits, queryAuthor, queryTitle }) {
+  const now = new Date().toISOString();
+  getDb().prepare(`
+    INSERT INTO catalogue_lookups (citation_id, hits, query_author, query_title, looked_up_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(citation_id) DO UPDATE SET
+      hits = excluded.hits,
+      query_author = excluded.query_author,
+      query_title = excluded.query_title,
+      looked_up_at = excluded.looked_up_at
+  `).run(citationId, hits ?? null, queryAuthor || null, queryTitle || null, now);
+}
+
+export function loadCatalogueLookup(citationId) {
+  return getDb().prepare(`
+    SELECT citation_id, hits, query_author, query_title, looked_up_at
+    FROM catalogue_lookups
+    WHERE citation_id = ?
+  `).get(citationId);
+}
+
+export function getCatalogueLookupStats() {
+  return getDb().prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN hits > 0 THEN 1 ELSE 0 END) AS found,
+      SUM(CASE WHEN hits = 0 THEN 1 ELSE 0 END) AS not_found,
+      SUM(CASE WHEN hits IS NULL THEN 1 ELSE 0 END) AS skipped
+    FROM catalogue_lookups
+  `).get();
+}
+
+export function listPendingLookups(limit = 100) {
+  return getDb().prepare(`
+    SELECT c.id, c.citation_text
+    FROM citations c
+    LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
+    WHERE cl.citation_id IS NULL
+    LIMIT ?
+  `).all(limit);
 }
 
 export async function logCacheStats() {
