@@ -350,7 +350,7 @@ tbody tr:nth-child(even) {
 
 .detail-body {
   display: grid;
-  gap: 0.8rem;
+  gap: 1.2rem;
 }
 
 .detail-section-title {
@@ -366,6 +366,11 @@ tbody tr:nth-child(even) {
   font-size: 0.85rem;
   line-height: 1.65;
   color: var(--ink-soft);
+  max-height: 30vh;
+  overflow-y: auto;
+  position: relative;
+  mask-image: linear-gradient(to bottom, #000 85%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 85%, transparent 100%);
 }
 
 .detail-abstract p {
@@ -398,6 +403,82 @@ tbody tr:nth-child(even) {
   font-size: 0.74rem;
   color: var(--ink-soft);
   background: rgba(255, 255, 255, 0.75);
+}
+
+.token.concept {
+  background: rgba(47, 155, 125, 0.10);
+  border-color: rgba(47, 155, 125, 0.35);
+  color: #1a6b50;
+}
+
+/* --- Document detail subtitle & actions --- */
+
+.doc-subtitle {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 0.9rem;
+  color: var(--ink-soft);
+  line-height: 1.4;
+}
+
+.doc-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.doc-actions .btn {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
+
+.detail-download-note {
+  margin: 0;
+  font-family: var(--sans);
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+  font-style: italic;
+}
+
+/* --- Detail metadata grid --- */
+
+.detail-meta {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 0.75rem;
+  font-family: var(--sans);
+  font-size: 0.84rem;
+}
+
+.detail-meta-label {
+  color: var(--ink-soft);
+  font-weight: 600;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.detail-meta-value {
+  color: var(--ink);
+}
+
+/* --- Citations disclosure --- */
+
+.citations-details summary {
+  font-family: var(--serif);
+  font-size: 0.88rem;
+  font-weight: 700;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--line);
+  color: var(--accent);
+  cursor: pointer;
+  list-style: revert;
+}
+
+.citations-details summary:hover {
+  opacity: 0.8;
 }
 
 .related-list {
@@ -853,7 +934,7 @@ a:hover {
   gap: 0.75rem;
 }
 
-.citation-entries { max-height: 50vh; overflow-y: auto; }
+.citation-entries { max-height: 78vh; overflow-y: auto; }
 
 .citation-entry {
   padding: 0.55rem 0.6rem;

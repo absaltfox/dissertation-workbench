@@ -30,6 +30,7 @@ const tabPanels = Array.from(document.querySelectorAll('.tab-panel'));
 // Modal elements
 const docModalOverlay = document.getElementById('docModalOverlay');
 const docModalCloseBtn = document.getElementById('docModalClose');
+const docModalTitleEl = document.getElementById('docModalTitle');
 
 // Admin elements
 const loginGate = document.getElementById('loginGate');
@@ -342,6 +343,7 @@ function renderDocuments() {
 function renderDetails() {
   const docs = state.payload?.documents || [];
   if (!docs.length) {
+    docModalTitleEl.textContent = 'Document Details';
     docDetailsEl.textContent = 'No documents in current result set.';
     return;
   }
@@ -352,6 +354,9 @@ function renderDetails() {
     state.selectedDocId = doc.id;
   }
 
+  // Set modal heading to document title
+  docModalTitleEl.textContent = doc.title || '(Untitled)';
+
   const related = relatedDocuments(doc, docs);
   const abstract = doc.abstract
     ? doc.abstract.split(/\n{2,}|\r?\n/).map((p) => `<p>${escapeHtml(p.trim())}</p>`).join('')
@@ -360,8 +365,8 @@ function renderDetails() {
     ? doc.themes.map((t) => `<span class="token">${escapeHtml(t)}</span>`).join('')
     : '<span class="token">No themes</span>';
   const concepts = doc.conceptTerms?.length
-    ? doc.conceptTerms.map((t) => `<span class="token">${escapeHtml(t)}</span>`).join('')
-    : '<span class="token">No concepts</span>';
+    ? doc.conceptTerms.map((t) => `<span class="token concept">${escapeHtml(t)}</span>`).join('')
+    : '<span class="token concept">No concepts</span>';
 
   const relatedHtml = related.length
     ? related
@@ -376,7 +381,7 @@ function renderDetails() {
         .join('')
     : '<p class="meta">No related documents identified from overlapping themes.</p>';
 
-  // Committee members display (skip supervisor roles if already shown in Supervisor line)
+  // Committee members for metadata grid
   let committeeHtml = '';
   const hasSupervisorsShown = doc.supervisors?.length > 0;
   const supervisorRoles = new Set(['Supervisor', 'Co-Supervisor']);
@@ -390,10 +395,32 @@ function renderDetails() {
     }
     committeeHtml = Object.entries(grouped).map(([role, members]) =>
       members.map((m) =>
-        `<p><strong>${escapeHtml(role)}:</strong> ${escapeHtml(m.name)}${m.affiliation ? ` (${escapeHtml(m.affiliation)})` : ''}</p>`
+        `<div class="detail-meta-label">${escapeHtml(role)}</div><div class="detail-meta-value">${escapeHtml(m.name)}${m.affiliation ? ` (${escapeHtml(m.affiliation)})` : ''}</div>`
       ).join('')
     ).join('');
   }
+
+  // Subtitle line: author, year, degree
+  const subtitleParts = [
+    doc.author || 'Unknown',
+    doc.year || '',
+    doc.degree || ''
+  ].filter(Boolean);
+
+  // Action buttons
+  const actions = [];
+  if (doc.downloadUrl) {
+    actions.push(`<a class="btn ghost btn-sm" href="${escapeHtml(doc.downloadUrl)}" target="_blank" rel="noreferrer">Open PDF</a>`);
+  }
+  if (doc.uri) {
+    actions.push(`<a class="btn ghost btn-sm" href="${escapeHtml(doc.uri)}" target="_blank" rel="noreferrer">Open Record</a>`);
+  }
+  const actionsHtml = actions.length
+    ? `<div class="doc-actions">${actions.join('')}</div>`
+    : '';
+  const downloadNoteHtml = doc.downloadError
+    ? `<p class="detail-download-note">${escapeHtml(doc.downloadError)}</p>`
+    : '';
 
   // Works cited section (lazy loaded)
   const citationCount = doc.citationCount || 0;
@@ -405,20 +432,16 @@ function renderDetails() {
     : '';
 
   docDetailsEl.innerHTML = `
-    <div class="meta">
-      <p><strong>Title:</strong> ${escapeHtml(doc.title || '(Untitled)')}</p>
-      <p><strong>Author:</strong> ${escapeHtml(doc.author || 'Unknown')}</p>
-      <p><strong>Date:</strong> ${escapeHtml(doc.date || '-')}</p>
-      <p><strong>Degree:</strong> ${escapeHtml(doc.degree || '-')}</p>
-      <p><strong>Program:</strong> ${escapeHtml(doc.program || '-')}</p>
-      ${doc.supervisors?.length ? `<p><strong>Supervisor:</strong> ${escapeHtml(doc.supervisors.join('; '))}</p>` : ''}
+    <p class="doc-subtitle">${escapeHtml(subtitleParts.join(' \u00B7 '))}</p>
+    ${actionsHtml}
+    ${downloadNoteHtml}
+    <div class="detail-meta">
+      <div class="detail-meta-label">Date</div><div class="detail-meta-value">${escapeHtml(doc.date || '-')}</div>
+      <div class="detail-meta-label">Program</div><div class="detail-meta-value">${escapeHtml(doc.program || '-')}</div>
+      <div class="detail-meta-label">Pages</div><div class="detail-meta-value">${formatNum(doc.pages)}</div>
+      <div class="detail-meta-label">Words</div><div class="detail-meta-value">${formatNum(doc.wordCount)}</div>
+      ${doc.supervisors?.length ? `<div class="detail-meta-label">Supervisor</div><div class="detail-meta-value">${escapeHtml(doc.supervisors.join('; '))}</div>` : ''}
       ${committeeHtml}
-      <p><strong>Pages:</strong> ${formatNum(doc.pages)} (${escapeHtml(doc.pagesSource)})</p>
-      <p><strong>Word Count:</strong> ${formatNum(doc.wordCount)} (${escapeHtml(doc.wordCountSource || 'unknown')})</p>
-      <p><strong>Download:</strong> ${escapeHtml(doc.downloadStatus || 'unknown')}</p>
-      ${doc.downloadUrl ? `<p><strong>File URL:</strong> <a href="${escapeHtml(doc.downloadUrl)}" target="_blank" rel="noreferrer">Open file</a></p>` : ''}
-      ${doc.downloadError ? `<p><strong>Download Note:</strong> ${escapeHtml(doc.downloadError)}</p>` : ''}
-      ${doc.uri ? `<p><strong>Link:</strong> <a href="${escapeHtml(doc.uri)}" target="_blank" rel="noreferrer">Open record</a></p>` : ''}
     </div>
     <div>
       <p class="detail-section-title">Abstract</p>
