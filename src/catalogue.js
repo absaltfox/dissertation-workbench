@@ -181,6 +181,11 @@ function parseHitsFromOutput(stdout) {
   return match ? Number(match[1]) : null;
 }
 
+function parseBibIdFromOutput(stdout) {
+  const match = String(stdout).match(/\b001\s+(\d+)/);
+  return match ? match[1] : null;
+}
+
 function runYazClient(commands, timeoutMs = 15_000) {
   return new Promise((resolve, reject) => {
     const child = spawn('yaz-client', [], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -235,6 +240,7 @@ export async function lookupCitation(citationText) {
   const commands = [
     `open ${Z3950_HOST}:${Z3950_PORT}/${Z3950_DB}`,
     `f ${query}`,
+    'show 1',
     'quit'
   ].join('\n') + '\n';
 
@@ -246,7 +252,8 @@ export async function lookupCitation(citationText) {
       return { found: null, hits: null, author, title, error: 'Could not parse yaz-client output' };
     }
 
-    return { found: hits > 0, hits, author, title };
+    const bibId = hits > 0 ? parseBibIdFromOutput(stdout) : null;
+    return { found: hits > 0, hits, author, title, bibId };
   } catch (err) {
     logger.warn('yaz-client lookup failed', { author, title, error: err.message });
     return { found: null, hits: null, author, title, error: err.message };
@@ -290,6 +297,7 @@ export async function lookupCitationBatch(citationTexts, { concurrency = 1, onPr
     const commandLines = [`open ${Z3950_HOST}:${Z3950_PORT}/${Z3950_DB}`];
     for (const item of batch) {
       commandLines.push(`f ${item.query}`);
+      commandLines.push('show 1');
     }
     commandLines.push('quit');
 
@@ -300,12 +308,20 @@ export async function lookupCitationBatch(citationTexts, { concurrency = 1, onPr
 
       // Parse all "Number of hits:" lines in order
       const hitsMatches = [...String(stdout).matchAll(/Number of hits:\s*(\d+)/g)];
+      // Parse all bib IDs (001 fields) — only present for queries with hits
+      const bibIdMatches = [...String(stdout).matchAll(/\b001\s+(\d+)/g)];
 
+      let bibIdx = 0;
       for (let i = 0; i < batch.length; i++) {
         const item = batch[i];
         if (i < hitsMatches.length) {
           const hits = Number(hitsMatches[i][1]);
-          results[item.idx] = { found: hits > 0, hits, author: item.author, title: item.title };
+          let bibId = null;
+          if (hits > 0 && bibIdx < bibIdMatches.length) {
+            bibId = bibIdMatches[bibIdx][1];
+            bibIdx++;
+          }
+          results[item.idx] = { found: hits > 0, hits, author: item.author, title: item.title, bibId };
         } else {
           results[item.idx] = { found: null, hits: null, author: item.author, title: item.title, error: 'Missing hits in batch output' };
         }

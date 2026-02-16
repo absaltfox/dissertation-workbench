@@ -350,6 +350,7 @@ const server = http.createServer(async (req, res) => {
           hits: result.hits,
           queryAuthor: result.author,
           queryTitle: result.title,
+          bibId: result.bibId,
         });
         if (result.found === true) found++;
         else if (result.found === false) notFound++;

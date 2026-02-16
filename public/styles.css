@@ -913,6 +913,17 @@ a:hover {
   color: #9f5b53;
 }
 
+a.catalogue-badge {
+  text-decoration: none;
+  color: inherit;
+  cursor: pointer;
+}
+
+a.catalogue-badge:hover {
+  text-decoration: underline;
+  text-underline-offset: 0.12em;
+}
+
 .citation-graph-controls {
   display: flex;
   flex-wrap: wrap;

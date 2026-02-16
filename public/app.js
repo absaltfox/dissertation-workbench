@@ -1196,7 +1196,11 @@ function renderCitationGraph(citations, doc) {
 function catalogueBadge(citation) {
   if (citation.catalogue_hits == null) return '';
   if (citation.catalogue_hits > 0) {
-    return `<span class="catalogue-badge held" title="Found in UBC Library (${citation.catalogue_hits} hit${citation.catalogue_hits !== 1 ? 's' : ''})">UBC Library</span>`;
+    const label = `Found in UBC Library (${citation.catalogue_hits} hit${citation.catalogue_hits !== 1 ? 's' : ''})`;
+    if (citation.catalogue_bib_id) {
+      return `<a class="catalogue-badge held" href="https://webcat.library.ubc.ca/vwebv/holdingsInfo?bibId=${encodeURIComponent(citation.catalogue_bib_id)}" target="_blank" rel="noreferrer" title="${label}" onclick="event.stopPropagation()">UBC Library</a>`;
+    }
+    return `<span class="catalogue-badge held" title="${label}">UBC Library</span>`;
   }
   return `<span class="catalogue-badge not-held" title="Not found in UBC Library catalogue">Not in UBC Library</span>`;
 }

@@ -30,6 +30,7 @@
       <nav class="tabs reveal" role="tablist" aria-label="Views">
         <button class="tab-btn active" data-tab="records" role="tab" aria-selected="true">Document Explorer</button>
         <button class="tab-btn" data-tab="analytics" role="tab" aria-selected="false">Analytics Dashboard</button>
+        <button class="tab-btn" data-tab="citations" role="tab" aria-selected="false">Citation Explorer</button>
         <button class="tab-btn" data-tab="admin" role="tab" aria-selected="false">Admin</button>
       </nav>
 
@@ -125,6 +126,49 @@
           <h2>Weighted Mean Word Count by Concept</h2>
           <div id="subjectBars" class="bars"></div>
         </article>
+      </section>
+
+      <!-- Citation Explorer -->
+      <section id="tab-citations" class="tab-panel reveal" role="tabpanel">
+        <div class="citations-explorer">
+          <div class="citations-list-col">
+            <article class="panel">
+              <h2>Dissertations</h2>
+              <input id="citationDocFilter" class="doc-filter" type="search"
+                     placeholder="Filter dissertations..." />
+              <div class="table-wrap">
+                <table class="citation-docs-table">
+                  <thead>
+                    <tr>
+                      <th>Title</th>
+                      <th>Author</th>
+                      <th>Year</th>
+                      <th>Refs</th>
+                    </tr>
+                  </thead>
+                  <tbody id="citationDocsTable"></tbody>
+                </table>
+              </div>
+            </article>
+          </div>
+          <div class="citations-detail-col">
+            <article class="panel">
+              <h2 id="citationGraphTitle">Select a dissertation to explore its citations</h2>
+              <div class="citation-graph-controls" aria-label="Citation graph controls">
+                <button id="citationZoomInBtn" class="btn btn-sm" type="button">Zoom In</button>
+                <button id="citationZoomOutBtn" class="btn btn-sm" type="button">Zoom Out</button>
+                <button id="citationZoomResetBtn" class="btn btn-sm" type="button">Reset View</button>
+              </div>
+              <svg id="citationGraph" viewBox="0 0 1000 760" role="img"
+                   aria-label="Citation network graph"></svg>
+              <p class="meta citation-graph-hint">Scroll to zoom. Drag to pan. Click a bubble for citation details.</p>
+            </article>
+            <article class="panel">
+              <h2 id="citationListTitle">Works Cited</h2>
+              <div id="citationEntries" class="citation-entries"></div>
+            </article>
+          </div>
+        </div>
       </section>
 
       <!-- Admin Panel -->

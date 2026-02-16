@@ -94,6 +94,10 @@ export function getDb() {
       FOREIGN KEY (citation_id) REFERENCES citations(id)
     );
   `);
+
+  // Migrations — add columns to existing tables
+  try { db.exec('ALTER TABLE catalogue_lookups ADD COLUMN bib_id TEXT'); } catch {}
+
   return db;
 }
 
@@ -396,6 +400,7 @@ export function loadDocumentCitationsWithSharing(docId) {
       cl.hits AS catalogue_hits,
       cl.query_author AS catalogue_query_author,
       cl.query_title AS catalogue_query_title,
+      cl.bib_id AS catalogue_bib_id,
       cl.looked_up_at AS catalogue_looked_up_at
     FROM citations c
     JOIN document_citations dc ON dc.citation_id = c.id
@@ -432,17 +437,18 @@ export function getCitationStats() {
 
 // --- Catalogue lookup functions ---
 
-export function saveCatalogueLookup(citationId, { hits, queryAuthor, queryTitle }) {
+export function saveCatalogueLookup(citationId, { hits, queryAuthor, queryTitle, bibId }) {
   const now = new Date().toISOString();
   getDb().prepare(`
-    INSERT INTO catalogue_lookups (citation_id, hits, query_author, query_title, looked_up_at)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO catalogue_lookups (citation_id, hits, query_author, query_title, bib_id, looked_up_at)
+    VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(citation_id) DO UPDATE SET
       hits = excluded.hits,
       query_author = excluded.query_author,
       query_title = excluded.query_title,
+      bib_id = excluded.bib_id,
       looked_up_at = excluded.looked_up_at
-  `).run(citationId, hits ?? null, queryAuthor || null, queryTitle || null, now);
+  `).run(citationId, hits ?? null, queryAuthor || null, queryTitle || null, bibId || null, now);
 }
 
 export function loadCatalogueLookup(citationId) {

@@ -178,17 +178,40 @@ export function parseCommittee(fullText) {
   return members;
 }
 
-const BIBLIOGRAPHY_HEADING = /^(references|bibliography|works\s+cited)\s*$/im;
-const APPENDIX_HEADING = /^(appendix|appendices)\b/im;
+const BIBLIOGRAPHY_HEADING = /^(references|bibliography|works\s+cited)$/im;
+const APPENDIX_HEADING = /^(appendix|appendices|glossary|index|vita|curriculum\s+vitae|about\s+the\s+author)\b/im;
+
+function isLikelyCitationStart(line) {
+  const text = String(line || '').trim();
+  if (!text) return false;
+  if (text.length < 8) return false;
+  if (/^\d+\s*$/.test(text)) return false;
+  if (!/^[A-Z\u00C0-\u024F]/.test(text)) return false;
+
+  // Person-author starts: "Lastname, Firstname ..."
+  if (/^[A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F'\u2019.\-]+,\s+[A-Z\u00C0-\u024F]/.test(text)) {
+    return true;
+  }
+
+  // Organization-author starts: "BCTF Newsletter. ..."
+  if (/^[A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F0-9&'"\u2019.\- ]{1,90}\.\s+(?:[“"']|[A-Z\u00C0-\u024F])/.test(text)) {
+    return true;
+  }
+
+  return false;
+}
 
 export function parseBibliography(fullText) {
   if (!fullText) return [];
 
+  // Normalize form feeds to newlines so page-break headings are matchable
+  const text = fullText.replace(/\f/g, '\n');
+
   // Find the LAST occurrence of the heading (skip table-of-contents references)
   let lastMatch = null;
   let searchFrom = 0;
-  while (searchFrom < fullText.length) {
-    const remaining = fullText.slice(searchFrom);
+  while (searchFrom < text.length) {
+    const remaining = text.slice(searchFrom);
     const m = remaining.match(BIBLIOGRAPHY_HEADING);
     if (!m) break;
     lastMatch = { index: searchFrom + m.index, length: m[0].length };
@@ -197,26 +220,59 @@ export function parseBibliography(fullText) {
   if (!lastMatch) return [];
 
   const startIdx = lastMatch.index + lastMatch.length;
-  let endText = fullText.slice(startIdx);
+  let endText = text.slice(startIdx);
 
   const appendixMatch = endText.match(APPENDIX_HEADING);
   if (appendixMatch) {
     endText = endText.slice(0, appendixMatch.index);
   }
 
-  // Split on double newlines (paragraph boundaries)
-  const rawEntries = endText.split(/\n\s*\n/).map((entry) =>
-    entry.replace(/\s*\n\s*/g, ' ').trim()
-  );
+  // Split on double newlines (page boundaries in pdftotext output)
+  const rawBlocks = endText.split(/\n\s*\n/);
 
+  // Sub-split each block on likely citation starts to un-clump merged entries.
+  // This handles both person-author and organization-author bibliography lines.
+  const entries = [];
+  for (const block of rawBlocks) {
+    const cleaned = block.replace(/\s*\n\s*/g, ' ').trim();
+    if (!cleaned) continue;
+
+    const lines = block
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    const subEntries = [];
+    let current = [];
+    for (const line of lines) {
+      if (isLikelyCitationStart(line) && current.length) {
+        subEntries.push(current.join(' '));
+        current = [line];
+      } else {
+        current.push(line);
+      }
+    }
+    if (current.length) subEntries.push(current.join(' '));
+
+    if (subEntries.length > 1) {
+      entries.push(...subEntries);
+    } else {
+      entries.push(cleaned);
+    }
+  }
+
+  // Filter out non-citation content
   const citations = [];
-  for (const entry of rawEntries) {
+  for (const entry of entries) {
     if (entry.length < 20) continue;
-    // Skip entries that look like page numbers, section headers, or TOC noise
-    if (/^\d+$/.test(entry)) continue;
+    if (entry.length > 2000) continue;
+    if (/^\d+\s*$/.test(entry)) continue;                          // bare page numbers
     if (/^(appendix|chapter|section)\b/i.test(entry)) continue;
-    if (/[.·]{5,}/.test(entry)) continue; // dotted leader lines from TOC
-    if (/^(list of|table of|figure\s)/i.test(entry)) continue;
+    if (/[.·]{5,}/.test(entry)) continue;                          // dot leaders
+    if (/^(list of|table of|figure\s|table\s)/i.test(entry)) continue;
+    if (/^(abstract|acknowledge?ment|dedication|a\s+thesis|the\s+university|in\s+this)/i.test(entry)) continue;
+    if (/^(submitted|faculty|doctor|copyright|©)/i.test(entry)) continue;
+    if (!/[a-zA-Z]{3,}/.test(entry)) continue;                     // must contain words
     citations.push(entry);
   }
 
