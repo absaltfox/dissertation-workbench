@@ -924,35 +924,6 @@ a.catalogue-badge:hover {
   text-underline-offset: 0.12em;
 }
 
-.citation-graph-controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.35rem;
-  margin-bottom: 0.55rem;
-}
-
-#citationGraph {
-  width: 100%;
-  min-height: 520px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.5);
-  touch-action: none;
-  cursor: grab;
-}
-
-#citationGraph.dragging { cursor: grabbing; }
-
-.citation-graph-hint {
-  margin-top: 0.45rem;
-  font-size: 0.78rem;
-  color: var(--ink-soft);
-}
-
-#citationGraphTitle {
-  overflow-wrap: anywhere;
-}
-
 .citation-docs-table {
   table-layout: fixed;
   width: 100%;
@@ -977,10 +948,6 @@ a.catalogue-badge:hover {
   overflow-wrap: anywhere;
   word-break: break-word;
 }
-
-.cite-node { cursor: pointer; transition: opacity 0.15s; }
-.cite-node:hover { opacity: 0.8; }
-.cite-label { font-family: var(--sans); pointer-events: none; }
 
 .citation-doc-row { cursor: pointer; transition: background 0.12s; }
 .citation-doc-row:hover { background: rgba(8, 90, 99, 0.06); }
