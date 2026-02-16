@@ -14,7 +14,7 @@ import { createUser, deleteUser, countUsers, findUserByUsername, checkCacheInteg
 import { validateMetricsParams, validateAdminUser, parseNumberParam, parseBooleanParam } from './validate.js';
 import { deleteCachedPdf, analyzeDocumentFile, analyzePdfAtPath, extractAndSaveParsedData } from './pdf.js';
 import { getConceptPipelineStatus, rebuildConceptDictionary, scheduleDailyConceptRebuild } from './conceptsPipeline.js';
-import { lookupCitation, extractSearchTerms, checkYazAvailability } from './catalogue.js';
+import { lookupCitation, lookupCitationBatch, extractSearchTerms, checkYazAvailability } from './catalogue.js';
 import { logger } from './logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -340,13 +340,16 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      const texts = pending.map((row) => row.citation_text);
+      const results = await lookupCitationBatch(texts);
+
       let found = 0;
       let notFound = 0;
       let skipped = 0;
 
-      for (const row of pending) {
-        const result = await lookupCitation(row.citation_text);
-        saveCatalogueLookup(row.id, {
+      for (let i = 0; i < pending.length; i++) {
+        const result = results[i];
+        saveCatalogueLookup(pending[i].id, {
           hits: result.hits,
           queryAuthor: result.author,
           queryTitle: result.title,
