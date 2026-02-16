@@ -508,13 +508,26 @@ function renderKpis() {
     return;
   }
 
+  // Compute citation stats from documents with parsed citations
+  const docs = state.payload?.documents || [];
+  const citeCounts = docs.map((d) => d.citationCount || 0).filter((c) => c > 0);
+  const citeMin = citeCounts.length ? Math.min(...citeCounts) : null;
+  const citeMax = citeCounts.length ? Math.max(...citeCounts) : null;
+  const citeMean = citeCounts.length
+    ? citeCounts.reduce((a, b) => a + b, 0) / citeCounts.length
+    : null;
+
   const cards = [
     { label: 'Retrieved Records', value: metrics.recordCount },
     { label: 'Mean Pages', value: metrics.overallPageCount.mean },
-    { label: 'Mean Words', value: metrics.overallWordCount.mean },
-    { label: 'Max Pages', value: metrics.overallPageCount.max },
     { label: 'Min Pages', value: metrics.overallPageCount.min },
-    { label: 'Min Words', value: metrics.overallWordCount.min }
+    { label: 'Max Pages', value: metrics.overallPageCount.max },
+    { label: 'Mean Words', value: metrics.overallWordCount.mean },
+    { label: 'Min Words', value: metrics.overallWordCount.min },
+    { label: 'Max Words', value: metrics.overallWordCount.max },
+    { label: 'Mean Works Cited', value: citeMean },
+    { label: 'Min Works Cited', value: citeMin },
+    { label: 'Max Works Cited', value: citeMax }
   ];
 
   kpisEl.innerHTML = cards
