@@ -186,6 +186,10 @@ function isLikelyCitationStart(line) {
   if (!text) return false;
   if (text.length < 8) return false;
   if (/^\d+\s*$/.test(text)) return false;
+
+  // Numbered citation: "[1] Author..." (IEEE style)
+  if (/^\[\d+\]\s+/.test(text)) return true;
+
   if (!/^[A-Z\u00C0-\u024F]/.test(text)) return false;
 
   // Person-author starts: "Lastname, Firstname ..."
@@ -194,7 +198,7 @@ function isLikelyCitationStart(line) {
   }
 
   // Organization-author starts: "BCTF Newsletter. ..."
-  if (/^[A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F0-9&'"\u2019.\- ]{1,90}\.\s+(?:[“"']|[A-Z\u00C0-\u024F])/.test(text)) {
+  if (/^[A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F0-9&'"\u2019.\- ]{1,90}\.\s+(?:[""']|[A-Z\u00C0-\u024F])/.test(text)) {
     return true;
   }
 
