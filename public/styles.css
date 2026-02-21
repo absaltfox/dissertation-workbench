@@ -1159,6 +1159,22 @@ a.catalogue-badge:hover {
   text-underline-offset: 0.12em;
 }
 
+button.summon-check-btn {
+  border: 1px solid rgba(8, 90, 99, 0.35);
+  background: transparent;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+button.summon-check-btn:hover:not(:disabled) {
+  background: rgba(8, 90, 99, 0.07);
+}
+
+button.summon-check-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
 .citation-docs-table {
   table-layout: fixed;
   width: 100%;

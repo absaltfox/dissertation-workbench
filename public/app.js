@@ -1098,7 +1098,7 @@ function catalogueBadge(citation) {
     }
     return `<span class="catalogue-badge held" title="${label}">UBC Library</span>`;
   }
-  return `<span class="catalogue-badge not-held" title="Not found in UBC Library catalogue">Not in UBC Library</span>`;
+  return `<button class="catalogue-badge summon-check-btn" data-citation-id="${escapeHtml(String(citation.id))}" title="Check UBC Summon for this item" onclick="event.stopPropagation()">Check Summon</button>`;
 }
 
 function renderCitationList(citations) {
@@ -1144,6 +1144,37 @@ function renderCitationList(citations) {
         entry.dataset.citationText,
         Number(entry.dataset.citationCount || 1)
       );
+    });
+  }
+
+  for (const btn of citationEntriesEl.querySelectorAll('.summon-check-btn')) {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const citationId = btn.dataset.citationId;
+      btn.textContent = 'Checking\u2026';
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/citations/${encodeURIComponent(citationId)}/summon-check`);
+        const data = await res.json();
+        const replacement = document.createElement('a');
+        replacement.className = `catalogue-badge ${data.found ? 'held' : 'not-held'}`;
+        replacement.target = '_blank';
+        replacement.rel = 'noreferrer';
+        replacement.addEventListener('click', (ev) => ev.stopPropagation());
+        if (data.found) {
+          replacement.href = data.link;
+          replacement.title = data.title || 'Found in UBC Library via Summon';
+          replacement.textContent = 'Found in Summon';
+        } else {
+          replacement.href = data.illUrl || 'https://ill-docdel.library.ubc.ca/home';
+          replacement.title = 'Not found in UBC Library \u2014 request via Interlibrary Loan / Document Delivery';
+          replacement.textContent = 'Not found \u2014 ILL/DocDel';
+        }
+        btn.replaceWith(replacement);
+      } catch {
+        btn.textContent = 'Check Summon';
+        btn.disabled = false;
+      }
     });
   }
 }

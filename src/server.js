@@ -10,7 +10,7 @@ import {
 } from './config.js';
 import { ensureStorage, getDb, listUsers, listFileMetrics, getFileMetricsStats, deleteFileMetric, listRecentRuns, getAllSettings, getSetting, setSetting, loadDocumentMetadata } from './db.js';
 import { authenticate, requireAdmin, login, destroySession, setSessionCookie, clearSessionCookie, ensureDefaultAdmin, createPasswordHash } from './auth.js';
-import { createUser, deleteUser, countUsers, findUserByUsername, checkCacheIntegrity, logCacheStats, loadDocumentCitationsWithSharing, loadDocsByCitation, clearAllCitations, saveCatalogueLookup, getCatalogueLookupStats, listPendingLookups, getTopCitedWorks } from './db.js';
+import { createUser, deleteUser, countUsers, findUserByUsername, checkCacheIntegrity, logCacheStats, loadDocumentCitationsWithSharing, loadDocsByCitation, clearAllCitations, saveCatalogueLookup, getCatalogueLookupStats, listPendingLookups, getTopCitedWorks, getCitationForSummon } from './db.js';
 import { validateMetricsParams, validateAdminUser, parseNumberParam, parseBooleanParam } from './validate.js';
 import { deleteCachedPdf, analyzeDocumentFile, analyzePdfAtPath, extractAndSaveParsedData } from './pdf.js';
 import { getConceptPipelineStatus, rebuildConceptDictionary, scheduleDailyConceptRebuild } from './conceptsPipeline.js';
@@ -478,6 +478,42 @@ const server = http.createServer(async (req, res) => {
       }
       const documents = loadDocsByCitation(citationId);
       sendJson(res, 200, { documents });
+      return;
+    }
+
+    // --- Summon availability check ---
+    if (url.pathname.startsWith('/api/citations/') && url.pathname.endsWith('/summon-check') && method === 'GET') {
+      const citationId = Number(url.pathname.slice('/api/citations/'.length, -'/summon-check'.length));
+      if (!Number.isFinite(citationId) || citationId <= 0) {
+        sendJson(res, 400, { error: 'Invalid citation ID' });
+        return;
+      }
+      const row = getCitationForSummon(citationId);
+      if (!row) { sendJson(res, 404, { error: 'Citation not found' }); return; }
+
+      let q = row.query_title
+        ? `Title:(${row.query_title})${row.query_author ? ` AND Author:(${row.query_author})` : ''}`
+        : String(row.citation_text || '').slice(0, 200);
+      if (!q) { sendJson(res, 422, { error: 'Insufficient citation data' }); return; }
+
+      try {
+        const summonUrl = `https://ubc.summon.serialssolutions.com/api/search?pn=1&l=en&include.ft.matches=t&q=${encodeURIComponent(q)}`;
+        const resp = await fetch(summonUrl, {
+          headers: { 'Accept': 'application/json', 'User-Agent': 'Mozilla/5.0' },
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!resp.ok) throw new Error(`Summon ${resp.status}`);
+        const data = await resp.json();
+        const held = (data.documents || []).find((d) => d.in_holdings === true);
+        if (held) {
+          const title = String(held.title || '').replace(/<\/?mark>/g, '');
+          sendJson(res, 200, { found: true, title, link: held.link });
+        } else {
+          sendJson(res, 200, { found: false, illUrl: 'https://ill-docdel.library.ubc.ca/home' });
+        }
+      } catch {
+        sendJson(res, 502, { error: 'Summon lookup failed' });
+      }
       return;
     }
 

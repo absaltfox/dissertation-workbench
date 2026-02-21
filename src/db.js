@@ -460,6 +460,15 @@ export function loadCatalogueLookup(citationId) {
   `).get(citationId);
 }
 
+export function getCitationForSummon(citationId) {
+  return getDb().prepare(`
+    SELECT c.citation_text, cl.query_title, cl.query_author
+    FROM citations c
+    LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
+    WHERE c.id = ?
+  `).get(citationId);
+}
+
 export function getCatalogueLookupStats() {
   return getDb().prepare(`
     SELECT
