@@ -193,12 +193,23 @@ function isLikelyCitationStart(line) {
   if (!/^[A-Z\u00C0-\u024F]/.test(text)) return false;
 
   // Person-author starts: "Lastname, Firstname ..."
+  // Exclude publisher-location patterns and common non-name words that appear on wrapped lines
   if (/^[A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F'\u2019.\-]+,\s+[A-Z\u00C0-\u024F]/.test(text)) {
+    if (/^[A-Z][A-Za-z\s]+,\s+[A-Z]{2}\s*:/.test(text)) return false;
+    if (/^(Dissertation|Thesis|Theses|Journal|Computers?|University|Department|Faculty|Ministry|Province|Government|Report|Paper|Conference|School|Press|Association|Institute|Committee|Society|Museum|Archive|Archives|Magazine|Newsletter|Vol|Chapter|Retrieved|Available|Accessed|Edited|Translated|Published|Information|Education|Teacher|Teachers|Inc|York|Studies|Study|Distribution|Exceptional|December|January|February|March|April|May|June|July|August|September|October|November)\.?,/i.test(text)) return false;
     return true;
   }
 
-  // Organization-author starts: "BCTF Newsletter. ..."
-  if (/^[A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F0-9&'"\u2019.\- ]{1,90}\.\s+(?:[""']|[A-Z\u00C0-\u024F])/.test(text)) {
+  // Organization-author starts: "BCTF Newsletter. ..." (must be multi-word)
+  // Single words before the period ("America.", "Canada.") are location/fragment artifacts, not org authors.
+  if (/^[A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F0-9&'"\u2019.\- ]{1,90}\.\s+(?:[""'\u201C\u201D\u2018\u2019]|[A-Z\u00C0-\u024F])/.test(text)) {
+    // Check that the org name before the sentence-ending period is multi-word.
+    // Strip dotted acronyms (e.g. "B.C.T.F.") before checking for spaces.
+    const stripped = text.replace(/^([A-Z]\.)+\s*/, (m) => m.replace(/\./g, ''));
+    const beforePeriod = stripped.match(/^([^.]+)\./)?.[1]?.trim() || '';
+    if (!/\s/.test(beforePeriod)) return false;
+    // Reject date fragments: "December 1980.", "October 1983.", etc.
+    if (/^(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}\b/.test(text)) return false;
     return true;
   }
 
@@ -276,6 +287,12 @@ export function parseBibliography(fullText) {
     if (/^(list of|table of|figure\s|table\s)/i.test(entry)) continue;
     if (/^(abstract|acknowledge?ment|dedication|a\s+thesis|the\s+university|in\s+this)/i.test(entry)) continue;
     if (/^(submitted|faculty|doctor|copyright|©)/i.test(entry)) continue;
+    if (/^[A-Z][A-Za-z\s]+,\s+[A-Z]{2}\s*:/.test(entry)) continue; // "Toronto, ON: ..."
+    if (/^[A-Z][A-Za-z]+\.\s+/.test(entry) && !/\s/.test(entry.match(/^([^.]+)\./)?.[1]?.trim() || '')) continue; // single-word prefix fragments ("Canada. ...", "America. ...")
+    if (entry.length < 60 && !/\b(1[89]\d{2}|20[0-2]\d)\b/.test(entry) && /:/.test(entry)) continue; // short fragments with colon but no year
+    if (entry.length < 40 && !/\b(1[89]\d{2}|20[0-2]\d)\b/.test(entry)) continue; // very short fragments without a year
+    // Short entries without a person-author start, quoted title, or URL/DOI are likely truncated tails
+    if (entry.length < 60 && !/^[A-Z][A-Za-z'\u2019.-]+,\s+[A-Z]/.test(entry) && !/[""\u201C\u201D]/.test(entry) && !/https?:|doi[.:]/.test(entry)) continue;
     if (!/[a-zA-Z]{3,}/.test(entry)) continue;                     // must contain words
     citations.push(entry);
   }

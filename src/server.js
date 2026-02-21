@@ -10,11 +10,11 @@ import {
 } from './config.js';
 import { ensureStorage, getDb, listUsers, listFileMetrics, getFileMetricsStats, deleteFileMetric, listRecentRuns, getAllSettings, getSetting, setSetting, loadDocumentMetadata } from './db.js';
 import { authenticate, requireAdmin, login, destroySession, setSessionCookie, clearSessionCookie, ensureDefaultAdmin, createPasswordHash } from './auth.js';
-import { createUser, deleteUser, countUsers, findUserByUsername, checkCacheIntegrity, logCacheStats, loadDocumentCitationsWithSharing, loadDocsByCitation, clearAllCitations, saveCatalogueLookup, getCatalogueLookupStats, listPendingLookups } from './db.js';
+import { createUser, deleteUser, countUsers, findUserByUsername, checkCacheIntegrity, logCacheStats, loadDocumentCitationsWithSharing, loadDocsByCitation, clearAllCitations, saveCatalogueLookup, getCatalogueLookupStats, listPendingLookups, getTopCitedWorks } from './db.js';
 import { validateMetricsParams, validateAdminUser, parseNumberParam, parseBooleanParam } from './validate.js';
 import { deleteCachedPdf, analyzeDocumentFile, analyzePdfAtPath, extractAndSaveParsedData } from './pdf.js';
 import { getConceptPipelineStatus, rebuildConceptDictionary, scheduleDailyConceptRebuild } from './conceptsPipeline.js';
-import { lookupCitation, lookupCitationBatch, extractSearchTerms, checkYazAvailability } from './catalogue.js';
+import { lookupCitation, lookupCitationBatch, extractSearchTerms, checkYazAvailability, runPendingCatalogueLookups } from './catalogue.js';
 import { logger } from './logger.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -324,13 +324,12 @@ const server = http.createServer(async (req, res) => {
       const limit = parseNumberParam(url.searchParams.get('limit'), 100);
       const dryRun = parseBooleanParam(url.searchParams.get('dryRun'), false);
 
-      const pending = listPendingLookups(limit);
-      if (!pending.length) {
-        sendJson(res, 200, { ok: true, processed: 0, found: 0, notFound: 0, skipped: 0, message: 'No pending citations to look up.' });
-        return;
-      }
-
       if (dryRun) {
+        const pending = listPendingLookups(limit);
+        if (!pending.length) {
+          sendJson(res, 200, { ok: true, dryRun: true, total: 0, previews: [] });
+          return;
+        }
         const previews = pending.map((row) => ({
           citationId: row.id,
           citationText: row.citation_text,
@@ -340,27 +339,8 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const texts = pending.map((row) => row.citation_text);
-      const results = await lookupCitationBatch(texts);
-
-      let found = 0;
-      let notFound = 0;
-      let skipped = 0;
-
-      for (let i = 0; i < pending.length; i++) {
-        const result = results[i];
-        saveCatalogueLookup(pending[i].id, {
-          hits: result.hits,
-          queryAuthor: result.author,
-          queryTitle: result.title,
-          bibId: result.bibId,
-        });
-        if (result.found === true) found++;
-        else if (result.found === false) notFound++;
-        else skipped++;
-      }
-
-      sendJson(res, 200, { ok: true, processed: pending.length, found, notFound, skipped });
+      const stats = await runPendingCatalogueLookups({ pageSize: limit });
+      sendJson(res, 200, { ok: true, ...stats });
       return;
     }
 
@@ -458,8 +438,11 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
+      // Automatically look up any new citations in the UBC Library catalogue
+      const lookupStats = await runPendingCatalogueLookups();
+
       metricsCache.clear();
-      sendJson(res, 200, { ok: true, processed, committees: withCommittee, citations: totalCitations });
+      sendJson(res, 200, { ok: true, processed, committees: withCommittee, citations: totalCitations, catalogueLookups: lookupStats });
       return;
     }
 
@@ -475,6 +458,14 @@ const server = http.createServer(async (req, res) => {
       const docId = decodeURIComponent(url.pathname.slice('/api/documents/'.length, -'/citations'.length));
       const citations = loadDocumentCitationsWithSharing(docId);
       sendJson(res, 200, { citations });
+      return;
+    }
+
+    // --- Top cited works (public) ---
+    if (url.pathname === '/api/citations/top' && method === 'GET') {
+      const limit = parseNumberParam(url.searchParams.get('limit'), 50);
+      const works = getTopCitedWorks(Math.min(limit, 200));
+      sendJson(res, 200, { works });
       return;
     }
 

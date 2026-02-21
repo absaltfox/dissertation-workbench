@@ -422,6 +422,7 @@ export function loadDocsByCitation(citationId) {
 }
 
 export function clearAllCitations() {
+  getDb().exec('DELETE FROM catalogue_lookups');
   getDb().exec('DELETE FROM document_citations');
   getDb().exec('DELETE FROM citations');
 }
@@ -476,6 +477,22 @@ export function listPendingLookups(limit = 100) {
     FROM citations c
     LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
     WHERE cl.citation_id IS NULL
+    LIMIT ?
+  `).all(limit);
+}
+
+export function getTopCitedWorks(limit = 50) {
+  return getDb().prepare(`
+    SELECT c.id, c.citation_text,
+      COUNT(DISTINCT dc.doc_id) AS doc_count,
+      cl.hits AS catalogue_hits,
+      cl.bib_id AS catalogue_bib_id
+    FROM citations c
+    JOIN document_citations dc ON dc.citation_id = c.id
+    LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
+    GROUP BY c.id
+    HAVING doc_count > 1
+    ORDER BY doc_count DESC, c.citation_text
     LIMIT ?
   `).all(limit);
 }

@@ -12,6 +12,7 @@ import {
 import { fetchPage, extractHits, resolveIndexName, collectCandidateUrls } from './api.js';
 import { enrichDocumentsWithFileAnalysis } from './pdf.js';
 import { dedupeSupervisorNames } from './supervisors.js';
+import { runPendingCatalogueLookups } from './catalogue.js';
 import { canonicalizeDomainText } from './domainDictionary.js';
 
 function average(values) {
@@ -403,6 +404,148 @@ function buildTermCooccurrence(records, topN = 20) {
     });
 }
 
+function buildConceptTimeline(records, topN = 8) {
+  const dict = loadConceptDictionary();
+  const conceptDocCounts = new Map();
+  const conceptYearCounts = new Map();
+
+  for (const rec of records) {
+    const concepts = docConceptTerms(rec, 12, dict);
+    for (const concept of concepts) {
+      conceptDocCounts.set(concept, (conceptDocCounts.get(concept) || 0) + 1);
+      if (rec.year) {
+        if (!conceptYearCounts.has(concept)) conceptYearCounts.set(concept, new Map());
+        const yearMap = conceptYearCounts.get(concept);
+        yearMap.set(rec.year, (yearMap.get(rec.year) || 0) + 1);
+      }
+    }
+  }
+
+  const topConcepts = Array.from(conceptDocCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, topN)
+    .map(([concept]) => concept);
+
+  return topConcepts.map((concept) => {
+    const yearMap = conceptYearCounts.get(concept) || new Map();
+    const data = Array.from(yearMap.entries())
+      .map(([year, count]) => ({ year: Number(year), count }))
+      .sort((a, b) => a.year - b.year);
+    return {
+      concept,
+      totalDocs: conceptDocCounts.get(concept) || 0,
+      data
+    };
+  });
+}
+
+function buildMethodologyConceptMatrix(records, topM = 10, topC = 10) {
+  const dict = loadConceptDictionary();
+  const methodCounts = new Map();
+  const conceptCounts = new Map();
+  const docConceptCache = new Map();
+
+  for (const rec of records) {
+    const terms = docConceptTerms(rec, 10, dict);
+    const concepts = terms.map((label) => `c:${label.replace(/\s+/g, '_')}`);
+    docConceptCache.set(rec.id, { concepts, labels: terms });
+
+    for (const m of (rec.methodologies || [])) {
+      methodCounts.set(m, (methodCounts.get(m) || 0) + 1);
+      for (const c of concepts) {
+        conceptCounts.set(c, (conceptCounts.get(c) || 0) + 1);
+      }
+    }
+  }
+
+  const topMethodologies = Array.from(methodCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, topM)
+    .map(([name]) => name);
+  const topConcepts = Array.from(conceptCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, topC)
+    .map(([conceptId]) => conceptId);
+
+  const methSet = new Set(topMethodologies);
+  const conSet = new Set(topConcepts);
+
+  const matrix = topMethodologies.map(() => topConcepts.map(() => 0));
+  for (const rec of records) {
+    const recMeths = (rec.methodologies || []).filter((m) => methSet.has(m));
+    if (!recMeths.length) continue;
+    const recConcepts = (docConceptCache.get(rec.id)?.concepts || []).filter((c) => conSet.has(c));
+    for (const m of recMeths) {
+      const mi = topMethodologies.indexOf(m);
+      for (const c of recConcepts) {
+        const ci = topConcepts.indexOf(c);
+        matrix[mi][ci] += 1;
+      }
+    }
+  }
+
+  const conceptIdToLabel = new Map();
+  for (const { concepts, labels } of docConceptCache.values()) {
+    for (let k = 0; k < concepts.length; k++) {
+      conceptIdToLabel.set(concepts[k], labels[k]);
+    }
+  }
+
+  return {
+    methodologies: topMethodologies,
+    concepts: topConcepts.map((id) => conceptIdToLabel.get(id) || id),
+    conceptIds: topConcepts,
+    matrix
+  };
+}
+
+function buildResearchGaps(records, topN = 15) {
+  const dict = loadConceptDictionary();
+  const conceptDocCounts = new Map();
+  const cooccurrenceCounts = new Map();
+
+  for (const rec of records) {
+    const concepts = docConceptTerms(rec, 15, dict);
+    for (const c of concepts) {
+      conceptDocCounts.set(c, (conceptDocCounts.get(c) || 0) + 1);
+    }
+    if (concepts.length >= 2) {
+      const sorted = [...concepts].sort();
+      for (let i = 0; i < sorted.length; i++) {
+        for (let j = i + 1; j < sorted.length; j++) {
+          const key = `${sorted[i]}|||${sorted[j]}`;
+          cooccurrenceCounts.set(key, (cooccurrenceCounts.get(key) || 0) + 1);
+        }
+      }
+    }
+  }
+
+  // Take top 20 concepts by doc count
+  const topConcepts = Array.from(conceptDocCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 20)
+    .map(([c]) => c);
+  const topSet = new Set(topConcepts);
+
+  const gaps = [];
+  for (let i = 0; i < topConcepts.length; i++) {
+    for (let j = i + 1; j < topConcepts.length; j++) {
+      const a = topConcepts[i];
+      const b = topConcepts[j];
+      const key = a < b ? `${a}|||${b}` : `${b}|||${a}`;
+      const cooccurrence = cooccurrenceCounts.get(key) || 0;
+      const countA = conceptDocCounts.get(a) || 0;
+      const countB = conceptDocCounts.get(b) || 0;
+      const gapScore = (countA * countB) / (cooccurrence + 1);
+      gaps.push({ conceptA: a, conceptB: b, countA, countB, cooccurrence, gapScore });
+    }
+  }
+
+  return gaps
+    .sort((a, b) => b.gapScore - a.gapScore)
+    .slice(0, topN);
+}
+
 export async function collectMetrics(options = {}) {
   await ensureStorage();
   getDb();
@@ -444,6 +587,9 @@ export async function collectMetrics(options = {}) {
     recomputeFromCache
   });
 
+  // Automatically look up any new citations in the UBC Library catalogue via Z39.50
+  await runPendingCatalogueLookups();
+
   const sourceMeta = {
     baseUrl,
     index,
@@ -479,6 +625,9 @@ export async function collectMetrics(options = {}) {
     ngramCloud: buildConceptCloud(normalizedRecords),
     methodologies: buildMethodologyStats(normalizedRecords),
     supervisorNgramMatrix: buildSupervisorNgramMatrix(normalizedRecords),
-    termCooccurrence: buildTermCooccurrence(normalizedRecords)
+    termCooccurrence: buildTermCooccurrence(normalizedRecords),
+    conceptTimeline: buildConceptTimeline(normalizedRecords),
+    methodologyConceptMatrix: buildMethodologyConceptMatrix(normalizedRecords),
+    researchGaps: buildResearchGaps(normalizedRecords)
   };
 }

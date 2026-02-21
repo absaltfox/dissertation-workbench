@@ -246,7 +246,10 @@ th {
   z-index: 1;
 }
 
-th.sortable[data-sort-key="title"]     { width: 36%; }
+.doc-check-col { width: 32px; text-align: center; padding-left: 0.3rem; padding-right: 0; }
+.doc-check-col input[type="checkbox"] { margin: 0; cursor: pointer; }
+
+th.sortable[data-sort-key="title"]     { width: 34%; }
 th.sortable[data-sort-key="author"]    { width: 20%; }
 th.sortable[data-sort-key="year"]      { width: 7%; }
 th.sortable[data-sort-key="degree"]    { width: 18%; }
@@ -907,6 +910,42 @@ a:hover {
   to { opacity: 1; transform: translateY(0); }
 }
 
+/* --- Citation sub-tabs --- */
+
+.citation-tabs {
+  display: flex;
+  gap: 1.2rem;
+  margin-bottom: 0.7rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.citation-tab-btn {
+  appearance: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 0.4rem 0.15rem;
+  background: transparent;
+  font-family: var(--sans);
+  font-size: 0.82rem;
+  color: var(--ink-soft);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.citation-tab-btn:hover {
+  color: var(--ink);
+}
+
+.citation-tab-btn.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.citation-tab-section { display: none; }
+.citation-tab-section.active { display: block; }
+
 /* --- Citation Explorer --- */
 
 .citations-explorer {
@@ -937,6 +976,9 @@ a:hover {
 .citation-entries { max-height: 78vh; overflow-y: auto; }
 
 .citation-entry {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
   padding: 0.55rem 0.6rem;
   border-bottom: 1px solid var(--line);
   font-family: var(--sans);
@@ -948,6 +990,23 @@ a:hover {
 }
 
 .citation-entry:hover { background: rgba(8, 90, 99, 0.06); }
+
+.citation-entry-check {
+  flex-shrink: 0;
+  margin-top: 0.15rem;
+  cursor: pointer;
+}
+
+.citation-select-all {
+  padding: 0.35rem 0.6rem;
+  border-bottom: 1px solid var(--line);
+  font-family: var(--sans);
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+}
+
+.citation-select-all label { cursor: pointer; }
+.citation-select-all input { margin-right: 0.3rem; vertical-align: middle; cursor: pointer; }
 
 .citation-entry .shared-badge {
   display: inline-block;
@@ -1034,6 +1093,109 @@ a.catalogue-badge:hover {
 .citation-doc-row:hover { background: rgba(8, 90, 99, 0.06); }
 .citation-doc-row.active { background: rgba(8, 90, 99, 0.10); }
 .citation-doc-row.greyed td { color: var(--ink-soft); opacity: 0.5; }
+
+/* --- Timeline legend --- */
+
+.timeline-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.55rem 1rem;
+  margin-top: 0.5rem;
+  padding: 0.3rem;
+}
+
+.timeline-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-family: var(--sans);
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+}
+
+.timeline-legend-swatch {
+  width: 14px;
+  height: 3px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+/* --- Foundational works --- */
+
+.foundational-works-list {
+  max-height: 40vh;
+  overflow-y: auto;
+}
+
+.foundational-work-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+  padding: 0.5rem 0.4rem;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+  transition: background 0.12s;
+  font-family: var(--sans);
+  font-size: 0.82rem;
+  line-height: 1.4;
+}
+
+.foundational-work-item:hover {
+  background: rgba(8, 90, 99, 0.06);
+}
+
+.fw-rank-badge {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 2rem;
+  height: 1.6rem;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.fw-text {
+  flex: 1;
+  min-width: 0;
+}
+
+/* --- Research gap fill --- */
+
+.bar-fill.gap-fill {
+  background: linear-gradient(90deg, #d07a34, #e6a54c);
+}
+
+/* --- Supervisor link --- */
+
+.supervisor-link {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  font: inherit;
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 0.15em;
+  cursor: pointer;
+}
+
+.supervisor-link:hover {
+  color: var(--accent-2);
+}
+
+/* --- Export row --- */
+
+.export-row {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  flex-wrap: wrap;
+}
 
 /* --- Responsive --- */
 

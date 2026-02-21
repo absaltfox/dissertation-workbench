@@ -1,6 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { logger } from './logger.js';
+import { listPendingLookups, saveCatalogueLookup } from './db.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -347,4 +348,57 @@ export async function lookupCitationBatch(citationTexts, { concurrency = 1, onPr
   }
 
   return results;
+}
+
+// --- Automatic pending-lookup runner ---
+
+/**
+ * Look up all citations that have no catalogue_lookups entry yet.
+ * Processes in pages of `pageSize` to bound memory and provide progress logging.
+ * Returns summary stats { processed, found, notFound, skipped }.
+ */
+export async function runPendingCatalogueLookups({ pageSize = 200 } = {}) {
+  if (!(await checkYazAvailability())) {
+    logger.warn('Skipping automatic catalogue lookups — yaz-client not available');
+    return { processed: 0, found: 0, notFound: 0, skipped: 0 };
+  }
+
+  let totalProcessed = 0;
+  let totalFound = 0;
+  let totalNotFound = 0;
+  let totalSkipped = 0;
+
+  // Process in pages until no pending citations remain
+  while (true) {
+    const pending = listPendingLookups(pageSize);
+    if (!pending.length) break;
+
+    const texts = pending.map((row) => row.citation_text);
+    const results = await lookupCitationBatch(texts);
+
+    for (let i = 0; i < pending.length; i++) {
+      const result = results[i];
+      saveCatalogueLookup(pending[i].id, {
+        hits: result.hits,
+        queryAuthor: result.author,
+        queryTitle: result.title,
+        bibId: result.bibId,
+      });
+      if (result.found === true) totalFound++;
+      else if (result.found === false) totalNotFound++;
+      else totalSkipped++;
+    }
+
+    totalProcessed += pending.length;
+    logger.info('Catalogue lookup progress', { processed: totalProcessed, found: totalFound, notFound: totalNotFound, skipped: totalSkipped });
+
+    // If we got fewer than a full page, we're done
+    if (pending.length < pageSize) break;
+  }
+
+  if (totalProcessed > 0) {
+    logger.info('Catalogue lookups complete', { processed: totalProcessed, found: totalFound, notFound: totalNotFound, skipped: totalSkipped });
+  }
+
+  return { processed: totalProcessed, found: totalFound, notFound: totalNotFound, skipped: totalSkipped };
 }

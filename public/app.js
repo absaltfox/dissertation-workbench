@@ -5,6 +5,7 @@ const statusEl = document.getElementById('status');
 const documentsTableEl = document.getElementById('documentsTable');
 const docFilterEl = document.getElementById('docFilter');
 const docTheadRow = document.querySelector('#tab-records thead tr');
+const selectAllDocsEl = document.getElementById('selectAllDocs');
 const docDetailsEl = document.getElementById('docDetails');
 const kpisEl = document.getElementById('kpis');
 const pagesByYearChartEl = document.getElementById('pagesByYearChart');
@@ -18,6 +19,15 @@ const ngramCloudEl = document.getElementById('ngramCloud');
 const methodologyBarsEl = document.getElementById('methodologyBars');
 const cooccurrenceBarsEl = document.getElementById('cooccurrenceBars');
 const supervisorHeatmapEl = document.getElementById('supervisorHeatmap');
+const conceptTimelineChartEl = document.getElementById('conceptTimelineChart');
+const conceptTimelineLegendEl = document.getElementById('conceptTimelineLegend');
+const methodologyConceptHeatmapEl = document.getElementById('methodologyConceptHeatmap');
+const researchGapsListEl = document.getElementById('researchGapsList');
+const foundationalWorksListEl = document.getElementById('foundationalWorksList');
+const exportBibTeXBtn = document.getElementById('exportBibTeX');
+const exportRISBtn = document.getElementById('exportRIS');
+const exportCitationBibTeXBtn = document.getElementById('exportCitationBibTeX');
+const exportCitationRISBtn = document.getElementById('exportCitationRIS');
 const settingsForm = document.getElementById('settingsForm');
 const loadBtn = document.getElementById('loadBtn');
 const refreshBtn = document.getElementById('refreshBtn');
@@ -50,6 +60,7 @@ const citationDocsTableEl = document.getElementById('citationDocsTable');
 const citationDocFilterEl = document.getElementById('citationDocFilter');
 const citationListTitleEl = document.getElementById('citationListTitle');
 const citationEntriesEl = document.getElementById('citationEntries');
+const citationTabButtons = Array.from(document.querySelectorAll('.citation-tab-btn'));
 
 // --- State ---
 const state = {
@@ -64,6 +75,8 @@ const state = {
   citationDocId: null,
   citationFilterText: '',
   citationRequestToken: 0,
+  selectedDocIds: new Set(),
+  selectedCitationIds: new Set(),
 };
 
 // --- Utilities ---
@@ -111,6 +124,19 @@ function setActiveTab(tabName) {
   }
   if (tabName === 'citations' && state.payload) {
     renderCitationDocs();
+    setActiveCitationTab('browse');
+  }
+}
+
+function setActiveCitationTab(tabName) {
+  for (const btn of citationTabButtons) {
+    btn.classList.toggle('active', btn.dataset.citationTab === tabName);
+  }
+  for (const section of document.querySelectorAll('.citation-tab-section')) {
+    section.classList.toggle('active', section.id === `citation-${tabName}`);
+  }
+  if (tabName === 'foundational' && state.payload) {
+    loadFoundationalWorks();
   }
 }
 
@@ -235,7 +261,7 @@ function openMatchesModal(title, matches) {
             (doc) => `
             <div class="related-item" data-related-id="${escapeHtml(doc.id)}">
               <strong>${escapeHtml(doc.title || '(Untitled)')}</strong>
-              <p>${escapeHtml(doc.author || 'Unknown')} &middot; ${formatNum(doc.year)} &middot; ${escapeHtml(doc.degree || '-')}</p>
+              <p>${escapeHtml(doc.author || 'Unknown')} &middot; ${doc.year || '-'} &middot; ${escapeHtml(doc.degree || '-')}</p>
             </div>
           `
           )
@@ -318,8 +344,10 @@ function renderDocuments() {
   documentsTableEl.innerHTML = docs
     .map((doc) => {
       const active = doc.id === state.selectedDocId ? ' active' : '';
+      const checked = state.selectedDocIds.has(doc.id) ? ' checked' : '';
       return `
         <tr class="doc-row${active}" data-doc-id="${escapeHtml(doc.id)}">
+          <td class="doc-check-col"><input type="checkbox" class="doc-row-check" data-check-id="${escapeHtml(doc.id)}"${checked} /></td>
           <td>${escapeHtml(doc.title || '(Untitled)')}</td>
           <td>${escapeHtml(doc.author || '')}</td>
           <td>${doc.year || '-'}</td>
@@ -332,12 +360,30 @@ function renderDocuments() {
     .join('');
 
   for (const row of documentsTableEl.querySelectorAll('.doc-row')) {
-    row.addEventListener('click', () => {
+    row.addEventListener('click', (e) => {
+      if (e.target.closest('.doc-row-check')) return;
       openRecord(row.dataset.docId, 'records');
     });
   }
 
+  for (const cb of documentsTableEl.querySelectorAll('.doc-row-check')) {
+    cb.addEventListener('change', () => {
+      const id = cb.dataset.checkId;
+      if (cb.checked) state.selectedDocIds.add(id);
+      else state.selectedDocIds.delete(id);
+      syncSelectAllDocs();
+    });
+  }
+
+  syncSelectAllDocs();
   updateSortHeaders();
+}
+
+function syncSelectAllDocs() {
+  const visibleChecks = documentsTableEl.querySelectorAll('.doc-row-check');
+  const allChecked = visibleChecks.length > 0 && Array.from(visibleChecks).every((cb) => cb.checked);
+  selectAllDocsEl.checked = allChecked;
+  selectAllDocsEl.indeterminate = !allChecked && state.selectedDocIds.size > 0;
 }
 
 function renderDetails() {
@@ -374,7 +420,7 @@ function renderDetails() {
           (r) => `
           <div class="related-item" data-related-id="${escapeHtml(r.id)}">
             <strong>${escapeHtml(r.title || '(Untitled)')}</strong>
-            <p>${escapeHtml(r.author || 'Unknown')} &middot; ${formatNum(r.year)} &middot; Shared themes: ${escapeHtml(r.sharedThemes.join(', '))}</p>
+            <p>${escapeHtml(r.author || 'Unknown')} &middot; ${r.year || '-'} &middot; Shared themes: ${escapeHtml(r.sharedThemes.join(', '))}</p>
           </div>
         `
         )
@@ -415,9 +461,8 @@ function renderDetails() {
   if (doc.uri) {
     actions.push(`<a class="btn ghost btn-sm" href="${escapeHtml(doc.uri)}" target="_blank" rel="noreferrer">Open Record</a>`);
   }
-  const actionsHtml = actions.length
-    ? `<div class="doc-actions">${actions.join('')}</div>`
-    : '';
+  actions.push(`<button class="btn ghost btn-sm" data-doc-bibtex>BibTeX</button>`);
+  const actionsHtml = `<div class="doc-actions">${actions.join('')}</div>`;
   const downloadNoteHtml = doc.downloadError
     ? `<p class="detail-download-note">${escapeHtml(doc.downloadError)}</p>`
     : '';
@@ -436,11 +481,11 @@ function renderDetails() {
     ${actionsHtml}
     ${downloadNoteHtml}
     <div class="detail-meta">
-      <div class="detail-meta-label">Date</div><div class="detail-meta-value">${escapeHtml(doc.date || '-')}</div>
+      <div class="detail-meta-label">Date</div><div class="detail-meta-value">${escapeHtml((doc.date || '-').replace(/\s*AD\s*$/i, ''))}</div>
       <div class="detail-meta-label">Program</div><div class="detail-meta-value">${escapeHtml(doc.program || '-')}</div>
       <div class="detail-meta-label">Pages</div><div class="detail-meta-value">${formatNum(doc.pages)}</div>
       <div class="detail-meta-label">Words</div><div class="detail-meta-value">${formatNum(doc.wordCount)}</div>
-      ${doc.supervisors?.length ? `<div class="detail-meta-label">Supervisor</div><div class="detail-meta-value">${escapeHtml(doc.supervisors.join('; '))}</div>` : ''}
+      ${doc.supervisors?.length ? `<div class="detail-meta-label">Supervisor</div><div class="detail-meta-value">${doc.supervisors.map((s) => `<button class="supervisor-link" data-supervisor-name="${escapeHtml(s)}">${escapeHtml(s)}</button>`).join('; ')}</div>` : ''}
       ${committeeHtml}
     </div>
     <div>
@@ -466,6 +511,22 @@ function renderDetails() {
     item.addEventListener('click', () => {
       const targetId = item.getAttribute('data-related-id');
       if (targetId) openRecord(targetId, 'records');
+    });
+  }
+
+  // Supervisor profile links
+  for (const btn of docDetailsEl.querySelectorAll('.supervisor-link[data-supervisor-name]')) {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openSupervisorProfile(btn.dataset.supervisorName);
+    });
+  }
+
+  // BibTeX export for single document
+  const bibBtn = docDetailsEl.querySelector('[data-doc-bibtex]');
+  if (bibBtn) {
+    bibBtn.addEventListener('click', () => {
+      downloadFile(generateBibTeX([doc]), `${sanitizeBibKey(doc.author)}${doc.year || ''}.bib`, 'application/x-bibtex');
     });
   }
 
@@ -701,12 +762,11 @@ function renderWordCloud() {
     node.addEventListener('click', () => {
       state.selectedTheme = node.getAttribute('data-theme');
       renderWordCloud();
-      renderThemeResults();
       openMatchesModal(`Theme: ${state.selectedTheme}`, docsForTheme(state.selectedTheme));
     });
   }
 
-  renderThemeResults();
+  themeResultsEl.innerHTML = '<p>Select a theme to view tagged dissertations.</p>';
 }
 
 function renderThemeResults() {
@@ -729,7 +789,7 @@ function renderThemeResults() {
           (doc) => `
           <div class="related-item" data-related-id="${escapeHtml(doc.id)}">
             <strong>${escapeHtml(doc.title || '(Untitled)')}</strong>
-            <p>${escapeHtml(doc.author || 'Unknown')} &middot; ${formatNum(doc.year)} &middot; ${escapeHtml(doc.degree || '-')}</p>
+            <p>${escapeHtml(doc.author || 'Unknown')} &middot; ${doc.year || '-'} &middot; ${escapeHtml(doc.degree || '-')}</p>
           </div>
         `
         )
@@ -928,7 +988,7 @@ function renderSupervisorHeatmap() {
           return `<td class="heatmap-cell" style="background:hsl(190 58% ${lightness}%);color:${textColor}">${content}</td>`;
         })
         .join('');
-      return `<tr><td class="heatmap-label" title="${escapeHtml(sup)}">${escapeHtml(sup)}</td>${cells}</tr>`;
+      return `<tr><td class="heatmap-label" title="${escapeHtml(sup)}"><button class="supervisor-link" data-supervisor-name="${escapeHtml(sup)}">${escapeHtml(sup)}</button></td>${cells}</tr>`;
     })
     .join('');
 
@@ -944,6 +1004,13 @@ function renderSupervisorHeatmap() {
       const sup = node.getAttribute('data-heatmap-sup');
       const concept = node.getAttribute('data-heatmap-concept');
       openMatchesModal(`Supervisor + Concept: ${sup} + ${concept}`, docsForSupervisorConcept(sup, concept));
+    });
+  }
+
+  for (const btn of supervisorHeatmapEl.querySelectorAll('.supervisor-link[data-supervisor-name]')) {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openSupervisorProfile(btn.dataset.supervisorName);
     });
   }
 }
@@ -1035,16 +1102,43 @@ function catalogueBadge(citation) {
 }
 
 function renderCitationList(citations) {
-  citationEntriesEl.innerHTML = citations
+  state.selectedCitationIds = new Set();
+  const selectAllHtml = `<div class="citation-select-all"><label><input type="checkbox" id="selectAllCitations" /> Select all</label></div>`;
+  citationEntriesEl.innerHTML = selectAllHtml + citations
     .map((c) => {
       const citeCount = Math.max(1, Number(c.total_docs) || 1);
       const badge = `<span class="citation-count">${formatNum(citeCount)}</span>`;
-      return `<div class="citation-entry" title="${escapeHtml(c.citation_text)}" data-citation-id="${c.id}" data-citation-text="${escapeHtml(c.citation_text)}" data-citation-count="${citeCount}">${escapeHtml(c.citation_text)}${badge}${catalogueBadge(c)}</div>`;
+      return `<div class="citation-entry" title="${escapeHtml(c.citation_text)}" data-citation-id="${c.id}" data-citation-text="${escapeHtml(c.citation_text)}" data-citation-count="${citeCount}"><input type="checkbox" class="citation-entry-check" data-check-cite-id="${c.id}" />${escapeHtml(c.citation_text)}${badge}${catalogueBadge(c)}</div>`;
     })
     .join('');
 
+  const selectAllCb = document.getElementById('selectAllCitations');
+  selectAllCb.addEventListener('change', () => {
+    for (const cb of citationEntriesEl.querySelectorAll('.citation-entry-check')) {
+      cb.checked = selectAllCb.checked;
+      const id = cb.dataset.checkCiteId;
+      if (selectAllCb.checked) state.selectedCitationIds.add(id);
+      else state.selectedCitationIds.delete(id);
+    }
+  });
+
+  for (const cb of citationEntriesEl.querySelectorAll('.citation-entry-check')) {
+    cb.addEventListener('change', (e) => {
+      e.stopPropagation();
+      const id = cb.dataset.checkCiteId;
+      if (cb.checked) state.selectedCitationIds.add(id);
+      else state.selectedCitationIds.delete(id);
+      const allChecks = citationEntriesEl.querySelectorAll('.citation-entry-check');
+      const allChecked = Array.from(allChecks).every((c) => c.checked);
+      selectAllCb.checked = allChecked;
+      selectAllCb.indeterminate = !allChecked && state.selectedCitationIds.size > 0;
+    });
+    cb.addEventListener('click', (e) => e.stopPropagation());
+  }
+
   for (const entry of citationEntriesEl.querySelectorAll('.citation-entry[data-citation-id]')) {
-    entry.addEventListener('click', () => {
+    entry.addEventListener('click', (e) => {
+      if (e.target.closest('.citation-entry-check')) return;
       showCitingDissertations(
         entry.dataset.citationId,
         entry.dataset.citationText,
@@ -1103,6 +1197,369 @@ async function showCitingDissertations(citationId, citationText, totalDocs = nul
   }
 }
 
+// --- Export utilities ---
+
+function downloadFile(content, filename, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function sanitizeBibKey(text) {
+  return String(text || 'unknown').replace(/[^a-zA-Z0-9]/g, '').slice(0, 20);
+}
+
+function generateBibTeX(docs) {
+  return docs.map((doc) => {
+    const key = `${sanitizeBibKey(doc.author)}${doc.year || ''}`;
+    const lines = [`@phdthesis{${key},`];
+    lines.push(`  author = {${(doc.author || 'Unknown').replace(/[{}]/g, '')}},`);
+    lines.push(`  title = {${(doc.title || '').replace(/[{}]/g, '')}},`);
+    if (doc.year) lines.push(`  year = {${doc.year}},`);
+    lines.push(`  school = {University of British Columbia},`);
+    if (doc.degree) lines.push(`  type = {${doc.degree.replace(/[{}]/g, '')}},`);
+    if (doc.doi) lines.push(`  doi = {${doc.doi}},`);
+    if (doc.uri) lines.push(`  url = {${doc.uri}},`);
+    lines.push('}');
+    return lines.join('\n');
+  }).join('\n\n');
+}
+
+function generateRIS(docs) {
+  return docs.map((doc) => {
+    const lines = ['TY  - THES'];
+    lines.push(`AU  - ${doc.author || 'Unknown'}`);
+    lines.push(`TI  - ${doc.title || ''}`);
+    if (doc.year) lines.push(`PY  - ${doc.year}`);
+    lines.push('PB  - University of British Columbia');
+    if (doc.degree) lines.push(`M3  - ${doc.degree}`);
+    if (doc.doi) lines.push(`DO  - ${doc.doi}`);
+    if (doc.uri) lines.push(`UR  - ${doc.uri}`);
+    if (doc.abstract) lines.push(`AB  - ${doc.abstract.slice(0, 500)}`);
+    lines.push('ER  - ');
+    return lines.join('\n');
+  }).join('\n');
+}
+
+function generateCitationBibTeX(citations) {
+  return citations.map((text, i) => {
+    const key = `cite${i + 1}`;
+    return `@misc{${key},\n  note = {${text.replace(/[{}]/g, '')}}\n}`;
+  }).join('\n\n');
+}
+
+function generateCitationRIS(citations) {
+  return citations.map((text) => {
+    return `TY  - GEN\nT1  - ${text}\nER  - `;
+  }).join('\n');
+}
+
+// --- Foundational Works ---
+
+async function loadFoundationalWorks() {
+  if (!foundationalWorksListEl) return;
+  foundationalWorksListEl.innerHTML = '<p class="meta">Loading...</p>';
+  try {
+    const res = await fetch('/api/citations/top?limit=50');
+    if (!res.ok) {
+      foundationalWorksListEl.innerHTML = '<p class="meta">Could not load foundational works.</p>';
+      return;
+    }
+    const data = await res.json();
+    renderFoundationalWorks(data.works || []);
+  } catch {
+    foundationalWorksListEl.innerHTML = '<p class="meta">Connection error.</p>';
+  }
+}
+
+function renderFoundationalWorks(works) {
+  if (!works.length) {
+    foundationalWorksListEl.innerHTML = '<p class="meta">No works cited across multiple dissertations yet.</p>';
+    return;
+  }
+
+  foundationalWorksListEl.innerHTML = works.map((w) => {
+    const badge = w.catalogue_hits > 0
+      ? (w.catalogue_bib_id
+        ? `<a class="catalogue-badge held" href="https://webcat.library.ubc.ca/vwebv/holdingsInfo?bibId=${encodeURIComponent(w.catalogue_bib_id)}" target="_blank" rel="noreferrer" onclick="event.stopPropagation()">UBC Library</a>`
+        : '<span class="catalogue-badge held">UBC Library</span>')
+      : '';
+    return `
+      <div class="foundational-work-item" data-citation-id="${w.id}" data-citation-text="${escapeHtml(w.citation_text)}" data-citation-count="${w.doc_count}">
+        <span class="fw-rank-badge">${formatNum(w.doc_count)}</span>
+        <span class="fw-text">${escapeHtml(w.citation_text)}${badge}</span>
+      </div>
+    `;
+  }).join('');
+
+  for (const item of foundationalWorksListEl.querySelectorAll('.foundational-work-item')) {
+    item.addEventListener('click', () => {
+      showCitingDissertations(
+        item.dataset.citationId,
+        item.dataset.citationText,
+        Number(item.dataset.citationCount || 1)
+      );
+    });
+  }
+}
+
+// --- Concept Timeline ---
+
+function renderConceptTimeline() {
+  const data = state.payload?.conceptTimeline || [];
+  if (!data.length || !conceptTimelineChartEl) {
+    if (conceptTimelineChartEl) conceptTimelineChartEl.innerHTML = '<text x="16" y="40" class="axis">No concept timeline data available.</text>';
+    if (conceptTimelineLegendEl) conceptTimelineLegendEl.innerHTML = '';
+    return;
+  }
+
+  const width = 940;
+  const height = 360;
+  const pad = { t: 20, r: 20, b: 40, l: 58 };
+
+  // Collect all years and find ranges
+  const allYears = new Set();
+  let maxCount = 1;
+  for (const series of data) {
+    for (const pt of series.data) {
+      allYears.add(pt.year);
+      if (pt.count > maxCount) maxCount = pt.count;
+    }
+  }
+  const years = Array.from(allYears).sort((a, b) => a - b);
+  if (!years.length) {
+    conceptTimelineChartEl.innerHTML = '<text x="16" y="40" class="axis">No year data.</text>';
+    conceptTimelineLegendEl.innerHTML = '';
+    return;
+  }
+
+  const minX = years[0];
+  const maxX = years[years.length - 1];
+  const x = (v) => pad.l + ((v - minX) / Math.max(maxX - minX, 1)) * (width - pad.l - pad.r);
+  const y = (v) => height - pad.b - (v / maxCount) * (height - pad.t - pad.b);
+
+  const yTicks = Array.from({ length: 6 }, (_, i) => {
+    const val = (maxCount / 5) * i;
+    return { val, y: y(val) };
+  });
+
+  const hueStep = 360 / data.length;
+  const lines = data.map((series, idx) => {
+    const hue = Math.round(idx * hueStep);
+    const color = `hsl(${hue} 65% 45%)`;
+    const points = series.data.map((pt) => `${x(pt.year)},${y(pt.count)}`).join(' ');
+    return `<polyline points="${points}" fill="none" stroke="${color}" stroke-width="2.5" />`;
+  }).join('');
+
+  const xLabels = years
+    .filter((_, i) => i % Math.ceil(years.length / 12) === 0)
+    .map((yr) => `<text class="axis" x="${x(yr)}" y="${height - 10}" text-anchor="middle">${yr}</text>`)
+    .join('');
+
+  conceptTimelineChartEl.innerHTML = `
+    ${yTicks.map((tick) => `
+      <line x1="${pad.l}" y1="${tick.y}" x2="${width - pad.r}" y2="${tick.y}" stroke="rgba(8,90,99,0.12)"/>
+      <text class="axis" x="${pad.l - 8}" y="${tick.y + 4}" text-anchor="end">${formatNum(tick.val)}</text>
+    `).join('')}
+    ${lines}
+    ${xLabels}
+  `;
+
+  conceptTimelineLegendEl.innerHTML = data.map((series, idx) => {
+    const hue = Math.round(idx * hueStep);
+    const color = `hsl(${hue} 65% 45%)`;
+    return `<span class="timeline-legend-item"><span class="timeline-legend-swatch" style="background:${color}"></span>${escapeHtml(series.concept)} (${series.totalDocs})</span>`;
+  }).join('');
+}
+
+// --- Supervisor Profiles ---
+
+function buildSupervisorProfile(name, docs) {
+  const supervised = docs.filter((d) => (d.supervisors || []).some((s) => s === name));
+  const years = supervised.map((d) => d.year).filter(Boolean).sort((a, b) => a - b);
+  const conceptMap = new Map();
+  const methMap = new Map();
+  for (const doc of supervised) {
+    for (const c of (doc.conceptTerms || [])) {
+      conceptMap.set(c, (conceptMap.get(c) || 0) + 1);
+    }
+    for (const m of (doc.methodologies || [])) {
+      methMap.set(m, (methMap.get(m) || 0) + 1);
+    }
+  }
+  const topConcepts = Array.from(conceptMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 12)
+    .map(([term, count]) => ({ term, count }));
+  const methodologies = Array.from(methMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([methodology, count]) => ({ methodology, count }));
+
+  return {
+    name,
+    count: supervised.length,
+    yearRange: years.length ? `${years[0]}\u2013${years[years.length - 1]}` : '-',
+    dissertations: supervised,
+    topConcepts,
+    methodologies
+  };
+}
+
+function renderSupervisorProfile(profile) {
+  docModalTitleEl.textContent = `Supervisor: ${profile.name}`;
+
+  const concepts = profile.topConcepts.length
+    ? profile.topConcepts.map((c) => `<span class="token concept">${escapeHtml(c.term)} (${c.count})</span>`).join('')
+    : '<span class="token concept">No concepts</span>';
+
+  const maxMeth = Math.max(...profile.methodologies.map((m) => m.count), 1);
+  const methBars = profile.methodologies.length
+    ? profile.methodologies.map((m) => {
+        const widthPct = (m.count / maxMeth) * 100;
+        return `
+          <div class="bar-row">
+            <span class="bar-label">${escapeHtml(m.methodology)}</span>
+            <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
+            <span class="bar-value">${formatNum(m.count)}</span>
+          </div>
+        `;
+      }).join('')
+    : '<p class="meta">No methodology signals.</p>';
+
+  const dissertationList = profile.dissertations.length
+    ? profile.dissertations.map((doc) => `
+        <div class="related-item" data-related-id="${escapeHtml(doc.id)}">
+          <strong>${escapeHtml(doc.title || '(Untitled)')}</strong>
+          <p>${escapeHtml(doc.author || 'Unknown')} &middot; ${doc.year || '-'} &middot; ${escapeHtml(doc.degree || '-')}</p>
+        </div>
+      `).join('')
+    : '<p class="meta">No dissertations found.</p>';
+
+  docDetailsEl.innerHTML = `
+    <div class="meta">
+      <p><strong>${escapeHtml(profile.name)}</strong></p>
+      <p>${formatNum(profile.count)} dissertation(s) &middot; ${profile.yearRange}</p>
+    </div>
+    <div>
+      <p class="detail-section-title">Top Concepts</p>
+      <div class="token-list">${concepts}</div>
+    </div>
+    <div>
+      <p class="detail-section-title">Methodologies</p>
+      <div class="bars">${methBars}</div>
+    </div>
+    <div>
+      <p class="detail-section-title">Supervised Dissertations</p>
+      <div class="related-list">${dissertationList}</div>
+    </div>
+  `;
+
+  for (const item of docDetailsEl.querySelectorAll('.related-item[data-related-id]')) {
+    item.addEventListener('click', () => {
+      const targetId = item.getAttribute('data-related-id');
+      if (targetId) openRecord(targetId, 'records');
+    });
+  }
+  docModalOverlay.hidden = false;
+}
+
+function openSupervisorProfile(name) {
+  const docs = state.payload?.documents || [];
+  const profile = buildSupervisorProfile(name, docs);
+  renderSupervisorProfile(profile);
+}
+
+// --- Methodology-Concept Matrix ---
+
+function docsForMethodologyConcept(methodology, concept) {
+  const methNorm = String(methodology || '').toLowerCase();
+  const conceptNorm = String(concept || '').toLowerCase();
+  const docs = state.payload?.documents || [];
+  return docs.filter((doc) => {
+    const hasMeth = (doc.methodologies || []).some((m) => String(m || '').toLowerCase() === methNorm);
+    if (!hasMeth) return false;
+    const terms = new Set((doc.conceptTerms || []).map((t) => String(t || '').toLowerCase()));
+    return terms.has(conceptNorm);
+  });
+}
+
+function renderMethodologyConceptMatrix() {
+  const data = state.payload?.methodologyConceptMatrix;
+  if (!data || !data.methodologies.length || !data.concepts.length) {
+    if (methodologyConceptHeatmapEl) methodologyConceptHeatmapEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No methodology-concept data available.</p>';
+    return;
+  }
+
+  const maxVal = Math.max(...data.matrix.flat(), 1);
+
+  const headerCells = data.concepts
+    .map((c) => `<th class="heatmap-header">${escapeHtml(c)}</th>`)
+    .join('');
+
+  const bodyRows = data.methodologies
+    .map((meth, mi) => {
+      const cells = data.concepts
+        .map((concept, ci) => {
+          const val = data.matrix[mi][ci];
+          const lightness = val > 0 ? 95 - Math.round((val / maxVal) * 65) : 97;
+          const textColor = lightness < 55 ? '#fff' : 'var(--ink)';
+          const content = val > 0
+            ? `<button class="heatmap-cell-btn" data-mc-meth="${escapeHtml(meth)}" data-mc-concept="${escapeHtml(concept)}" style="color:${textColor}">${val}</button>`
+            : '';
+          return `<td class="heatmap-cell" style="background:hsl(30 58% ${lightness}%);color:${textColor}">${content}</td>`;
+        })
+        .join('');
+      return `<tr><td class="heatmap-label" title="${escapeHtml(meth)}">${escapeHtml(meth)}</td>${cells}</tr>`;
+    })
+    .join('');
+
+  methodologyConceptHeatmapEl.innerHTML = `
+    <table class="heatmap-table">
+      <thead><tr><th></th>${headerCells}</tr></thead>
+      <tbody>${bodyRows}</tbody>
+    </table>
+  `;
+
+  for (const node of methodologyConceptHeatmapEl.querySelectorAll('[data-mc-meth][data-mc-concept]')) {
+    node.addEventListener('click', () => {
+      const meth = node.getAttribute('data-mc-meth');
+      const concept = node.getAttribute('data-mc-concept');
+      openMatchesModal(`${meth} + ${concept}`, docsForMethodologyConcept(meth, concept));
+    });
+  }
+}
+
+// --- Research Gaps ---
+
+function renderResearchGaps() {
+  const gaps = state.payload?.researchGaps || [];
+  if (!gaps.length) {
+    if (researchGapsListEl) researchGapsListEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No research gap data available.</p>';
+    return;
+  }
+
+  const maxScore = Math.max(...gaps.map((g) => g.gapScore), 1);
+
+  researchGapsListEl.innerHTML = gaps.map((entry) => {
+    const widthPct = (entry.gapScore / maxScore) * 100;
+    const label = `${entry.conceptA} + ${entry.conceptB}`;
+    return `
+      <div class="bar-row">
+        <span class="bar-label" title="${escapeHtml(label)}">${escapeHtml(label)}</span>
+        <div class="bar-track"><div class="bar-fill gap-fill" style="width:${widthPct}%"></div></div>
+        <span class="bar-value">${formatNum(Math.round(entry.gapScore))}</span>
+      </div>
+    `;
+  }).join('');
+
+}
+
 function renderAll() {
   renderDocuments();
   renderKpis();
@@ -1116,6 +1573,9 @@ function renderAll() {
   renderMethodologies();
   renderCooccurrence();
   renderSupervisorHeatmap();
+  renderConceptTimeline();
+  renderMethodologyConceptMatrix();
+  renderResearchGaps();
 }
 
 // --- Data loading ---
@@ -1146,6 +1606,7 @@ async function loadData({ refresh = false } = {}) {
     state.sortKey = null;
     state.sortDir = 'asc';
     state.filterText = '';
+    state.selectedDocIds = new Set();
     docFilterEl.value = '';
     renderAll();
 
@@ -1583,6 +2044,10 @@ for (const btn of adminTabButtons) {
   btn.addEventListener('click', () => setActiveAdminTab(btn.dataset.adminTab));
 }
 
+for (const btn of citationTabButtons) {
+  btn.addEventListener('click', () => setActiveCitationTab(btn.dataset.citationTab));
+}
+
 // Sort headers
 for (const th of docTheadRow.querySelectorAll('th.sortable')) {
   th.addEventListener('click', () => {
@@ -1636,6 +2101,56 @@ documentsTableEl.addEventListener('keydown', (e) => {
     openRecord(docs[nextIndex].id, 'records');
     const row = documentsTableEl.querySelector(`[data-doc-id="${CSS.escape(docs[nextIndex].id)}"]`);
     row?.scrollIntoView({ block: 'nearest' });
+  }
+});
+
+// Export buttons
+exportBibTeXBtn.addEventListener('click', () => {
+  const all = getFilteredSortedDocs();
+  const docs = state.selectedDocIds.size > 0 ? all.filter((d) => state.selectedDocIds.has(d.id)) : all;
+  if (!docs.length) return;
+  downloadFile(generateBibTeX(docs), 'dissertations.bib', 'application/x-bibtex');
+});
+
+exportRISBtn.addEventListener('click', () => {
+  const all = getFilteredSortedDocs();
+  const docs = state.selectedDocIds.size > 0 ? all.filter((d) => state.selectedDocIds.has(d.id)) : all;
+  if (!docs.length) return;
+  downloadFile(generateRIS(docs), 'dissertations.ris', 'application/x-research-info-systems');
+});
+
+function getSelectedCitationTexts() {
+  const entries = Array.from(citationEntriesEl.querySelectorAll('.citation-entry[data-citation-text]'));
+  if (state.selectedCitationIds.size > 0) {
+    return entries.filter((el) => state.selectedCitationIds.has(el.dataset.citationId)).map((el) => el.dataset.citationText);
+  }
+  return entries.map((el) => el.dataset.citationText);
+}
+
+exportCitationBibTeXBtn.addEventListener('click', () => {
+  const texts = getSelectedCitationTexts();
+  if (!texts.length) return;
+  downloadFile(generateCitationBibTeX(texts), 'citations.bib', 'application/x-bibtex');
+});
+
+exportCitationRISBtn.addEventListener('click', () => {
+  const texts = getSelectedCitationTexts();
+  if (!texts.length) return;
+  downloadFile(generateCitationRIS(texts), 'citations.ris', 'application/x-research-info-systems');
+});
+
+// Select-all docs checkbox
+selectAllDocsEl.addEventListener('change', () => {
+  const visibleChecks = documentsTableEl.querySelectorAll('.doc-row-check');
+  for (const cb of visibleChecks) {
+    const id = cb.dataset.checkId;
+    if (selectAllDocsEl.checked) {
+      cb.checked = true;
+      state.selectedDocIds.add(id);
+    } else {
+      cb.checked = false;
+      state.selectedDocIds.delete(id);
+    }
   }
 });
 
