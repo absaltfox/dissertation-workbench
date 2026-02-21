@@ -10,6 +10,7 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <div class="beta-ribbon">Beta</div>
     <div class="bg-shape s1"></div>
     <div class="bg-shape s2"></div>
 
@@ -29,8 +30,8 @@
 
       <nav class="tabs reveal" role="tablist" aria-label="Views">
         <button class="tab-btn active" data-tab="records" role="tab" aria-selected="true">Document Explorer</button>
-        <button class="tab-btn" data-tab="analytics" role="tab" aria-selected="false">Analytics Dashboard</button>
         <button class="tab-btn" data-tab="citations" role="tab" aria-selected="false">Citation Explorer</button>
+        <button class="tab-btn" data-tab="analytics" role="tab" aria-selected="false">Analytics Dashboard</button>
         <button class="tab-btn" data-tab="admin" role="tab" aria-selected="false">Admin</button>
       </nav>
 
@@ -376,6 +377,15 @@
         </div>
       </section>
     </main>
+
+    <footer class="site-footer">
+      <p class="footer-disclaimer">This tool is a personal project built for exploratory purposes &mdash; to better understand public Open Collections APIs as well as the patterns that emerge from UBC open research. It is not officially supported by, endorsed by, or affiliated with the University of British Columbia. All copyrights and intellectual property rights belong to their respective holders.</p>
+      <p class="footer-meta">
+        Built using the <a href="https://open.library.ubc.ca/docs" target="_blank" rel="noreferrer">UBC Open Collections public API</a>.
+        &nbsp;&middot;&nbsp;
+        &copy; <a href="https://www.linkedin.com/in/michael-leblanc-4068621/" target="_blank" rel="noreferrer">Michael LeBlanc</a>
+      </p>
+    </footer>
 
     <script type="module" src="/app.js"></script>
   </body>
