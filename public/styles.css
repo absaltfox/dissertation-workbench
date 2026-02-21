@@ -35,6 +35,57 @@
   pointer-events: none;
 }
 
+/* --- About section --- */
+
+.about-section {
+  margin-bottom: 1.2rem;
+}
+
+.about-section summary {
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.about-section summary::-webkit-details-marker { display: none; }
+
+.about-section summary::before {
+  content: '▸';
+  font-size: 0.7rem;
+  transition: transform 0.15s ease;
+}
+
+.about-section[open] summary::before {
+  transform: rotate(90deg);
+}
+
+.about-body {
+  margin-top: 0.9rem;
+  padding: 1.2rem 1.4rem;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.about-body p {
+  font-family: var(--sans);
+  font-size: 0.85rem;
+  line-height: 1.7;
+  color: var(--ink-soft);
+  margin: 0 0 0.8rem;
+}
+
+.about-body p:last-child { margin-bottom: 0; }
+
 /* --- Footer --- */
 
 .site-footer {
