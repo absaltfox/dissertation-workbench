@@ -183,7 +183,7 @@ function parseHitsFromOutput(stdout) {
 }
 
 function parseBibIdFromOutput(stdout) {
-  const match = String(stdout).match(/\b001\s+(\d+)/);
+  const match = String(stdout).match(/^001\s+(\d+)/m);
   return match ? match[1] : null;
 }
 
@@ -310,7 +310,7 @@ export async function lookupCitationBatch(citationTexts, { concurrency = 1, onPr
       // Parse all "Number of hits:" lines in order
       const hitsMatches = [...String(stdout).matchAll(/Number of hits:\s*(\d+)/g)];
       // Parse all bib IDs (001 fields) — only present for queries with hits
-      const bibIdMatches = [...String(stdout).matchAll(/\b001\s+(\d+)/g)];
+      const bibIdMatches = [...String(stdout).matchAll(/^001\s+(\d+)/gm)];
 
       let bibIdx = 0;
       for (let i = 0; i < batch.length; i++) {

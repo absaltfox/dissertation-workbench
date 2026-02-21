@@ -973,7 +973,7 @@ a:hover {
   gap: 0.75rem;
 }
 
-.citation-entries { max-height: 78vh; overflow-y: auto; }
+.citation-entries { max-height: 78vh; overflow-y: auto; overflow-x: hidden; }
 
 .citation-entry {
   display: flex;
@@ -987,6 +987,8 @@ a:hover {
   cursor: pointer;
   transition: background 0.12s;
   line-height: 1.4;
+  overflow-wrap: anywhere;
+  min-width: 0;
 }
 
 .citation-entry:hover { background: rgba(8, 90, 99, 0.06); }
