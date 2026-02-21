@@ -1184,11 +1184,7 @@ async function showCitingDissertations(citationId, citationText, totalDocs = nul
     for (const item of docDetailsEl.querySelectorAll('.related-item[data-cite-nav-id]')) {
       item.addEventListener('click', () => {
         const targetId = item.getAttribute('data-cite-nav-id');
-        if (targetId) {
-          closeDocModal();
-          setActiveTab('citations');
-          selectCitationDoc(targetId);
-        }
+        if (targetId) openRecord(targetId, 'citations');
       });
     }
     docModalOverlay.hidden = false;
