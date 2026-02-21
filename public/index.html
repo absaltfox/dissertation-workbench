@@ -21,15 +21,6 @@
         <p class="subtitle">Explore dissertation records, inspect related themes, and run new Open Collections queries from one interface.</p>
       </header>
 
-      <details class="about-section reveal">
-        <summary>About this tool</summary>
-        <div class="about-body">
-          <p>UBC Open Collections offers an entry point into the university's graduate-level scholarship. Dissertation Intelligence Workbench interacts with Open Collections through its public APIs, and enriches and links dissertation metadata in ways that may support researchers and graduate students with discovery &mdash; in terms of thematic and conceptual connections, methodologies, and even supervisor interests.</p>
-          <p>The purpose of the tool is to tell the story of UBC's research through metadata. That is, metadata already stored in Open Collections, and also through metadata enrichment conducted by the workbench (through document parsing, NLP, and other mechanisms).</p>
-          <p>Currently, the tool's dataset is limited to Education Studies (Faculty of Education) Doctor of Education dissertations. The intention is to slowly expand the dataset to include other dissertations, by subject, in Open Collections.</p>
-        </div>
-      </details>
-
       <section class="status-wrap reveal">
         <div id="status" class="status">
           <span id="statusText">Ready.</span>
@@ -41,6 +32,7 @@
         <button class="tab-btn active" data-tab="records" role="tab" aria-selected="true">Document Explorer</button>
         <button class="tab-btn" data-tab="citations" role="tab" aria-selected="false">Citation Explorer</button>
         <button class="tab-btn" data-tab="analytics" role="tab" aria-selected="false">Analytics Dashboard</button>
+        <button class="tab-btn" data-tab="about" role="tab" aria-selected="false">About this Tool</button>
         <button class="tab-btn" data-tab="admin" role="tab" aria-selected="false">Admin</button>
       </nav>
 
@@ -207,6 +199,16 @@
           <div id="foundationalWorksList" class="foundational-works-list"></div>
         </article>
         </div>
+      </section>
+
+      <!-- About this Tool -->
+      <section id="tab-about" class="tab-panel reveal" role="tabpanel">
+        <article class="panel about-panel">
+          <h2>About this Tool</h2>
+          <p>UBC Open Collections offers an entry point into the university's graduate-level scholarship. Dissertation Intelligence Workbench interacts with Open Collections through its public APIs, and enriches and links dissertation metadata in ways that may support researchers and graduate students with discovery &mdash; in terms of thematic and conceptual connections, methodologies, and even supervisor interests.</p>
+          <p>The purpose of the tool is to tell the story of UBC's research through metadata. That is, metadata already stored in Open Collections, and also through metadata enrichment conducted by the workbench (through document parsing, NLP, and other mechanisms).</p>
+          <p>Currently, the tool's dataset is limited to Education Studies (Faculty of Education) Doctor of Education dissertations. The intention is to slowly expand the dataset to include other dissertations, by subject, in Open Collections.</p>
+        </article>
       </section>
 
       <!-- Admin Panel -->
