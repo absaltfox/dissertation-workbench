@@ -35,18 +35,42 @@
   pointer-events: none;
 }
 
-/* --- About panel --- */
+/* --- About grid --- */
 
-.about-panel p {
-  font-family: var(--sans);
-  font-size: 0.9rem;
-  line-height: 1.75;
-  color: var(--ink-soft);
-  max-width: 72ch;
-  margin: 0 0 1rem;
+.about-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1.2rem;
 }
 
-.about-panel p:last-child { margin-bottom: 0; }
+@media (max-width: 800px) {
+  .about-grid { grid-template-columns: 1fr; }
+}
+
+.about-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 1.5rem 1.6rem;
+}
+
+.about-card h3 {
+  font-family: var(--sans);
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin: 0 0 0.9rem;
+}
+
+.about-card p {
+  font-family: var(--sans);
+  font-size: 0.875rem;
+  line-height: 1.75;
+  color: var(--ink-soft);
+  margin: 0;
+}
 
 /* --- Footer --- */
 
