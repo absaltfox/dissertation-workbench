@@ -85,10 +85,10 @@ export async function fetchPage({ baseUrl, index, apiKey, from, pageSize, query,
 
   const apiRoot = new URL('/search/8.5', baseUrl).toString();
   const params = [
-    `index=${encodeURIComponent(index)}`,
     `size=${encodeURIComponent(String(pageSize))}`,
     `from=${encodeURIComponent(String(from))}`
   ];
+  if (index) params.unshift(`index=${encodeURIComponent(index)}`);
 
   if (query) params.push(`q=${encodeURIComponent(query)}`);
   if (term) {

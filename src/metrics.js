@@ -555,7 +555,7 @@ export async function collectMetrics(options = {}) {
   const scanLimit = Number(options.scanLimit || Math.max(maxRecords * 10, 1000));
   const subjectLimit = Number(options.subjectLimit || 25);
   const baseUrl = options.baseUrl || DEFAULT_BASE_URL;
-  const requestedIndex = options.index || DEFAULT_INDEX;
+  const requestedIndex = options.index !== undefined ? options.index : DEFAULT_INDEX;
   const apiKey = options.apiKey || DEFAULT_API_KEY;
   const query = options.query === undefined ? DEFAULT_QUERY : options.query;
   const term = options.term === undefined ? DEFAULT_TERM : options.term;
@@ -567,16 +567,24 @@ export async function collectMetrics(options = {}) {
   const index = await resolveIndexName(baseUrl, requestedIndex, apiKey);
   const conceptDict = loadConceptDictionary();
   const records = [];
+  let apiTotal = null; // populated from first response
 
   for (let from = 0; from < scanLimit; from += pageSize) {
     const payload = await fetchPage({ baseUrl, index, apiKey, from, pageSize, query, term, source });
     const docs = extractHits(payload);
+
+    // Capture the API-reported total on the first page
+    if (apiTotal === null) {
+      apiTotal = payload?.data?.hits?.total ?? null;
+    }
+
     if (!docs.length) break;
-
     records.push(...docs.map((doc) => normalizeRecord(doc, conceptDict)));
-
-    if (docs.length < pageSize) break;
     if (records.length >= maxRecords) break;
+
+    // Stop when we've fetched everything the API has
+    if (apiTotal !== null && records.length >= Math.min(apiTotal, maxRecords)) break;
+    // Fallback: stop on a genuinely empty next page (don't stop on partial pages)
   }
 
   const normalizedRecords = records.slice(0, maxRecords);

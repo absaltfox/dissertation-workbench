@@ -15,7 +15,7 @@ export function validateMetricsParams({ maxRecords, pageSize, scanLimit, subject
 
   if (maxRecords != null && maxRecords !== '') {
     const n = Number(maxRecords);
-    if (!Number.isFinite(n) || n < 1 || n > 2000) errors.push('maxRecords must be between 1 and 2000.');
+    if (!Number.isFinite(n) || n < 1 || n > 9999) errors.push('maxRecords must be between 1 and 9999.');
   }
   if (pageSize != null && pageSize !== '') {
     const n = Number(pageSize);

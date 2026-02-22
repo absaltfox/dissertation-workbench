@@ -545,7 +545,7 @@ const server = http.createServer(async (req, res) => {
       const pageSize = parseNumberParam(rawParams.pageSize, 20);
       const scanLimit = parseNumberParam(rawParams.scanLimit, Math.max(maxRecords * 10, 1000));
       const subjectLimit = parseNumberParam(rawParams.subjectLimit, 25);
-      const index = url.searchParams.get('index') || undefined;
+      const index = rawParams.index !== null ? rawParams.index : undefined;
       const query = url.searchParams.get('query') || undefined;
       const term = url.searchParams.get('term') || undefined;
       const source = url.searchParams.get('source') || undefined;
