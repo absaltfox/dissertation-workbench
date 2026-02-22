@@ -36,6 +36,16 @@
         <button class="tab-btn" data-tab="admin" role="tab" aria-selected="false">Admin</button>
       </nav>
 
+      <div id="facetFilterBar" class="facet-filter-bar reveal" hidden>
+        <div class="facet-filter-controls">
+          <select id="filterDegree"      class="facet-select"><option value="">All Degrees</option></select>
+          <select id="filterProgram"     class="facet-select"><option value="">All Programs</option></select>
+          <select id="filterAffiliation" class="facet-select"><option value="">All Affiliations</option></select>
+          <button id="clearFacets" class="btn ghost btn-sm">&times; Clear filters</button>
+        </div>
+        <span id="facetCount" class="facet-count"></span>
+      </div>
+
       <!-- Document Explorer -->
       <section id="tab-records" class="tab-panel reveal active" role="tabpanel">
         <article class="panel">
@@ -289,7 +299,7 @@
                 </label>
                 <label>
                   <span>Max Records</span>
-                  <input id="s-maxRecords" type="number" value="200" min="1" max="2000" step="20" />
+                  <input id="s-maxRecords" type="number" value="9999" min="1" max="9999" step="20" />
                 </label>
                 <label>
                   <span>Page Size</span>
@@ -297,7 +307,7 @@
                 </label>
                 <label>
                   <span>Scan Limit</span>
-                  <input id="s-scanLimit" type="number" value="1000" min="1" max="50000" step="100" />
+                  <input id="s-scanLimit" type="number" value="50000" min="1" max="50000" step="100" />
                 </label>
                 <label>
                   <span>Subject Limit</span>

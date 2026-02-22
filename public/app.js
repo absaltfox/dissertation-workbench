@@ -68,6 +68,14 @@ const citationListTitleEl = document.getElementById('citationListTitle');
 const citationEntriesEl = document.getElementById('citationEntries');
 const citationTabButtons = Array.from(document.querySelectorAll('.citation-tab-btn'));
 
+// Facet filter bar
+const facetFilterBarEl    = document.getElementById('facetFilterBar');
+const filterDegreeEl      = document.getElementById('filterDegree');
+const filterProgramEl     = document.getElementById('filterProgram');
+const filterAffiliationEl = document.getElementById('filterAffiliation');
+const clearFacetsBtn      = document.getElementById('clearFacets');
+const facetCountEl        = document.getElementById('facetCount');
+
 // --- State ---
 const state = {
   payload: null,
@@ -83,6 +91,7 @@ const state = {
   citationRequestToken: 0,
   selectedDocIds: new Set(),
   selectedCitationIds: new Set(),
+  activeFilters: { degree: '', program: '', affiliation: '' },
 };
 
 // --- Utilities ---
@@ -305,8 +314,17 @@ function docSortValue(doc, key) {
   }
 }
 
-function getFilteredSortedDocs() {
+function getFilteredDocs() {
   let docs = state.payload?.documents || [];
+  const { degree, program, affiliation } = state.activeFilters;
+  if (degree)      docs = docs.filter(d => d.degree === degree);
+  if (program)     docs = docs.filter(d => d.program === program);
+  if (affiliation) docs = docs.filter(d => (d.affiliation || []).includes(affiliation));
+  return docs;
+}
+
+function getFilteredSortedDocs() {
+  let docs = getFilteredDocs();
 
   if (state.filterText) {
     const q = state.filterText.toLowerCase();
@@ -570,14 +588,14 @@ function renderDetails() {
 // --- Analytics rendering ---
 
 function renderKpis() {
-  const metrics = state.payload?.metrics;
+  const metrics = getAnalytics()?.metrics;
   if (!metrics) {
     kpisEl.innerHTML = '';
     return;
   }
 
   // Compute citation stats from documents with parsed citations
-  const docs = state.payload?.documents || [];
+  const docs = getFilteredDocs();
   const citeCounts = docs.map((d) => d.citationCount || 0).filter((c) => c > 0);
   const citeMin = citeCounts.length ? Math.min(...citeCounts) : null;
   const citeMax = citeCounts.length ? Math.max(...citeCounts) : null;
@@ -611,7 +629,7 @@ function renderKpis() {
 }
 
 function renderPagesByYear() {
-  const rows = state.payload?.metrics?.avgPagesByYear || [];
+  const rows = getAnalytics()?.metrics?.avgPagesByYear || [];
   if (!rows.length) {
     pagesByYearChartEl.innerHTML = '<text x="16" y="40">No year/page data available.</text>';
     return;
@@ -654,7 +672,7 @@ function renderPagesByYear() {
 }
 
 function renderDissertationsByYear() {
-  const rows = state.payload?.metrics?.byYear || [];
+  const rows = getAnalytics()?.metrics?.byYear || [];
   if (!rows.length) {
     dissertationsByYearChartEl.innerHTML = '<text x="16" y="40">No year data available.</text>';
     return;
@@ -704,7 +722,7 @@ function renderDissertationsByYear() {
 }
 
 function renderWordsByYear() {
-  const rows = state.payload?.metrics?.byYear || [];
+  const rows = getAnalytics()?.metrics?.byYear || [];
   if (!rows.length) {
     wordsByYearChartEl.innerHTML = '<text x="16" y="40">No year/word data available.</text>';
     return;
@@ -747,7 +765,7 @@ function renderWordsByYear() {
 }
 
 function renderWordCloud() {
-  const words = state.payload?.wordCloud || [];
+  const words = getAnalytics()?.wordCloud || [];
   if (!words.length) {
     wordCloudEl.innerHTML = '<span>No theme terms available.</span>';
     themeResultsEl.innerHTML = '';
@@ -813,7 +831,7 @@ function renderThemeResults() {
 }
 
 function renderSubjectBars() {
-  const byConcept = state.payload?.metrics?.byConcept || [];
+  const byConcept = getAnalytics()?.metrics?.byConcept || [];
   if (!byConcept.length) {
     subjectBarsEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No concept length data available.</p>';
     return;
@@ -837,7 +855,7 @@ function renderSubjectBars() {
 }
 
 function renderPageTrend() {
-  const rows = state.payload?.metrics?.pageTrend || [];
+  const rows = getAnalytics()?.metrics?.pageTrend || [];
   if (!rows.length) {
     pageTrendChartEl.innerHTML = '<text x="16" y="40">No page trend data available.</text>';
     return;
@@ -885,7 +903,7 @@ function renderPageTrend() {
 }
 
 function renderNgramCloud() {
-  const words = state.payload?.ngramCloud || [];
+  const words = getAnalytics()?.ngramCloud || [];
   if (!words.length) {
     ngramCloudEl.innerHTML = '<span>No n-gram data available.</span>';
     return;
@@ -910,7 +928,7 @@ function renderNgramCloud() {
 }
 
 function renderMethodologies() {
-  const items = state.payload?.methodologies || [];
+  const items = getAnalytics()?.methodologies || [];
   if (!items.length) {
     methodologyBarsEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No methodology signals detected.</p>';
     return;
@@ -939,7 +957,7 @@ function renderMethodologies() {
 }
 
 function renderCooccurrence() {
-  const pairs = state.payload?.termCooccurrence || [];
+  const pairs = getAnalytics()?.termCooccurrence || [];
   if (!pairs.length) {
     cooccurrenceBarsEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No co-occurring term pairs found.</p>';
     return;
@@ -970,7 +988,7 @@ function renderCooccurrence() {
 }
 
 function renderSupervisorHeatmap() {
-  const data = state.payload?.supervisorNgramMatrix;
+  const data = getAnalytics()?.supervisorNgramMatrix;
   if (!data || !data.supervisors.length || !data.ngrams.length) {
     supervisorHeatmapEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No supervisor-term data available.</p>';
     return;
@@ -1025,7 +1043,7 @@ function renderSupervisorHeatmap() {
 // --- Citation Explorer ---
 
 function renderCitationDocs() {
-  let docs = state.payload?.documents || [];
+  let docs = getFilteredDocs();
   if (state.citationFilterText) {
     const q = state.citationFilterText.toLowerCase();
     docs = docs.filter((doc) =>
@@ -1376,7 +1394,7 @@ function renderFoundationalWorks(works) {
 // --- Concept Timeline ---
 
 function renderConceptTimeline() {
-  const data = state.payload?.conceptTimeline || [];
+  const data = getAnalytics()?.conceptTimeline || [];
   if (!data.length || !conceptTimelineChartEl) {
     if (conceptTimelineChartEl) conceptTimelineChartEl.innerHTML = '<text x="16" y="40" class="axis">No concept timeline data available.</text>';
     if (conceptTimelineLegendEl) conceptTimelineLegendEl.innerHTML = '';
@@ -1554,7 +1572,7 @@ function docsForMethodologyConcept(methodology, concept) {
 }
 
 function renderMethodologyConceptMatrix() {
-  const data = state.payload?.methodologyConceptMatrix;
+  const data = getAnalytics()?.methodologyConceptMatrix;
   if (!data || !data.methodologies.length || !data.concepts.length) {
     if (methodologyConceptHeatmapEl) methodologyConceptHeatmapEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No methodology-concept data available.</p>';
     return;
@@ -1602,7 +1620,7 @@ function renderMethodologyConceptMatrix() {
 // --- Research Gaps ---
 
 function renderResearchGaps() {
-  const gaps = state.payload?.researchGaps || [];
+  const gaps = getAnalytics()?.researchGaps || [];
   if (!gaps.length) {
     if (researchGapsListEl) researchGapsListEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No research gap data available.</p>';
     return;
@@ -1622,6 +1640,215 @@ function renderResearchGaps() {
     `;
   }).join('');
 
+}
+
+// --- Facet filter helpers ---
+
+function updateFacetCount() {
+  const total    = state.payload?.documents?.length || 0;
+  const filtered = getFilteredDocs().length;
+  const { degree, program, affiliation } = state.activeFilters;
+  const active = !!(degree || program || affiliation);
+  facetCountEl.textContent = active ? `Showing ${filtered} of ${total} dissertations` : '';
+  clearFacetsBtn.style.display = active ? '' : 'none';
+}
+
+function populateFacetFilters() {
+  const docs = state.payload?.documents || [];
+  const degrees      = [...new Set(docs.map(d => d.degree).filter(Boolean))].sort();
+  const programs     = [...new Set(docs.map(d => d.program).filter(Boolean))].sort();
+  const affiliations = [...new Set(docs.flatMap(d => d.affiliation || []).filter(Boolean))].sort();
+
+  const populate = (el, values, allLabel) => {
+    el.innerHTML = `<option value="">${allLabel}</option>` +
+      values.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join('');
+    el.value = '';
+  };
+  populate(filterDegreeEl,      degrees,      'All Degrees');
+  populate(filterProgramEl,     programs,     'All Programs');
+  populate(filterAffiliationEl, affiliations, 'All Affiliations');
+
+  state.activeFilters = { degree: '', program: '', affiliation: '' };
+  facetFilterBarEl.hidden = false;
+  updateFacetCount();
+}
+
+// --- Client-side analytics builder (used when facet filters are active) ---
+
+function buildAnalytics(docs) {
+  function statsOf(arr) {
+    if (!arr.length) return { count: 0, min: null, max: null, mean: null, median: null };
+    const s = [...arr].sort((a, b) => a - b);
+    return {
+      count: s.length,
+      min: s[0], max: s[s.length - 1],
+      mean: Math.round(arr.reduce((a, b) => a + b, 0) / arr.length),
+      median: s.length % 2 === 0 ? (s[s.length / 2 - 1] + s[s.length / 2]) / 2 : s[Math.floor(s.length / 2)]
+    };
+  }
+
+  // Accumulate data in a single pass
+  const byYearPagesMap  = new Map();
+  const byYearWordsMap  = new Map();
+  const byYearCountMap  = new Map();
+  const themeMap        = new Map();
+  const ngramMap        = new Map();
+  const methMap         = new Map();
+  const pairMap         = new Map();
+  const conceptDocMap   = new Map();
+  const supCountMap     = new Map();
+  const supConceptMap   = new Map();
+  const mcCountMap      = new Map();
+  const conceptYearMap  = new Map();
+
+  for (const doc of docs) {
+    const { year, pages, wordCount,
+      themes = [], conceptTerms = [],
+      methodologies: meths = [], supervisors: sups = [] } = doc;
+
+    if (year) {
+      if (!byYearCountMap.has(year)) {
+        byYearPagesMap.set(year, []); byYearWordsMap.set(year, []); byYearCountMap.set(year, 0);
+      }
+      if (pages) byYearPagesMap.get(year).push(pages);
+      if (wordCount) byYearWordsMap.get(year).push(wordCount);
+      byYearCountMap.set(year, byYearCountMap.get(year) + 1);
+    }
+
+    for (const t of themes) themeMap.set(t, (themeMap.get(t) || 0) + 1);
+
+    for (const t of conceptTerms) {
+      ngramMap.set(t, (ngramMap.get(t) || 0) + 1);
+      if (!conceptDocMap.has(t)) conceptDocMap.set(t, { sum: 0, count: 0 });
+      const e = conceptDocMap.get(t);
+      e.sum += wordCount || 0; e.count += 1;
+      if (year) {
+        if (!conceptYearMap.has(t)) conceptYearMap.set(t, new Map());
+        const ym = conceptYearMap.get(t);
+        ym.set(year, (ym.get(year) || 0) + 1);
+      }
+    }
+
+    for (const m of meths) methMap.set(m, (methMap.get(m) || 0) + 1);
+
+    const uniqTerms = [...new Set(conceptTerms)];
+    for (let i = 0; i < uniqTerms.length; i++) {
+      for (let j = i + 1; j < uniqTerms.length; j++) {
+        const key = uniqTerms[i] < uniqTerms[j]
+          ? `${uniqTerms[i]}\0${uniqTerms[j]}`
+          : `${uniqTerms[j]}\0${uniqTerms[i]}`;
+        pairMap.set(key, (pairMap.get(key) || 0) + 1);
+      }
+    }
+
+    for (const sup of sups) {
+      supCountMap.set(sup, (supCountMap.get(sup) || 0) + 1);
+      if (!supConceptMap.has(sup)) supConceptMap.set(sup, new Map());
+      const sm = supConceptMap.get(sup);
+      for (const t of conceptTerms) sm.set(t, (sm.get(t) || 0) + 1);
+    }
+
+    for (const m of meths) {
+      for (const t of conceptTerms) {
+        const key = `${m}\0${t}`;
+        mcCountMap.set(key, (mcCountMap.get(key) || 0) + 1);
+      }
+    }
+  }
+
+  const sortedYears = Array.from(byYearCountMap.keys()).sort((a, b) => a - b);
+
+  const byYear = sortedYears.map(year => {
+    const ws = statsOf(byYearWordsMap.get(year));
+    return { year, count: byYearCountMap.get(year), mean: ws.mean, min: ws.min, max: ws.max };
+  });
+
+  const avgPagesByYear = sortedYears.map(year => {
+    const ps = statsOf(byYearPagesMap.get(year));
+    return { year, mean: ps.mean, min: ps.min, max: ps.max, count: ps.count };
+  });
+
+  const pageTrend = sortedYears.map(year => {
+    const ps = statsOf(byYearPagesMap.get(year));
+    return { year, median: ps.median, min: ps.min, max: ps.max, count: ps.count };
+  });
+
+  const byConcept = Array.from(conceptDocMap.entries())
+    .map(([concept, { sum, count }]) => ({ concept, weightedMean: count ? Math.round(sum / count) : 0, docCount: count }))
+    .sort((a, b) => b.weightedMean - a.weightedMean)
+    .slice(0, 20);
+
+  const overallPageCount = statsOf(docs.map(d => d.pages).filter(Boolean));
+  const overallWordCount = statsOf(docs.map(d => d.wordCount).filter(Boolean));
+
+  const metrics = { recordCount: docs.length, byYear, avgPagesByYear, pageTrend, byConcept, overallPageCount, overallWordCount };
+
+  const wordCloud = Array.from(themeMap.entries())
+    .map(([term, count]) => ({ term, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 70);
+
+  const ngramCloud = Array.from(ngramMap.entries())
+    .map(([term, count]) => ({ term, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 60);
+
+  const methodologies = Array.from(methMap.entries())
+    .map(([methodology, count]) => ({ methodology, count }))
+    .sort((a, b) => b.count - a.count);
+
+  const termCooccurrence = Array.from(pairMap.entries())
+    .map(([key, count]) => { const [termA, termB] = key.split('\0'); return { termA, termB, count }; })
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 20);
+
+  const topSups = Array.from(supCountMap.entries()).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([s]) => s);
+  const top10Ngrams = ngramCloud.slice(0, 10).map(w => w.term);
+  const supervisorNgramMatrix = {
+    supervisors: topSups,
+    ngrams: top10Ngrams,
+    matrix: topSups.map(sup => top10Ngrams.map(concept => supConceptMap.get(sup)?.get(concept) || 0))
+  };
+
+  const top8Concepts = ngramCloud.slice(0, 8).map(w => w.term);
+  const conceptTimeline = top8Concepts
+    .map(concept => {
+      const ym = conceptYearMap.get(concept) || new Map();
+      const data = sortedYears.map(year => ({ year, count: ym.get(year) || 0 }));
+      const totalDocs = Array.from(ym.values()).reduce((a, b) => a + b, 0);
+      return { concept, data, totalDocs };
+    })
+    .filter(s => s.totalDocs > 0);
+
+  const topMeths     = methodologies.slice(0, 10).map(m => m.methodology);
+  const top10Concepts = ngramCloud.slice(0, 10).map(w => w.term);
+  const methodologyConceptMatrix = {
+    methodologies: topMeths,
+    concepts: top10Concepts,
+    matrix: topMeths.map(meth => top10Concepts.map(concept => mcCountMap.get(`${meth}\0${concept}`) || 0))
+  };
+
+  const top30 = ngramCloud.slice(0, 30).map(w => ({ term: w.term, count: w.count }));
+  const researchGaps = [];
+  for (let i = 0; i < top30.length; i++) {
+    for (let j = i + 1; j < top30.length; j++) {
+      const { term: tA, count: cA } = top30[i];
+      const { term: tB, count: cB } = top30[j];
+      const key = tA < tB ? `${tA}\0${tB}` : `${tB}\0${tA}`;
+      const cooc = pairMap.get(key) || 0;
+      researchGaps.push({ conceptA: tA, conceptB: tB, gapScore: (cA * cB) / (cooc + 1) });
+    }
+  }
+  researchGaps.sort((a, b) => b.gapScore - a.gapScore);
+
+  return { metrics, wordCloud, ngramCloud, methodologies, supervisorNgramMatrix, termCooccurrence, conceptTimeline, methodologyConceptMatrix, researchGaps: researchGaps.slice(0, 15) };
+}
+
+function getAnalytics() {
+  if (!state.payload) return null;
+  const { degree, program, affiliation } = state.activeFilters;
+  if (!degree && !program && !affiliation) return state.payload;
+  return buildAnalytics(getFilteredDocs());
 }
 
 function renderAll() {
@@ -1650,6 +1877,7 @@ async function loadData({ refresh = false } = {}) {
   loadBtn.disabled = true;
   refreshBtn.disabled = true;
   showSpinner(true);
+  facetFilterBarEl.hidden = true;
 
   const params = getCurrentParams();
   if (refresh) params.refresh = '1';
@@ -1673,6 +1901,7 @@ async function loadData({ refresh = false } = {}) {
     state.selectedDocIds = new Set();
     docFilterEl.value = '';
     renderAll();
+    populateFacetFilters();
 
     const docs = state.payload.documents || [];
     const statusCounts = docs.reduce((acc, doc) => {
@@ -2223,6 +2452,30 @@ selectAllDocsEl.addEventListener('change', () => {
       state.selectedDocIds.delete(id);
     }
   }
+});
+
+// Facet filter handlers
+function onFacetChange() {
+  state.activeFilters.degree      = filterDegreeEl.value;
+  state.activeFilters.program     = filterProgramEl.value;
+  state.activeFilters.affiliation = filterAffiliationEl.value;
+  updateFacetCount();
+  // Deselect docs that are no longer in the filtered set
+  if (!getFilteredDocs().some(d => d.id === state.selectedDocId)) state.selectedDocId = null;
+  if (!getFilteredDocs().some(d => d.id === state.citationDocId)) {
+    state.citationDocId = null;
+    citationEntriesEl.innerHTML = '<p class="meta">Select a document to view its works cited.</p>';
+    citationListTitleEl.textContent = 'Works Cited';
+  }
+  renderAll();
+  if (document.querySelector('#tab-citations.active')) renderCitationDocs();
+}
+filterDegreeEl.addEventListener('change', onFacetChange);
+filterProgramEl.addEventListener('change', onFacetChange);
+filterAffiliationEl.addEventListener('change', onFacetChange);
+clearFacetsBtn.addEventListener('click', () => {
+  filterDegreeEl.value = filterProgramEl.value = filterAffiliationEl.value = '';
+  onFacetChange();
 });
 
 // Staggered reveal animation

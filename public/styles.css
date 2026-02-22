@@ -270,6 +270,36 @@ h3 {
 .tab-panel { display: none; margin-top: 0.9rem; }
 .tab-panel.active { display: block; }
 
+/* --- Facet filter bar --- */
+
+.facet-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  padding: 0.6rem 1rem;
+  background: var(--surface, var(--panel));
+  border: 1px solid var(--line);
+  border-radius: var(--radius, 8px);
+  margin: 0 0 1rem;
+}
+.facet-filter-controls { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; flex: 1; }
+.facet-select {
+  font-family: var(--sans);
+  font-size: 0.82rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius, 6px);
+  background: var(--bg);
+  color: var(--ink);
+}
+.facet-count {
+  font-family: var(--sans);
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+  white-space: nowrap;
+}
+
 /* --- Panels --- */
 
 .panel {
