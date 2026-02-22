@@ -42,6 +42,12 @@ const docModalOverlay = document.getElementById('docModalOverlay');
 const docModalCloseBtn = document.getElementById('docModalClose');
 const docModalTitleEl = document.getElementById('docModalTitle');
 
+// Summon modal elements
+const summonModalOverlayEl = document.getElementById('summonModalOverlay');
+const summonModalTitleEl = document.getElementById('summonModalTitle');
+const summonResultsEl = document.getElementById('summonResults');
+const summonModalCloseBtn = document.getElementById('summonModalClose');
+
 // Admin elements
 const loginGate = document.getElementById('loginGate');
 const adminContent = document.getElementById('adminContent');
@@ -551,7 +557,7 @@ function renderDetails() {
           return;
         }
         contentEl.innerHTML = data.citations.map((c) =>
-          `<p class="citation-entry">${escapeHtml(c.citation_text)}${catalogueBadge(c)}</p>`
+          `<p class="citation-entry" data-citation-text="${escapeHtml(c.citation_text)}">${escapeHtml(c.citation_text)}${catalogueBadge(c)}</p>`
         ).join('');
         attachSummonHandlers(contentEl);
       } catch {
@@ -1102,31 +1108,56 @@ function catalogueBadge(citation) {
   return `<button class="catalogue-badge summon-check-btn" data-citation-id="${escapeHtml(String(citation.id))}" title="Check UBC Summon for this item" onclick="event.stopPropagation()">Check Summon</button>`;
 }
 
+function openSummonModal(data, citationText) {
+  summonModalTitleEl.textContent = citationText
+    ? `Summon: ${citationText.slice(0, 80)}${citationText.length > 80 ? '\u2026' : ''}`
+    : 'Summon Search Results';
+
+  const itemsHtml = data.results.length
+    ? data.results.map((r) => {
+        const metaParts = [r.authors, r.year, r.contentType].filter(Boolean).join(' \u00B7 ');
+        const holdingsBadge = r.inHoldings
+          ? `<span class="catalogue-badge held">In UBC Library</span>`
+          : `<span class="catalogue-badge not-held">Not held</span>`;
+        const titleHtml = r.link
+          ? `<a href="${escapeHtml(r.link)}" target="_blank" rel="noreferrer">${escapeHtml(r.title || '(No title)')}</a>`
+          : escapeHtml(r.title || '(No title)');
+        return `<div class="summon-result-item">
+          <div class="summon-result-title">${titleHtml} ${holdingsBadge}</div>
+          ${metaParts ? `<div class="summon-result-meta">${escapeHtml(metaParts)}</div>` : ''}
+        </div>`;
+      }).join('')
+    : '<p class="meta">No results found in Summon.</p>';
+
+  const footerHtml = `<div class="summon-result-footer">
+    ${!data.found ? `<a href="${escapeHtml(data.illUrl)}" target="_blank" rel="noreferrer">Not found &mdash; request via ILL/DocDel &rarr;</a>` : '<span></span>'}
+    <a href="${escapeHtml(data.searchUrl)}" target="_blank" rel="noreferrer">View all results in UBC Summon &rarr;</a>
+  </div>`;
+
+  summonResultsEl.innerHTML = itemsHtml + footerHtml;
+  summonModalOverlayEl.hidden = false;
+}
+
 function attachSummonHandlers(container) {
   for (const btn of container.querySelectorAll('.summon-check-btn')) {
     btn.addEventListener('click', async (e) => {
       e.stopPropagation();
       const citationId = btn.dataset.citationId;
+      const citationText = btn.closest('[data-citation-text]')?.dataset.citationText || '';
       btn.textContent = 'Checking\u2026';
       btn.disabled = true;
       try {
         const res = await fetch(`/api/citations/${encodeURIComponent(citationId)}/summon-check`);
         const data = await res.json();
-        const replacement = document.createElement('a');
-        replacement.className = `catalogue-badge ${data.found ? 'held' : 'not-held'}`;
-        replacement.target = '_blank';
-        replacement.rel = 'noreferrer';
-        replacement.addEventListener('click', (ev) => ev.stopPropagation());
-        if (data.found) {
-          replacement.href = data.link;
-          replacement.title = data.title || 'Found in UBC Library via Summon';
-          replacement.textContent = 'Found in Summon';
-        } else {
-          replacement.href = data.illUrl || 'https://ill-docdel.library.ubc.ca/home';
-          replacement.title = 'Not found in UBC Library \u2014 request via Interlibrary Loan / Document Delivery';
-          replacement.textContent = 'Not found \u2014 ILL/DocDel';
-        }
-        btn.replaceWith(replacement);
+        // Replace button with a re-openable badge
+        const badge = document.createElement('button');
+        badge.className = `catalogue-badge summon-check-btn ${data.found ? 'held' : 'not-held'}`;
+        badge.dataset.citationId = citationId;
+        badge.title = data.found ? 'View Summon results' : 'Not found in UBC Library \u2014 view Summon results';
+        badge.textContent = data.found ? 'Summon \u2713' : 'Not in Summon';
+        badge.addEventListener('click', (ev) => { ev.stopPropagation(); openSummonModal(data, citationText); });
+        btn.replaceWith(badge);
+        openSummonModal(data, citationText);
       } catch {
         btn.textContent = 'Check Summon';
         btn.disabled = false;
@@ -2109,8 +2140,15 @@ docModalCloseBtn.addEventListener('click', closeDocModal);
 docModalOverlay.addEventListener('click', (e) => {
   if (e.target === docModalOverlay) closeDocModal();
 });
+summonModalCloseBtn.addEventListener('click', () => { summonModalOverlayEl.hidden = true; });
+summonModalOverlayEl.addEventListener('click', (e) => {
+  if (e.target === summonModalOverlayEl) summonModalOverlayEl.hidden = true;
+});
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !docModalOverlay.hidden) closeDocModal();
+  if (e.key === 'Escape') {
+    if (!summonModalOverlayEl.hidden) { summonModalOverlayEl.hidden = true; return; }
+    if (!docModalOverlay.hidden) closeDocModal();
+  }
 });
 
 loginForm.addEventListener('submit', handleLogin);
