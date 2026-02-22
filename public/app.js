@@ -1125,6 +1125,7 @@ function openSummonModal(data, citationText) {
         return `<div class="summon-result-item">
           <div class="summon-result-title">${titleHtml} ${holdingsBadge}</div>
           ${metaParts ? `<div class="summon-result-meta">${escapeHtml(metaParts)}</div>` : ''}
+          ${r.snippet ? `<div class="summon-result-snippet">${escapeHtml(r.snippet)}</div>` : ''}
         </div>`;
       }).join('')
     : '<p class="meta">No results found in Summon.</p>';

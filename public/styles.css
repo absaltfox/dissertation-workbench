@@ -1159,6 +1159,64 @@ a.catalogue-badge:hover {
   text-underline-offset: 0.12em;
 }
 
+.summon-modal-overlay { z-index: 200; }
+
+.summon-result-item {
+  padding: 0.75rem 0;
+  border-bottom: 1px solid var(--line);
+  display: grid;
+  gap: 0.2rem;
+}
+
+.summon-result-item:last-of-type { border-bottom: none; }
+
+.summon-result-title {
+  font-family: var(--sans);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.summon-result-title a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.summon-result-title a:hover { text-decoration: underline; }
+
+.summon-result-meta {
+  font-family: var(--sans);
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+}
+
+.summon-result-snippet {
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  color: var(--ink-soft);
+  margin-top: 0.3rem;
+  line-height: 1.45;
+}
+
+.summon-result-footer {
+  margin-top: 1.2rem;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--line);
+  font-family: var(--sans);
+  font-size: 0.8rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.summon-result-footer a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.summon-result-footer a:hover { text-decoration: underline; }
+
 button.summon-check-btn {
   border: 1px solid rgba(8, 90, 99, 0.35);
   background: transparent;

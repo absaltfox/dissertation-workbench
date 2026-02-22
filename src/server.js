@@ -504,13 +504,18 @@ const server = http.createServer(async (req, res) => {
         });
         if (!resp.ok) throw new Error(`Summon ${resp.status}`);
         const data = await resp.json();
-        const held = (data.documents || []).find((d) => d.in_holdings === true);
-        if (held) {
-          const title = String(held.title || '').replace(/<\/?mark>/g, '');
-          sendJson(res, 200, { found: true, title, link: held.link });
-        } else {
-          sendJson(res, 200, { found: false, illUrl: 'https://ill-docdel.library.ubc.ca/home' });
-        }
+        const results = (data.documents || []).slice(0, 10).map((d) => ({
+          title: String(d.title || '').replace(/<\/?mark>/g, ''),
+          authors: (d.authors || []).map((a) => a.fullname || a.name || '').filter(Boolean).join(', '),
+          contentType: d.content_type || '',
+          year: d.publication_date || '',
+          inHoldings: d.in_holdings === true,
+          link: d.link || '',
+          snippet: String(d.snippet || '').replace(/<\/?mark>/g, ''),
+        }));
+        const found = results.some((r) => r.inHoldings);
+        const searchUrl = `https://ubc.summon.serialssolutions.com/#!/search?q=${encodeURIComponent(q)}`;
+        sendJson(res, 200, { found, results, searchUrl, illUrl: 'https://ill-docdel.library.ubc.ca/home' });
       } catch {
         sendJson(res, 502, { error: 'Summon lookup failed' });
       }
