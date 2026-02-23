@@ -55,6 +55,16 @@ function unique(values) {
 export function collectCandidateUrls(doc, id, doi) {
   const candidates = [];
 
+  // Build a collection-specific direct PDF URL using the Elasticsearch index name
+  // (e.g. "dsp.831-2022-11-13" → collection 831, URL: /media/download/pdf/831/{id}/1)
+  const indexMatch = String(doc?.__oc_index || '').match(/dsp\.(\d+)/);
+  if (indexMatch && id) {
+    const collNum = indexMatch[1];
+    candidates.push(`https://open.library.ubc.ca/media/download/pdf/${collNum}/${id}/1`);
+    candidates.push(`https://open.library.ubc.ca/media/download/pdf/${collNum}/${id}/2`);
+    candidates.push(`https://open.library.ubc.ca/media/download/pdf/${collNum}/${id}/3`);
+  }
+
   if (doi) {
     const suffix = doi.split('/').pop();
     if (suffix) {
@@ -152,7 +162,14 @@ export function extractHits(payload) {
   ];
 
   const list = arrays.find((arr) => Array.isArray(arr)) || [];
-  return list.map((hit) => hit?._source || hit?.doc || hit).filter(Boolean);
+  return list.map((hit) => {
+    const source = hit?._source || hit?.doc || hit;
+    // Inject the Elasticsearch index name so collectCandidateUrls can derive the collection number
+    if (source && typeof source === 'object' && hit?._index && !source.__oc_index) {
+      source.__oc_index = hit._index;
+    }
+    return source;
+  }).filter(Boolean);
 }
 
 export async function resolveIndexName(baseUrl, requestedIndex, apiKey) {

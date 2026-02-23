@@ -13,6 +13,7 @@ export const DEFAULT_SOURCE = process.env.UBC_SOURCE || [
 ].join(',');
 export const DEFAULT_DOWNLOAD_FILES = process.env.DOWNLOAD_FILES !== '0';
 export const FILE_CONCURRENCY = 2;
+export const PDF_DOWNLOAD_RATE_PER_MIN = Number(process.env.PDF_DOWNLOAD_RATE_PER_MIN || 0); // 0 = unlimited
 export const DATA_DIR = process.env.APP_DATA_DIR || path.join(process.cwd(), 'data');
 export const PDF_CACHE_DIR = process.env.PDF_CACHE_DIR || path.join(DATA_DIR, 'pdf-cache');
 export const SQLITE_PATH = process.env.SQLITE_PATH || path.join(DATA_DIR, 'metrics.sqlite');

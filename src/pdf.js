@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { PDF_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS } from './config.js';
+import { PDF_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, PDF_DOWNLOAD_RATE_PER_MIN } from './config.js';
 import {
   loadStoredFileMetric, saveFileMetric, saveDocumentMetadata, saveCommitteeMembers,
   loadCommitteeMembers, saveCitations, loadDocumentCitations, deleteCommitteeMembersByRoles
@@ -12,6 +12,36 @@ import { logger } from './logger.js';
 import { dedupeSupervisorNames } from './supervisors.js';
 
 const execFileAsync = promisify(execFile);
+
+// --- PDF download rate limiter ---
+// Serialized queue so concurrent workers share a single sliding window.
+const _downloadTimestamps = [];
+let _downloadRateTail = Promise.resolve();
+
+async function acquireDownloadSlot() {
+  if (!PDF_DOWNLOAD_RATE_PER_MIN) return; // 0 = unlimited
+  let release;
+  const prev = _downloadRateTail;
+  _downloadRateTail = new Promise((resolve) => { release = resolve; });
+  await prev;
+  const windowMs = 60_000;
+  const now = Date.now();
+  while (_downloadTimestamps.length && _downloadTimestamps[0] < now - windowMs) {
+    _downloadTimestamps.shift();
+  }
+  if (_downloadTimestamps.length >= PDF_DOWNLOAD_RATE_PER_MIN) {
+    const waitMs = _downloadTimestamps[0] + windowMs - Date.now();
+    if (waitMs > 0) {
+      logger.info(`PDF rate limit: waiting ${Math.round(waitMs / 1000)}s`, { downloadsInWindow: _downloadTimestamps.length });
+      await new Promise((r) => setTimeout(r, waitMs));
+      while (_downloadTimestamps.length && _downloadTimestamps[0] < Date.now() - windowMs) {
+        _downloadTimestamps.shift();
+      }
+    }
+  }
+  _downloadTimestamps.push(Date.now());
+  release();
+}
 
 let hasPdftotext;
 
@@ -338,6 +368,7 @@ async function resolveDownloadUrl(candidateUrl) {
     }
 
     const finalUrl = res.url || candidateUrl;
+    if (/download_blacklist/i.test(finalUrl)) return null;
     const contentType = res.headers.get('content-type') || '';
     if (contentType.includes('pdf') || /\.pdf($|\?)/i.test(finalUrl)) {
       const bytes = Buffer.from(await res.arrayBuffer());
@@ -537,6 +568,7 @@ export async function analyzeDocumentFile(doc, options) {
     return;
   }
 
+  await acquireDownloadSlot();
   logger.info('Downloading PDF', { docId: doc.id, candidates: doc.downloadCandidates.length });
 
   for (const candidate of doc.downloadCandidates) {
