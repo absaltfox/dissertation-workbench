@@ -140,6 +140,125 @@ const ROLE_PATTERNS = [
 ];
 const SUPERVISOR_ROLES = new Set(['Supervisor', 'Co-Supervisor']);
 
+// --- Acknowledgements-based committee parsing (fallback for pre-2018 docs) ---
+
+/**
+ * Extract a clean person name from a raw regex capture group such as
+ * "((?:[A-Z]\\S*\\s*){1,4})". Keeps only capital-starting tokens, stops on
+ * first lowercase-starting word, strips trailing punctuation from each token.
+ */
+function extractNameFromCapture(raw) {
+  const parts = [];
+  for (const word of raw.trim().split(/\s+/)) {
+    // Strip trailing punctuation but keep periods for middle initials (e.g. "J.")
+    const stripped = word.replace(/[,;:()\[\]!?]+$/, '');
+    if (!stripped) break;
+    // Must start with an uppercase letter (including accented uppercase)
+    if (!/^[A-Z\u00C0-\u024F]/.test(stripped)) break;
+    // Reject common pronouns/articles that appear after a sentence boundary
+    if (/^(He|She|They|We|I|It|His|Her|Their|This|That|The|A|An)$/.test(stripped)) break;
+    // Sentence-ending period (word length > 2 means NOT a middle initial like "J.")
+    const endsWithSentencePeriod = /\.$/.test(stripped) && stripped.length > 2;
+    // Push with period stripped from non-initial words
+    parts.push(endsWithSentencePeriod ? stripped.slice(0, -1) : stripped);
+    if (parts.length >= 4) break;
+    // Stop after a sentence-ending period or name-boundary punctuation
+    if (endsWithSentencePeriod) break;
+    if (/[,;]$/.test(word)) break;
+  }
+  const name = parts.join(' ').trim();
+  return name.length >= 3 ? name : '';
+}
+
+// Matches the last occurrence of an ACKNOWLEDGEMENTS section heading.
+// pdftotext prepends \f (form feed) at each page boundary.
+const ACK_HEADING_RE = /(?:^|\n|\f)(ACKNOWLEDGEMENTS?|Acknowledgements?)\s*\n/g;
+// Capture group: 1–4 tokens each starting with uppercase, including \S* tail and optional trailing space
+const DR_CAP = '((?:[A-Z\\u00C0-\\u024F]\\S*\\s*){1,4})';
+
+export function parseAcknowledgements(fullText) {
+  if (!fullText) return [];
+
+  // Normalize form feeds so they appear as newlines to the heading regex
+  const text = fullText.replace(/\f/g, '\n');
+
+  // Use the LAST occurrence of the heading (first occurrence is usually the Table of Contents)
+  let lastMatch = null;
+  let m;
+  ACK_HEADING_RE.lastIndex = 0;
+  while ((m = ACK_HEADING_RE.exec(text)) !== null) lastMatch = m;
+  if (!lastMatch) return [];
+
+  const section = text.slice(lastMatch.index + lastMatch[0].length, lastMatch.index + lastMatch[0].length + 3000);
+
+  const members = [];
+  const seen = new Set();
+
+  function addMember(rawName, role) {
+    const name = extractNameFromCapture(rawName);
+    if (!name || name.length > 60) return;
+    // Reject pronouns/articles that slip through
+    if (/^(The|A|An|My|His|Her|In|For|At|To|With|This|Their|I|We|You|It|She|He|Also)$/i.test(name)) return;
+    const key = `${name}|${role}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    members.push({ name, role, affiliation: null });
+  }
+
+  // --- Supervisor patterns ---
+
+  // "my supervisor Dr. X" / "research supervisor Dr. X" / "my co-supervisor Dr. X"
+  // Allow optional comma between "supervisor" and "Dr." (e.g. "my supervisor, Dr. X")
+  for (const pm of section.matchAll(new RegExp(
+    `(?:my|research)\\s+(co-?)?supervisor,?\\s+Dr\\.\\s+${DR_CAP}`, 'gi'
+  ))) {
+    addMember(pm[2], pm[1] ? 'Co-Supervisor' : 'Supervisor');
+  }
+
+  // "Committee Chair Dr. X"
+  for (const pm of section.matchAll(new RegExp(`Committee\\s+Chair\\s+Dr\\.\\s+${DR_CAP}`, 'gi'))) {
+    addMember(pm[1], 'Supervisor');
+  }
+
+  // "Dr. X (Supervisor)" or "Dr. X (Co-Supervisor)"
+  for (const pm of section.matchAll(new RegExp(`Dr\\.\\s+${DR_CAP}\\s*\\(\\s*(Co-?)?Supervisor\\s*\\)`, 'gi'))) {
+    addMember(pm[1], pm[2] ? 'Co-Supervisor' : 'Supervisor');
+  }
+
+  // "Dr. X, my supervisor" / "Dr. X, my committee chair" / "Dr. X, as my committee chair"
+  for (const pm of section.matchAll(new RegExp(`Dr\\.\\s+${DR_CAP},\\s*(?:as\\s+)?(?:my\\s+)?(?:supervisor|committee\\s+chair)\\b`, 'gi'))) {
+    addMember(pm[1], 'Supervisor');
+  }
+
+  // "Dr. X, as co-advisor" / "Dr. X, as my co-advisor"
+  for (const pm of section.matchAll(new RegExp(`Dr\\.\\s+${DR_CAP},\\s*as\\s+(?:my\\s+)?co-?advisor\\b`, 'gi'))) {
+    addMember(pm[1], 'Co-Supervisor');
+  }
+
+  // "co-advisor Dr. X" / "co-advisor, Dr. X"
+  for (const pm of section.matchAll(new RegExp(`co-?advisor,?\\s+Dr\\.\\s+${DR_CAP}`, 'gi'))) {
+    addMember(pm[1], 'Co-Supervisor');
+  }
+
+  // "Dr. X ... as my supervisor" (name comes before the role keyword, within 150 chars)
+  for (const pm of section.matchAll(new RegExp(`Dr\\.\\s+${DR_CAP}[^.]{0,150}as\\s+(?:my\\s+)?(?:(co-?))?supervisor`, 'gi'))) {
+    addMember(pm[1], pm[2] ? 'Co-Supervisor' : 'Supervisor');
+  }
+
+  // --- Committee member patterns ---
+  // Sentences containing "committee members" — extract remaining Dr. names not already supervisors
+  for (const cm of section.matchAll(/committee\s+members?[^.!?\n]{0,400}/gi)) {
+    for (const dm of cm[0].matchAll(new RegExp(`Dr\\.\\s+${DR_CAP}`, 'g'))) {
+      const name = extractNameFromCapture(dm[1]);
+      if (name && !seen.has(`${name}|Supervisor`) && !seen.has(`${name}|Co-Supervisor`)) {
+        addMember(dm[1], 'Supervisory Committee Member');
+      }
+    }
+  }
+
+  return members;
+}
+
 export function parseCommittee(fullText) {
   if (!fullText) return [];
 
@@ -412,10 +531,12 @@ export function extractAndSaveParsedData(doc, fullText) {
   if (!fullText) return;
   try {
     const committee = parseCommittee(fullText);
+    // Fall back to acknowledgements-based parsing when the certify-page parser finds nothing
+    const effectiveCommittee = committee.length > 0 ? committee : parseAcknowledgements(fullText);
 
     if (hasApiSupervisors(doc)) {
       const apiSupervisors = dedupeSupervisorNames(doc.supervisors || []);
-      const nonSupervisorCommittee = committee.filter((member) => !SUPERVISOR_ROLES.has(member.role));
+      const nonSupervisorCommittee = effectiveCommittee.filter((member) => !SUPERVISOR_ROLES.has(member.role));
       if (nonSupervisorCommittee.length) {
         saveCommitteeMembers(doc.id, nonSupervisorCommittee, 'pdf');
       }
@@ -428,13 +549,13 @@ export function extractAndSaveParsedData(doc, fullText) {
       doc.supervisors = apiSupervisors;
       doc.supervisorsSource = 'api';
     } else {
-      if (committee.length) {
-        saveCommitteeMembers(doc.id, committee, 'pdf');
+      if (effectiveCommittee.length) {
+        saveCommitteeMembers(doc.id, effectiveCommittee, 'pdf');
       }
-      const parsedSupervisors = supervisorsFromCommittee(committee);
+      const parsedSupervisors = supervisorsFromCommittee(effectiveCommittee);
       if (parsedSupervisors.length) {
         doc.supervisors = parsedSupervisors;
-        doc.supervisorsSource = 'pdf_fallback';
+        doc.supervisorsSource = committee.length > 0 ? 'pdf_fallback' : 'pdf_acknowledgements';
       }
     }
     doc.committee = loadCommitteeMembers(doc.id);

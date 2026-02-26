@@ -452,22 +452,23 @@ function renderDetails() {
     : '<p class="meta">No related documents identified from overlapping themes.</p>';
 
   // Committee members for metadata grid
-  let committeeHtml = '';
-  const hasSupervisorsShown = doc.supervisors?.length > 0;
+  // Supervisor roles are always shown via the clickable supervisor buttons, never in the committee section
   const supervisorRoles = new Set(['Supervisor', 'Co-Supervisor']);
+  let committeeHtml = '';
   if (doc.committee?.length) {
     const grouped = {};
     for (const m of doc.committee) {
       const role = m.role || 'Committee Member';
-      if (hasSupervisorsShown && supervisorRoles.has(role)) continue;
+      if (supervisorRoles.has(role)) continue;
       if (!grouped[role]) grouped[role] = [];
       grouped[role].push(m);
     }
-    committeeHtml = Object.entries(grouped).map(([role, members]) =>
-      members.map((m) =>
-        `<div class="detail-meta-label">${escapeHtml(role)}</div><div class="detail-meta-value">${escapeHtml(m.name)}${m.affiliation ? ` (${escapeHtml(m.affiliation)})` : ''}</div>`
-      ).join('')
-    ).join('');
+    committeeHtml = Object.entries(grouped).map(([role, members]) => {
+      const names = members.map((m) =>
+        `${escapeHtml(m.name)}${m.affiliation ? ` (${escapeHtml(m.affiliation)})` : ''}`
+      ).join(', ');
+      return `<div class="detail-meta-label">${escapeHtml(role)}</div><div class="detail-meta-value">${names}</div>`;
+    }).join('');
   }
 
   // Subtitle line: author, year, degree
