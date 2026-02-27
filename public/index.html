@@ -38,12 +38,24 @@
 
       <div id="facetFilterBar" class="facet-filter-bar reveal" hidden>
         <div class="facet-filter-controls">
-          <select id="filterDegree"      class="facet-select"><option value="">All Degrees</option></select>
-          <select id="filterProgram"     class="facet-select"><option value="">All Programs</option></select>
-          <select id="filterAffiliation" class="facet-select"><option value="">All Affiliations</option></select>
-          <button id="clearFacets" class="btn ghost btn-sm">&times; Clear filters</button>
+          <div class="facet-group">
+            <label class="facet-label" for="filterDegree">Degree</label>
+            <select id="filterDegree" class="facet-select"><option value="">All</option></select>
+          </div>
+          <div class="facet-group">
+            <label class="facet-label" for="filterProgram">Program</label>
+            <select id="filterProgram" class="facet-select"><option value="">All</option></select>
+          </div>
+          <div class="facet-group">
+            <label class="facet-label" for="filterAffiliation">Affiliation</label>
+            <select id="filterAffiliation" class="facet-select"><option value="">All</option></select>
+          </div>
+          <div class="facet-filter-right">
+            <span id="facetCount" class="facet-count"></span>
+            <button id="clearFacets" class="btn ghost btn-sm">&times; Clear</button>
+          </div>
         </div>
-        <span id="facetCount" class="facet-count"></span>
+        <div id="facetChips" class="facet-chips"></div>
       </div>
 
       <!-- Document Explorer -->

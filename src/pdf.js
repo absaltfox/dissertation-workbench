@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import { PDF_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, PDF_DOWNLOAD_RATE_PER_MIN } from './config.js';
 import {
   loadStoredFileMetric, saveFileMetric, saveDocumentMetadata, saveCommitteeMembers,
-  loadCommitteeMembers, saveCitations, loadDocumentCitations, deleteCommitteeMembersByRoles
+  loadCommitteeMembers, saveCitations, clearDocumentCitations, loadDocumentCitations, deleteCommitteeMembersByRoles
 } from './db.js';
 import { logger } from './logger.js';
 import { dedupeSupervisorNames } from './supervisors.js';
@@ -327,7 +327,27 @@ export function parseCommittee(fullText) {
   return members;
 }
 
-const BIBLIOGRAPHY_HEADING = /^(references|bibliography|works\s+cited)$/im;
+// Collapse OCR character-spacing artifacts in bibliography entries.
+// Older typewritten/scanned dissertations often have letters separated by spaces:
+//   "A p p l i c a t i o n" → "Application",  "U n i v e r s i t y" → "University"
+// Matches runs of 2+ single letters each separated by exactly one space.
+// Word boundaries prevent matching across normal word breaks or dotted initials.
+function collapseOcrSpacing(text) {
+  // Collapse character-spacing runs: "A p p l i c a t i o n" → "Application"
+  let result = text.replace(/\b([a-zA-Z])(?: ([a-zA-Z]))+\b/g, (m) => m.replace(/ /g, ''));
+  // Remove spaces before punctuation left by OCR: "Alkin ," → "Alkin,", "word ." → "word."
+  result = result.replace(/ ([,.:;!?])/g, '$1');
+  return result;
+}
+
+// Match bibliography/references section headings.
+// The simple form ("REFERENCES", "BIBLIOGRAPHY") is anchored to the full line.
+// The extended form allows a short suffix (≤ 60 chars) to handle headings like
+// "BIBLIOGRAPHY OF SOURCES CITED IN TEXT" or "BIBLIOGRAPHY OF PRIMARY SOURCES".
+// The 60-char cap prevents matching mid-sentence OCR wrap fragments such as
+// "references to such programs as 'Dr. Curry's Method of Teaching Reading' and".
+const BIBLIOGRAPHY_HEADING =
+  /^(?:(?:selected|complete|general|annotated|primary)\s+)?(?:references?|bibliography|bibliographie|r[eé]f[eé]rences?|works\s+cited|literature\s+cited|sources\s+consulted)\b.{0,60}\s*$|^(?:list\s+of\s+references?|reference\s+list|ouvrages?\s+(?:de\s+)?r[eé]f[eé]rence)\s*$/im;
 const APPENDIX_HEADING = /^(appendix|appendices|glossary|index|vita|curriculum\s+vitae|about\s+the\s+author)\b/im;
 
 function isLikelyCitationStart(line) {
@@ -368,8 +388,13 @@ function isLikelyCitationStart(line) {
 export function parseBibliography(fullText) {
   if (!fullText) return [];
 
-  // Normalize form feeds to newlines so page-break headings are matchable
-  const text = fullText.replace(/\f/g, '\n');
+  // Normalize form feeds to newlines and collapse OCR character-spacing so
+  // headings like "L I T E R A T U R E  C I T E D" become matchable.
+  // Then strip OCR page-number prefixes fused to heading words at line starts,
+  // e.g. "-97BIBLIOGRAPHY" → "BIBLIOGRAPHY" (a common pdftotext artifact in
+  // older scanned dissertations where the margin page marker is on the same line).
+  const text = collapseOcrSpacing(fullText.replace(/\f/g, '\n'))
+    .replace(/^-?\d+([A-Z\u00C0-\u024F])/gm, '$1');
 
   // Find the LAST occurrence of the heading (skip table-of-contents references)
   let lastMatch = null;
@@ -427,7 +452,9 @@ export function parseBibliography(fullText) {
 
   // Filter out non-citation content
   const citations = [];
-  for (const entry of entries) {
+  for (const rawEntry of entries) {
+    // Strip leading footnote/endnote number: "146 Caplan, ..." or "31. Author ..." → "Author ..."
+    const entry = collapseOcrSpacing(rawEntry).replace(/^\d{1,4}[.\s]\s*(?=[A-Z\u00C0-\u024F])/, '');
     if (entry.length < 20) continue;
     if (entry.length > 2000) continue;
     if (/^\d+\s*$/.test(entry)) continue;                          // bare page numbers
@@ -436,6 +463,8 @@ export function parseBibliography(fullText) {
     if (/^(list of|table of|figure\s|table\s)/i.test(entry)) continue;
     if (/^(abstract|acknowledge?ment|dedication|a\s+thesis|the\s+university|in\s+this)/i.test(entry)) continue;
     if (/^(submitted|faculty|doctor|copyright|©)/i.test(entry)) continue;
+    // Survey/questionnaire items from appendices: "4. How many years have you..."
+    if (/^\d+\.\s+(?:How|Do|Did|Does|Have|Has|Would|Should|Could|Can|What|When|Where|Who|Which|Is|Are|Were|Was|Please|Describe|Indicate|Rate|Check|List|Select|Choose|Rank|Mark|Circle)\b/i.test(entry)) continue;
     if (/^[A-Z][A-Za-z\s]+,\s+[A-Z]{2}\s*:/.test(entry)) continue; // "Toronto, ON: ..."
     if (/^[A-Z][A-Za-z]+\.\s+/.test(entry) && !/\s/.test(entry.match(/^([^.]+)\./)?.[1]?.trim() || '')) continue; // single-word prefix fragments ("Canada. ...", "America. ...")
     if (entry.length < 60 && !/\b(1[89]\d{2}|20[0-2]\d)\b/.test(entry) && /:/.test(entry)) continue; // short fragments with colon but no year
@@ -450,7 +479,43 @@ export function parseBibliography(fullText) {
 }
 
 export function normalizeCitation(text) {
-  const normalized = text.toLowerCase().replace(/\s+/g, ' ').replace(/\.\s*$/, '').trim();
+  const normalized = text
+    .toLowerCase()
+    // Remove all periods — normalises initials (J.A. → JA), trailing dots, and
+    // common abbreviations ("Mass." → "Mass", "Ed." → "Ed").
+    .replace(/\./g, '')
+    // Strip the standalone article "the" so that "The University of Chicago Press"
+    // and "University of Chicago Press" hash identically.  The word appears
+    // symmetrically in titles too ("The Human Condition" → "Human Condition"),
+    // so removing it does not create false positives across different works.
+    .replace(/\bthe\b\s*/g, '')
+    // Normalise common US/Canadian place-of-publication abbreviations so that
+    // "Cambridge, Mass" and "Cambridge, MA" produce the same hash.
+    .replace(/\bmass(achusetts)?\b/g, 'ma')
+    .replace(/\bconn(ecticut)?\b/g, 'ct')
+    .replace(/\bcalif(ornia)?\b/g, 'ca')
+    .replace(/\bnew york\b/g, 'ny')
+    .replace(/\bn y\b/g, 'ny')
+    .replace(/\bnew jersey\b/g, 'nj')
+    .replace(/\bn j\b/g, 'nj')
+    .replace(/\bont(ario)?\b/g, 'on')
+    .replace(/\bbc\b|\bbritish columbia\b/g, 'bc')
+    // Collapse spaces between adjacent single letters: "J A Smith" → "JA Smith".
+    // Run twice to handle up to 4 consecutive initials.
+    .replace(/\b([a-z]) ([a-z])\b/g, '$1$2')
+    .replace(/\b([a-z]) ([a-z])\b/g, '$1$2')
+    // Normalise author-list semicolons to commas: "Ball, SJ; Gold, A" → "Ball, SJ, Gold, A".
+    .replace(/;\s*/g, ', ')
+    // Remove stray commas immediately before an opening parenthesis: ", (1993)" → " (1993)".
+    .replace(/,\s*\(/g, ' (')
+    // Remove spaces before opening parentheses: "103 (6)" → "103(6)".
+    .replace(/\s+\(/g, '(')
+    // Normalise spacing around remaining punctuation: "MA:Harvard" → "MA: Harvard".
+    .replace(/\s*([,:]) \s*/g, '$1 ')
+    // Collapse all remaining whitespace and strip trailing punctuation.
+    .replace(/\s+/g, ' ')
+    .replace(/[,;:\s]+$/, '')
+    .trim();
   return crypto.createHash('sha1').update(normalized).digest('hex');
 }
 
@@ -573,6 +638,7 @@ export function extractAndSaveParsedData(doc, fullText) {
     }
 
     const citations = parseBibliography(fullText);
+    clearDocumentCitations(doc.id);
     if (citations.length) {
       saveCitations(doc.id, citations, normalizeCitation);
     }

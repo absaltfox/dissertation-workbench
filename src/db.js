@@ -421,6 +421,14 @@ export function loadDocsByCitation(citationId) {
   `).all(citationId);
 }
 
+export function clearDocumentCitations(docId) {
+  getDb().prepare('DELETE FROM document_citations WHERE doc_id = ?').run(docId);
+  // Remove orphaned citation rows (citations no longer linked to any document).
+  // catalogue_lookups has a FK to citations.id so must be cleaned first.
+  getDb().exec('DELETE FROM catalogue_lookups WHERE citation_id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
+  getDb().exec('DELETE FROM citations WHERE id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
+}
+
 export function clearAllCitations() {
   getDb().exec('DELETE FROM catalogue_lookups');
   getDb().exec('DELETE FROM document_citations');

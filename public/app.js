@@ -75,6 +75,7 @@ const filterProgramEl     = document.getElementById('filterProgram');
 const filterAffiliationEl = document.getElementById('filterAffiliation');
 const clearFacetsBtn      = document.getElementById('clearFacets');
 const facetCountEl        = document.getElementById('facetCount');
+const facetChipsEl        = document.getElementById('facetChips');
 
 // --- State ---
 const state = {
@@ -93,6 +94,20 @@ const state = {
   selectedCitationIds: new Set(),
   activeFilters: { degree: '', program: '', affiliation: '' },
 };
+
+let _analyticsCache = null;
+let _analyticsCacheKey = '';
+
+// Mirrors COOCCURRENCE_BLOCKLIST in src/metrics.js — keep in sync.
+const COOCCURRENCE_BLOCKLIST = new Set([
+  'significant differences', 'statistically significant', 'significant difference',
+  'control group', 'treatment groups', 'experimental groups', 'randomly assigned',
+  'dependent variables', 'independent variables', 'dependent variable', 'independent variable',
+  'regression analysis', 'regression analyses', 'multiple regression',
+  'analysis variance', 'multivariate analysis', 'repeated measures',
+  'three groups', 'two groups', 'experimental design',
+  'data analysis', 'attitudes toward',
+]);
 
 // --- Utilities ---
 
@@ -383,22 +398,6 @@ function renderDocuments() {
     })
     .join('');
 
-  for (const row of documentsTableEl.querySelectorAll('.doc-row')) {
-    row.addEventListener('click', (e) => {
-      if (e.target.closest('.doc-row-check')) return;
-      openRecord(row.dataset.docId, 'records');
-    });
-  }
-
-  for (const cb of documentsTableEl.querySelectorAll('.doc-row-check')) {
-    cb.addEventListener('change', () => {
-      const id = cb.dataset.checkId;
-      if (cb.checked) state.selectedDocIds.add(id);
-      else state.selectedDocIds.delete(id);
-      syncSelectAllDocs();
-    });
-  }
-
   syncSelectAllDocs();
   updateSortHeaders();
 }
@@ -595,9 +594,11 @@ function renderKpis() {
     return;
   }
 
-  // Compute citation stats from documents with parsed citations
+  // Compute citation stats from documents with reliably parsed citations.
+  // Counts below 20 on a full-text PDF almost always indicate the bibliography
+  // section wasn't detected (stray references only) — exclude them from stats.
   const docs = getFilteredDocs();
-  const citeCounts = docs.map((d) => d.citationCount || 0).filter((c) => c > 0);
+  const citeCounts = docs.map((d) => d.citationCount || 0).filter((c) => c >= 20);
   const citeMin = citeCounts.length ? Math.min(...citeCounts) : null;
   const citeMax = citeCounts.length ? Math.max(...citeCounts) : null;
   const citeMean = citeCounts.length
@@ -969,11 +970,12 @@ function renderCooccurrence() {
     .map((entry) => {
       const widthPct = (entry.count / maxCount) * 100;
       const label = `${entry.termA} + ${entry.termB}`;
+      const liftStr = entry.lift != null ? ` · lift ${entry.lift}` : '';
       return `
         <div class="bar-row">
           <span class="bar-label" title="${escapeHtml(label)}">${escapeHtml(label)}</span>
           <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
-          <button class="bar-value" data-co-term-a="${escapeHtml(entry.termA)}" data-co-term-b="${escapeHtml(entry.termB)}">${formatNum(entry.count)}</button>
+          <button class="bar-value" title="${entry.count} dissertations${escapeHtml(liftStr)}" data-co-term-a="${escapeHtml(entry.termA)}" data-co-term-b="${escapeHtml(entry.termB)}">${formatNum(entry.count)}</button>
         </div>
       `;
     })
@@ -1650,8 +1652,27 @@ function updateFacetCount() {
   const filtered = getFilteredDocs().length;
   const { degree, program, affiliation } = state.activeFilters;
   const active = !!(degree || program || affiliation);
-  facetCountEl.textContent = active ? `Showing ${filtered} of ${total} dissertations` : '';
+
+  facetCountEl.textContent = active ? `${formatNum(filtered)} of ${formatNum(total)}` : '';
   clearFacetsBtn.style.display = active ? '' : 'none';
+
+  // Active highlight on selects
+  filterDegreeEl.classList.toggle('is-active', !!degree);
+  filterProgramEl.classList.toggle('is-active', !!program);
+  filterAffiliationEl.classList.toggle('is-active', !!affiliation);
+
+  // Active filter chips
+  const chips = [
+    { key: 'degree',      dim: 'Degree',      value: degree },
+    { key: 'program',     dim: 'Program',     value: program },
+    { key: 'affiliation', dim: 'Affiliation', value: affiliation },
+  ].filter(c => c.value);
+  facetChipsEl.innerHTML = chips.map(c =>
+    `<span class="facet-chip">` +
+      `<span class="facet-chip-dim">${escapeHtml(c.dim)}</span> ${escapeHtml(c.value)}` +
+      `<button class="facet-chip-remove" data-chip-key="${c.key}" aria-label="Remove ${escapeHtml(c.dim)} filter">&times;</button>` +
+    `</span>`
+  ).join('');
 }
 
 function populateFacetFilters() {
@@ -1665,9 +1686,9 @@ function populateFacetFilters() {
       values.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join('');
     el.value = '';
   };
-  populate(filterDegreeEl,      degrees,      'All Degrees');
-  populate(filterProgramEl,     programs,     'All Programs');
-  populate(filterAffiliationEl, affiliations, 'All Affiliations');
+  populate(filterDegreeEl,      degrees,      'All');
+  populate(filterProgramEl,     programs,     'All');
+  populate(filterAffiliationEl, affiliations, 'All');
 
   state.activeFilters = { degree: '', program: '', affiliation: '' };
   facetFilterBarEl.hidden = false;
@@ -1696,6 +1717,7 @@ function buildAnalytics(docs) {
   const ngramMap        = new Map();
   const methMap         = new Map();
   const pairMap         = new Map();
+  const termCountMap    = new Map();
   const conceptDocMap   = new Map();
   const supCountMap     = new Map();
   const supConceptMap   = new Map();
@@ -1732,12 +1754,14 @@ function buildAnalytics(docs) {
 
     for (const m of meths) methMap.set(m, (methMap.get(m) || 0) + 1);
 
-    const uniqTerms = [...new Set(conceptTerms)];
-    for (let i = 0; i < uniqTerms.length; i++) {
-      for (let j = i + 1; j < uniqTerms.length; j++) {
-        const key = uniqTerms[i] < uniqTerms[j]
-          ? `${uniqTerms[i]}\0${uniqTerms[j]}`
-          : `${uniqTerms[j]}\0${uniqTerms[i]}`;
+    // Budget to top-10 (matches server-side docConceptTerms budget), apply blocklist
+    const uniqTerms = [...new Set(conceptTerms)].slice(0, 10)
+      .filter((t) => !COOCCURRENCE_BLOCKLIST.has(t));
+    for (const t of uniqTerms) termCountMap.set(t, (termCountMap.get(t) || 0) + 1);
+    const sortedTerms = [...uniqTerms].sort();
+    for (let i = 0; i < sortedTerms.length; i++) {
+      for (let j = i + 1; j < sortedTerms.length; j++) {
+        const key = `${sortedTerms[i]}\0${sortedTerms[j]}`;
         pairMap.set(key, (pairMap.get(key) || 0) + 1);
       }
     }
@@ -1798,9 +1822,24 @@ function buildAnalytics(docs) {
     .map(([methodology, count]) => ({ methodology, count }))
     .sort((a, b) => b.count - a.count);
 
+  const N = docs.length;
   const termCooccurrence = Array.from(pairMap.entries())
-    .map(([key, count]) => { const [termA, termB] = key.split('\0'); return { termA, termB, count }; })
-    .sort((a, b) => b.count - a.count)
+    .filter(([, count]) => count >= 3)
+    .map(([key, count]) => {
+      const [termA, termB] = key.split('\0');
+      const freqA = termCountMap.get(termA) || 1;
+      const freqB = termCountMap.get(termB) || 1;
+      // Fragment filter: one term's docs almost entirely overlap the other's
+      if (count / Math.min(freqA, freqB) >= 0.7) return null;
+      // Shared-token filter: near-synonyms sharing a meaningful word
+      const tokensA = new Set(termA.split(' ').filter((t) => t.length >= 4));
+      const tokensB = termB.split(' ').filter((t) => t.length >= 4);
+      if (tokensB.some((t) => tokensA.has(t))) return null;
+      const lift = (count * N) / (freqA * freqB);
+      return { termA, termB, count, lift: Math.round(lift * 10) / 10 };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.lift - a.lift || b.count - a.count)
     .slice(0, 20);
 
   const topSups = Array.from(supCountMap.entries()).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([s]) => s);
@@ -1849,7 +1888,11 @@ function getAnalytics() {
   if (!state.payload) return null;
   const { degree, program, affiliation } = state.activeFilters;
   if (!degree && !program && !affiliation) return state.payload;
-  return buildAnalytics(getFilteredDocs());
+  const key = `${degree}\0${program}\0${affiliation}`;
+  if (_analyticsCache && _analyticsCacheKey === key) return _analyticsCache;
+  _analyticsCache = buildAnalytics(getFilteredDocs());
+  _analyticsCacheKey = key;
+  return _analyticsCache;
 }
 
 function renderAll() {
@@ -1894,6 +1937,8 @@ async function loadData({ refresh = false } = {}) {
     }
 
     state.payload = await res.json();
+    _analyticsCache = null;
+    _analyticsCacheKey = '';
     state.selectedDocId = state.payload.documents?.[0]?.id || null;
     state.selectedTheme = null;
     state.sortKey = null;
@@ -2477,6 +2522,32 @@ filterAffiliationEl.addEventListener('change', onFacetChange);
 clearFacetsBtn.addEventListener('click', () => {
   filterDegreeEl.value = filterProgramEl.value = filterAffiliationEl.value = '';
   onFacetChange();
+});
+facetChipsEl.addEventListener('click', (e) => {
+  const btn = e.target.closest('.facet-chip-remove');
+  if (!btn) return;
+  const key = btn.dataset.chipKey;
+  if (key === 'degree')      filterDegreeEl.value = '';
+  if (key === 'program')     filterProgramEl.value = '';
+  if (key === 'affiliation') filterAffiliationEl.value = '';
+  onFacetChange();
+});
+
+// Delegated row click — navigate to document
+documentsTableEl.addEventListener('click', (e) => {
+  if (e.target.closest('.doc-row-check')) return;
+  const row = e.target.closest('.doc-row');
+  if (row) openRecord(row.dataset.docId, 'records');
+});
+
+// Delegated checkbox change — update selection state
+documentsTableEl.addEventListener('change', (e) => {
+  const cb = e.target.closest('.doc-row-check');
+  if (!cb) return;
+  const id = cb.dataset.checkId;
+  if (cb.checked) state.selectedDocIds.add(id);
+  else state.selectedDocIds.delete(id);
+  syncSelectAllDocs();
 });
 
 // Staggered reveal animation

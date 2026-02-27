@@ -1,6 +1,3 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { DATA_DIR } from './config.js';
 
 function stripDiacritics(value) {
   return value.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
@@ -115,43 +112,7 @@ for (const row of phraseRows) {
   byFirstToken.get(first).push(row);
 }
 
-const dynamicByFirstToken = new Map();
-const DYNAMIC_PATH = path.join(DATA_DIR, 'concepts', 'latest.json');
-let dynamicLoadedAt = 0;
-const DYNAMIC_RELOAD_MS = 60_000;
-
-function loadDynamicDictionaryIfNeeded() {
-  const now = Date.now();
-  if (now - dynamicLoadedAt < DYNAMIC_RELOAD_MS) return;
-  dynamicLoadedAt = now;
-
-  dynamicByFirstToken.clear();
-  try {
-    const raw = fs.readFileSync(DYNAMIC_PATH, 'utf-8');
-    const parsed = JSON.parse(raw);
-    const map = parsed?.variantToCanonical || {};
-    for (const [variantRaw, canonicalRaw] of Object.entries(map)) {
-      const normalizedVariant = normalizeText(variantRaw);
-      const normalizedCanonical = normalizeText(canonicalRaw);
-      if (!normalizedVariant || !normalizedCanonical) continue;
-      const row = {
-        variantTokens: normalizedVariant.split(' '),
-        canonicalTokens: normalizedCanonical.split(' ')
-      };
-      const first = row.variantTokens[0];
-      if (!dynamicByFirstToken.has(first)) dynamicByFirstToken.set(first, []);
-      dynamicByFirstToken.get(first).push(row);
-    }
-    for (const rows of dynamicByFirstToken.values()) {
-      rows.sort((a, b) => b.variantTokens.length - a.variantTokens.length);
-    }
-  } catch {
-    // Missing or invalid dynamic dictionary: keep static-only behavior.
-  }
-}
-
 export function canonicalizeDomainText(text) {
-  loadDynamicDictionaryIfNeeded();
   const normalized = normalizeText(text);
   if (!normalized) return '';
   const words = normalized.split(' ').filter(Boolean);
@@ -160,7 +121,6 @@ export function canonicalizeDomainText(text) {
   const out = [];
   for (let i = 0; i < words.length;) {
     const candidates = [
-      ...(dynamicByFirstToken.get(words[i]) || []),
       ...(byFirstToken.get(words[i]) || []),
     ];
     let matched = null;

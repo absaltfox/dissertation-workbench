@@ -2,7 +2,7 @@ import path from 'node:path';
 
 export const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 export const DEFAULT_BASE_URL = process.env.UBC_API_BASE_URL || 'https://oc-index.library.ubc.ca';
-export const DEFAULT_INDEX = process.env.UBC_INDEX || '24';
+export const DEFAULT_INDEX = process.env.UBC_INDEX || '';
 export const DEFAULT_API_KEY = process.env.UBC_API_KEY || '';
 export const DEFAULT_QUERY = process.env.UBC_QUERY || '';
 export const DEFAULT_TERM = process.env.UBC_TERM || 'degree.raw,Doctor of Education - EdD';

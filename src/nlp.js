@@ -81,7 +81,8 @@ export function topTermsFromText(text, limit = 10) {
 export function buildWordCloud(records, maxTerms = 70) {
   const counts = new Map();
   for (const rec of records) {
-    const text = [rec.title, rec.abstract, rec.subjects.join(' '), rec.program, rec.degree].join(' ');
+    const subjects = rec.subjects.filter((s) => s !== '(Unspecified)');
+    const text = [rec.title, rec.abstract, subjects.join(' '), rec.program, rec.degree].join(' ');
     for (const token of tokenize(text)) {
       counts.set(token, (counts.get(token) || 0) + 1);
     }

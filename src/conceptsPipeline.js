@@ -69,6 +69,13 @@ function extractDocPhrases(doc, maxPerDoc = 140) {
   return phrases;
 }
 
+// Strip common English plural suffixes for comparison only — keeps canonical as-is
+function stemForSim(token) {
+  if (token.length > 5 && token.endsWith('ies')) return token.slice(0, -3) + 'y';
+  if (token.length > 4 && token.endsWith('s') && !token.endsWith('ss')) return token.slice(0, -1);
+  return token;
+}
+
 function jaccard(a, b) {
   const setA = new Set(a);
   const setB = new Set(b);
@@ -80,9 +87,29 @@ function jaccard(a, b) {
 
 function phraseSimilarity(aTokens, bTokens) {
   if (!aTokens.length || !bTokens.length) return 0;
-  const jac = jaccard(aTokens, bTokens);
-  const prefix = aTokens.join(' ').startsWith(bTokens.join(' ')) || bTokens.join(' ').startsWith(aTokens.join(' '));
-  return jac + (prefix ? 0.2 : 0);
+  const aStemmed = aTokens.map(stemForSim);
+  const bStemmed = bTokens.map(stemForSim);
+  const jac = jaccard(aStemmed, bStemmed);
+  const prefix = aStemmed.join(' ').startsWith(bStemmed.join(' ')) || bStemmed.join(' ').startsWith(aStemmed.join(' '));
+  let bonus = prefix ? 0.2 : 0;
+
+  // Same-length phrases with identical modifiers and morphologically related heads
+  // e.g. "educational leaders" / "educational leadership" — "leadership".startsWith("leader") ✓
+  // but NOT "educational practices" / "educational practitioners" — neither starts the other ✓
+  if (aTokens.length === bTokens.length && aTokens.length >= 2) {
+    const aHead = aStemmed[aStemmed.length - 1];
+    const bHead = bStemmed[bStemmed.length - 1];
+    if (
+      aHead !== bHead &&
+      Math.min(aHead.length, bHead.length) >= 5 &&
+      (aHead.startsWith(bHead) || bHead.startsWith(aHead)) &&
+      aStemmed.slice(0, -1).join(' ') === bStemmed.slice(0, -1).join(' ')
+    ) {
+      bonus = Math.max(bonus, 0.7);
+    }
+  }
+
+  return jac + bonus;
 }
 
 function pickCanonical(cluster, phraseStats) {
@@ -199,7 +226,7 @@ function consolidateConcepts(concepts) {
     for (const large of items) {
       if (small.canonical === large.canonical || !byCanonical.has(large.canonical)) continue;
       const largeTokens = large.canonical.split(' ');
-      if (!isPrefix(smallTokens, largeTokens)) continue;
+      if (!isPrefix(smallTokens, largeTokens) && !isSubsequence(smallTokens, largeTokens)) continue;
       const enoughSupport = large.docFreq >= Math.max(3, Math.floor(small.docFreq * 0.5));
       if (!enoughSupport) continue;
       if (!mergeTarget || large.docFreq > mergeTarget.docFreq || largeTokens.length > mergeTarget.canonical.split(' ').length) {
@@ -352,6 +379,12 @@ export async function rebuildConceptDictionary({ trigger = 'manual' } = {}) {
       for (const variant of concept.variants) {
         variantToCanonical[variant] = concept.canonical;
       }
+    }
+
+    // Compute smoothed IDF for each concept: log((N+1) / (docFreq+1))
+    const N = docs.length;
+    for (const concept of concepts) {
+      concept.idf = Math.log((N + 1) / (concept.docFreq + 1));
     }
 
     const generatedAt = new Date().toISOString();

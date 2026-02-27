@@ -6,7 +6,8 @@ import { collectMetrics } from './metrics.js';
 import {
   PORT, CACHE_TTL_MS, LOGIN_WINDOW_MS, LOGIN_BLOCK_MS, LOGIN_MAX_ATTEMPTS_IP,
   LOGIN_MAX_ATTEMPTS_USER, LOGIN_FAILURE_DELAY_MS, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT,
-  ALLOW_PUBLIC_DOWNLOADS, ALLOW_PUBLIC_REFRESH, ALLOW_PUBLIC_RECOMPUTE, EXPOSE_ERROR_DETAILS
+  ALLOW_PUBLIC_DOWNLOADS, ALLOW_PUBLIC_REFRESH, ALLOW_PUBLIC_RECOMPUTE, EXPOSE_ERROR_DETAILS,
+  DEFAULT_TERM, DEFAULT_SOURCE
 } from './config.js';
 import { ensureStorage, getDb, listUsers, listFileMetrics, getFileMetricsStats, deleteFileMetric, listRecentRuns, getAllSettings, getSetting, setSetting, loadDocumentMetadata } from './db.js';
 import { authenticate, requireAdmin, login, destroySession, setSessionCookie, clearSessionCookie, ensureDefaultAdmin, createPasswordHash } from './auth.js';
@@ -626,6 +627,53 @@ async function start() {
 
   server.listen(PORT, () => {
     logger.info(`UBC Dissertation Intelligence Workbench running at http://localhost:${PORT}`);
+  });
+
+  // Warm the in-memory metrics cache so the first browser load is served instantly.
+  // Key is constructed to match exactly what the request handler produces for a default
+  // non-admin request (no query params): index/query/term/source all undefined → omitted by JSON.stringify.
+  const _warmupApiKey = getSetting('apiKey') || process.env.UBC_API_KEY;
+  // The browser always sends maxRecords=9999 (UI default), which the server caps to
+  // PUBLIC_MAX_RECORDS. The scan limit is derived from the uncapped value, then capped
+  // to PUBLIC_SCAN_LIMIT. We replicate that math here so the warmup key matches the
+  // first browser request exactly and the cache is used without a cold re-fetch.
+  // Other values must mirror the HTML input defaults in public/index.html:
+  //   subjectLimit=20, downloadFiles=0, index='', term=DEFAULT_TERM, source=DEFAULT_SOURCE.
+  const _warmupMaxRecords = PUBLIC_MAX_RECORDS;
+  const _warmupScanLimit = PUBLIC_SCAN_LIMIT;
+  const _warmupSubjectLimit = 20; // mirrors s-subjectLimit input default
+  collectMetrics({
+    maxRecords: _warmupMaxRecords,
+    pageSize: 20,
+    scanLimit: _warmupScanLimit,
+    subjectLimit: _warmupSubjectLimit,
+    apiKey: _warmupApiKey || undefined,
+    term: DEFAULT_TERM,
+    source: DEFAULT_SOURCE,
+    downloadFiles: false,
+    forceDownload: false,
+    recomputeFromCache: false,
+  }).then((payload) => {
+    // Key must match what a default anonymous browser request produces so the
+    // first page load is served from cache without a round-trip to the UBC API.
+    const warmupKey = JSON.stringify({
+      maxRecords: _warmupMaxRecords, pageSize: 20, scanLimit: _warmupScanLimit,
+      subjectLimit: _warmupSubjectLimit,
+      index: '',             // browser sends index='' (empty input) which is not || undefined'd
+      term: DEFAULT_TERM,    // browser sends this from s-term input
+      source: DEFAULT_SOURCE, // browser sends this from s-source input
+      hasApiKey: Boolean(_warmupApiKey),
+      downloadFiles: false, recomputeFromCache: false, refresh: false, isAdminRequest: false,
+    });
+    metricsCache.set(warmupKey, { timestamp: Date.now(), payload });
+    logger.info('Metrics cache warmed on startup');
+    // Run catalogue lookups in the background after the cache is ready so
+    // they never block the first page load.
+    runPendingCatalogueLookups().catch((e) => {
+      logger.warn('Background catalogue lookups failed', { error: e.message });
+    });
+  }).catch((e) => {
+    logger.warn('Startup metrics cache warmup failed', { error: e.message });
   });
 
   stopDailyConceptScheduler = scheduleDailyConceptRebuild();

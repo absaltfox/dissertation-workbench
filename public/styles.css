@@ -267,23 +267,39 @@ h3 {
   border-color: transparent;
 }
 
-.tab-panel { display: none; margin-top: 0.9rem; }
+.tab-panel { display: none; margin-top: 1rem; }
 .tab-panel.active { display: block; }
 
 /* --- Facet filter bar --- */
 
 .facet-filter-bar {
   display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  flex-wrap: wrap;
-  padding: 0.6rem 1rem;
-  background: var(--surface, var(--panel));
-  border: 1px solid var(--line);
-  border-radius: var(--radius, 8px);
-  margin: 0 0 1rem;
+  flex-direction: column;
+  gap: 0.45rem;
+  margin: 0.85rem 0 0;
+  padding: 0 0 0.8rem;
+  border-bottom: 1px solid var(--line);
 }
-.facet-filter-controls { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; flex: 1; }
+.facet-filter-controls {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.85rem;
+  flex-wrap: wrap;
+}
+.facet-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+}
+.facet-label {
+  font-family: var(--sans);
+  font-size: 0.63rem;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
 .facet-select {
   font-family: var(--sans);
   font-size: 0.82rem;
@@ -292,6 +308,21 @@ h3 {
   border-radius: var(--radius, 6px);
   background: var(--bg);
   color: var(--ink);
+  max-width: 220px;
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.facet-select.is-active {
+  border-color: var(--accent);
+  background: rgba(8, 90, 99, 0.07);
+  color: var(--accent);
+  font-weight: 600;
+}
+.facet-filter-right {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-left: auto;
+  padding-bottom: 0.1rem;
 }
 .facet-count {
   font-family: var(--sans);
@@ -299,6 +330,43 @@ h3 {
   color: var(--ink-soft);
   white-space: nowrap;
 }
+.facet-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.facet-chips:empty { display: none; }
+.facet-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.18rem 0.45rem 0.18rem 0.65rem;
+  background: var(--accent);
+  color: #fff;
+  font-family: var(--sans);
+  font-size: 0.73rem;
+  border-radius: 999px;
+  line-height: 1.4;
+}
+.facet-chip-dim {
+  font-size: 0.62rem;
+  opacity: 0.72;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.facet-chip-remove {
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.7);
+  cursor: pointer;
+  padding: 0;
+  font-size: 1rem;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+}
+.facet-chip-remove:hover { color: #fff; }
 
 /* --- Panels --- */
 

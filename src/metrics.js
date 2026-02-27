@@ -12,7 +12,6 @@ import {
 import { fetchPage, extractHits, resolveIndexName, collectCandidateUrls } from './api.js';
 import { enrichDocumentsWithFileAnalysis } from './pdf.js';
 import { dedupeSupervisorNames } from './supervisors.js';
-import { runPendingCatalogueLookups } from './catalogue.js';
 import { canonicalizeDomainText } from './domainDictionary.js';
 
 function average(values) {
@@ -160,12 +159,19 @@ function normalizeRecord(doc, dict = null) {
   };
 }
 
+// Word count is unreliable when the PDF exists but text extraction failed (scan-only):
+// the stored count is just the abstract length, not the dissertation length.
+function hasReliableWordCount(rec) {
+  return rec.wordCountSource !== 'metadata_text' || !rec.fileBytes;
+}
+
 function buildMetrics(records, subjectLimit) {
   const conceptWords = new Map();
   const yearWords = new Map();
   const yearPages = new Map();
 
   for (const rec of records) {
+    const reliableWords = hasReliableWordCount(rec);
     const concepts = Array.from(new Set((rec.conceptTerms || []).filter(Boolean)));
     if (concepts.length) {
       const weight = 1 / concepts.length;
@@ -174,7 +180,7 @@ function buildMetrics(records, subjectLimit) {
           conceptWords.set(concept, { weightedWordSum: 0, weightSum: 0, docCount: 0 });
         }
         const entry = conceptWords.get(concept);
-        entry.weightedWordSum += rec.wordCount * weight;
+        if (reliableWords) entry.weightedWordSum += rec.wordCount * weight;
         entry.weightSum += weight;
         entry.docCount += 1;
       }
@@ -183,7 +189,7 @@ function buildMetrics(records, subjectLimit) {
     if (rec.year) {
       if (!yearWords.has(rec.year)) yearWords.set(rec.year, []);
       if (!yearPages.has(rec.year)) yearPages.set(rec.year, []);
-      yearWords.get(rec.year).push(rec.wordCount);
+      if (reliableWords) yearWords.get(rec.year).push(rec.wordCount);
       yearPages.get(rec.year).push(rec.pages);
     }
   }
@@ -218,7 +224,7 @@ function buildMetrics(records, subjectLimit) {
 
   return {
     recordCount: records.length,
-    overallWordCount: stats(records.map((r) => r.wordCount)),
+    overallWordCount: stats(records.filter(hasReliableWordCount).map((r) => r.wordCount)),
     overallPageCount: stats(records.map((r) => r.pages)),
     overallCharCount: stats(records.map((r) => r.charCount)),
     byConcept,
@@ -274,29 +280,31 @@ function loadConceptDictionary() {
     const parsed = JSON.parse(raw);
     const canonicalSet = new Set((parsed.concepts || []).map((c) => c.canonical));
     const variantMap = parsed.variantToCanonical || {};
-    return { canonicalSet, variantMap };
+    const idfMap = new Map((parsed.concepts || []).map((c) => [c.canonical, c.idf ?? 1]));
+    return { canonicalSet, variantMap, idfMap };
   } catch {
-    return { canonicalSet: new Set(), variantMap: {} };
+    return { canonicalSet: new Set(), variantMap: {}, idfMap: new Map() };
   }
 }
 
 function docConceptTerms(rec, limit = 12, dict = null) {
-  const { canonicalSet, variantMap } = dict || loadConceptDictionary();
+  const { canonicalSet, variantMap, idfMap } = dict || loadConceptDictionary();
   const text = [rec.title, rec.abstract, rec.subjects.join(' ')].join(' ');
-  const seen = new Set();
-  const result = [];
+  const tf = new Map();
   for (const n of [2, 3]) {
     for (const ng of extractNgrams(text, n)) {
       const term = canonicalizeDomainText(ng);
       if (!term) continue;
       const canonical = variantMap[term] || (canonicalSet.has(term) ? term : null);
-      if (!canonical || seen.has(canonical)) continue;
-      seen.add(canonical);
-      result.push(canonical);
-      if (result.length >= limit) return result;
+      if (!canonical) continue;
+      tf.set(canonical, (tf.get(canonical) || 0) + 1);
     }
   }
-  return result;
+  return Array.from(tf.entries())
+    .map(([canonical, count]) => ({ canonical, score: count * (idfMap.get(canonical) ?? 1) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map(({ canonical }) => canonical);
 }
 
 function buildConceptCloud(records, maxTerms = 60) {
@@ -375,13 +383,35 @@ function buildSupervisorNgramMatrix(records, topN = 12, topM = 10) {
   };
 }
 
+// Statistical and experimental-design vocabulary that always clusters together
+// in quantitative research regardless of topic. Excluding these from co-occurrence
+// lets topical associations surface instead.
+const COOCCURRENCE_BLOCKLIST = new Set([
+  'significant differences', 'statistically significant', 'significant difference',
+  'control group', 'treatment groups', 'experimental groups', 'randomly assigned',
+  'dependent variables', 'independent variables', 'dependent variable', 'independent variable',
+  'regression analysis', 'regression analyses', 'multiple regression',
+  'analysis variance', 'multivariate analysis', 'repeated measures',
+  'three groups', 'two groups', 'experimental design',
+  'data analysis', 'attitudes toward',
+]);
+
 function buildTermCooccurrence(records, topN = 20) {
   const dict = loadConceptDictionary();
   const pairCounts = new Map();
+  const termCounts = new Map(); // per-document frequency within this corpus view
+  const N = records.length;
+
   for (const rec of records) {
-    const concepts = docConceptTerms(rec, 15, dict);
+    const concepts = docConceptTerms(rec, 10, dict);
     if (concepts.length < 2) continue;
-    const sorted = [...concepts].sort();
+    const unique = Array.from(new Set(concepts))
+      // Strip out statistical/experimental methodology boilerplate that clusters
+      // trivially in quantitative studies regardless of topic. These belong in
+      // the Methodology panel; including them here hides meaningful topic pairs.
+      .filter((c) => !COOCCURRENCE_BLOCKLIST.has(c));
+    for (const c of unique) termCounts.set(c, (termCounts.get(c) || 0) + 1);
+    const sorted = [...unique].sort();
     for (let i = 0; i < sorted.length; i++) {
       for (let j = i + 1; j < sorted.length; j++) {
         const key = `${sorted[i]}|||${sorted[j]}`;
@@ -389,19 +419,43 @@ function buildTermCooccurrence(records, topN = 20) {
       }
     }
   }
+
   return Array.from(pairCounts.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, topN)
+    .filter(([, count]) => count >= 3) // require minimum co-occurrence
     .map(([key, count]) => {
       const [termA, termB] = key.split('|||');
-      return {
-        conceptIdA: `c:${termA.replace(/\s+/g, '_')}`,
-        conceptIdB: `c:${termB.replace(/\s+/g, '_')}`,
-        termA,
-        termB,
-        count
-      };
-    });
+      const freqA = termCounts.get(termA) || 1;
+      const freqB = termCounts.get(termB) || 1;
+
+      // Fragment filter: if one term almost never appears without the other,
+      // they are likely sliding-window bigrams of the same longer phrase
+      // (e.g. "pearson product" + "product moment" from "pearson product moment").
+      if (count / Math.min(freqA, freqB) >= 0.7) return null;
+
+      // Shared-token filter: if the two phrases share any substantive word
+      // (length ≥ 4) they are probably fragments or near-synonyms of the same
+      // phrase (e.g. "reading achievement" + "reading test" share "reading").
+      const tokensA = new Set(termA.split(' ').filter((t) => t.length >= 4));
+      const tokensB = termB.split(' ').filter((t) => t.length >= 4);
+      if (tokensB.some((t) => tokensA.has(t))) return null;
+
+      // Lift: observed co-occurrence relative to what chance predicts.
+      // Promotes genuinely surprising topic associations over common-term pairings.
+      const lift = (count * N) / (freqA * freqB);
+      return { key, count, termA, termB, freqA, freqB, lift };
+    })
+    .filter(Boolean)
+    // Rank by lift (statistical surprise) then raw count as tiebreaker.
+    .sort((a, b) => b.lift - a.lift || b.count - a.count)
+    .slice(0, topN)
+    .map(({ termA, termB, count, lift }) => ({
+      conceptIdA: `c:${termA.replace(/\s+/g, '_')}`,
+      conceptIdB: `c:${termB.replace(/\s+/g, '_')}`,
+      termA,
+      termB,
+      count,
+      lift: Math.round(lift * 10) / 10
+    }));
 }
 
 function buildConceptTimeline(records, topN = 8) {
@@ -564,7 +618,7 @@ export async function collectMetrics(options = {}) {
   const forceDownload = Boolean(options.forceDownload);
   const recomputeFromCache = Boolean(options.recomputeFromCache);
 
-  const index = await resolveIndexName(baseUrl, requestedIndex, apiKey);
+  const index = requestedIndex ? await resolveIndexName(baseUrl, requestedIndex, apiKey) : null;
   const conceptDict = loadConceptDictionary();
   const records = [];
   let apiTotal = null; // populated from first response
@@ -594,9 +648,6 @@ export async function collectMetrics(options = {}) {
     forceDownload,
     recomputeFromCache
   });
-
-  // Automatically look up any new citations in the UBC Library catalogue via Z39.50
-  await runPendingCatalogueLookups();
 
   const sourceMeta = {
     baseUrl,
@@ -628,7 +679,12 @@ export async function collectMetrics(options = {}) {
       'Redownload occurs only when force refresh is used; recompute-from-cache updates metrics without redownloading.'
     ],
     metrics,
-    documents: normalizedRecords,
+    documents: normalizedRecords.map(({
+      charCount, extent, campus, scholarlyLevel, rights,
+      downloadCandidates, supervisorsSource, subjects,
+      pagesSource, wordCountSource, fileBytes,
+      ...rest
+    }) => rest),
     wordCloud: buildWordCloud(normalizedRecords),
     ngramCloud: buildConceptCloud(normalizedRecords),
     methodologies: buildMethodologyStats(normalizedRecords),
