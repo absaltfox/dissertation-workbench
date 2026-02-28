@@ -100,13 +100,28 @@ let _analyticsCacheKey = '';
 
 // Mirrors COOCCURRENCE_BLOCKLIST in src/metrics.js — keep in sync.
 const COOCCURRENCE_BLOCKLIST = new Set([
+  // Statistical and experimental design
   'significant differences', 'statistically significant', 'significant difference',
-  'control group', 'treatment groups', 'experimental groups', 'randomly assigned',
+  'significant relationships', 'significant relationship', 'significantly related',
+  'control group', 'treatment groups', 'treatment group',
+  'experimental groups', 'experimental group', 'experimental design',
+  'randomly assigned', 'randomly selected', 'random sample',
   'dependent variables', 'independent variables', 'dependent variable', 'independent variable',
-  'regression analysis', 'regression analyses', 'multiple regression',
+  'predictor variables', 'criterion variables',
+  'regression analysis', 'regression analyses', 'multiple regression', 'stepwise regression',
+  'factor analysis', 'path analysis', 'discriminant analysis', 'canonical analysis',
   'analysis variance', 'multivariate analysis', 'repeated measures',
-  'three groups', 'two groups', 'experimental design',
-  'data analysis', 'attitudes toward',
+  'three groups', 'two groups',
+  // Results / findings boilerplate
+  'results indicated', 'results showed', 'results suggest', 'results revealed',
+  'analysis revealed', 'analysis indicated', 'analyses indicated',
+  'findings indicate', 'findings indicated', 'findings suggest',
+  // Generic academic-writing filler
+  'data analysis', 'data collected', 'data collection', 'data gathering', 'data sources',
+  'analyzed using', 'semi structured', 'interview data',
+  'attitudes toward', 'determine whether', 'based upon', 'directed towards',
+  'further investigation', 'important factor', 'wide range',
+  'higher levels', 'high levels', 'second part', 'first part',
 ]);
 
 // --- Utilities ---

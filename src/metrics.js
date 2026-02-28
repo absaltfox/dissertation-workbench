@@ -289,10 +289,30 @@ function loadConceptDictionary() {
 
 function docConceptTerms(rec, limit = 12, dict = null) {
   const { canonicalSet, variantMap, idfMap } = dict || loadConceptDictionary();
-  const text = [rec.title, rec.abstract, rec.subjects.join(' ')].join(' ');
   const tf = new Map();
+
+  // Title concepts are counted with 3× weight: title language is denser and
+  // more intentionally chosen than abstract prose, so title bigrams should
+  // outrank abstract-only bigrams even when all have the same IDF.
+  // Split on delimiters to prevent cross-boundary n-grams (e.g. "teachers grassroots
+  // computing" spanning subtitle boundary in "bootstraps : teachers, grassroots computing").
+  const TITLE_WEIGHT = 3;
+  const titleSegments = (rec.title || '').split(/[:;,]/).map((s) => s.trim()).filter(Boolean);
+  for (const seg of titleSegments) {
+    for (const n of [2, 3]) {
+      for (const ng of extractNgrams(seg, n)) {
+        const term = canonicalizeDomainText(ng);
+        if (!term) continue;
+        const canonical = variantMap[term] || (canonicalSet.has(term) ? term : null);
+        if (!canonical) continue;
+        tf.set(canonical, (tf.get(canonical) || 0) + TITLE_WEIGHT);
+      }
+    }
+  }
+
+  const body = [(rec.abstract || ''), (rec.subjects || []).join(' ')].join(' ');
   for (const n of [2, 3]) {
-    for (const ng of extractNgrams(text, n)) {
+    for (const ng of extractNgrams(body, n)) {
       const term = canonicalizeDomainText(ng);
       if (!term) continue;
       const canonical = variantMap[term] || (canonicalSet.has(term) ? term : null);
@@ -300,6 +320,7 @@ function docConceptTerms(rec, limit = 12, dict = null) {
       tf.set(canonical, (tf.get(canonical) || 0) + 1);
     }
   }
+
   return Array.from(tf.entries())
     .map(([canonical, count]) => ({ canonical, score: count * (idfMap.get(canonical) ?? 1) }))
     .sort((a, b) => b.score - a.score)
@@ -311,7 +332,11 @@ function buildConceptCloud(records, maxTerms = 60) {
   const counts = new Map();
   for (const rec of records) {
     for (const term of (rec.conceptTerms || [])) {
-      counts.set(term, (counts.get(term) || 0) + 1);
+      // Exclude statistical boilerplate and generic academic filler so the cloud
+      // reflects research topics rather than methodology vocabulary.
+      if (!COOCCURRENCE_BLOCKLIST.has(term)) {
+        counts.set(term, (counts.get(term) || 0) + 1);
+      }
     }
   }
   return Array.from(counts.entries())
@@ -383,17 +408,35 @@ function buildSupervisorNgramMatrix(records, topN = 12, topM = 10) {
   };
 }
 
-// Statistical and experimental-design vocabulary that always clusters together
-// in quantitative research regardless of topic. Excluding these from co-occurrence
-// lets topical associations surface instead.
+// Non-topical phrases excluded from the concept cloud and co-occurrence panel.
+// Covers three categories:
+//   • Statistical / experimental-design vocabulary (quantitative boilerplate)
+//   • Results-reporting boilerplate (findings indicate, results showed, …)
+//   • Generic academic-writing filler (based upon, further investigation, …)
+// Keep in sync with COOCCURRENCE_BLOCKLIST in public/app.js.
 const COOCCURRENCE_BLOCKLIST = new Set([
+  // Statistical and experimental design
   'significant differences', 'statistically significant', 'significant difference',
-  'control group', 'treatment groups', 'experimental groups', 'randomly assigned',
+  'significant relationships', 'significant relationship', 'significantly related',
+  'control group', 'treatment groups', 'treatment group',
+  'experimental groups', 'experimental group', 'experimental design',
+  'randomly assigned', 'randomly selected', 'random sample',
   'dependent variables', 'independent variables', 'dependent variable', 'independent variable',
-  'regression analysis', 'regression analyses', 'multiple regression',
+  'predictor variables', 'criterion variables',
+  'regression analysis', 'regression analyses', 'multiple regression', 'stepwise regression',
+  'factor analysis', 'path analysis', 'discriminant analysis', 'canonical analysis',
   'analysis variance', 'multivariate analysis', 'repeated measures',
-  'three groups', 'two groups', 'experimental design',
-  'data analysis', 'attitudes toward',
+  'three groups', 'two groups',
+  // Results / findings boilerplate
+  'results indicated', 'results showed', 'results suggest', 'results revealed',
+  'analysis revealed', 'analysis indicated', 'analyses indicated',
+  'findings indicate', 'findings indicated', 'findings suggest',
+  // Generic academic-writing filler
+  'data analysis', 'data collected', 'data collection', 'data gathering', 'data sources',
+  'analyzed using', 'semi structured', 'interview data',
+  'attitudes toward', 'determine whether', 'based upon', 'directed towards',
+  'further investigation', 'important factor', 'wide range',
+  'higher levels', 'high levels', 'second part', 'first part',
 ]);
 
 function buildTermCooccurrence(records, topN = 20) {

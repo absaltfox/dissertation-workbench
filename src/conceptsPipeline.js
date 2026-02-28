@@ -11,6 +11,10 @@ const LATEST_PATH = path.join(CONCEPTS_DIR, 'latest.json');
 const STATUS_PATH = path.join(CONCEPTS_DIR, 'status.json');
 const LOCK_PATH = path.join(CONCEPTS_DIR, '.rebuild.lock');
 const DAILY_HOUR_LOCAL = 2;
+// Minimum document frequency for the full quality pipeline (C-value scoring,
+// nested-phrase analysis, similarity clustering). Keeping this at 2 ensures the
+// O(n²) steps operate on a manageable candidate set.
+// Single-document phrases are handled by a separate lightweight pass below.
 const MIN_PHRASE_DOC_FREQ = 2;
 const QUALITY_SCORE_THRESHOLD = 1.0;
 
@@ -21,7 +25,13 @@ const WEAK_HEAD_TOKENS = new Set([
   'including', 'based', 'used',
   'explores', 'examined', 'governed', 'ensures', 'requires', 'played',
   'included', 'completed', 'witnessed', 'takes', 'suggests', 'indicates',
-  'ensuring', 'involving'
+  'ensuring', 'involving',
+  // Verb-headed phrases that are process descriptions, not concepts
+  'reveal', 'reveals', 'revealed', 'supported', 'draws', 'drawn', 'reflect', 'reflects',
+  'responsible', 'highlights', 'describe', 'describes', 'described', 'suggest',
+  'identified', 'reported', 'found', 'showed', 'presented', 'addressed',
+  'formed', 'held', 'discuss', 'discussed', 'demonstrates', 'demonstrated',
+  'achieved', 'selected', 'chosen', 'conducted', 'designed', 'established',
 ]);
 
 const WEAK_ANYWHERE_TOKENS = new Set([
@@ -29,7 +39,9 @@ const WEAK_ANYWHERE_TOKENS = new Set([
   'participants', 'interviewees', 'transcribed', 'audio', 'taped', 'shared',
   'current', 'future', 'used', 'based', 'broad', 'complex', 'important',
   'necessary', 'well', 'british', 'columbia', 'unspecified', 'rather', 'even',
-  'although', 'already', 'often', 'particularly'
+  'although', 'already', 'often', 'particularly',
+  // Methodological / results-language that produces non-topical phrases
+  'significant', 'include', 'resulting', 'related', 'general', 'various',
 ]);
 
 const DISALLOWED_LOW_SIGNAL_TOKENS = new Set([
@@ -53,17 +65,31 @@ function isSkippableToken(w) {
 }
 
 function extractDocPhrases(doc, maxPerDoc = 140) {
-  const text = [doc.title, doc.abstract, (doc.subjects || []).join(' '), doc.program, doc.degree].join(' ');
-  const words = splitWords(text);
+  // Deliberately excludes doc.program and doc.degree: structured metadata fields
+  // containing comma-separated program names produce artefact bigrams such as
+  // "administrative adult" (from "Administrative, Adult and Higher Education").
+  // Genuine program-related concepts (e.g. "counselling psychology") appear
+  // naturally in titles and abstracts and are captured from those fields.
+  //
+  // Title is split at common delimiters (:, ;, ,) before n-gram extraction so
+  // that cross-boundary bigrams like "teachers grassroots computing" (from
+  // "…bootstraps : teachers, grassroots computing…") are never generated.
+  // This allows distinctive short phrases from subtitle segments (e.g.
+  // "grassroots computing") to survive the nesting filter.
+  const titleSegments = (doc.title || '').split(/[:;,]/).map((s) => s.trim()).filter(Boolean);
+  const parts = [...titleSegments, doc.abstract || '', (doc.subjects || []).join(' ')];
   const phrases = new Set();
-  for (const n of [2, 3]) {
-    for (let i = 0; i <= words.length - n; i++) {
-      const window = words.slice(i, i + n);
-      if (window.some(isSkippableToken)) continue;
-      const phrase = window.join(' ');
-      if (isLowSignalConceptPhrase(phrase)) continue;
-      phrases.add(phrase);
-      if (phrases.size >= maxPerDoc) break;
+  for (const part of parts) {
+    const words = splitWords(part);
+    for (const n of [2, 3]) {
+      for (let i = 0; i <= words.length - n; i++) {
+        const window = words.slice(i, i + n);
+        if (window.some(isSkippableToken)) continue;
+        const phrase = window.join(' ');
+        if (isLowSignalConceptPhrase(phrase)) continue;
+        phrases.add(phrase);
+        if (phrases.size >= maxPerDoc) return phrases;
+      }
     }
   }
   return phrases;
@@ -155,18 +181,24 @@ function isPrefix(tokens, largerTokens) {
 }
 
 function buildNestedStats(phraseStats) {
-  const entries = Array.from(phraseStats.values());
   const nested = new Map();
-  for (const entry of entries) {
+  for (const entry of phraseStats.values()) {
     nested.set(entry.phrase, { containers: 0, containerFreqSum: 0 });
   }
-  for (const small of entries) {
-    for (const large of entries) {
-      if (small.phrase === large.phrase) continue;
-      if (!isSubsequence(small.tokens, large.tokens)) continue;
-      const stat = nested.get(small.phrase);
-      stat.containers += 1;
-      stat.containerFreqSum += large.docFreq;
+
+  // For each phrase, generate all contiguous sub-phrases directly and look them
+  // up by key — O(n × L²) instead of O(n²). For 2- and 3-gram phrases this
+  // means at most 3 lookups per phrase regardless of dictionary size.
+  for (const large of phraseStats.values()) {
+    const { tokens, docFreq } = large;
+    for (let len = 1; len < tokens.length; len++) {
+      for (let start = 0; start <= tokens.length - len; start++) {
+        const subPhrase = tokens.slice(start, start + len).join(' ');
+        const stat = nested.get(subPhrase);
+        if (!stat) continue;
+        stat.containers += 1;
+        stat.containerFreqSum += docFreq;
+      }
     }
   }
   return nested;
@@ -304,9 +336,11 @@ export async function rebuildConceptDictionary({ trigger = 'manual' } = {}) {
   try {
     const docs = listAllDocumentMetadata().map((row) => row.metadata || {});
     const phraseDocs = new Map(); // phrase -> set(docIndex)
+    const docPhrases = [];        // docIndex -> Set<phrase> (for single-doc nesting checks)
 
     docs.forEach((doc, index) => {
       const phrases = extractDocPhrases(doc);
+      docPhrases.push(phrases);
       for (const phrase of phrases) {
         if (!phraseDocs.has(phrase)) phraseDocs.set(phrase, new Set());
         phraseDocs.get(phrase).add(index);
@@ -387,6 +421,57 @@ export async function rebuildConceptDictionary({ trigger = 'manual' } = {}) {
       concept.idf = Math.log((N + 1) / (concept.docFreq + 1));
     }
 
+    // Single-document phrase pass: concepts unique to one dissertation.
+    // These get high IDF (≈ log(N/2)) and make niche-topic dissertations
+    // discoverable even when their subject matter appears nowhere else.
+    // We skip the O(n²) C-value and clustering steps (not meaningful for
+    // singletons) and apply three lightweight filters instead:
+    //   1. Weak-token filters (same as the multi-doc pipeline).
+    //   2. For 2-grams: suppress if any 3-gram in the same document is a
+    //      containing phrase — avoids sliding-window bigram fragments.
+    //   3. Skip phrases already covered by the multi-doc concepts.
+    const multiDocCanonicals = new Set(concepts.map((c) => c.canonical));
+    const singleDocCount = { added: 0 };
+    for (const [phrase, ids] of phraseDocs.entries()) {
+      if (ids.size !== 1) continue;
+      const tokens = phrase.split(' ');
+      const head = tokens[tokens.length - 1];
+      if (WEAK_HEAD_TOKENS.has(head)) continue;
+      if (tokens.some((t) => WEAK_ANYWHERE_TOKENS.has(t))) continue;
+      if (tokens.some((t) => DISALLOWED_LOW_SIGNAL_TOKENS.has(t))) continue;
+      if (multiDocCanonicals.has(phrase)) continue;
+      if (variantToCanonical[phrase]) continue;
+
+      // 2-gram nesting check: suppress if a containing 3-gram exists in
+      // the same document's phrase set (prevents "undergoing significant"
+      // when "undergoing significant changes" is also present).
+      if (tokens.length === 2) {
+        const [tok0, tok1] = tokens;
+        const docIndex = ids.values().next().value;
+        const docPhraseSet = docPhrases[docIndex] || new Set();
+        let isNested = false;
+        for (const dp of docPhraseSet) {
+          if (dp === phrase) continue;
+          const dpts = dp.split(' ');
+          if (dpts.length < 3) continue;
+          for (let i = 0; i <= dpts.length - 2; i++) {
+            if (dpts[i] === tok0 && dpts[i + 1] === tok1) { isNested = true; break; }
+          }
+          if (isNested) break;
+        }
+        if (isNested) continue;
+      }
+
+      concepts.push({
+        canonical: phrase,
+        variants: [],
+        docFreq: 1,
+        idf: Math.log((N + 1) / 2)
+      });
+      multiDocCanonicals.add(phrase);
+      singleDocCount.added += 1;
+    }
+
     const generatedAt = new Date().toISOString();
     const artifact = {
       version: 1,
@@ -399,6 +484,7 @@ export async function rebuildConceptDictionary({ trigger = 'manual' } = {}) {
         candidatePhrases: phraseStats.size,
         qualityFilteredPhrases: filteredPhraseStats.size,
         concepts: concepts.length,
+        singleDocConcepts: singleDocCount.added,
         aliases: Object.keys(variantToCanonical).length
       },
       concepts,
