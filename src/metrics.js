@@ -281,7 +281,11 @@ function loadConceptDictionary() {
     const canonicalSet = new Set((parsed.concepts || []).map((c) => c.canonical));
     const variantMap = parsed.variantToCanonical || {};
     const idfMap = new Map((parsed.concepts || []).map((c) => [c.canonical, c.idf ?? 1]));
-    return { canonicalSet, variantMap, idfMap };
+    // Multi-doc concepts appear in 2+ documents and are the only ones that can
+    // co-occur across the corpus. Single-doc concepts (docFreq=1) dominate the
+    // IDF-based ranking but are useless for co-occurrence analysis.
+    const multiDocSet = new Set((parsed.concepts || []).filter((c) => (c.docFreq ?? 1) >= 2).map((c) => c.canonical));
+    return { canonicalSet, variantMap, idfMap, multiDocSet };
   } catch {
     return { canonicalSet: new Set(), variantMap: {}, idfMap: new Map() };
   }
@@ -437,6 +441,10 @@ const COOCCURRENCE_BLOCKLIST = new Set([
   'attitudes toward', 'determine whether', 'based upon', 'directed towards',
   'further investigation', 'important factor', 'wide range',
   'higher levels', 'high levels', 'second part', 'first part',
+  // Older psychometric / measurement instruments
+  'main effects', 'significant main', 'interaction effects', 'post test',
+  'discriminant function', 'tennessee self', 'concept scale',
+  'native indian', // archaic, from older dissertations — not a useful discovery concept
 ]);
 
 function buildTermCooccurrence(records, topN = 20) {
@@ -446,9 +454,14 @@ function buildTermCooccurrence(records, topN = 20) {
   const N = records.length;
 
   for (const rec of records) {
-    const concepts = docConceptTerms(rec, 10, dict);
+    // Use a generous budget (20) so multi-doc concepts aren't crowded out by
+    // high-IDF single-doc concepts occupying all the top slots.  Then keep only
+    // multi-doc concepts: single-doc concepts (docFreq=1) can never co-occur
+    // across documents so they would only reduce signal here.
+    const concepts = docConceptTerms(rec, 20, dict);
     if (concepts.length < 2) continue;
     const unique = Array.from(new Set(concepts))
+      .filter((c) => dict.multiDocSet.has(c))
       // Strip out statistical/experimental methodology boilerplate that clusters
       // trivially in quantitative studies regardless of topic. These belong in
       // the Methodology panel; including them here hides meaningful topic pairs.
@@ -464,7 +477,7 @@ function buildTermCooccurrence(records, topN = 20) {
   }
 
   return Array.from(pairCounts.entries())
-    .filter(([, count]) => count >= 3) // require minimum co-occurrence
+    .filter(([, count]) => count >= 2) // minimum co-occurrence (corpus is ~400 docs)
     .map(([key, count]) => {
       const [termA, termB] = key.split('|||');
       const freqA = termCounts.get(termA) || 1;
@@ -475,12 +488,11 @@ function buildTermCooccurrence(records, topN = 20) {
       // (e.g. "pearson product" + "product moment" from "pearson product moment").
       if (count / Math.min(freqA, freqB) >= 0.7) return null;
 
-      // Shared-token filter: if the two phrases share any substantive word
-      // (length ≥ 4) they are probably fragments or near-synonyms of the same
-      // phrase (e.g. "reading achievement" + "reading test" share "reading").
-      const tokensA = new Set(termA.split(' ').filter((t) => t.length >= 4));
-      const tokensB = termB.split(' ').filter((t) => t.length >= 4);
-      if (tokensB.some((t) => tokensA.has(t))) return null;
+      // NOTE: shared-token filter removed. In education research, many distinct
+      // concepts share domain words (e.g. "public school" + "school district" share
+      // "school") — filtering them out eliminates the most meaningful pairs in the
+      // corpus. The fragment filter above is sufficient to catch sliding-window
+      // bigrams, and the blocklist handles methodology boilerplate.
 
       // Lift: observed co-occurrence relative to what chance predicts.
       // Promotes genuinely surprising topic associations over common-term pairings.

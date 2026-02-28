@@ -122,6 +122,10 @@ const COOCCURRENCE_BLOCKLIST = new Set([
   'attitudes toward', 'determine whether', 'based upon', 'directed towards',
   'further investigation', 'important factor', 'wide range',
   'higher levels', 'high levels', 'second part', 'first part',
+  // Older psychometric / measurement instruments
+  'main effects', 'significant main', 'interaction effects', 'post test',
+  'discriminant function', 'tennessee self', 'concept scale',
+  'native indian',
 ]);
 
 // --- Utilities ---
@@ -1769,17 +1773,9 @@ function buildAnalytics(docs) {
 
     for (const m of meths) methMap.set(m, (methMap.get(m) || 0) + 1);
 
-    // Budget to top-10 (matches server-side docConceptTerms budget), apply blocklist
-    const uniqTerms = [...new Set(conceptTerms)].slice(0, 10)
-      .filter((t) => !COOCCURRENCE_BLOCKLIST.has(t));
-    for (const t of uniqTerms) termCountMap.set(t, (termCountMap.get(t) || 0) + 1);
-    const sortedTerms = [...uniqTerms].sort();
-    for (let i = 0; i < sortedTerms.length; i++) {
-      for (let j = i + 1; j < sortedTerms.length; j++) {
-        const key = `${sortedTerms[i]}\0${sortedTerms[j]}`;
-        pairMap.set(key, (pairMap.get(key) || 0) + 1);
-      }
-    }
+    // Track document frequency for ALL concept terms (used after the loop to
+    // filter pairs to multi-doc concepts only).
+    for (const t of new Set(conceptTerms)) termCountMap.set(t, (termCountMap.get(t) || 0) + 1);
 
     for (const sup of sups) {
       supCountMap.set(sup, (supCountMap.get(sup) || 0) + 1);
@@ -1837,19 +1833,35 @@ function buildAnalytics(docs) {
     .map(([methodology, count]) => ({ methodology, count }))
     .sort((a, b) => b.count - a.count);
 
+  // Second pass: build co-occurrence pairs using only multi-doc concepts.
+  // Single-doc concepts dominate per-document IDF rankings and crowd out shared
+  // concepts from the top slots; filtering to docFreq≥2 concepts ensures pairs
+  // can actually reach the count≥3 threshold.
+  for (const doc of docs) {
+    const multiDocTerms = (doc.conceptTerms || [])
+      .filter((t) => (termCountMap.get(t) || 0) >= 2 && !COOCCURRENCE_BLOCKLIST.has(t));
+    if (multiDocTerms.length < 2) continue;
+    const sorted = [...new Set(multiDocTerms)].sort();
+    for (let i = 0; i < sorted.length; i++) {
+      for (let j = i + 1; j < sorted.length; j++) {
+        const key = `${sorted[i]}\0${sorted[j]}`;
+        pairMap.set(key, (pairMap.get(key) || 0) + 1);
+      }
+    }
+  }
+
   const N = docs.length;
   const termCooccurrence = Array.from(pairMap.entries())
-    .filter(([, count]) => count >= 3)
+    .filter(([, count]) => count >= 2) // minimum co-occurrence (corpus ~400 docs)
     .map(([key, count]) => {
       const [termA, termB] = key.split('\0');
       const freqA = termCountMap.get(termA) || 1;
       const freqB = termCountMap.get(termB) || 1;
       // Fragment filter: one term's docs almost entirely overlap the other's
       if (count / Math.min(freqA, freqB) >= 0.7) return null;
-      // Shared-token filter: near-synonyms sharing a meaningful word
-      const tokensA = new Set(termA.split(' ').filter((t) => t.length >= 4));
-      const tokensB = termB.split(' ').filter((t) => t.length >= 4);
-      if (tokensB.some((t) => tokensA.has(t))) return null;
+      // Shared-token filter removed: education-domain concepts legitimately share
+      // words (e.g. "public school" + "school district") and the filter was
+      // eliminating the best pairs. Fragment filter handles actual bigram fragments.
       const lift = (count * N) / (freqA * freqB);
       return { termA, termB, count, lift: Math.round(lift * 10) / 10 };
     })
