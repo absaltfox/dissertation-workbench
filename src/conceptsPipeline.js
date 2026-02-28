@@ -32,6 +32,9 @@ const WEAK_HEAD_TOKENS = new Set([
   'identified', 'reported', 'found', 'showed', 'presented', 'addressed',
   'formed', 'held', 'discuss', 'discussed', 'demonstrates', 'demonstrated',
   'achieved', 'selected', 'chosen', 'conducted', 'designed', 'established',
+  // Additional verb forms and participials that appear as phrase heads
+  'using', 'provided', 'providing', 'relied', 'operationalized', 'similarly',
+  'explored', 'explores', 'argue', 'argued', 'argues',
 ]);
 
 const WEAK_ANYWHERE_TOKENS = new Set([
@@ -60,8 +63,18 @@ function splitWords(text) {
     .filter(Boolean);
 }
 
+// Cardinal number words produce meaningless methodology phrases like "three schools",
+// "eight coordinators", "four elders" from participant-count sentences.
+const CARDINAL_WORDS = new Set([
+  'four', 'five', 'nine', 'three', 'seven', 'eight',
+  'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen',
+  'twenty', 'thirty', 'forty', 'fifty', 'hundred',
+]);
+
 function isSkippableToken(w) {
-  return w.length < 4 || STOP_WORDS.has(w) || /^\d{4}$/.test(w) || /^\d+$/.test(w);
+  return w.length < 4 || STOP_WORDS.has(w) || CARDINAL_WORDS.has(w)
+    // APA citation year tokens: "2012a", "1976b" produce concept fragments
+    || /^\d{4}[a-z]?$/.test(w) || /^\d+$/.test(w);
 }
 
 function extractDocPhrases(doc, maxPerDoc = 140) {

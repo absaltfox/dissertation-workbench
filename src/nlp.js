@@ -7,13 +7,68 @@ const LOW_SIGNAL_HEAD_TOKENS = new Set([
   'post', 'types', 'type', 'want', 'wants',
   'explores', 'examined', 'governed', 'ensures', 'requires', 'played',
   'included', 'completed', 'witnessed', 'takes', 'suggests', 'indicates',
-  'ensuring', 'involving'
+  'ensuring', 'involving',
+  // Third-person singular verbs that are sentence predicates, not noun-phrase heads
+  // (e.g. "abstract examines strategies", "thesis discusses students")
+  'examines', 'discusses', 'investigates', 'considers', 'contributes', 'uncovers',
+  'pervades', 'focuses', 'highlights', 'illustrates', 'argues', 'contends',
+  'concludes', 'centres', 'centers', 'uses', 'makes', 'tends', 'seems', 'leads',
+  'becomes', 'remains', 'helps', 'needs', 'varies', 'reports',
+  // Base-form / simple-present verbs at phrase end
+  'think', 'feel', 'know', 'show', 'work', 'move', 'grow', 'view', 'seek',
+  'face', 'play', 'hold', 'call', 'turn', 'bring', 'give', 'allow',
+  // Past-participle adjectives that signal results/process descriptions
+  // (e.g. "phenomena recognized", "implementors guided", "discourses embodied",
+  // "unit articulated", "policy operationalized")
+  'recognized', 'guided', 'embodied', 'oriented', 'enabled', 'embedded',
+  'framed', 'situated', 'constructed', 'perceived', 'positioned',
+  'articulated', 'articulates', 'operationalized', 'operationalizes',
+  'conceptualized', 'conceptualizes', 'problematized',
+  'analyzed', 'extracted', 'retrieved', 'obtained', 'measured',
+  // Preposition/adverb phrase-enders that indicate sentence fragments
+  // (e.g. "society beyond", "unit articulated beyond", "highlights commonalities around")
+  'beyond', 'around', 'effective', 'affected',
+  // Weak phrase-ending words that indicate sentence fragments or quantified mentions
+  // (e.g. "trust many", "grade three", "question will")
+  'first', 'many', 'might', 'will', 'next', 'last', 'once',
 ]);
 
 const LOW_SIGNAL_ANYWHERE_TOKENS = new Set([
   'better', 'furthermore', 'moreover', 'therefore', 'thus', 'however', 'year', 'years',
   'different', 'british', 'columbia', 'unspecified', 'rather', 'even', 'although',
-  'already', 'often', 'particularly'
+  'already', 'often', 'particularly',
+  // Adverbs that mark sentence prose rather than noun-phrase concepts
+  // (e.g. "increasingly playing roles", "highly contextualized", "differently across")
+  'increasingly', 'differently', 'highly', 'largely', 'generally', 'typically',
+  'commonly', 'rarely', 'mostly', 'primarily', 'mainly', 'directly', 'closely',
+  'deeply', 'simply', 'similarly', 'essentially', 'effectively', 'actively',
+  'broadly', 'widely',
+  // Generic academic qualifiers that appear in phrases but add no topical meaning
+  // (e.g. "particular point", "ways particular", "specific instance")
+  'particular', 'reasonably', 'specific', 'certain',
+  // Verbs that signal a phrase is a sentence clause, not a noun phrase.
+  // These are listed in LOW_SIGNAL_HEAD_TOKENS too, but must also be checked
+  // anywhere since they may appear mid-phrase (e.g. "units think critically",
+  // "dissertation highlights commonalities", "district using ethnodrama",
+  // "suite exploring faculty").
+  'think', 'highlights', 'argues', 'contends', 'concludes', 'becomes', 'remains',
+  'using', 'exploring',
+]);
+
+// Phrases that START with these tokens are verbal or adverbial fragments, not concepts
+// (e.g. "using activity theory", "providing legitimacy", "playing roles",
+// "reported judgements", "reframing leadership", "perceived intentions")
+const LOW_SIGNAL_START_TOKENS = new Set([
+  'using', 'providing', 'examining', 'exploring', 'applying', 'explaining',
+  'introducing', 'considering', 'addressing', 'presenting', 'discussing',
+  'analyzing', 'analysing', 'investigating', 'operationalized', 'beyond',
+  'playing', 'reported', 'reframing', 'perceived', 'focused', 'desired',
+  'intended', 'centered', 'centred', 'situated',
+  'reasonably', 'arguably', 'seemingly', 'notably',
+  'broader', 'wider', 'deeper', 'greater', 'lesser', 'further',
+  // Third-person verbs that begin verbal predicates when phrase-initial
+  'examines', 'discusses', 'identifies', 'analyzed', 'analyzes', 'provided',
+  'reporting', 'considers',
 ]);
 
 const LOW_SIGNAL_LOCATION_FRAGMENT_HEADS = new Set([
@@ -58,9 +113,14 @@ export function tokenize(text) {
 export function isLowSignalConceptPhrase(phrase) {
   const tokens = String(phrase || '').split(/\s+/).filter(Boolean);
   if (tokens.length < 2) return true;
+  // Repeated word: "society society", "change change", "child child interaction"
+  if (new Set(tokens).size < tokens.length) return true;
   if (tokens.some((token) => LOW_SIGNAL_ANYWHERE_TOKENS.has(token))) return true;
   const head = tokens[tokens.length - 1];
   if (LOW_SIGNAL_HEAD_TOKENS.has(head)) return true;
+  // Verbal/adverbial start: "using activity theory", "providing legitimacy",
+  // "exploring whether", "beyond borders" — sentence fragments, not noun phrases
+  if (LOW_SIGNAL_START_TOKENS.has(tokens[0])) return true;
   if (tokens[0] === 'columbia') return true;
   if (tokens[0] === 'columbia' && LOW_SIGNAL_LOCATION_FRAGMENT_HEADS.has(head)) return true;
   if (tokens[0] === 'mcfd' && (head === 'furthermore' || head === 'however')) return true;
@@ -94,12 +154,23 @@ export function buildWordCloud(records, maxTerms = 70) {
     .map(([term, count]) => ({ term, count }));
 }
 
+// Cardinal number words: skip any n-gram window containing one to prevent
+// methodology-count phrases like "three schools", "eight coordinators".
+const CARDINAL_WORDS = new Set([
+  'four', 'five', 'nine', 'three', 'seven', 'eight',
+  'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen',
+  'twenty', 'thirty', 'forty', 'fifty', 'hundred',
+]);
+
 export function extractNgrams(text, n) {
   const words = canonicalizeDomainText(text).split(/\s+/).filter(Boolean);
   const ngrams = [];
   for (let i = 0; i <= words.length - n; i++) {
     const window = words.slice(i, i + n);
-    if (window.some((w) => w.length < 4 || STOP_WORDS.has(w) || /^\d{4}$/.test(w) || /^\d+$/.test(w))) continue;
+    if (window.some((w) =>
+      w.length < 4 || STOP_WORDS.has(w) || CARDINAL_WORDS.has(w)
+      || /^\d{4}[a-z]?$/.test(w) || /^\d+$/.test(w)
+    )) continue;
     const phrase = window.join(' ');
     if (isLowSignalConceptPhrase(phrase)) continue;
     ngrams.push(phrase);
