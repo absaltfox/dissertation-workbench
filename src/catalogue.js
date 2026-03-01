@@ -23,7 +23,15 @@ export function extractSearchTerms(citationText) {
     return { author: null, title: null };
   }
 
-  const text = citationText.trim();
+  let text = citationText.trim();
+
+  // Strip leading numbered-reference markers: "[1]", "[23]", etc.
+  text = text.replace(/^\[\d+\]\s*/, '');
+
+  // Normalize OCR-spaced digits inside parentheses: "( 1 9 8 1 )" → "(1981)".
+  // Older scanned PDFs frequently have spaces between individual digit characters.
+  text = text.replace(/\(\s*(\d)\s+(\d)\s+(\d)\s+(\d)\s*([a-z]?)\s*\)/gi,
+    (_, a, b, c, d, s) => `(${a}${b}${c}${d}${s})`);
 
   // Detect APA vs Chicago: APA has "(YYYY)." early after the author segment,
   // typically as the 2nd or 3rd element. Chicago puts the year at the end or
@@ -67,6 +75,20 @@ function cleanTitle(raw) {
   title = title.replace(/[.,;:]+$/, '').trim();
   if (!title || title.length < 3) return null;
 
+  // Strip leading editor/translator markers left by extractChicago's part-splitting:
+  // "(Ed.) Democracy and difference" → "Democracy and difference"
+  title = title.replace(/^\s*\(\s*(?:Ed|Eds|ed|eds)\.?\s*\)\s*/i, '').trim();
+
+  // Strip leading bare year (or year+letter suffix) from Chicago-style citations:
+  // "1982 The Paideia Proposal" → "The Paideia Proposal"
+  // "1976a Educational Policy" → "Educational Policy"
+  title = title.replace(/^\d{4}[a-z]?\s+/, '').trim();
+
+  // Reject a string that IS nothing but a bare year (e.g. "1976a" from a split path)
+  if (/^\d{4}[a-z]?$/.test(title)) return null;
+
+  if (!title || title.length < 3) return null;
+
   // Truncate at colon/subtitle — the main title is more reliable for catalogue matching
   if (title.includes(':')) {
     const mainTitle = title.slice(0, title.indexOf(':')).trim();
@@ -92,6 +114,11 @@ function extractApa(text) {
   // Title: text after "(YYYY...)." up to the next sentence-ending period
   const afterYearIdx = yearParenMatch.index + yearParenMatch[0].length;
   let afterYear = text.slice(afterYearIdx).replace(/^\.\s*/, '').trim();
+
+  // Strip translator/edition preambles before the title:
+  // "(trans. H. Gray). What is the cinema?" → "What is the cinema?"
+  // "(2nd ed.). Principles of..."           → "Principles of..."
+  afterYear = afterYear.replace(/^\([^)]{0,60}(?:trans|ed\.?|rev\.?|abridged)[^)]*\)\s*\.?\s*/i, '').trim();
 
   if (!afterYear) return { author, title: null };
 
@@ -120,26 +147,56 @@ function extractChicago(text) {
     if (title) return { author, title };
   }
 
+  // Bare-year format: "Author YYYY Title" or "Author. YYYY Title" or "Author. YYYYa. Title"
+  // Many Chicago/Turabian citations place the year unparenthesized after the author.
+  // Scan for the first bare 4-digit year and split on it.
+  // Allow an optional period between the year/letter-suffix and the title word.
+  const bareYearMatch = text.match(/\b(1[89]\d\d|20\d\d)[a-z]?\.?\s+([A-Z\(].{5,})/);
+  if (bareYearMatch) {
+    const beforeYear = text.slice(0, bareYearMatch.index).replace(/[.\s]+$/, '');
+    const author = extractAuthorSurname(beforeYear) || null;
+    // Truncate the captured tail at the first sentence-ending period so we don't
+    // drag in the publisher/place/edition that follows the title sentence.
+    let rawTitle = bareYearMatch[2];
+    const sentenceEnd = rawTitle.search(/\.\s+[A-Z]/);
+    if (sentenceEnd > 5) rawTitle = rawTitle.slice(0, sentenceEnd);
+    const title = cleanTitle(rawTitle);
+    if (title) return { author, title };
+  }
+
+  // Institution-authored or title-only entries (e.g. after stripping "[1]"):
+  // if the text has no comma in the first 20 chars it's unlikely to be "Last, First. Title."
+  // — treat the first sentence directly as the title with no author.
+  // Check this BEFORE the split loop so we don't mis-assign a city as the title.
+  const firstSentence = text.split(/\.\s+/)[0].trim();
+  if (firstSentence.length >= 20 && !/,/.test(firstSentence.slice(0, 20))) {
+    const title = cleanTitle(firstSentence);
+    if (title) return { author: null, title };
+  }
+
   // Unquoted Chicago: Author. Title. (split on sentence-ending periods)
   // Pattern: "Lastname, Firstname. Title of Work. ..."
   const parts = text.split(/\.\s+/);
   if (parts.length >= 2) {
     // First part(s) are author, next part is likely the title
-    // Heuristic: author segment(s) contain names (short, with comma for "Last, First")
-    // Try: first segment as author, second as title
     const authorPart = parts[0].trim();
     const author = extractAuthorSurname(authorPart);
 
-    // If first part looks like a name and second part is substantial, use it as title
-    if (author && parts[1] && parts[1].trim().length >= 5) {
-      const title = cleanTitle(parts[1].trim());
-      if (title) return { author, title };
-    }
+    // Skip parts that are continuations of the author list rather than titles:
+    // "& Surname", "and Firstname", "6c X" (OCR garble of &), "with X".
+    // Do NOT skip year-prefixed parts — cleanTitle strips leading years.
+    const isAuthorContinuation = (s) =>
+      /^(?:[&]|and |6c |with )\s*[A-Z]/i.test(s.trim());
 
-    // Try: first two segments as author (e.g. "Lastname, First Middle. Jr."), third as title
-    if (parts.length >= 3 && author && parts[2] && parts[2].trim().length >= 5) {
-      const title = cleanTitle(parts[2].trim());
-      if (title) return { author, title };
+    // If first part looks like a name, scan subsequent parts for a real title
+    if (author) {
+      for (let i = 1; i < Math.min(parts.length, 5); i++) {
+        const candidate = parts[i].trim();
+        if (!candidate || candidate.length < 5) continue;
+        if (isAuthorContinuation(candidate)) continue;
+        const title = cleanTitle(candidate);
+        if (title) return { author, title };
+      }
     }
   }
 

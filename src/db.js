@@ -489,11 +489,18 @@ export function getCatalogueLookupStats() {
 }
 
 export function listPendingLookups(limit = 100) {
+  // Include two populations:
+  // 1. Citations with no lookup row at all (truly new).
+  // 2. Citations where a previous lookup ran but stored hits=NULL with a non-null
+  //    query_title — these are Z39.50 network/timeout failures that should be retried.
+  //    Citations stored with query_title=NULL were intentionally skipped (unparseable)
+  //    and are not retried here; the improved extractor will handle them on first run.
   return getDb().prepare(`
     SELECT c.id, c.citation_text
     FROM citations c
     LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
     WHERE cl.citation_id IS NULL
+       OR (cl.hits IS NULL AND cl.query_title IS NOT NULL)
     LIMIT ?
   `).all(limit);
 }
