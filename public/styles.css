@@ -79,8 +79,6 @@
   margin: 0 auto 2.5rem;
   padding: 1.5rem 0 0;
   border-top: 1px solid var(--line);
-  position: relative;
-  z-index: 2;
 }
 
 .footer-disclaimer {
