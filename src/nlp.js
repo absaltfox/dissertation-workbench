@@ -39,6 +39,10 @@ const LOW_SIGNAL_HEAD_TOKENS = new Set([
   // Third-person singular verbs (additional)
   'falls', 'rises', 'shows', 'gives', 'takes', 'comes', 'goes', 'runs', 'puts',
   'interact', 'exists', 'occurs', 'appears', 'differs',
+  // Present participles that always indicate a participial clause when at phrase end
+  // (e.g. "transformative force leading", "primary factor contributing")
+  'leading', 'contributing', 'resulting', 'serving', 'allowing', 'causing',
+  'producing', 'creating', 'forming', 'shaping',
   // Weak phrase-ending words that indicate sentence fragments or quantified mentions
   // (e.g. "trust many", "grade three", "question will")
   'first', 'second', 'many', 'might', 'will', 'next', 'last', 'once',
@@ -112,8 +116,12 @@ const LOW_SIGNAL_START_TOKENS = new Set([
   // Present-participle starters not already in the list
   'encountering', 'reporting', 'maintaining', 'addressing',
   // Discourse-marker adjective "following" always means "the following X", not a noun phrase
-  // (e.g. "following subcategories", "following common practice")
+  // (e.g. "following subcategories", "following nominal practice")
   'following',
+  // Past-tense/past-participle predicate verbs at phrase start
+  // (e.g. "held meaning" from "symbols that held meaning for people")
+  'held', 'viewed', 'seen', 'known', 'given', 'drawn', 'taken', 'made',
+  'found', 'placed', 'based', 'defined', 'shaped', 'formed',
 ]);
 
 const LOW_SIGNAL_LOCATION_FRAGMENT_HEADS = new Set([
