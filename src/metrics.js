@@ -539,6 +539,7 @@ function buildConceptTimeline(records, topN = 8) {
   }
 
   const topConcepts = Array.from(conceptDocCounts.entries())
+    .filter(([concept]) => !COOCCURRENCE_BLOCKLIST.has(concept))
     .sort((a, b) => b[1] - a[1])
     .slice(0, topN)
     .map(([concept]) => concept);
