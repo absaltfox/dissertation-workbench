@@ -90,7 +90,16 @@ function extractDocPhrases(doc, maxPerDoc = 140) {
   // This allows distinctive short phrases from subtitle segments (e.g.
   // "grassroots computing") to survive the nesting filter.
   const titleSegments = (doc.title || '').split(/[:;,]/).map((s) => s.trim()).filter(Boolean);
-  const parts = [...titleSegments, doc.abstract || '', (doc.subjects || []).join(' ')];
+  // Abstract and subjects are also split on "/" (slash notation like
+  // "coordinators/directors" produces spurious bigrams after "/" → space).
+  // Abstract is split on "/" and "," to prevent cross-boundary bigrams from
+  // slash notation ("coordinators/directors") and enumeration lists
+  // ("teachers, parents, and students" → strip commas → "teachers parents").
+  const abstractSegments = (doc.abstract || '').split(/[/,]/).map((s) => s.trim()).filter(Boolean);
+  // Subjects are joined with "/" so each subject string becomes a separate segment
+  // and cannot form cross-subject bigrams (e.g. "teachers" + "students" subjects).
+  const subjectSegments = (doc.subjects || []).join('/').split('/').map((s) => s.trim()).filter(Boolean);
+  const parts = [...titleSegments, ...abstractSegments, ...subjectSegments];
   const phrases = new Set();
   for (const part of parts) {
     const words = splitWords(part);

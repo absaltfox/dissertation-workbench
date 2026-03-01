@@ -314,14 +314,22 @@ function docConceptTerms(rec, limit = 12, dict = null) {
     }
   }
 
-  const body = [(rec.abstract || ''), (rec.subjects || []).join(' ')].join(' ');
-  for (const n of [2, 3]) {
-    for (const ng of extractNgrams(body, n)) {
-      const term = canonicalizeDomainText(ng);
-      if (!term) continue;
-      const canonical = variantMap[term] || (canonicalSet.has(term) ? term : null);
-      if (!canonical) continue;
-      tf.set(canonical, (tf.get(canonical) || 0) + 1);
+  // Split abstract and subjects on "/" to prevent slash-notation artifacts
+  // (e.g. "coordinators/directors" → "coordinators directors" bigram).
+  const bodySegments = [
+    ...(rec.abstract || '').split(/[/,]/),  // "/" and "," both act as phrase boundaries
+    ...(rec.subjects || []).join('/')        // "/" join keeps each subject as its own segment
+      .split('/')
+  ].map((s) => s.trim()).filter(Boolean);
+  for (const seg of bodySegments) {
+    for (const n of [2, 3]) {
+      for (const ng of extractNgrams(seg, n)) {
+        const term = canonicalizeDomainText(ng);
+        if (!term) continue;
+        const canonical = variantMap[term] || (canonicalSet.has(term) ? term : null);
+        if (!canonical) continue;
+        tf.set(canonical, (tf.get(canonical) || 0) + 1);
+      }
     }
   }
 

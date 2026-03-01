@@ -19,18 +19,34 @@ const LOW_SIGNAL_HEAD_TOKENS = new Set([
   'face', 'play', 'hold', 'call', 'turn', 'bring', 'give', 'allow',
   // Past-participle adjectives that signal results/process descriptions
   // (e.g. "phenomena recognized", "implementors guided", "discourses embodied",
-  // "unit articulated", "policy operationalized")
+  // "unit articulated", "policy operationalized", "literature followed",
+  // "information collected", "group scored")
   'recognized', 'guided', 'embodied', 'oriented', 'enabled', 'embedded',
   'framed', 'situated', 'constructed', 'perceived', 'positioned',
   'articulated', 'articulates', 'operationalized', 'operationalizes',
   'conceptualized', 'conceptualizes', 'problematized',
   'analyzed', 'extracted', 'retrieved', 'obtained', 'measured',
+  'followed', 'collected', 'gathered', 'administered', 'scored',
+  'tested', 'coded', 'rated', 'recorded', 'compiled',
+  'employed', 'employing', 'implemented', 'reviewed', 'surveyed', 'adopted',
+  'introduced', 'applied', 'confirmed', 'documented', 'reinforced',
+  'rejected', 'observed', 'distributed', 'undertaken', 'utilized',
+  'initiated', 'assigned', 'categorized', 'classified', 'recommended',
+  'strongly', // adverb that always precedes another word, never a concept head
   // Preposition/adverb phrase-enders that indicate sentence fragments
   // (e.g. "society beyond", "unit articulated beyond", "highlights commonalities around")
-  'beyond', 'around', 'effective', 'affected',
+  'beyond', 'around', 'effective', 'affected', 'toward',
+  // Third-person singular verbs (additional)
+  'falls', 'rises', 'shows', 'gives', 'takes', 'comes', 'goes', 'runs', 'puts',
+  'interact', 'exists', 'occurs', 'appears', 'differs',
   // Weak phrase-ending words that indicate sentence fragments or quantified mentions
   // (e.g. "trust many", "grade three", "question will")
-  'first', 'many', 'might', 'will', 'next', 'last', 'once',
+  'first', 'second', 'many', 'might', 'will', 'next', 'last', 'once',
+  // Adverbs of frequency/degree that mark sentence prose, not concepts
+  // (e.g. "coordinators report regularly", "falls predominantly")
+  'regularly', 'predominantly', 'frequently', 'consistently', 'significantly',
+  // Additional past-participle verbs at phrase end
+  'encountered',
 ]);
 
 const LOW_SIGNAL_ANYWHERE_TOKENS = new Set([
@@ -42,17 +58,25 @@ const LOW_SIGNAL_ANYWHERE_TOKENS = new Set([
   'increasingly', 'differently', 'highly', 'largely', 'generally', 'typically',
   'commonly', 'rarely', 'mostly', 'primarily', 'mainly', 'directly', 'closely',
   'deeply', 'simply', 'similarly', 'essentially', 'effectively', 'actively',
-  'broadly', 'widely',
+  'broadly', 'widely', 'regularly', 'predominantly', 'frequently', 'consistently',
+  'significantly', 'substantially', 'considerably',
   // Generic academic qualifiers that appear in phrases but add no topical meaning
   // (e.g. "particular point", "ways particular", "specific instance")
   'particular', 'reasonably', 'specific', 'certain',
+  // Adverbs that mark epistemic/temporal hedging — signal prose, not concepts
+  // (e.g. "potentially oppressive", "initially sorted", "historically public")
+  'potentially', 'initially', 'traditionally', 'historically', 'ultimately',
+  'previously', 'currently', 'recently', 'actually',
   // Verbs that signal a phrase is a sentence clause, not a noun phrase.
   // These are listed in LOW_SIGNAL_HEAD_TOKENS too, but must also be checked
   // anywhere since they may appear mid-phrase (e.g. "units think critically",
   // "dissertation highlights commonalities", "district using ethnodrama",
-  // "suite exploring faculty").
+  // "suite exploring faculty", "learning involving themes").
   'think', 'highlights', 'argues', 'contends', 'concludes', 'becomes', 'remains',
-  'using', 'exploring',
+  'using', 'exploring', 'involving',
+  // Specific adverbs that always modify within a clause, not within a noun phrase
+  // (e.g. "leading specifically", "situated specifically")
+  'specifically',
 ]);
 
 // Phrases that START with these tokens are verbal or adverbial fragments, not concepts
@@ -69,6 +93,27 @@ const LOW_SIGNAL_START_TOKENS = new Set([
   // Third-person verbs that begin verbal predicates when phrase-initial
   'examines', 'discusses', 'identifies', 'analyzed', 'analyzes', 'provided',
   'reporting', 'considers',
+  // Temporal/existential adjectives as phrase starters produce non-concept phrases
+  // (e.g. "former social", "highest expectation", "overall aims", "proposed solutions")
+  'former', 'highest', 'lowest', 'overall', 'previous', 'existing',
+  'proposed', 'suggested', 'potential', 'recent', 'creating', 'changing',
+  'determining', 'strongly',
+  // Base-form verbs as phrase starters (infinitive clause heads)
+  // (e.g. "inform ongoing conversations", "exercise gatekeeping responsibilities",
+  // "address student professional")
+  'inform', 'exercise', 'address', 'engage', 'ensure', 'promote', 'develop',
+  'support', 'enable', 'enhance', 'improve', 'increase', 'reduce', 'prevent',
+  'identify', 'assess', 'evaluate', 'implement', 'establish', 'maintain',
+  'achieve', 'facilitate', 'demonstrate', 'understand', 'explore', 'examine',
+  // Adverb starters (frequency/degree adverbs beginning phrase are clause prose)
+  // (e.g. "regularly encountering cases", "predominantly falls within")
+  'regularly', 'predominantly', 'frequently', 'consistently', 'significantly',
+  'substantially', 'considerably',
+  // Present-participle starters not already in the list
+  'encountering', 'reporting', 'maintaining', 'addressing',
+  // Discourse-marker adjective "following" always means "the following X", not a noun phrase
+  // (e.g. "following subcategories", "following common practice")
+  'following',
 ]);
 
 const LOW_SIGNAL_LOCATION_FRAGMENT_HEADS = new Set([
