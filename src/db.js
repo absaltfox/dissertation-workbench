@@ -98,7 +98,27 @@ export function getDb() {
   // Migrations — add columns to existing tables
   try { db.exec('ALTER TABLE catalogue_lookups ADD COLUMN bib_id TEXT'); } catch {}
 
+  const cleaned = cleanupCommitteeArtifacts(db);
+  if (cleaned > 0) logger.info(`Cleaned up ${cleaned} committee artefact rows`);
+
   return db;
+}
+
+export function cleanupCommitteeArtifacts(dbInstance) {
+  const d = dbInstance || getDb();
+  return d.prepare(`
+    DELETE FROM committee_members
+    WHERE lower(name) IN (
+      'additional supervisory committee members:',
+      'additional supervisory committee members',
+      'examining committee members',
+      'examining committee',
+      'supervisory committee members',
+      'supervisory committee',
+      'committee members'
+    )
+    OR name LIKE '%Committee Members%'
+  `).run().changes;
 }
 
 // --- Document functions ---

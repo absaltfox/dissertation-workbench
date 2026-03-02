@@ -66,11 +66,22 @@ export function normalizePersonName(raw) {
 export function supervisorNameKey(raw) {
   const normalized = normalizePersonName(raw);
   if (!normalized) return null;
-  return stripDiacritics(normalized)
+  let key = stripDiacritics(normalized)
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+
+  // Strip middle initials: single-letter tokens between first and last word.
+  // "deirdre m kelly" → "deirdre kelly"    "thomas j sork" → "thomas sork"
+  // Two-word or single-word names are unchanged.
+  const parts = key.split(' ');
+  if (parts.length >= 3) {
+    key = parts.filter((p, i) =>
+      i === 0 || i === parts.length - 1 || p.length > 1
+    ).join(' ');
+  }
+  return key;
 }
 
 export function dedupeSupervisorNames(values = []) {

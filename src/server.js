@@ -11,7 +11,7 @@ import {
 } from './config.js';
 import { ensureStorage, getDb, listUsers, listFileMetrics, getFileMetricsStats, deleteFileMetric, listRecentRuns, getAllSettings, getSetting, setSetting, loadDocumentMetadata } from './db.js';
 import { authenticate, requireAdmin, login, destroySession, setSessionCookie, clearSessionCookie, ensureDefaultAdmin, createPasswordHash } from './auth.js';
-import { createUser, deleteUser, countUsers, findUserByUsername, checkCacheIntegrity, logCacheStats, loadDocumentCitationsWithSharing, loadDocsByCitation, clearAllCitations, saveCatalogueLookup, getCatalogueLookupStats, listPendingLookups, getTopCitedWorks, getCitationForSummon } from './db.js';
+import { createUser, deleteUser, countUsers, findUserByUsername, checkCacheIntegrity, logCacheStats, loadDocumentCitationsWithSharing, loadDocsByCitation, clearAllCitations, saveCatalogueLookup, getCatalogueLookupStats, listPendingLookups, getTopCitedWorks, getCitationForSummon, loadCommitteeMembers } from './db.js';
 import { validateMetricsParams, validateAdminUser, parseNumberParam, parseBooleanParam } from './validate.js';
 import { deleteCachedPdf, analyzeDocumentFile, analyzePdfAtPath, extractAndSaveParsedData } from './pdf.js';
 import { getConceptPipelineStatus, rebuildConceptDictionary, scheduleDailyConceptRebuild } from './conceptsPipeline.js';
@@ -444,6 +444,39 @@ const server = http.createServer(async (req, res) => {
 
       metricsCache.clear();
       sendJson(res, 200, { ok: true, processed, committees: withCommittee, citations: totalCitations, catalogueLookups: lookupStats });
+      return;
+    }
+
+    if (url.pathname === '/api/admin/reparse-committee' && method === 'POST') {
+      if (!requireAdmin(req, res)) return;
+
+      const targets = getDb().prepare(`
+        SELECT fm.doc_id, fm.pdf_path
+        FROM file_metrics fm
+        WHERE fm.pdf_path IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM committee_members cm WHERE cm.doc_id = fm.doc_id
+        )
+      `).all();
+
+      let processed = 0, withCommittee = 0;
+      for (const row of targets) {
+        const doc = loadDocumentMetadata(row.doc_id);
+        if (!doc) continue;
+        try {
+          const analysis = await analyzePdfAtPath(row.pdf_path);
+          if (analysis?.fullText) {
+            const before = loadCommitteeMembers(row.doc_id).length;
+            extractAndSaveParsedData(doc, analysis.fullText);
+            const after = loadCommitteeMembers(row.doc_id).length;
+            if (after > before) withCommittee++;
+          }
+        } catch { /* skip individual failures */ }
+        processed++;
+      }
+
+      metricsCache.clear();
+      sendJson(res, 200, { ok: true, processed, withCommittee });
       return;
     }
 

@@ -170,11 +170,16 @@ function extractNameFromCapture(raw) {
   return name.length >= 3 ? name : '';
 }
 
-// Matches the last occurrence of an ACKNOWLEDGEMENTS section heading.
+// Matches occurrences of an ACKNOWLEDGEMENTS section heading.
 // pdftotext prepends \f (form feed) at each page boundary.
-const ACK_HEADING_RE = /(?:^|\n|\f)(ACKNOWLEDGEMENTS?|Acknowledgements?)\s*\n/g;
+// The fuzzy fallback ACKNOW[A-Z]{4,12} captures OCR/transcription typos such as
+// "ACKNOWDLEGMENTS" (D/L transposition) and American vs British spelling variants
+// that the exact spellings miss. "ACKNOW" is the safe common prefix for all variants.
+const ACK_HEADING_RE = /(?:^|\n|\f)(ACKNOWLEDGEMENTS?|Acknowledgements?|ACKNOWLEDG[A-Z]{2,10}|ACKNOW[A-Z]{4,12})\s*\n/g;
 // Capture group: 1–4 tokens each starting with uppercase, including \S* tail and optional trailing space
 const DR_CAP = '((?:[A-Z\\u00C0-\\u024F]\\S*\\s*){1,4})';
+// Title prefix: Dr. or Prof/Professor (period optional for Prof/Professor)
+const TITLE_RE = '(?:Dr\\.|Prof(?:essor)?\\.?)';
 
 export function parseAcknowledgements(fullText) {
   if (!fullText) return [];
@@ -182,14 +187,26 @@ export function parseAcknowledgements(fullText) {
   // Normalize form feeds so they appear as newlines to the heading regex
   const text = fullText.replace(/\f/g, '\n');
 
-  // Use the LAST occurrence of the heading (first occurrence is usually the Table of Contents)
-  let lastMatch = null;
+  // Use the first *substantive* occurrence — TOC entries have dotted leaders and few words
+  // while real sections have prose. This avoids appendix "Acknowledgement" headings in
+  // appended external documents (policy docs, ethics letters) displacing the actual section.
+  let ackMatch = null;
   let m;
   ACK_HEADING_RE.lastIndex = 0;
-  while ((m = ACK_HEADING_RE.exec(text)) !== null) lastMatch = m;
-  if (!lastMatch) return [];
+  while ((m = ACK_HEADING_RE.exec(text)) !== null) {
+    const preview = text.slice(m.index + m[0].length, m.index + m[0].length + 300);
+    const firstToken = preview.trimStart().split(/\s+/)[0] || '';
+    // TOC entries begin with a page number: lowercase Roman numerals (i, ii, xii…) or digits.
+    // Capital "I" is always the English first-person pronoun starting a real sentence, not a numeral.
+    const isTocPageNum = /^[ivxl]+$/.test(firstToken) || /^\d{1,3}$/.test(firstToken);
+    if (preview.split(/\s+/).length > 20 && !/\.{4}/.test(preview) && !isTocPageNum) {
+      ackMatch = m;
+      break;
+    }
+  }
+  if (!ackMatch) return [];
 
-  const section = text.slice(lastMatch.index + lastMatch[0].length, lastMatch.index + lastMatch[0].length + 3000);
+  const section = text.slice(ackMatch.index + ackMatch[0].length, ackMatch.index + ackMatch[0].length + 3000);
 
   const members = [];
   const seen = new Set();
@@ -207,51 +224,83 @@ export function parseAcknowledgements(fullText) {
 
   // --- Supervisor patterns ---
 
-  // "my supervisor Dr. X" / "research supervisor Dr. X" / "my co-supervisor Dr. X"
-  // Allow optional comma between "supervisor" and "Dr." (e.g. "my supervisor, Dr. X")
+  // "my supervisors, Dr. X and Dr. Y" (plural — both are co-supervisors)
   for (const pm of section.matchAll(new RegExp(
-    `(?:my|research)\\s+(co-?)?supervisor,?\\s+Dr\\.\\s+${DR_CAP}`, 'gi'
+    `my\\s+supervisors?,?\\s+${TITLE_RE}\\s+${DR_CAP}\\s+and\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi'
+  ))) {
+    addMember(pm[1], 'Co-Supervisor');
+    addMember(pm[2], 'Co-Supervisor');
+  }
+
+  // "my supervisor Dr. X" / "research supervisor Dr. X" / "my co-supervisor Dr. X"
+  // Allow optional comma between "supervisor" and title (e.g. "my supervisor, Dr. X")
+  for (const pm of section.matchAll(new RegExp(
+    `(?:my|research)\\s+(co-?)?supervisor,?\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi'
   ))) {
     addMember(pm[2], pm[1] ? 'Co-Supervisor' : 'Supervisor');
   }
 
   // "Committee Chair Dr. X"
-  for (const pm of section.matchAll(new RegExp(`Committee\\s+Chair\\s+Dr\\.\\s+${DR_CAP}`, 'gi'))) {
+  for (const pm of section.matchAll(new RegExp(`Committee\\s+Chair\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi'))) {
     addMember(pm[1], 'Supervisor');
   }
 
   // "Dr. X (Supervisor)" or "Dr. X (Co-Supervisor)"
-  for (const pm of section.matchAll(new RegExp(`Dr\\.\\s+${DR_CAP}\\s*\\(\\s*(Co-?)?Supervisor\\s*\\)`, 'gi'))) {
+  for (const pm of section.matchAll(new RegExp(`${TITLE_RE}\\s+${DR_CAP}\\s*\\(\\s*(Co-?)?Supervisor\\s*\\)`, 'gi'))) {
     addMember(pm[1], pm[2] ? 'Co-Supervisor' : 'Supervisor');
   }
 
-  // "Dr. X, my supervisor" / "Dr. X, my committee chair" / "Dr. X, as my committee chair"
-  for (const pm of section.matchAll(new RegExp(`Dr\\.\\s+${DR_CAP},\\s*(?:as\\s+)?(?:my\\s+)?(?:supervisor|committee\\s+chair)\\b`, 'gi'))) {
+  // "Dr. X, my supervisor" / "Dr. X, my research supervisor" / "Dr. X, my committee chair"
+  // Also: "Dr. X, the chair of my committee" / "Dr. X, chair of the committee"
+  // "research" (and similar modifiers) may precede "supervisor".
+  for (const pm of section.matchAll(new RegExp(
+    `${TITLE_RE}\\s+${DR_CAP},\\s*(?:as\\s+)?(?:(?:my|the)\\s+)?(?:research\\s+)?(?:supervisor|committee\\s+chair|chair\\s+of\\s+(?:my\\s+)?(?:the\\s+)?committee)\\b`, 'gi'
+  ))) {
     addMember(pm[1], 'Supervisor');
   }
 
   // "Dr. X, as co-advisor" / "Dr. X, as my co-advisor"
-  for (const pm of section.matchAll(new RegExp(`Dr\\.\\s+${DR_CAP},\\s*as\\s+(?:my\\s+)?co-?advisor\\b`, 'gi'))) {
+  for (const pm of section.matchAll(new RegExp(`${TITLE_RE}\\s+${DR_CAP},\\s*as\\s+(?:my\\s+)?co-?advisor\\b`, 'gi'))) {
     addMember(pm[1], 'Co-Supervisor');
   }
 
   // "co-advisor Dr. X" / "co-advisor, Dr. X"
-  for (const pm of section.matchAll(new RegExp(`co-?advisor,?\\s+Dr\\.\\s+${DR_CAP}`, 'gi'))) {
+  for (const pm of section.matchAll(new RegExp(`co-?advisor,?\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi'))) {
     addMember(pm[1], 'Co-Supervisor');
   }
 
   // "Dr. X ... as my supervisor" (name comes before the role keyword, within 150 chars)
-  for (const pm of section.matchAll(new RegExp(`Dr\\.\\s+${DR_CAP}[^.]{0,150}as\\s+(?:my\\s+)?(?:(co-?))?supervisor`, 'gi'))) {
+  for (const pm of section.matchAll(new RegExp(`${TITLE_RE}\\s+${DR_CAP}[^.]{0,150}as\\s+(?:my\\s+)?(?:(co-?))?supervisor`, 'gi'))) {
     addMember(pm[1], pm[2] ? 'Co-Supervisor' : 'Supervisor');
   }
 
   // --- Committee member patterns ---
-  // Sentences containing "committee members" — extract remaining Dr. names not already supervisors
-  for (const cm of section.matchAll(/committee\s+members?[^.!?\n]{0,400}/gi)) {
-    for (const dm of cm[0].matchAll(new RegExp(`Dr\\.\\s+${DR_CAP}`, 'g'))) {
+  // Text around each "committee members" / "my committee" occurrence — scan 400 chars forward for titled names.
+  // (A character-class exclusion on '.' would incorrectly stop at the '.' in "Dr.".)
+  for (const cm of section.matchAll(/committee\s+members?|my\s+committee/gi)) {
+    const chunk = section.slice(cm.index, cm.index + 400);
+    for (const dm of chunk.matchAll(new RegExp(`${TITLE_RE}\\s+${DR_CAP}`, 'g'))) {
       const name = extractNameFromCapture(dm[1]);
       if (name && !seen.has(`${name}|Supervisor`) && !seen.has(`${name}|Co-Supervisor`)) {
         addMember(dm[1], 'Supervisory Committee Member');
+      }
+    }
+  }
+
+  // Bare committee list: "committee consisting of Name1, Name2 and Name3"
+  // Used when no title prefix (Dr./Prof.) is present, e.g. "my research committee
+  // consisting of Tom Sork, Pierre Walter and Robert VanWynsberghe".
+  // Extracts sequences of 2–3 consecutive capitalised words as names.
+  const BARE_NAME = '[A-Z][a-zA-Z]+(?:\\s+[A-Z][a-zA-Z]+){1,2}';
+  for (const cm of section.matchAll(
+    new RegExp(`committee\\s+(?:consisting|comprised)\\s+of\\s+(${BARE_NAME}(?:,\\s*${BARE_NAME})*(?:\\s+and\\s+${BARE_NAME})?)`, 'gi')
+  )) {
+    const listText = cm[1];
+    for (const nm of listText.matchAll(new RegExp(BARE_NAME, 'g'))) {
+      const name = nm[0].trim();
+      if (!seen.has(`${name}|Supervisor`) && !seen.has(`${name}|Co-Supervisor`) &&
+          !seen.has(`${name}|Supervisory Committee Member`)) {
+        addMember(name, 'Supervisory Committee Member');
       }
     }
   }
@@ -286,7 +335,22 @@ export function parseCommittee(fullText) {
     }
 
     if (matchedRole) {
-      // Look backwards for name/affiliation lines (1-2 lines above)
+      // Inline format (2019+): "Tracy Friedel (Co-Supervisor)" — name and role on the same line.
+      // Extract the text before the parenthesised role as the name.
+      const inlineMatch = line.match(/^(.+?)\s*\(\s*(?:Co-?)?Supervisor\s*\)\s*$/i);
+      if (inlineMatch) {
+        const inlineName = inlineMatch[1].trim();
+        if (inlineName && inlineName.length > 1 && inlineName.length < 120) {
+          if (!/^(additional|examining)\s+/i.test(inlineName) && !/committee\s+member/i.test(inlineName)) {
+            const exists = members.some((m) => m.name === inlineName && m.role === matchedRole);
+            if (!exists) members.push({ name: inlineName, role: matchedRole, affiliation: null });
+          }
+        }
+        continue;
+      }
+
+      // Look backwards for name/affiliation lines (1-2 lines above).
+      // Pre-2016 format: name appears above the role label.
       let name = '';
       let affiliation = '';
 
@@ -297,6 +361,8 @@ export function parseCommittee(fullText) {
         if (/the following individuals certify/i.test(prev)) break;
         if (/examining committee/i.test(prev)) break;
         if (/entitled/i.test(prev)) break;
+        // Skip signature-box underscore lines
+        if (/^_+$/.test(prev)) continue;
 
         if (!name) {
           // Check if name,affiliation on one line
@@ -309,6 +375,24 @@ export function parseCommittee(fullText) {
           }
         } else if (!affiliation) {
           affiliation = prev;
+        }
+      }
+
+      // Forward-look fallback: 2018+ format has role label above name+affiliation.
+      if (!name) {
+        for (let j = i + 1; j <= Math.min(lines.length - 1, i + 3); j++) {
+          const next = lines[j];
+          if (ROLE_PATTERNS.some(({ pattern }) => pattern.test(next))) break;
+          if (stopPattern.test(next)) break;
+          if (/^_+$/.test(next)) continue;
+          const commaParts = next.split(',').map((s) => s.trim());
+          if (commaParts.length >= 2) {
+            name = commaParts[0];
+            affiliation = commaParts.slice(1).join(', ');
+          } else {
+            name = next;
+          }
+          break;
         }
       }
 
