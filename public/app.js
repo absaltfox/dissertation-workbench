@@ -68,6 +68,14 @@ const citationListTitleEl = document.getElementById('citationListTitle');
 const citationEntriesEl = document.getElementById('citationEntries');
 const citationTabButtons = Array.from(document.querySelectorAll('.citation-tab-btn'));
 
+// Person Explorer elements
+const personTableEl = document.getElementById('personTable');
+const personDetailEl = document.getElementById('personDetail');
+const personFilterEl = document.getElementById('personFilter');
+const personRoleFilterEl = document.getElementById('personRoleFilter');
+const personCountEl = document.getElementById('personCount');
+const personSortHeaders = Array.from(document.querySelectorAll('[data-person-sort]'));
+
 // Facet filter bar
 const facetFilterBarEl    = document.getElementById('facetFilterBar');
 const filterDegreeEl      = document.getElementById('filterDegree');
@@ -93,10 +101,17 @@ const state = {
   selectedDocIds: new Set(),
   selectedCitationIds: new Set(),
   activeFilters: { degree: '', program: '', affiliation: '' },
+  personFilterText: '',
+  personSortKey: 'docCount',
+  personSortDir: 'desc',
+  personRoleFilter: '',
+  selectedPersonKey: null,
 };
 
 let _analyticsCache = null;
 let _analyticsCacheKey = '';
+let _personListCache = null;
+let _personListCacheKey = '';
 
 // Mirrors COOCCURRENCE_BLOCKLIST in src/metrics.js — keep in sync.
 const COOCCURRENCE_BLOCKLIST = new Set([
@@ -174,6 +189,10 @@ function setActiveTab(tabName) {
   if (tabName === 'citations' && state.payload) {
     renderCitationDocs();
     setActiveCitationTab('browse');
+  }
+  if (tabName === 'people' && state.payload) {
+    renderPersonTable();
+    if (state.selectedPersonKey) renderPersonDetail(state.selectedPersonKey);
   }
 }
 
@@ -1579,6 +1598,263 @@ function openSupervisorProfile(name) {
   renderSupervisorProfile(profile);
 }
 
+// --- Person Explorer ---
+
+function buildPersonList(docs) {
+  const people = new Map();
+
+  for (const doc of docs) {
+    const docPersonKeys = new Set();
+
+    // Process supervisors
+    for (const name of (doc.supervisors || [])) {
+      const key = name.toLowerCase().trim();
+      if (!key) continue;
+      docPersonKeys.add(key);
+      let person = people.get(key);
+      if (!person) {
+        person = { name, roles: new Set(), docs: [], affiliations: new Set(), conceptMap: new Map(), methMap: new Map(), coSupervisors: new Set() };
+        people.set(key, person);
+      }
+      person.roles.add('Supervisor');
+      person.docs.push(doc);
+      for (const c of (doc.conceptTerms || [])) person.conceptMap.set(c, (person.conceptMap.get(c) || 0) + 1);
+      for (const m of (doc.methodologies || [])) person.methMap.set(m, (person.methMap.get(m) || 0) + 1);
+      // Track co-supervisors
+      for (const other of (doc.supervisors || [])) {
+        const otherKey = other.toLowerCase().trim();
+        if (otherKey && otherKey !== key) person.coSupervisors.add(other);
+      }
+    }
+
+    // Process committee members
+    for (const member of (doc.committee || [])) {
+      const name = member.name;
+      const key = name.toLowerCase().trim();
+      if (!key) continue;
+      let person = people.get(key);
+      if (!person) {
+        person = { name, roles: new Set(), docs: [], affiliations: new Set(), conceptMap: new Map(), methMap: new Map(), coSupervisors: new Set() };
+        people.set(key, person);
+      }
+      const role = member.role || 'Committee Member';
+      person.roles.add(role);
+      if (member.affiliation) person.affiliations.add(member.affiliation);
+      // Only add doc if not already counted from supervisors
+      if (!docPersonKeys.has(key)) {
+        person.docs.push(doc);
+        for (const c of (doc.conceptTerms || [])) person.conceptMap.set(c, (person.conceptMap.get(c) || 0) + 1);
+        for (const m of (doc.methodologies || [])) person.methMap.set(m, (person.methMap.get(m) || 0) + 1);
+      }
+      docPersonKeys.add(key);
+    }
+  }
+
+  // Derive final fields
+  const result = [];
+  for (const [key, p] of people) {
+    const years = p.docs.map(d => d.year).filter(Boolean).sort((a, b) => a - b);
+    const topConcepts = Array.from(p.conceptMap.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12)
+      .map(([term, count]) => ({ term, count }));
+    const methodologies = Array.from(p.methMap.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([methodology, count]) => ({ methodology, count }));
+    result.push({
+      key,
+      name: p.name,
+      roles: Array.from(p.roles),
+      docCount: p.docs.length,
+      docs: p.docs,
+      affiliations: Array.from(p.affiliations),
+      yearRange: years.length ? `${years[0]}\u2013${years[years.length - 1]}` : '\u2013',
+      yearMin: years[0] || 9999,
+      topConcepts,
+      methodologies,
+      coSupervisors: Array.from(p.coSupervisors),
+    });
+  }
+
+  return result;
+}
+
+function getPersonList() {
+  if (!state.payload) return [];
+  const { degree, program, affiliation } = state.activeFilters;
+  const key = `${degree}\0${program}\0${affiliation}`;
+  if (_personListCache && _personListCacheKey === key) return _personListCache;
+  _personListCache = buildPersonList(getFilteredDocs());
+  _personListCacheKey = key;
+  return _personListCache;
+}
+
+function renderPersonTable() {
+  if (!personTableEl) return;
+  let people = getPersonList();
+
+  // Role filter
+  if (state.personRoleFilter) {
+    people = people.filter(p => p.roles.includes(state.personRoleFilter));
+  }
+
+  // Text filter
+  if (state.personFilterText) {
+    const q = state.personFilterText.toLowerCase();
+    people = people.filter(p =>
+      p.name.toLowerCase().includes(q) ||
+      p.roles.some(r => r.toLowerCase().includes(q)) ||
+      p.affiliations.some(a => a.toLowerCase().includes(q))
+    );
+  }
+
+  // Sort
+  const dir = state.personSortDir === 'asc' ? 1 : -1;
+  people = [...people].sort((a, b) => {
+    switch (state.personSortKey) {
+      case 'name': {
+        const cmp = a.name.localeCompare(b.name);
+        return cmp * dir;
+      }
+      case 'docCount': {
+        const cmp = a.docCount - b.docCount || a.name.localeCompare(b.name);
+        return cmp * dir;
+      }
+      case 'roles': {
+        const cmp = a.roles.join(', ').localeCompare(b.roles.join(', '));
+        return cmp * dir;
+      }
+      case 'years': {
+        const cmp = a.yearMin - b.yearMin || a.name.localeCompare(b.name);
+        return cmp * dir;
+      }
+      default: return 0;
+    }
+  });
+
+  // Update sort header indicators
+  for (const th of personSortHeaders) {
+    th.classList.remove('sort-asc', 'sort-desc');
+    if (th.dataset.personSort === state.personSortKey) {
+      th.classList.add(state.personSortDir === 'asc' ? 'sort-asc' : 'sort-desc');
+    }
+  }
+
+  // Render rows
+  personTableEl.innerHTML = people.map(p => `
+    <tr class="doc-row${state.selectedPersonKey === p.key ? ' active' : ''}" data-person-key="${escapeHtml(p.key)}">
+      <td>${escapeHtml(p.name)}</td>
+      <td>${p.docCount}</td>
+      <td><div class="token-list">${p.roles.map(r => `<span class="token">${escapeHtml(r)}</span>`).join('')}</div></td>
+      <td>${escapeHtml(p.yearRange)}</td>
+    </tr>
+  `).join('');
+
+  // Count
+  personCountEl.textContent = `${people.length} ${people.length === 1 ? 'person' : 'people'}`;
+}
+
+function renderPersonDetail(personKey) {
+  if (!personDetailEl) return;
+  const people = getPersonList();
+  const person = people.find(p => p.key === personKey);
+  if (!person) {
+    personDetailEl.innerHTML = '<p class="meta">Select a person to view their profile.</p>';
+    return;
+  }
+
+  const concepts = person.topConcepts.length
+    ? person.topConcepts.map(c => `<span class="token concept">${escapeHtml(c.term)} (${c.count})</span>`).join('')
+    : '<span class="token">No concepts</span>';
+
+  const maxMeth = Math.max(...person.methodologies.map(m => m.count), 1);
+  const methBars = person.methodologies.length
+    ? person.methodologies.map(m => {
+        const widthPct = (m.count / maxMeth) * 100;
+        return `
+          <div class="bar-row">
+            <span class="bar-label">${escapeHtml(m.methodology)}</span>
+            <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
+            <span class="bar-value">${formatNum(m.count)}</span>
+          </div>
+        `;
+      }).join('')
+    : '<p class="meta">No methodology signals.</p>';
+
+  const rolesHtml = person.roles.map(r => `<span class="token">${escapeHtml(r)}</span>`).join(' ');
+  const affiliationsHtml = person.affiliations.length
+    ? person.affiliations.map(a => `<span class="token">${escapeHtml(a)}</span>`).join(' ')
+    : '';
+
+  const coSupHtml = person.coSupervisors.length
+    ? person.coSupervisors.map(name =>
+        `<button class="supervisor-link" data-person-nav="${escapeHtml(name.toLowerCase().trim())}">${escapeHtml(name)}</button>`
+      ).join(', ')
+    : '';
+
+  const dissertationList = person.docs.length
+    ? person.docs.map(doc => `
+        <div class="related-item" data-related-id="${escapeHtml(doc.id)}">
+          <strong>${escapeHtml(doc.title || '(Untitled)')}</strong>
+          <p>${escapeHtml(doc.author || 'Unknown')} &middot; ${doc.year || '-'} &middot; ${escapeHtml(doc.degree || '-')}</p>
+        </div>
+      `).join('')
+    : '<p class="meta">No dissertations found.</p>';
+
+  personDetailEl.innerHTML = `
+    <h2 style="margin-bottom:0.3rem">${escapeHtml(person.name)}</h2>
+    <div class="meta">
+      <p>${formatNum(person.docCount)} dissertation(s) &middot; ${person.yearRange}</p>
+    </div>
+    <div class="detail-body">
+      <div>
+        <p class="detail-section-title">Roles</p>
+        <div class="token-list">${rolesHtml}</div>
+      </div>
+      ${affiliationsHtml ? `<div><p class="detail-section-title">Affiliations</p><div class="token-list">${affiliationsHtml}</div></div>` : ''}
+      <div>
+        <p class="detail-section-title">Top Concepts</p>
+        <div class="token-list">${concepts}</div>
+      </div>
+      <div>
+        <p class="detail-section-title">Methodologies</p>
+        <div class="bars">${methBars}</div>
+      </div>
+      ${coSupHtml ? `<div><p class="detail-section-title">Co-Supervisors</p><div class="token-list">${coSupHtml}</div></div>` : ''}
+      <div>
+        <p class="detail-section-title">Dissertations</p>
+        <div class="related-list">${dissertationList}</div>
+      </div>
+    </div>
+  `;
+
+  // Wire dissertation clicks
+  for (const item of personDetailEl.querySelectorAll('.related-item[data-related-id]')) {
+    item.addEventListener('click', () => {
+      const targetId = item.getAttribute('data-related-id');
+      if (targetId) openRecord(targetId, 'records');
+    });
+  }
+
+  // Wire co-supervisor navigation
+  for (const link of personDetailEl.querySelectorAll('[data-person-nav]')) {
+    link.addEventListener('click', () => {
+      const targetKey = link.getAttribute('data-person-nav');
+      if (targetKey) openPersonProfile(targetKey);
+    });
+  }
+}
+
+function openPersonProfile(nameOrKey) {
+  state.selectedPersonKey = nameOrKey.toLowerCase().trim();
+  setActiveTab('people');
+  renderPersonTable();
+  renderPersonDetail(state.selectedPersonKey);
+  // Scroll selected row into view
+  const activeRow = personTableEl?.querySelector('.doc-row.active');
+  if (activeRow) activeRow.scrollIntoView({ block: 'nearest' });
+}
+
 // --- Methodology-Concept Matrix ---
 
 function docsForMethodologyConcept(methodology, concept) {
@@ -1938,6 +2214,7 @@ function renderAll() {
   renderConceptTimeline();
   renderMethodologyConceptMatrix();
   renderResearchGaps();
+  if (document.querySelector('#tab-people.active')) renderPersonTable();
 }
 
 // --- Data loading ---
@@ -1966,11 +2243,14 @@ async function loadData({ refresh = false } = {}) {
     state.payload = await res.json();
     _analyticsCache = null;
     _analyticsCacheKey = '';
+    _personListCache = null;
+    _personListCacheKey = '';
     state.selectedDocId = state.payload.documents?.[0]?.id || null;
     state.selectedTheme = null;
     state.sortKey = null;
     state.sortDir = 'asc';
     state.filterText = '';
+    state.selectedPersonKey = null;
     state.selectedDocIds = new Set();
     docFilterEl.value = '';
     renderAll();
@@ -2575,6 +2855,38 @@ documentsTableEl.addEventListener('change', (e) => {
   if (cb.checked) state.selectedDocIds.add(id);
   else state.selectedDocIds.delete(id);
   syncSelectAllDocs();
+});
+
+// Person Explorer event wiring
+personTableEl.addEventListener('click', (e) => {
+  const row = e.target.closest('.doc-row');
+  if (!row) return;
+  state.selectedPersonKey = row.dataset.personKey;
+  renderPersonTable();
+  renderPersonDetail(state.selectedPersonKey);
+});
+
+for (const th of personSortHeaders) {
+  th.addEventListener('click', () => {
+    const key = th.dataset.personSort;
+    if (state.personSortKey === key) {
+      state.personSortDir = state.personSortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      state.personSortKey = key;
+      state.personSortDir = key === 'name' ? 'asc' : 'desc';
+    }
+    renderPersonTable();
+  });
+}
+
+personFilterEl.addEventListener('input', () => {
+  state.personFilterText = personFilterEl.value.trim();
+  renderPersonTable();
+});
+
+personRoleFilterEl.addEventListener('change', () => {
+  state.personRoleFilter = personRoleFilterEl.value;
+  renderPersonTable();
 });
 
 // Staggered reveal animation

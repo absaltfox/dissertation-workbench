@@ -31,6 +31,7 @@
       <nav class="tabs reveal" role="tablist" aria-label="Views">
         <button class="tab-btn active" data-tab="records" role="tab" aria-selected="true">Document Explorer</button>
         <button class="tab-btn" data-tab="citations" role="tab" aria-selected="false">Citation Explorer</button>
+        <button class="tab-btn" data-tab="people" role="tab" aria-selected="false">Person Explorer</button>
         <button class="tab-btn" data-tab="analytics" role="tab" aria-selected="false">Analytics Dashboard</button>
         <button class="tab-btn" data-tab="about" role="tab" aria-selected="false">About this Tool</button>
         <button class="tab-btn" data-tab="admin" role="tab" aria-selected="false">Admin</button>
@@ -229,6 +230,50 @@
           <p class="meta" style="margin-bottom:0.5rem">Citations appearing across the most dissertations in the database.</p>
           <div id="foundationalWorksList" class="foundational-works-list"></div>
         </article>
+        </div>
+      </section>
+
+      <!-- Person Explorer -->
+      <section id="tab-people" class="tab-panel reveal" role="tabpanel">
+        <div class="people-explorer">
+          <div class="people-list-col">
+            <article class="panel">
+              <h2>People</h2>
+              <div class="people-filter-row">
+                <input id="personFilter" class="doc-filter" type="search" placeholder="Filter by name, role, affiliation..." style="flex:1;margin:0" />
+                <div class="facet-group">
+                  <label class="facet-label" for="personRoleFilter">Role</label>
+                  <select id="personRoleFilter" class="facet-select">
+                    <option value="">All Roles</option>
+                    <option value="Supervisor">Supervisor</option>
+                    <option value="Co-Supervisor">Co-Supervisor</option>
+                    <option value="Committee Member">Committee Member</option>
+                    <option value="External Examiner">External Examiner</option>
+                    <option value="University Examiner">University Examiner</option>
+                  </select>
+                </div>
+              </div>
+              <div class="table-wrap" style="max-height:78vh">
+                <table>
+                  <thead>
+                    <tr>
+                      <th class="sortable" data-person-sort="name">Name</th>
+                      <th class="sortable" data-person-sort="docCount">Docs</th>
+                      <th class="sortable" data-person-sort="roles">Roles</th>
+                      <th class="sortable" data-person-sort="years">Years</th>
+                    </tr>
+                  </thead>
+                  <tbody id="personTable"></tbody>
+                </table>
+              </div>
+              <span id="personCount" class="facet-count" style="display:block;margin-top:0.4rem"></span>
+            </article>
+          </div>
+          <div class="people-detail-col">
+            <article class="panel">
+              <div id="personDetail"><p class="meta">Select a person to view their profile.</p></div>
+            </article>
+          </div>
         </div>
       </section>
 

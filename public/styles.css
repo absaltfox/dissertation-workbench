@@ -1462,12 +1462,49 @@ button.summon-check-btn:disabled {
   flex-wrap: wrap;
 }
 
+/* --- Person Explorer --- */
+
+.people-explorer {
+  display: grid;
+  grid-template-columns: minmax(320px, 0.9fr) minmax(0, 1.1fr);
+  gap: 0.75rem;
+  align-items: start;
+}
+
+.people-list-col,
+.people-detail-col {
+  min-width: 0;
+}
+
+.people-filter-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.75rem;
+  margin: 0 0 0.55rem;
+}
+
+.people-detail-col {
+  position: sticky;
+  top: 1rem;
+}
+
+.people-explorer td .token-list {
+  gap: 0.3rem 0.35rem;
+  padding: 0.15rem 0;
+}
+
+.people-detail-col .detail-body {
+  margin-top: 0.9rem;
+}
+
 /* --- Responsive --- */
 
 @media (max-width: 1020px) {
   .analytics-grid { grid-template-columns: 1fr; }
   .kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .citations-explorer { grid-template-columns: 1fr; }
+  .people-explorer { grid-template-columns: 1fr; }
+  .people-detail-col { position: static; }
 }
 
 @media (max-width: 680px) {
