@@ -43,6 +43,11 @@ function normalizeCommaName(value) {
   const family = parts[0];
   const given = parts[1];
   if (!family || !given) return String(value || '').trim();
+  // Only swap if "given" part looks like a first name: 1–3 words, starts uppercase, no digits
+  const givenWords = given.trim().split(/\s+/);
+  if (givenWords.length > 3 || /\d/.test(given) || !/^[A-Z\u00C0-\u024F]/.test(given)) {
+    return String(value || '').trim();
+  }
   return `${given} ${family}`.replace(/\s+/g, ' ').trim();
 }
 

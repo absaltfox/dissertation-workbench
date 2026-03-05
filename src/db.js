@@ -117,7 +117,6 @@ export function cleanupCommitteeArtifacts(dbInstance) {
       'supervisory committee',
       'committee members'
     )
-    OR name LIKE '%Committee Members%'
   `).run().changes;
 }
 
@@ -340,6 +339,8 @@ export function saveCommitteeMembers(docId, members, source) {
         ELSE excluded.updated_at
       END
   `);
+  // Second dedup layer: normalised name-key + role. The caller may also dedup by exact name,
+  // and the SQL UNIQUE(doc_id, name, role) constraint provides a final safety net.
   const seen = new Set();
   for (const member of members || []) {
     const role = member.role || null;
