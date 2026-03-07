@@ -4,7 +4,7 @@ import {
   DEFAULT_BASE_URL, DEFAULT_INDEX, DEFAULT_API_KEY, DEFAULT_QUERY,
   DEFAULT_TERM, DEFAULT_SOURCE, DEFAULT_DOWNLOAD_FILES, PDF_CACHE_DIR, SQLITE_PATH, DATA_DIR
 } from './config.js';
-import { ensureStorage, getDb, saveRunMetrics } from './db.js';
+import { ensureStorage, getDb, saveRunMetrics, hasTopics, loadTopics, loadDocumentTopics, loadDocumentTopicCoords, loadTopicHierarchy, getCitationCooccurrence } from './db.js';
 import {
   toArray, flattenText, extractYear, parsePageCount, topTermsFromText, buildWordCloud,
   buildMethodologyStats, extractNgrams, detectMethodologies, isLowSignalConceptPhrase
@@ -511,13 +511,15 @@ function buildTermCooccurrence(records, topN = 20) {
     // Rank by lift (statistical surprise) then raw count as tiebreaker.
     .sort((a, b) => b.lift - a.lift || b.count - a.count)
     .slice(0, topN)
-    .map(({ termA, termB, count, lift }) => ({
+    .map(({ termA, termB, count, lift, freqA, freqB }) => ({
       conceptIdA: `c:${termA.replace(/\s+/g, '_')}`,
       conceptIdB: `c:${termB.replace(/\s+/g, '_')}`,
       termA,
       termB,
       count,
-      lift: Math.round(lift * 10) / 10
+      lift: Math.round(lift * 10) / 10,
+      freqA,
+      freqB
     }));
 }
 
@@ -617,6 +619,93 @@ function buildMethodologyConceptMatrix(records, topM = 10, topC = 10) {
   };
 }
 
+function buildParentClusters(hierarchy, topics, targetK = 10) {
+  const { leafTopicIds, linkage } = hierarchy;
+  const N = leafTopicIds.length;
+  if (N <= targetK) {
+    // Fewer leaves than target — each leaf is its own parent
+    const parentClusters = topics.filter((t) => t.topicId !== -1).map((t, i) => ({
+      parentId: i, topicId: i, label: t.label, docCount: t.docCount, children: [t.topicId],
+    }));
+    const leafToParent = new Map(parentClusters.map((p) => [p.children[0], p.parentId]));
+    return { parentClusters, leafToParent };
+  }
+
+  // Union-find over N leaves + up to N-1 merge nodes
+  const parent = new Array(N + linkage.length).fill(-1);
+  const find = (x) => { while (parent[x] !== -1) x = parent[x]; return x; };
+  const union = (a, b, into) => { parent[find(a)] = into; parent[find(b)] = into; };
+
+  // Apply first N - targetK merges (linkage is sorted by distance)
+  const mergesToApply = N - targetK;
+  for (let m = 0; m < mergesToApply; m++) {
+    const [i, j] = linkage[m];
+    union(i, j, N + m);
+  }
+
+  // Collect connected components — each root is a parent cluster
+  const rootToChildren = new Map();
+  const leafIdxToTopicId = new Map();
+  const topicDocCount = new Map(topics.map((t) => [t.topicId, t.docCount || 0]));
+  for (let i = 0; i < N; i++) {
+    leafIdxToTopicId.set(i, leafTopicIds[i]);
+    const root = find(i);
+    if (!rootToChildren.has(root)) rootToChildren.set(root, []);
+    rootToChildren.get(root).push(leafTopicIds[i]);
+  }
+
+  const topicLabelMap = new Map(topics.map((t) => [t.topicId, t.label]));
+  const parentClusters = [];
+  const leafToParent = new Map();
+  let parentIdx = 0;
+
+  for (const [, children] of rootToChildren) {
+    // Label = label of the child topic with the most docs
+    const bestChild = children.reduce((best, tid) =>
+      (topicDocCount.get(tid) || 0) > (topicDocCount.get(best) || 0) ? tid : best
+    , children[0]);
+    const totalDocs = children.reduce((sum, tid) => sum + (topicDocCount.get(tid) || 0), 0);
+    parentClusters.push({
+      parentId: parentIdx, topicId: parentIdx,
+      label: topicLabelMap.get(bestChild) || `Cluster ${parentIdx}`,
+      docCount: totalDocs, children,
+    });
+    for (const tid of children) leafToParent.set(tid, parentIdx);
+    parentIdx++;
+  }
+
+  parentClusters.sort((a, b) => b.docCount - a.docCount);
+  // Re-index after sort
+  const oldToNew = new Map(parentClusters.map((p, i) => [p.parentId, i]));
+  for (const p of parentClusters) p.parentId = p.topicId = oldToNew.get(p.parentId);
+  for (const [tid, oldPid] of leafToParent) leafToParent.set(tid, oldToNew.get(oldPid));
+
+  return { parentClusters, leafToParent };
+}
+
+function buildTopicsByYear(topics, documents, leafToParent) {
+  const yearCounts = new Map(); // topicId -> Map<year, count>
+
+  for (const doc of documents) {
+    if (doc.topicId == null || !doc.year) continue;
+    const resolvedId = leafToParent ? (leafToParent.get(doc.topicId) ?? doc.topicId) : doc.topicId;
+    if (!yearCounts.has(resolvedId)) yearCounts.set(resolvedId, new Map());
+    const ym = yearCounts.get(resolvedId);
+    ym.set(doc.year, (ym.get(doc.year) || 0) + 1);
+  }
+
+  return topics
+    .filter((t) => t.topicId !== -1)
+    .slice(0, 10)
+    .map((topic) => {
+      const ym = yearCounts.get(topic.topicId) || new Map();
+      const data = Array.from(ym.entries())
+        .map(([year, count]) => ({ year: Number(year), count }))
+        .sort((a, b) => a.year - b.year);
+      return { topicId: topic.topicId, label: topic.label, data };
+    });
+}
+
 function buildResearchGaps(records, topN = 15) {
   const dict = loadConceptDictionary();
   const conceptDocCounts = new Map();
@@ -662,6 +751,119 @@ function buildResearchGaps(records, topN = 15) {
   return gaps
     .sort((a, b) => b.gapScore - a.gapScore)
     .slice(0, topN);
+}
+
+function buildSupervisorNetwork(records, minEdge = 1) {
+  const nodeMap = new Map(); // name -> docCount
+  const edgeMap = new Map(); // "A|||B" -> { weight, docs }
+
+  for (const rec of records) {
+    const people = [];
+    for (const s of (rec.supervisors || [])) people.push(s);
+    if (rec.committee) {
+      for (const m of rec.committee) {
+        if (m.role === 'Supervisor' || m.role === 'Co-Supervisor' || m.role === 'Committee Member') {
+          if (!people.includes(m.name)) people.push(m.name);
+        }
+      }
+    }
+    if (people.length === 0) continue;
+
+    for (const p of people) {
+      nodeMap.set(p, (nodeMap.get(p) || 0) + 1);
+    }
+
+    const sorted = [...people].sort();
+    for (let i = 0; i < sorted.length; i++) {
+      for (let j = i + 1; j < sorted.length; j++) {
+        const key = `${sorted[i]}|||${sorted[j]}`;
+        if (!edgeMap.has(key)) edgeMap.set(key, { weight: 0, docs: [] });
+        const e = edgeMap.get(key);
+        e.weight += 1;
+        e.docs.push(rec.id);
+      }
+    }
+  }
+
+  // Top 30 nodes by docCount
+  const topNodes = Array.from(nodeMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 30);
+  const topSet = new Set(topNodes.map(([name]) => name));
+
+  const nodes = topNodes.map(([id, docCount]) => ({ id, docCount }));
+  const edges = Array.from(edgeMap.entries())
+    .filter(([key, e]) => {
+      const [a, b] = key.split('|||');
+      return topSet.has(a) && topSet.has(b) && e.weight >= minEdge;
+    })
+    .map(([key, e]) => {
+      const [source, target] = key.split('|||');
+      return { source, target, weight: e.weight, docs: e.docs };
+    });
+
+  return { nodes, edges };
+}
+
+function buildCitationCooccurrenceNetwork() {
+  const rows = getCitationCooccurrence(100);
+  const nodeMap = new Map();
+
+  for (const row of rows) {
+    if (!nodeMap.has(row.id1)) nodeMap.set(row.id1, { id: row.id1, label: row.text1, freq: row.freq1 });
+    if (!nodeMap.has(row.id2)) nodeMap.set(row.id2, { id: row.id2, label: row.text2, freq: row.freq2 });
+  }
+
+  const nodes = Array.from(nodeMap.values());
+  const edges = rows.map(row => ({
+    source: row.id1,
+    target: row.id2,
+    weight: row.shared
+  }));
+
+  return { nodes, edges };
+}
+
+function buildMethodologyTopicMatrix(records, topics) {
+  const methCounts = new Map();
+  const topicMap = new Map(topics.map(t => [t.topicId, t.label]));
+
+  for (const rec of records) {
+    for (const m of (rec.methodologies || [])) {
+      methCounts.set(m, (methCounts.get(m) || 0) + 1);
+    }
+  }
+
+  const topMethodologies = Array.from(methCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([name]) => name);
+
+  const validTopics = topics
+    .filter(t => t.topicId !== -1)
+    .slice(0, 8);
+
+  const methSet = new Set(topMethodologies);
+  const topicIdList = validTopics.map(t => t.topicId);
+  const topicIdSet = new Set(topicIdList);
+
+  const matrix = topMethodologies.map(() => topicIdList.map(() => 0));
+
+  for (const rec of records) {
+    if (rec.topicId == null || !topicIdSet.has(rec.topicId)) continue;
+    const recMeths = (rec.methodologies || []).filter(m => methSet.has(m));
+    const ti = topicIdList.indexOf(rec.topicId);
+    for (const m of recMeths) {
+      const mi = topMethodologies.indexOf(m);
+      matrix[mi][ti] += 1;
+    }
+  }
+
+  return {
+    methodologies: topMethodologies,
+    topics: validTopics.map(t => ({ topicId: t.topicId, label: t.label })),
+    matrix
+  };
 }
 
 export async function collectMetrics(options = {}) {
@@ -734,6 +936,36 @@ export async function collectMetrics(options = {}) {
   const metrics = buildMetrics(normalizedRecords, subjectLimit);
   saveRunMetrics(sourceMeta, metrics);
 
+  // Load BERTopic results if available
+  let topicData = null;
+  if (hasTopics()) {
+    const topics = loadTopics();
+    const docTopics = loadDocumentTopics();
+    // Attach topic_id and UMAP coords to each document
+    const topicCoords = loadDocumentTopicCoords();
+    for (const doc of normalizedRecords) {
+      const dt = docTopics.get(doc.id);
+      if (dt) {
+        doc.topicId = dt.topicId;
+        doc.topicProbability = dt.probability;
+      }
+      const coord = topicCoords.get(doc.id);
+      if (coord) {
+        doc.umapX = coord.x;
+        doc.umapY = coord.y;
+      }
+    }
+    const hierarchy = loadTopicHierarchy();
+    const parentInfo = hierarchy ? buildParentClusters(hierarchy, topics) : null;
+    topicData = {
+      topics,
+      byYear: parentInfo
+        ? buildTopicsByYear(parentInfo.parentClusters, normalizedRecords, parentInfo.leafToParent)
+        : buildTopicsByYear(topics, normalizedRecords),
+      hierarchy,
+    };
+  }
+
   return {
     generatedAt: new Date().toISOString(),
     source: sourceMeta,
@@ -756,6 +988,10 @@ export async function collectMetrics(options = {}) {
     termCooccurrence: buildTermCooccurrence(normalizedRecords),
     conceptTimeline: buildConceptTimeline(normalizedRecords),
     methodologyConceptMatrix: buildMethodologyConceptMatrix(normalizedRecords),
-    researchGaps: buildResearchGaps(normalizedRecords)
+    researchGaps: buildResearchGaps(normalizedRecords),
+    supervisorNetwork: buildSupervisorNetwork(normalizedRecords),
+    citationCooccurrence: buildCitationCooccurrenceNetwork(),
+    methodologyTopicMatrix: topicData ? buildMethodologyTopicMatrix(normalizedRecords, topicData.topics) : null,
+    topicData
   };
 }

@@ -93,6 +93,35 @@ export function getDb() {
       looked_up_at TEXT NOT NULL,
       FOREIGN KEY (citation_id) REFERENCES citations(id)
     );
+
+    CREATE TABLE IF NOT EXISTS topics (
+      topic_id    INTEGER PRIMARY KEY,
+      label       TEXT NOT NULL,
+      top_terms   TEXT NOT NULL,
+      doc_count   INTEGER NOT NULL,
+      model_name  TEXT NOT NULL,
+      created_at  TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS document_topics (
+      doc_id      TEXT NOT NULL,
+      topic_id    INTEGER NOT NULL,
+      probability REAL,
+      PRIMARY KEY (doc_id, topic_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS document_topic_coords (
+      doc_id  TEXT PRIMARY KEY,
+      umap_x  REAL NOT NULL,
+      umap_y  REAL NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS topic_hierarchy_meta (
+      id              INTEGER PRIMARY KEY DEFAULT 1,
+      leaf_topic_ids  TEXT NOT NULL,
+      linkage_json    TEXT NOT NULL,
+      created_at      TEXT NOT NULL
+    );
   `);
 
   // Migrations — add columns to existing tables
@@ -526,6 +555,37 @@ export function listPendingLookups(limit = 100) {
   `).all(limit);
 }
 
+export function getCitationCooccurrence(limit = 100) {
+  // First find the top most-shared citations (those appearing in most dissertations),
+  // then find co-occurrence pairs among them. This keeps the graph focused on the
+  // most influential works rather than all 8k+ pairs at the minimum threshold.
+  return getDb().prepare(`
+    WITH top_citations AS (
+      SELECT citation_id, COUNT(DISTINCT doc_id) AS cnt
+      FROM document_citations
+      GROUP BY citation_id
+      HAVING cnt >= 2
+      ORDER BY cnt DESC
+      LIMIT 50
+    )
+    SELECT
+      c1.id AS id1, substr(c1.citation_text, 1, 80) AS text1, tc1.cnt AS freq1,
+      c2.id AS id2, substr(c2.citation_text, 1, 80) AS text2, tc2.cnt AS freq2,
+      COUNT(DISTINCT dc1.doc_id) AS shared
+    FROM document_citations dc1
+    JOIN document_citations dc2
+      ON dc1.doc_id = dc2.doc_id AND dc1.citation_id < dc2.citation_id
+    JOIN citations c1 ON c1.id = dc1.citation_id
+    JOIN citations c2 ON c2.id = dc2.citation_id
+    JOIN top_citations tc1 ON tc1.citation_id = c1.id
+    JOIN top_citations tc2 ON tc2.citation_id = c2.id
+    GROUP BY dc1.citation_id, dc2.citation_id
+    HAVING shared >= 2
+    ORDER BY shared DESC
+    LIMIT ?
+  `).all(limit);
+}
+
 export function getTopCitedWorks(limit = 50) {
   return getDb().prepare(`
     SELECT c.id, c.citation_text,
@@ -540,6 +600,62 @@ export function getTopCitedWorks(limit = 50) {
     ORDER BY doc_count DESC, c.citation_text
     LIMIT ?
   `).all(limit);
+}
+
+// --- Topic functions ---
+
+export function hasTopics() {
+  try {
+    const row = getDb().prepare('SELECT 1 FROM topics LIMIT 1').get();
+    return !!row;
+  } catch {
+    return false;
+  }
+}
+
+export function loadTopics() {
+  const rows = getDb().prepare('SELECT topic_id, label, top_terms, doc_count, model_name, created_at FROM topics ORDER BY doc_count DESC').all();
+  return rows.map((row) => ({
+    topicId: row.topic_id,
+    label: row.label,
+    topTerms: (() => { try { return JSON.parse(row.top_terms); } catch { return []; } })(),
+    docCount: row.doc_count,
+    modelName: row.model_name,
+    createdAt: row.created_at,
+  }));
+}
+
+export function loadDocumentTopics() {
+  const rows = getDb().prepare('SELECT doc_id, topic_id, probability FROM document_topics').all();
+  const map = new Map();
+  for (const row of rows) {
+    map.set(row.doc_id, { topicId: row.topic_id, probability: row.probability });
+  }
+  return map;
+}
+
+export function loadDocumentTopicCoords() {
+  try {
+    const rows = getDb().prepare('SELECT doc_id, umap_x, umap_y FROM document_topic_coords').all();
+    const map = new Map();
+    for (const row of rows) {
+      map.set(row.doc_id, { x: row.umap_x, y: row.umap_y });
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+export function loadTopicHierarchy() {
+  try {
+    const row = getDb().prepare('SELECT leaf_topic_ids, linkage_json FROM topic_hierarchy_meta WHERE id = 1').get();
+    if (!row) return null;
+    return {
+      leafTopicIds: JSON.parse(row.leaf_topic_ids),
+      linkage: JSON.parse(row.linkage_json),
+    };
+  } catch { return null; }
 }
 
 export async function logCacheStats() {
