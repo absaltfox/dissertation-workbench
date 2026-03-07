@@ -341,6 +341,29 @@ export function parseCommittee(fullText) {
   const section = fullText.slice(startIdx, startIdx + 3000);
   const lines = section.split(/\n/).map((l) => l.trim()).filter(Boolean);
 
+  // Join continuation lines that are fragments of a wrapped affiliation line.
+  // e.g. "Department of French, Hispanic & Italian Studies,\nUBC" → single line.
+  // Process bottom-up so splicing doesn't shift indices we haven't visited yet.
+  for (let i = lines.length - 1; i > 0; i--) {
+    const line = lines[i];
+    // Skip if this IS a role line
+    if (ROLE_PATTERNS.some(({ pattern }) => pattern.test(line))) continue;
+    // Skip if this looks like a new name,affiliation entry
+    if (/^(Dr\.|Prof\.)/.test(line)) continue;
+    if (/^[A-Z][a-z]+ [A-Z]/.test(line) && line.includes(',')) continue;
+    // Fragment: short (≤40 chars), no comma, not "Firstname Lastname"
+    const isFragment = line.length <= 40 && !line.includes(',')
+      && !/^[A-Z][a-z]+\s+[A-Z][a-z]/.test(line);
+    const isInstitutionTail = /^(University|Columbia|UBC|SFU|of\s)/i.test(line);
+    if (isFragment || isInstitutionTail) {
+      // Only join if previous line isn't a role line
+      if (!ROLE_PATTERNS.some(({ pattern }) => pattern.test(lines[i - 1]))) {
+        lines[i - 1] = lines[i - 1] + ' ' + line;
+        lines.splice(i, 1);
+      }
+    }
+  }
+
   const members = [];
   const stopPattern = /^(abstract|table of contents|acknowledgment|dedication|preface)/i;
 
@@ -363,11 +386,17 @@ export function parseCommittee(fullText) {
       // Match any parenthesised text — matchedRole already verified it's a known role.
       const inlineMatch = line.match(/^(.+?)\s*\(([^)]+)\)\s*$/);
       if (inlineMatch) {
-        const inlineName = inlineMatch[1].trim();
+        let inlineName = inlineMatch[1].trim();
+        // Clean trailing role/title text
+        inlineName = inlineName.replace(/\s*[–—-]\s*(Professor|Assistant|Associate|Instructor).*$/i, '').trim();
+        inlineName = inlineName.replace(/\s+(Thank|You|Sessional\s+Le[ct].*|Senior\s+Inst.*)$/i, '').trim();
+        inlineName = inlineName.replace(/-$/, '').trim();
         if (inlineName && inlineName.length > 1 && inlineName.length < 120) {
           if (!/^(additional|examining)\s+/i.test(inlineName) && !/committee\s+member/i.test(inlineName)) {
-            const exists = members.some((m) => m.name === inlineName && m.role === matchedRole);
-            if (!exists) members.push({ name: inlineName, role: matchedRole, affiliation: null });
+            if (!/^(University|UBC|SFU|Columbia|Research|of\s|&\s)/i.test(inlineName)) {
+              const exists = members.some((m) => m.name === inlineName && m.role === matchedRole);
+              if (!exists) members.push({ name: inlineName, role: matchedRole, affiliation: null });
+            }
           }
         }
         continue;
@@ -421,8 +450,18 @@ export function parseCommittee(fullText) {
       }
 
       if (name && name.length > 1 && name.length < 120) {
+        // Clean trailing role/title text that leaked into the name
+        name = name.replace(/\s*[–—-]\s*(Professor|Assistant|Associate|Instructor).*$/i, '').trim();
+        name = name.replace(/\s+(Thank|You|Sessional\s+Le[ct].*|Senior\s+Inst.*)$/i, '').trim();
+        name = name.replace(/-$/, '').trim();
         // Skip label lines captured as names
         if (/^(additional|examining)\s+/i.test(name) || /committee\s+member/i.test(name)) continue;
+        // Reject institution/department fragments, bare role words, and page artifacts
+        if (/^(University|UBC|SFU|Columbia|Research|of\s|&\s)/i.test(name)) continue;
+        if (/^(Professor|Examiner|Academic|Abstract)\b/i.test(name)) continue;
+        if (/\bExaminer\b/.test(name)) continue;
+        if (/^(ii|iii|iv|v|vi)\s/i.test(name)) continue;
+        if (!name) continue;
         // Avoid adding duplicates
         const exists = members.some((m) => m.name === name && m.role === matchedRole);
         if (!exists) {

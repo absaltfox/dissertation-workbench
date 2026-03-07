@@ -23,6 +23,13 @@ const conceptTimelineChartEl = document.getElementById('conceptTimelineChart');
 const conceptTimelineLegendEl = document.getElementById('conceptTimelineLegend');
 const methodologyConceptHeatmapEl = document.getElementById('methodologyConceptHeatmap');
 const researchGapsListEl = document.getElementById('researchGapsList');
+const supervisorTopicPanelEl = document.getElementById('supervisorTopicPanel');
+const supervisorTopicHeatmapEl = document.getElementById('supervisorTopicHeatmap');
+const topicDistPanelEl = document.getElementById('topicDistPanel');
+const topicBarsEl = document.getElementById('topicBars');
+const topicTimelinePanelEl = document.getElementById('topicTimelinePanel');
+const topicTimelineChartEl = document.getElementById('topicTimelineChart');
+const topicTimelineLegendEl = document.getElementById('topicTimelineLegend');
 const foundationalWorksListEl = document.getElementById('foundationalWorksList');
 const exportBibTeXBtn = document.getElementById('exportBibTeX');
 const exportRISBtn = document.getElementById('exportRIS');
@@ -166,6 +173,105 @@ function escapeHtml(text) {
     .replaceAll("'", '&#39;');
 }
 
+function normalizeAffiliation(raw) {
+  if (!raw) return '';
+  let s = raw.trim();
+
+  // Strip academic titles/ranks (order matters: longer phrases first)
+  const titles = [
+    'Associate Professor', 'Assistant Professor', 'Adjunct Professor',
+    'Full Professor', 'Professor Emerita', 'Professor Emeritus',
+    'Professor of Teaching', 'Senior Instructor', 'Senior Lecturer',
+    'Clinical Professor', 'Professor', 'Emerita', 'Emeritus', 'Dean', 'Dr\\.'
+  ];
+  const titleRe = new RegExp('(?:^|\\b)(' + titles.join('|') + ')(?:\\b|(?=\\s|,|;|$))', 'gi');
+  s = s.replace(titleRe, '');
+
+  // Normalize institution names
+  s = s.replace(/\bThe University of British Columbia\b/gi, 'UBC');
+  s = s.replace(/\bUniversity of British Columbia\b/gi, 'UBC');
+  s = s.replace(/\bSimon Fraser University\b/gi, 'SFU');
+  s = s.replace(/\bUniversity of Victoria\b/gi, 'UVic');
+  s = s.replace(/\bThompson Rivers University\b/gi, 'TRU');
+  s = s.replace(/\bRoyal Roads University\b/gi, 'RRU');
+
+  // Strip department/faculty/school prefixes
+  s = s.replace(/\b(Department|Dept\.?|Faculty|School|Division|Institute|Centre|Center)\s+of\s+/gi, '');
+
+  // Normalize "and" → "&" in department names
+  s = s.replace(/\band\b/gi, '&');
+
+  // Move institution acronym from start to end: "UBC X" → "X, UBC"
+  s = s.replace(/^(UBC|SFU|UVic|TRU|RRU)\b[,;\s]*(.+)$/i, (_, inst, rest) => rest.trim() + ', ' + inst.toUpperCase());
+
+  // Collapse whitespace, strip leftover separators
+  s = s.replace(/\s+/g, ' ').trim();
+  s = s.replace(/^[,;\s\-–—]+|[,;\s\-–—]+$/g, '').trim();
+
+  // Title case, but preserve all-caps acronyms (UBC, SFU, etc.)
+  s = s.replace(/\w\S*/g, w => {
+    if (/^[A-Z]{2,}$/.test(w)) return w; // preserve acronyms
+    return w.length <= 2 ? w.toLowerCase() : w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+  });
+  // Fix common small words
+  s = s.replace(/\b(And|Or|Of|In|For|The|At|By|To)\b/g, m => m.toLowerCase());
+
+  return s || '';
+}
+
+/** Merge semantically similar normalized affiliations for display.
+ *  - Defaults bare departments (no institution) to ", UBC"
+ *  - Uses token containment: if A's dept tokens ⊆ B's, merge A into B */
+function mergeAffiliations(affiliations) {
+  const KNOWN_INSTITUTIONS = ['UBC', 'SFU', 'UVic', 'TRU', 'RRU'];
+  const instRe = new RegExp(',\\s*(' + KNOWN_INSTITUTIONS.join('|') + ')\\s*$', 'i');
+
+  // Parse each affiliation into { dept tokens, institution, original }
+  const parsed = affiliations.map(a => {
+    const m = a.match(instRe);
+    const institution = m ? m[1].toUpperCase() : null;
+    const dept = m ? a.slice(0, m.index).trim() : a.trim();
+    const tokens = dept.toLowerCase().replace(/[&,]/g, ' ').split(/\s+/).filter(Boolean);
+    return { original: a, dept, institution, tokens };
+  });
+
+  // Default bare departments to UBC
+  for (const p of parsed) {
+    if (!p.institution) {
+      p.institution = 'UBC';
+      p.original = p.dept + ', UBC';
+    }
+  }
+
+  // Deduplicate after defaulting institution
+  const deduped = new Map();
+  for (const p of parsed) {
+    const key = p.original.toLowerCase();
+    if (!deduped.has(key)) deduped.set(key, p);
+  }
+  const entries = Array.from(deduped.values());
+
+  // Containment merge: if A's tokens ⊆ B's tokens (same institution), drop A
+  const merged = [];
+  for (let i = 0; i < entries.length; i++) {
+    const a = entries[i];
+    let subsumed = false;
+    for (let j = 0; j < entries.length; j++) {
+      if (i === j) continue;
+      const b = entries[j];
+      if (a.institution !== b.institution) continue;
+      if (a.tokens.length >= b.tokens.length) continue;
+      // Check if all of A's tokens appear in B
+      if (a.tokens.every(t => b.tokens.includes(t))) {
+        subsumed = true;
+        break;
+      }
+    }
+    if (!subsumed) merged.push(a.original);
+  }
+  return merged.length ? merged : affiliations;
+}
+
 function setStatus(message, isError = false) {
   statusTextEl.textContent = message;
   statusEl.classList.toggle('error', isError);
@@ -290,6 +396,11 @@ function docsForConceptTerm(term) {
   return docs.filter((doc) => (doc.conceptTerms || []).some((t) => String(t || '').toLowerCase() === normalized));
 }
 
+function docsForTopic(topicId) {
+  const docs = state.payload?.documents || [];
+  return docs.filter((doc) => doc.topicId === topicId);
+}
+
 function docsForMethodology(methodology) {
   const docs = state.payload?.documents || [];
   const normalized = String(methodology || '').toLowerCase();
@@ -372,7 +483,7 @@ function getFilteredDocs() {
   const { degree, program, affiliation } = state.activeFilters;
   if (degree)      docs = docs.filter(d => d.degree === degree);
   if (program)     docs = docs.filter(d => d.program === program);
-  if (affiliation) docs = docs.filter(d => (d.affiliation || []).includes(affiliation));
+  if (affiliation) docs = docs.filter(d => (d.affiliation || []).some(a => normalizeAffiliation(a) === affiliation));
   return docs;
 }
 
@@ -502,7 +613,7 @@ function renderDetails() {
     }
     committeeHtml = Object.entries(grouped).map(([role, members]) => {
       const names = members.map((m) =>
-        `${escapeHtml(m.name)}${m.affiliation ? ` (${escapeHtml(m.affiliation)})` : ''}`
+        `${escapeHtml(m.name)}${m.affiliation ? ` (${escapeHtml(normalizeAffiliation(m.affiliation))})` : ''}`
       ).join(', ');
       return `<div class="detail-meta-label">${escapeHtml(role)}</div><div class="detail-meta-value">${names}</div>`;
     }).join('');
@@ -549,6 +660,11 @@ function renderDetails() {
       <div class="detail-meta-label">Words</div><div class="detail-meta-value">${formatNum(doc.wordCount)}</div>
       ${doc.supervisors?.length ? `<div class="detail-meta-label">Supervisor</div><div class="detail-meta-value">${doc.supervisors.map((s) => `<button class="supervisor-link" data-supervisor-name="${escapeHtml(s)}">${escapeHtml(s)}</button>`).join('; ')}</div>` : ''}
       ${committeeHtml}
+      ${doc.topicId != null ? (() => {
+        const topic = state.payload?.topicData?.topics?.find((t) => t.topicId === doc.topicId);
+        const label = doc.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || `Topic ${doc.topicId}`);
+        return `<div class="detail-meta-label">Topic</div><div class="detail-meta-value">${escapeHtml(label)}</div>`;
+      })() : ''}
     </div>
     <div>
       <p class="detail-section-title">Abstract</p>
@@ -1081,6 +1197,109 @@ function renderSupervisorHeatmap() {
   }
 }
 
+function renderSupervisorTopicHeatmap() {
+  const td = getAnalytics()?.topicData;
+  if (!td || !td.topics || !td.topics.length) {
+    if (supervisorTopicPanelEl) supervisorTopicPanelEl.hidden = true;
+    return;
+  }
+
+  const docs = getFilteredDocs();
+  // Build supervisor counts
+  const supCounts = new Map();
+  const supTopicCounts = new Map(); // sup -> Map<topicId, count>
+  for (const doc of docs) {
+    if (doc.topicId == null) continue;
+    for (const sup of (doc.supervisors || [])) {
+      supCounts.set(sup, (supCounts.get(sup) || 0) + 1);
+      if (!supTopicCounts.has(sup)) supTopicCounts.set(sup, new Map());
+      const tm = supTopicCounts.get(sup);
+      tm.set(doc.topicId, (tm.get(doc.topicId) || 0) + 1);
+    }
+  }
+
+  const topSups = Array.from(supCounts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 12)
+    .map(([name]) => name);
+
+  // Only include topics that appear with at least one of the top supervisors
+  const supSet = new Set(topSups);
+  const topicIdsWithSups = new Set();
+  for (const doc of docs) {
+    if (doc.topicId == null || doc.topicId === -1) continue;
+    if ((doc.supervisors || []).some((s) => supSet.has(s))) {
+      topicIdsWithSups.add(doc.topicId);
+    }
+  }
+  const topTopics = td.topics
+    .filter((t) => t.topicId !== -1 && topicIdsWithSups.has(t.topicId))
+    .slice(0, 10);
+
+  if (!topSups.length || !topTopics.length) {
+    if (supervisorTopicPanelEl) supervisorTopicPanelEl.hidden = true;
+    return;
+  }
+
+  supervisorTopicPanelEl.hidden = false;
+
+  const matrix = topSups.map((sup) =>
+    topTopics.map((topic) => (supTopicCounts.get(sup)?.get(topic.topicId) || 0))
+  );
+  const maxVal = Math.max(...matrix.flat(), 1);
+
+  const headerCells = topTopics
+    .map((t) => {
+      const label = topicDisplayLabel(t.label);
+      return `<th class="heatmap-header heatmap-header-wrap" title="${escapeHtml(t.label)}">${escapeHtml(label)}</th>`;
+    })
+    .join('');
+
+  const bodyRows = topSups
+    .map((sup, si) => {
+      const cells = topTopics
+        .map((topic, tj) => {
+          const val = matrix[si][tj];
+          const lightness = val > 0 ? 95 - Math.round((val / maxVal) * 65) : 97;
+          const textColor = lightness < 55 ? '#fff' : 'var(--ink)';
+          const content = val > 0
+            ? `<button class="heatmap-cell-btn" data-hm-sup="${escapeHtml(sup)}" data-hm-topic="${topic.topicId}" style="color:${textColor}">${val}</button>`
+            : '';
+          return `<td class="heatmap-cell" style="background:hsl(190 58% ${lightness}%);color:${textColor}">${content}</td>`;
+        })
+        .join('');
+      return `<tr><td class="heatmap-label" title="${escapeHtml(sup)}"><button class="supervisor-link" data-supervisor-name="${escapeHtml(sup)}">${escapeHtml(sup)}</button></td>${cells}</tr>`;
+    })
+    .join('');
+
+  supervisorTopicHeatmapEl.innerHTML = `
+    <table class="heatmap-table">
+      <thead><tr><th></th>${headerCells}</tr></thead>
+      <tbody>${bodyRows}</tbody>
+    </table>
+  `;
+
+  for (const node of supervisorTopicHeatmapEl.querySelectorAll('[data-hm-sup][data-hm-topic]')) {
+    node.addEventListener('click', () => {
+      const sup = node.getAttribute('data-hm-sup');
+      const topicId = Number(node.getAttribute('data-hm-topic'));
+      const topic = td.topics.find((t) => t.topicId === topicId);
+      const label = topicDisplayLabel(topic?.label || `Topic ${topicId}`);
+      const matches = docs.filter((d) =>
+        d.topicId === topicId && (d.supervisors || []).includes(sup)
+      );
+      openMatchesModal(`${sup} + ${label}`, matches);
+    });
+  }
+
+  for (const btn of supervisorTopicHeatmapEl.querySelectorAll('.supervisor-link[data-supervisor-name]')) {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openSupervisorProfile(btn.dataset.supervisorName);
+    });
+  }
+}
+
 // --- Citation Explorer ---
 
 function renderCitationDocs() {
@@ -1501,6 +1720,126 @@ function renderConceptTimeline() {
   }).join('');
 }
 
+// --- Topic Distribution ---
+
+function topicDisplayLabel(label) {
+  // BERTopic labels are "0_word1_word2_word3" — strip the ID prefix and join
+  const cleaned = label.replace(/^-?\d+_/, '').replace(/_/g, ' ');
+  return cleaned || label;
+}
+
+function renderTopicDistribution() {
+  const td = getAnalytics()?.topicData;
+  if (!td || !td.topics || !td.topics.length) {
+    if (topicDistPanelEl) topicDistPanelEl.hidden = true;
+    return;
+  }
+  topicDistPanelEl.hidden = false;
+
+  // Show all topics except outliers at end
+  const regular = td.topics.filter((t) => t.topicId !== -1);
+  const outlier = td.topics.find((t) => t.topicId === -1);
+  const ordered = [...regular];
+  if (outlier) ordered.push(outlier);
+
+  const maxCount = Math.max(...ordered.map((t) => t.docCount), 1);
+
+  topicBarsEl.innerHTML = ordered
+    .map((topic) => {
+      const widthPct = (topic.docCount / maxCount) * 100;
+      const displayLabel = topic.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic.label);
+      const topTerms = topic.topicId === -1 ? '' : (topic.topTerms || []).slice(0, 3).map((pair) => Array.isArray(pair) ? pair[0] : pair).join(', ');
+      return `
+        <div class="bar-row">
+          <span class="bar-label" title="${escapeHtml(topic.label)}">
+            ${escapeHtml(displayLabel)}
+            ${topTerms ? `<span class="topic-terms">${escapeHtml(topTerms)}</span>` : ''}
+          </span>
+          <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
+          <button class="bar-value" data-topic-id="${topic.topicId}">${formatNum(topic.docCount)}</button>
+        </div>
+      `;
+    })
+    .join('');
+
+  for (const node of topicBarsEl.querySelectorAll('[data-topic-id]')) {
+    node.addEventListener('click', () => {
+      const topicId = Number(node.getAttribute('data-topic-id'));
+      const topic = td.topics.find((t) => t.topicId === topicId);
+      const label = topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || '');
+      openMatchesModal(`Topic: ${label}`, docsForTopic(topicId));
+    });
+  }
+}
+
+function renderTopicTimeline() {
+  const td = getAnalytics()?.topicData;
+  if (!td || !td.byYear || !td.byYear.length) {
+    if (topicTimelinePanelEl) topicTimelinePanelEl.hidden = true;
+    return;
+  }
+  topicTimelinePanelEl.hidden = false;
+
+  const data = td.byYear;
+  const width = 940;
+  const height = 360;
+  const pad = { t: 20, r: 20, b: 40, l: 58 };
+
+  const allYears = new Set();
+  let maxCount = 1;
+  for (const series of data) {
+    for (const pt of series.data) {
+      allYears.add(pt.year);
+      if (pt.count > maxCount) maxCount = pt.count;
+    }
+  }
+  const years = Array.from(allYears).sort((a, b) => a - b);
+  if (!years.length) {
+    topicTimelineChartEl.innerHTML = '<text x="16" y="40" class="axis">No year data.</text>';
+    topicTimelineLegendEl.innerHTML = '';
+    return;
+  }
+
+  const minX = years[0];
+  const maxX = years[years.length - 1];
+  const x = (v) => pad.l + ((v - minX) / Math.max(maxX - minX, 1)) * (width - pad.l - pad.r);
+  const y = (v) => height - pad.b - (v / maxCount) * (height - pad.t - pad.b);
+
+  const yTicks = Array.from({ length: 6 }, (_, i) => {
+    const val = (maxCount / 5) * i;
+    return { val, y: y(val) };
+  });
+
+  const hueStep = 360 / data.length;
+  const lines = data.map((series, idx) => {
+    const hue = Math.round(idx * hueStep);
+    const color = `hsl(${hue} 65% 45%)`;
+    const points = series.data.map((pt) => `${x(pt.year)},${y(pt.count)}`).join(' ');
+    return `<polyline points="${points}" fill="none" stroke="${color}" stroke-width="2.5" />`;
+  }).join('');
+
+  const xLabels = years
+    .filter((_, i) => i % Math.ceil(years.length / 12) === 0)
+    .map((yr) => `<text class="axis" x="${x(yr)}" y="${height - 10}" text-anchor="middle">${yr}</text>`)
+    .join('');
+
+  topicTimelineChartEl.innerHTML = `
+    ${yTicks.map((tick) => `
+      <line x1="${pad.l}" y1="${tick.y}" x2="${width - pad.r}" y2="${tick.y}" stroke="rgba(8,90,99,0.12)"/>
+      <text class="axis" x="${pad.l - 8}" y="${tick.y + 4}" text-anchor="end">${formatNum(tick.val)}</text>
+    `).join('')}
+    ${lines}
+    ${xLabels}
+  `;
+
+  topicTimelineLegendEl.innerHTML = data.map((series, idx) => {
+    const hue = Math.round(idx * hueStep);
+    const color = `hsl(${hue} 65% 45%)`;
+    const label = topicDisplayLabel(series.label);
+    return `<span class="timeline-legend-item"><span class="timeline-legend-swatch" style="background:${color}"></span>${escapeHtml(label)}</span>`;
+  }).join('');
+}
+
 // --- Supervisor Profiles ---
 
 function buildSupervisorProfile(name, docs) {
@@ -1534,6 +1873,30 @@ function buildSupervisorProfile(name, docs) {
   };
 }
 
+function buildTopicSummary(docs) {
+  const topicCounts = new Map();
+  for (const doc of docs) {
+    if (doc.topicId == null) continue;
+    topicCounts.set(doc.topicId, (topicCounts.get(doc.topicId) || 0) + 1);
+  }
+  const topics = state.payload?.topicData?.topics || [];
+  return Array.from(topicCounts.entries())
+    .map(([topicId, count]) => {
+      const topic = topics.find((t) => t.topicId === topicId);
+      const label = topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || `Topic ${topicId}`);
+      return { topicId, label, count };
+    })
+    .sort((a, b) => b.count - a.count);
+}
+
+function renderTopicTokens(docs) {
+  const summary = buildTopicSummary(docs);
+  if (!summary.length) return '';
+  return summary.map((t) =>
+    `<span class="token topic">${escapeHtml(t.label)} (${t.count})</span>`
+  ).join('');
+}
+
 function renderSupervisorProfile(profile) {
   docModalTitleEl.textContent = `Supervisor: ${profile.name}`;
 
@@ -1564,11 +1927,14 @@ function renderSupervisorProfile(profile) {
       `).join('')
     : '<p class="meta">No dissertations found.</p>';
 
+  const topicTokens = renderTopicTokens(profile.dissertations);
+
   docDetailsEl.innerHTML = `
     <div class="meta">
       <p><strong>${escapeHtml(profile.name)}</strong></p>
       <p>${formatNum(profile.count)} dissertation(s) &middot; ${profile.yearRange}</p>
     </div>
+    ${topicTokens ? `<div><p class="detail-section-title">Topics</p><div class="token-list">${topicTokens}</div></div>` : ''}
     <div>
       <p class="detail-section-title">Top Concepts</p>
       <div class="token-list">${concepts}</div>
@@ -1600,6 +1966,17 @@ function openSupervisorProfile(name) {
 
 // --- Person Explorer ---
 
+function isValidPersonName(name) {
+  if (!name) return false;
+  const n = name.trim();
+  if (n.length < 3) return false;
+  const words = n.split(/\s+/);
+  if (words.length < 2) return false;
+  if (/^(University|UBC|SFU|Columbia|of\s|&\s|Research$)/i.test(n)) return false;
+  if (words.every(w => w.replace(/\./g, '').length <= 2)) return false;
+  return true;
+}
+
 function buildPersonList(docs) {
   const people = new Map();
 
@@ -1608,6 +1985,7 @@ function buildPersonList(docs) {
 
     // Process supervisors
     for (const name of (doc.supervisors || [])) {
+      if (!isValidPersonName(name)) continue;
       const key = name.toLowerCase().trim();
       if (!key) continue;
       docPersonKeys.add(key);
@@ -1630,6 +2008,7 @@ function buildPersonList(docs) {
     // Process committee members
     for (const member of (doc.committee || [])) {
       const name = member.name;
+      if (!isValidPersonName(name)) continue;
       const key = name.toLowerCase().trim();
       if (!key) continue;
       let person = people.get(key);
@@ -1639,7 +2018,10 @@ function buildPersonList(docs) {
       }
       const role = member.role || 'Committee Member';
       person.roles.add(role);
-      if (member.affiliation) person.affiliations.add(member.affiliation);
+      if (member.affiliation) {
+        const norm = normalizeAffiliation(member.affiliation);
+        if (norm) person.affiliations.add(norm);
+      }
       // Only add doc if not already counted from supervisors
       if (!docPersonKeys.has(key)) {
         person.docs.push(doc);
@@ -1667,7 +2049,7 @@ function buildPersonList(docs) {
       roles: Array.from(p.roles),
       docCount: p.docs.length,
       docs: p.docs,
-      affiliations: Array.from(p.affiliations),
+      affiliations: mergeAffiliations(Array.from(p.affiliations)),
       yearRange: years.length ? `${years[0]}\u2013${years[years.length - 1]}` : '\u2013',
       yearMin: years[0] || 9999,
       topConcepts,
@@ -1764,7 +2146,7 @@ function renderPersonDetail(personKey) {
   }
 
   const concepts = person.topConcepts.length
-    ? person.topConcepts.map(c => `<span class="token concept">${escapeHtml(c.term)} (${c.count})</span>`).join('')
+    ? person.topConcepts.map(c => `<span class="token concept clickable" data-person-concept="${escapeHtml(c.term)}">${escapeHtml(c.term)} (${c.count})</span>`).join('')
     : '<span class="token">No concepts</span>';
 
   const maxMeth = Math.max(...person.methodologies.map(m => m.count), 1);
@@ -1812,6 +2194,14 @@ function renderPersonDetail(personKey) {
         <div class="token-list">${rolesHtml}</div>
       </div>
       ${affiliationsHtml ? `<div><p class="detail-section-title">Affiliations</p><div class="token-list">${affiliationsHtml}</div></div>` : ''}
+      ${(() => {
+        const summary = buildTopicSummary(person.docs);
+        if (!summary.length) return '';
+        const tt = summary.map(t =>
+          `<span class="token topic clickable" data-person-topic="${t.topicId}">${escapeHtml(t.label)} (${t.count})</span>`
+        ).join('');
+        return `<div><p class="detail-section-title">Topics</p><div class="token-list">${tt}</div></div>`;
+      })()}
       <div>
         <p class="detail-section-title">Top Concepts</p>
         <div class="token-list">${concepts}</div>
@@ -1841,6 +2231,27 @@ function renderPersonDetail(personKey) {
     link.addEventListener('click', () => {
       const targetKey = link.getAttribute('data-person-nav');
       if (targetKey) openPersonProfile(targetKey);
+    });
+  }
+
+  // Wire concept pill clicks → show matching dissertations for this person
+  for (const pill of personDetailEl.querySelectorAll('[data-person-concept]')) {
+    pill.style.cursor = 'pointer';
+    pill.addEventListener('click', () => {
+      const term = pill.getAttribute('data-person-concept');
+      const matches = person.docs.filter(d => (d.conceptTerms || []).includes(term));
+      openMatchesModal(`${person.name} — "${term}"`, matches);
+    });
+  }
+
+  // Wire topic pill clicks → show matching dissertations for this person
+  for (const pill of personDetailEl.querySelectorAll('[data-person-topic]')) {
+    pill.style.cursor = 'pointer';
+    pill.addEventListener('click', () => {
+      const topicId = Number(pill.getAttribute('data-person-topic'));
+      const matches = person.docs.filter(d => d.topicId === topicId);
+      const label = pill.textContent.replace(/\s*\(\d+\)\s*$/, '');
+      openMatchesModal(`${person.name} — ${label}`, matches);
     });
   }
 }
@@ -1974,7 +2385,7 @@ function populateFacetFilters() {
   const docs = state.payload?.documents || [];
   const degrees      = [...new Set(docs.map(d => d.degree).filter(Boolean))].sort();
   const programs     = [...new Set(docs.map(d => d.program).filter(Boolean))].sort();
-  const affiliations = [...new Set(docs.flatMap(d => d.affiliation || []).filter(Boolean))].sort();
+  const affiliations = [...new Set(docs.flatMap(d => d.affiliation || []).map(normalizeAffiliation).filter(Boolean))].sort();
 
   const populate = (el, values, allLabel) => {
     el.innerHTML = `<option value="">${allLabel}</option>` +
@@ -2184,7 +2595,39 @@ function buildAnalytics(docs) {
   }
   researchGaps.sort((a, b) => b.gapScore - a.gapScore);
 
-  return { metrics, wordCloud, ngramCloud, methodologies, supervisorNgramMatrix, termCooccurrence, conceptTimeline, methodologyConceptMatrix, researchGaps: researchGaps.slice(0, 15) };
+  // Recompute topic distribution from filtered docs if topicData exists
+  let topicData = null;
+  const srcTopics = state.payload?.topicData?.topics;
+  if (srcTopics && srcTopics.length) {
+    const topicCountMap = new Map();
+    const topicYearMap = new Map();
+    for (const doc of docs) {
+      if (doc.topicId == null) continue;
+      topicCountMap.set(doc.topicId, (topicCountMap.get(doc.topicId) || 0) + 1);
+      if (doc.year) {
+        if (!topicYearMap.has(doc.topicId)) topicYearMap.set(doc.topicId, new Map());
+        const ym = topicYearMap.get(doc.topicId);
+        ym.set(doc.year, (ym.get(doc.year) || 0) + 1);
+      }
+    }
+    const filteredTopics = srcTopics
+      .map((t) => ({ ...t, docCount: topicCountMap.get(t.topicId) || 0 }))
+      .filter((t) => t.docCount > 0)
+      .sort((a, b) => b.docCount - a.docCount);
+    const byYear = filteredTopics
+      .filter((t) => t.topicId !== -1)
+      .slice(0, 8)
+      .map((topic) => {
+        const ym = topicYearMap.get(topic.topicId) || new Map();
+        const data = Array.from(ym.entries())
+          .map(([yr, cnt]) => ({ year: Number(yr), count: cnt }))
+          .sort((a, b) => a.year - b.year);
+        return { topicId: topic.topicId, label: topic.label, data };
+      });
+    topicData = { topics: filteredTopics, byYear };
+  }
+
+  return { metrics, wordCloud, ngramCloud, methodologies, supervisorNgramMatrix, termCooccurrence, conceptTimeline, methodologyConceptMatrix, researchGaps: researchGaps.slice(0, 15), topicData };
 }
 
 function getAnalytics() {
@@ -2212,6 +2655,9 @@ function renderAll() {
   renderCooccurrence();
   renderSupervisorHeatmap();
   renderConceptTimeline();
+  renderTopicDistribution();
+  renderTopicTimeline();
+  renderSupervisorTopicHeatmap();
   renderMethodologyConceptMatrix();
   renderResearchGaps();
   if (document.querySelector('#tab-people.active')) renderPersonTable();
