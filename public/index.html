@@ -109,6 +109,14 @@
       <section id="tab-analytics" class="tab-panel reveal" role="tabpanel">
         <section id="kpis" class="kpis"></section>
 
+        <!-- Analytics sub-tabs -->
+        <nav class="sub-tabs">
+          <button class="sub-tab-btn active" data-analytics-tab="dashboard">Dashboard</button>
+          <button class="sub-tab-btn" data-analytics-tab="visualizations">Visualizations</button>
+        </nav>
+
+        <!-- Dashboard (existing panels) -->
+        <div id="analytics-dashboard" class="analytics-tab-section active">
         <div class="analytics-grid">
           <div class="analytics-left">
             <article class="panel">
@@ -141,12 +149,14 @@
           <div class="analytics-right">
             <article class="panel word-cloud-panel">
               <h2>Word Cloud (Themes)</h2>
+              <p class="meta" style="margin-bottom:0.5rem">Top unigrams extracted via TF-IDF from titles, abstracts, and subject headings.</p>
               <div id="wordCloud" class="word-cloud"></div>
               <div id="themeResults" class="theme-results"></div>
             </article>
 
             <article class="panel word-cloud-panel">
               <h2>Concept Cloud</h2>
+              <p class="meta" style="margin-bottom:0.5rem">Multi-word concepts matched against a domain dictionary built from corpus n-grams.</p>
               <div id="ngramCloud" class="word-cloud"></div>
             </article>
           </div>
@@ -157,7 +167,7 @@
           <div id="methodologyBars" class="bars"></div>
         </article>
 
-        <article class="panel">
+        <article class="panel" hidden>
           <h2>Co-occurring Concepts</h2>
           <div id="cooccurrenceBars" class="bars"></div>
         </article>
@@ -167,28 +177,103 @@
           <div id="supervisorHeatmap" class="table-wrap"></div>
         </article>
 
+        <article class="panel" id="supervisorTopicPanel" hidden>
+          <h2>Supervisor &ndash; Topic Heatmap</h2>
+          <div id="supervisorTopicHeatmap" class="table-wrap"></div>
+        </article>
+
         <article class="panel">
           <h2>Methodology &ndash; Concept Matrix</h2>
           <div id="methodologyConceptHeatmap" class="table-wrap"></div>
         </article>
 
-        <article class="panel">
+        <article class="panel" id="topicDistPanel" hidden>
+          <h2>Topic Distribution</h2>
+          <p class="meta" style="margin-bottom:0.5rem">Topics discovered by BERTopic clustering of dissertation abstracts.</p>
+          <div id="topicBars" class="bars"></div>
+        </article>
+
+        <article class="panel" id="topicTimelinePanel" hidden>
+          <h2>Topics Over Time</h2>
+          <svg id="topicTimelineChart" viewBox="0 0 940 360" role="img" aria-label="Topic frequency by year"></svg>
+          <div id="topicTimelineLegend" class="timeline-legend"></div>
+        </article>
+
+        <article class="panel" hidden>
           <h2>Research Gap Suggestions</h2>
           <p class="meta" style="margin-bottom:0.5rem">Concept pairs that are individually common but rarely co-occur &mdash; potential unexplored intersections.</p>
           <div id="researchGapsList" class="bars"></div>
         </article>
 
-        <article class="panel">
+        <article class="panel" hidden>
           <h2>Weighted Mean Word Count by Concept</h2>
           <div id="subjectBars" class="bars"></div>
         </article>
+        </div><!-- /analytics-dashboard -->
+
+        <!-- Visualizations -->
+        <div id="analytics-visualizations" class="analytics-tab-section">
+          <article class="panel" id="topicClusterPanel" hidden>
+            <h2>Topic Clusters</h2>
+            <p class="meta" style="margin-bottom:0.5rem">
+              Each dot is a dissertation, positioned by semantic similarity (UMAP) and
+              colored by BERTopic cluster assignment. Click a dot to view the dissertation.
+            </p>
+            <div id="topicClusterContainer" style="position:relative">
+              <svg id="topicClusterChart" viewBox="0 0 940 600" role="img"
+                   aria-label="Topic cluster scatter plot"></svg>
+              <div id="topicClusterTooltip" class="scatter-tooltip" hidden></div>
+            </div>
+            <div id="topicClusterLegend" class="scatter-legend"></div>
+          </article>
+          <article class="panel" id="topicDendrogramPanel" hidden>
+            <h2>Topic Hierarchy</h2>
+            <p class="meta" style="margin-bottom:0.5rem">
+              Topics clustered by shared terminology. Closer branches indicate
+              more similar research themes. Node size reflects dissertation count.
+            </p>
+            <div id="topicDendrogramContainer" style="position:relative">
+              <svg id="topicDendrogramChart" viewBox="0 0 940 600"></svg>
+              <div id="topicDendrogramTooltip" class="scatter-tooltip" hidden></div>
+            </div>
+          </article>
+
+          <article class="panel" id="topicSankeyPanel" hidden>
+            <h2>Topic Evolution</h2>
+            <p class="meta" style="margin-bottom:0.5rem">
+              How topic prevalence shifts across time periods. Band width shows
+              the number of dissertations in each topic per period.
+            </p>
+            <div id="topicSankeyContainer" style="position:relative">
+              <svg id="topicSankeyChart" viewBox="0 0 940 500"></svg>
+            </div>
+            <div id="topicSankeyLegend" class="scatter-legend"></div>
+            <p class="meta" style="margin-top:0.75rem; font-size:0.82rem; opacity:0.7">
+              Related fine-grained topics are merged into broader parent clusters
+              using hierarchical clustering. Each cluster is labeled after its
+              largest sub-grouping by document count.
+            </p>
+          </article>
+
+          <article class="panel" id="methTopicBubblePanel" hidden>
+            <h2>Methodology &times; Topic</h2>
+            <p class="meta" style="margin-bottom:0.5rem">
+              Bubble size shows how many dissertations use each methodology within
+              each topic cluster.
+            </p>
+            <div id="methTopicBubbleContainer" style="position:relative">
+              <svg id="methTopicBubbleChart" viewBox="0 0 940 500"></svg>
+              <div id="methTopicBubbleTooltip" class="scatter-tooltip" hidden></div>
+            </div>
+          </article>
+        </div><!-- /analytics-visualizations -->
       </section>
 
       <!-- Citation Explorer -->
       <section id="tab-citations" class="tab-panel reveal" role="tabpanel">
-        <nav class="citation-tabs">
-          <button class="citation-tab-btn active" data-citation-tab="browse">Browse Citations</button>
-          <button class="citation-tab-btn" data-citation-tab="foundational">Foundational Works</button>
+        <nav class="sub-tabs">
+          <button class="sub-tab-btn active" data-citation-tab="browse">Browse Citations</button>
+          <button class="sub-tab-btn" data-citation-tab="foundational">Foundational Works</button>
         </nav>
         <div id="citation-browse" class="citation-tab-section active">
         <div class="citations-explorer">
