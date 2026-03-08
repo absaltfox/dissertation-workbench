@@ -3177,7 +3177,7 @@ function renderPersonDetail(personKey) {
         <p class="detail-section-title">Methodologies</p>
         <div class="bars">${methBars}</div>
       </div>
-      ${coSupHtml ? `<div><p class="detail-section-title">Co-Supervisors</p><div class="token-list">${coSupHtml}</div></div>` : ''}
+      ${coSupHtml ? `<div><p class="detail-section-title">Supervisory Network</p><div class="token-list">${coSupHtml}</div></div>` : ''}
       <div>
         <p class="detail-section-title">Dissertations</p>
         <div class="related-list">${dissertationList}</div>
