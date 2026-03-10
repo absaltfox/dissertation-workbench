@@ -1558,7 +1558,8 @@ button.summon-check-btn:disabled {
   border: 0;
   background: transparent;
   padding: 0;
-  font: inherit;
+  font-family: var(--sans);
+  font-size: 0.78rem;
   color: var(--accent);
   text-decoration: underline;
   text-decoration-thickness: 1px;
