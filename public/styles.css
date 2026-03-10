@@ -1615,6 +1615,14 @@ button.summon-check-btn:disabled {
   margin-top: 0.9rem;
 }
 
+/* --- Responsive SVG --- */
+
+svg[viewBox] {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
 /* --- Responsive --- */
 
 @media (max-width: 1020px) {
@@ -1630,8 +1638,35 @@ button.summon-check-btn:disabled {
   .kpis { flex-direction: column; }
   .bar-row { grid-template-columns: 1fr; }
   .admin-tabs { gap: 0.3rem; }
-  .heatmap-table { font-size: 0.65rem; }
-  .heatmap-label { max-width: 100px; }
+  .heatmap-table { font-size: 0.7rem; }
+  .heatmap-label { max-width: 80px; }
+
+  /* Facet filter bar: stack vertically */
+  .facet-filter-controls { flex-direction: column; align-items: stretch; }
+  .facet-filter-right { margin-left: 0; }
+
+  /* Document table: hide low-priority columns (checkbox, degree, pages, words) */
+  #tab-records th:nth-child(1),
+  #tab-records td:nth-child(1),
+  #tab-records th:nth-child(5),
+  #tab-records td:nth-child(5),
+  #tab-records th:nth-child(6),
+  #tab-records td:nth-child(6),
+  #tab-records th:nth-child(7),
+  #tab-records td:nth-child(7) { display: none; }
+
+  /* Tighter table cells */
+  th, td { padding: 0.4rem 0.35rem; font-size: 0.78rem; }
+
+  /* Tab buttons */
+  .tab-btn { font-size: 0.78rem; padding: 0.4rem 0.7rem; }
+  .sub-tab-btn { font-size: 0.78rem; }
+
+  /* Tooltip width cap */
+  .scatter-tooltip { max-width: min(280px, 85vw); }
+
+  /* SVG chart containers: horizontal scroll fallback */
+  .panel > svg[viewBox] { min-width: 0; }
 
   .table-wrap {
     position: relative;
@@ -1647,4 +1682,11 @@ button.summon-check-btn:disabled {
     background: linear-gradient(90deg, transparent, rgba(246, 243, 234, 0.6));
     pointer-events: none;
   }
+}
+
+@media (max-width: 480px) {
+  .hero h1 { font-size: 1.3rem; }
+  .subtitle { font-size: 0.85rem; }
+  .kpis { gap: 0.3rem; }
+  .panel { padding: 0.7rem; }
 }
