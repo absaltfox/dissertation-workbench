@@ -85,6 +85,8 @@ export function getDb() {
       FOREIGN KEY (citation_id) REFERENCES citations(id)
     );
 
+    CREATE INDEX IF NOT EXISTS idx_document_citations_doc_id ON document_citations(doc_id);
+
     CREATE TABLE IF NOT EXISTS catalogue_lookups (
       citation_id INTEGER PRIMARY KEY,
       hits INTEGER,
@@ -126,6 +128,10 @@ export function getDb() {
 
   // Migrations — add columns to existing tables
   try { db.exec('ALTER TABLE catalogue_lookups ADD COLUMN bib_id TEXT'); } catch {}
+  try { db.exec('ALTER TABLE citations ADD COLUMN author TEXT'); } catch {}
+  try { db.exec('ALTER TABLE citations ADD COLUMN title TEXT'); } catch {}
+  try { db.exec('ALTER TABLE citations ADD COLUMN year TEXT'); } catch {}
+  try { db.exec('ALTER TABLE citations ADD COLUMN source TEXT'); } catch {}
 
   const cleaned = cleanupCommitteeArtifacts(db);
   if (cleaned > 0) logger.info(`Cleaned up ${cleaned} committee artefact rows`);
@@ -407,12 +413,16 @@ export function loadCommitteeMembers(docId) {
 
 // --- Citation functions ---
 
-export function saveCitations(docId, citationTexts, hashFn) {
+export function saveCitations(docId, citations, hashFn) {
   const now = new Date().toISOString();
   const upsertCitation = getDb().prepare(`
-    INSERT INTO citations (citation_hash, citation_text, created_at)
-    VALUES (?, ?, ?)
-    ON CONFLICT(citation_hash) DO NOTHING
+    INSERT INTO citations (citation_hash, citation_text, author, title, year, source, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(citation_hash) DO UPDATE SET
+      author = COALESCE(excluded.author, citations.author),
+      title = COALESCE(excluded.title, citations.title),
+      year = COALESCE(excluded.year, citations.year),
+      source = COALESCE(excluded.source, citations.source)
   `);
   const getCitationId = getDb().prepare(`
     SELECT id FROM citations WHERE citation_hash = ?
@@ -423,9 +433,17 @@ export function saveCitations(docId, citationTexts, hashFn) {
     ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
   `);
 
-  for (const text of citationTexts) {
+  for (const item of citations) {
+    const text = typeof item === 'string' ? item : item.text;
     const hash = hashFn(text);
-    upsertCitation.run(hash, text, now);
+    upsertCitation.run(
+      hash, text,
+      (typeof item === 'string' ? null : item.author) || null,
+      (typeof item === 'string' ? null : item.title) || null,
+      (typeof item === 'string' ? null : item.year) || null,
+      (typeof item === 'string' ? null : item.source) || null,
+      now
+    );
     const row = getCitationId.get(hash);
     if (row) {
       linkCitation.run(docId, row.id, now);
@@ -445,18 +463,27 @@ export function loadDocumentCitations(docId) {
 
 export function loadDocumentCitationsWithSharing(docId) {
   return getDb().prepare(`
+    WITH doc_cites AS (
+      SELECT citation_id FROM document_citations WHERE doc_id = ?
+    ),
+    sharing AS (
+      SELECT dc.citation_id, COUNT(DISTINCT dc.doc_id) AS total_docs
+      FROM document_citations dc
+      WHERE dc.citation_id IN (SELECT citation_id FROM doc_cites)
+      GROUP BY dc.citation_id
+    )
     SELECT c.id, c.citation_hash, c.citation_text,
-      (SELECT COUNT(*) FROM document_citations dc2 WHERE dc2.citation_id = c.id) as total_docs,
+      s.total_docs,
       cl.hits AS catalogue_hits,
       cl.query_author AS catalogue_query_author,
       cl.query_title AS catalogue_query_title,
       cl.bib_id AS catalogue_bib_id,
       cl.looked_up_at AS catalogue_looked_up_at
-    FROM citations c
-    JOIN document_citations dc ON dc.citation_id = c.id
-    LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
-    WHERE dc.doc_id = ?
-    ORDER BY total_docs DESC, c.citation_text
+    FROM doc_cites dc
+    JOIN citations c ON c.id = dc.citation_id
+    JOIN sharing s ON s.citation_id = dc.citation_id
+    LEFT JOIN catalogue_lookups cl ON cl.citation_id = dc.citation_id
+    ORDER BY s.total_docs DESC, c.citation_text
   `).all(docId);
 }
 
@@ -546,7 +573,7 @@ export function listPendingLookups(limit = 100) {
   //    Citations stored with query_title=NULL were intentionally skipped (unparseable)
   //    and are not retried here; the improved extractor will handle them on first run.
   return getDb().prepare(`
-    SELECT c.id, c.citation_text
+    SELECT c.id, c.citation_text, c.author, c.title, c.year, c.source
     FROM citations c
     LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
     WHERE cl.citation_id IS NULL

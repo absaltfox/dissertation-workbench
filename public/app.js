@@ -120,6 +120,8 @@ const state = {
   selectedDocId: null,
   selectedTheme: null,
   loading: false,
+  analyticsLoaded: false,
+  analyticsLoading: false,
   user: null, // { username } or null
   sortKey: null,   // 'title' | 'author' | 'year' | 'degree' | 'pages' | null
   sortDir: 'asc',  // 'asc' | 'desc'
@@ -321,6 +323,9 @@ function setActiveTab(tabName) {
   if (tabName === 'people' && state.payload) {
     renderPersonTable();
     if (state.selectedPersonKey) renderPersonDetail(state.selectedPersonKey);
+  }
+  if (tabName === 'analytics' && state.payload && !state.analyticsLoaded) {
+    loadAnalytics();
   }
 }
 
@@ -3750,8 +3755,7 @@ function getAnalytics() {
   return _analyticsCache;
 }
 
-function renderAll() {
-  renderDocuments();
+function renderAnalytics() {
   renderKpis();
   renderPagesByYear();
   renderDissertationsByYear();
@@ -3775,6 +3779,11 @@ function renderAll() {
     renderTopicSankey();
     renderMethTopicBubble();
   }
+}
+
+function renderAll() {
+  renderDocuments();
+  if (state.analyticsLoaded) renderAnalytics();
   if (document.querySelector('#tab-people.active')) renderPersonTable();
 }
 
@@ -3802,6 +3811,7 @@ async function loadData({ refresh = false } = {}) {
     }
 
     state.payload = await res.json();
+    state.analyticsLoaded = false;
     _analyticsCache = null;
     _analyticsCacheKey = '';
     _personListCache = null;
@@ -3816,6 +3826,7 @@ async function loadData({ refresh = false } = {}) {
     docFilterEl.value = '';
     renderAll();
     populateFacetFilters();
+    if (document.querySelector('#tab-analytics.active')) loadAnalytics();
 
     const docs = state.payload.documents || [];
     const statusCounts = docs.reduce((acc, doc) => {
@@ -3842,6 +3853,17 @@ async function loadData({ refresh = false } = {}) {
     loadBtn.disabled = false;
     refreshBtn.disabled = false;
     showSpinner(false);
+  }
+}
+
+function loadAnalytics() {
+  if (state.analyticsLoaded || state.analyticsLoading || !state.payload?.metrics) return;
+  state.analyticsLoading = true;
+  try {
+    renderAnalytics();
+    state.analyticsLoaded = true;
+  } finally {
+    state.analyticsLoading = false;
   }
 }
 
