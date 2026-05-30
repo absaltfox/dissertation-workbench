@@ -6,8 +6,9 @@ import {
 } from './config.js';
 import { ensureStorage, getDb, saveRunMetrics, hasTopics, loadTopics, loadDocumentTopics, loadDocumentTopicCoords, loadTopicHierarchy, getCitationCooccurrence } from './db.js';
 import {
-  toArray, flattenText, extractYear, parsePageCount, topTermsFromText, buildWordCloud,
-  buildMethodologyStats, extractNgrams, detectMethodologies, isLowSignalConceptPhrase
+  toArray, flattenText, extractYear, parsePageCount, buildWordCloud,
+  buildMethodologyStats, extractNgrams, detectMethodologies, isLowSignalConceptPhrase,
+  isLowSignalConceptTerm, buildDocumentFrequency, topTfidfTermsFromText
 } from './nlp.js';
 import { fetchPage, extractHits, resolveIndexName, collectCandidateUrls } from './api.js';
 import { enrichDocumentsWithFileAnalysis } from './pdf.js';
@@ -64,7 +65,7 @@ function extractOcId(value) {
   return null;
 }
 
-function ensureSourceFields(sourceValue) {
+export function ensureSourceFields(sourceValue) {
   const parts = String(sourceValue || '')
     .split(',')
     .map((part) => part.trim())
@@ -79,7 +80,7 @@ function ensureSourceFields(sourceValue) {
   return parts.join(',');
 }
 
-function normalizeRecord(doc, dict = null) {
+export function normalizeRecord(doc, dict = null) {
   const rawId = flattenText(firstPresent(doc, ['_id', 'id', 'identifier', 'Identifier'])) || '';
   const title = flattenText(firstPresent(doc, ['title', 'Title', 'name', 'Name']));
   const creators = toArray(firstPresent(doc, ['creator', 'Creator', 'author', 'Author']));
@@ -117,8 +118,6 @@ function normalizeRecord(doc, dict = null) {
   const extentPages = parsePageCount(extentValues);
   const metadataPages = extentPages || Math.max(1, Math.round((metadataWords || 1) / 300));
 
-  const themeText = [title, description, subjects.join(' '), program.join(' '), degree.join(' ')].join(' ');
-  const themes = topTermsFromText(themeText, 12);
   const methodologies = detectMethodologies([title, description, subjects.join(' ')].join(' '));
   const conceptTerms = docConceptTerms({ title, abstract: description, subjects }, 12, dict);
 
@@ -147,7 +146,7 @@ function normalizeRecord(doc, dict = null) {
     wordCount: metadataWords,
     wordCountSource: 'metadata_text',
     charCount: cleaned.length,
-    themes,
+    themes: [],
     methodologies,
     conceptTerms,
     uri,
@@ -278,21 +277,62 @@ function loadConceptDictionary() {
   try {
     const raw = fs.readFileSync(path.join(DATA_DIR, 'concepts', 'latest.json'), 'utf-8');
     const parsed = JSON.parse(raw);
-    const canonicalSet = new Set((parsed.concepts || []).map((c) => c.canonical));
+    const conceptMeta = new Map();
+    for (const concept of (parsed.concepts || [])) {
+      if (!concept?.canonical) continue;
+      conceptMeta.set(concept.canonical, {
+        docFreq: Number(concept.docFreq) || 0,
+        idf: Number(concept.idf) || 1,
+      });
+    }
+    const canonicalSet = new Set((parsed.concepts || [])
+      .map((c) => c.canonical)
+      .filter((term) => !isLowSignalConceptTerm(term)));
     const variantMap = parsed.variantToCanonical || {};
     const idfMap = new Map((parsed.concepts || []).map((c) => [c.canonical, c.idf ?? 1]));
+    const sourceDocuments = Number(parsed?.source?.documents) || 0;
     // Multi-doc concepts appear in 2+ documents and are the only ones that can
     // co-occur across the corpus. Single-doc concepts (docFreq=1) dominate the
     // IDF-based ranking but are useless for co-occurrence analysis.
     const multiDocSet = new Set((parsed.concepts || []).filter((c) => (c.docFreq ?? 1) >= 2).map((c) => c.canonical));
-    return { canonicalSet, variantMap, idfMap, multiDocSet };
+    return { canonicalSet, variantMap, idfMap, conceptMeta, multiDocSet, sourceDocuments };
   } catch {
-    return { canonicalSet: new Set(), variantMap: {}, idfMap: new Map() };
+    return { canonicalSet: new Set(), variantMap: {}, idfMap: new Map(), conceptMeta: new Map(), multiDocSet: new Set(), sourceDocuments: 0 };
   }
 }
 
+export function buildMetricsSourceOptions(options = {}) {
+  const maxRecords = Number(options.maxRecords || 200);
+  const pageSize = Number(options.pageSize || 20);
+  const scanLimit = Number(options.scanLimit || Math.max(maxRecords * 10, 1000));
+  const subjectLimit = Number(options.subjectLimit || 25);
+  const baseUrl = options.baseUrl || DEFAULT_BASE_URL;
+  const requestedIndex = options.index !== undefined ? options.index : DEFAULT_INDEX;
+  const apiKey = options.apiKey || DEFAULT_API_KEY;
+  const query = options.query === undefined ? DEFAULT_QUERY : options.query;
+  const term = options.term === undefined ? DEFAULT_TERM : options.term;
+  const source = ensureSourceFields(options.source === undefined ? DEFAULT_SOURCE : options.source);
+  const downloadFiles = options.downloadFiles === undefined ? DEFAULT_DOWNLOAD_FILES : Boolean(options.downloadFiles);
+  const forceDownload = Boolean(options.forceDownload);
+  const recomputeFromCache = Boolean(options.recomputeFromCache);
+  return {
+    maxRecords, pageSize, scanLimit, subjectLimit, baseUrl, requestedIndex,
+    apiKey, query, term, source, downloadFiles, forceDownload, recomputeFromCache
+  };
+}
+
+export function buildDocumentSyncKey({ baseUrl, requestedIndex, query, term, source }) {
+  return JSON.stringify({
+    baseUrl,
+    requestedIndex: requestedIndex || '',
+    query: query || '',
+    term: term || '',
+    source: ensureSourceFields(source || ''),
+  });
+}
+
 function docConceptTerms(rec, limit = 12, dict = null) {
-  const { canonicalSet, variantMap, idfMap } = dict || loadConceptDictionary();
+  const { canonicalSet, variantMap, idfMap, conceptMeta, sourceDocuments } = dict || loadConceptDictionary();
   const tf = new Map();
 
   // Title concepts are counted with 3× weight: title language is denser and
@@ -308,7 +348,7 @@ function docConceptTerms(rec, limit = 12, dict = null) {
         const term = canonicalizeDomainText(ng);
         if (!term) continue;
         const canonical = variantMap[term] || (canonicalSet.has(term) ? term : null);
-        if (!canonical) continue;
+        if (!canonical || isLowSignalConceptTerm(canonical)) continue;
         tf.set(canonical, (tf.get(canonical) || 0) + TITLE_WEIGHT);
       }
     }
@@ -327,17 +367,35 @@ function docConceptTerms(rec, limit = 12, dict = null) {
         const term = canonicalizeDomainText(ng);
         if (!term) continue;
         const canonical = variantMap[term] || (canonicalSet.has(term) ? term : null);
-        if (!canonical) continue;
+        if (!canonical || isLowSignalConceptTerm(canonical)) continue;
         tf.set(canonical, (tf.get(canonical) || 0) + 1);
       }
     }
   }
 
   return Array.from(tf.entries())
-    .map(([canonical, count]) => ({ canonical, score: count * (idfMap.get(canonical) ?? 1) }))
-    .sort((a, b) => b.score - a.score)
+    .map(([canonical, count]) => {
+      const meta = conceptMeta?.get(canonical) || {};
+      const docFreq = Number(meta.docFreq) || 0;
+      const idf = Number(meta.idf) || Number(idfMap.get(canonical)) || Math.log(((sourceDocuments || 1) + 1) / (docFreq + 1)) + 1;
+      const lengthBonus = canonical.split(/\s+/).length >= 3 ? 0.35 : 0;
+      return { canonical, count, score: count * idf + lengthBonus };
+    })
+    .filter((entry) => entry.score >= 1.2)
+    .sort((a, b) => b.score - a.score || b.count - a.count || a.canonical.localeCompare(b.canonical))
     .slice(0, limit)
     .map(({ canonical }) => canonical);
+}
+
+function themeTextForRecord(rec) {
+  return [rec.title, rec.abstract, rec.subjects.join(' '), rec.program, rec.degree].join(' ');
+}
+
+function assignTfidfThemes(records, limit = 12) {
+  const documentFrequency = buildDocumentFrequency(records, themeTextForRecord);
+  for (const rec of records) {
+    rec.themes = topTfidfTermsFromText(themeTextForRecord(rec), documentFrequency, records.length, limit);
+  }
 }
 
 function buildConceptCloud(records, maxTerms = 60) {
@@ -346,7 +404,7 @@ function buildConceptCloud(records, maxTerms = 60) {
     for (const term of (rec.conceptTerms || [])) {
       // Exclude statistical boilerplate and generic academic filler so the cloud
       // reflects research topics rather than methodology vocabulary.
-      if (!COOCCURRENCE_BLOCKLIST.has(term)) {
+      if (!COOCCURRENCE_BLOCKLIST.has(term) && !isLowSignalConceptTerm(term)) {
         counts.set(term, (counts.get(term) || 0) + 1);
       }
     }
@@ -706,53 +764,6 @@ function buildTopicsByYear(topics, documents, leafToParent) {
     });
 }
 
-function buildResearchGaps(records, topN = 15) {
-  const dict = loadConceptDictionary();
-  const conceptDocCounts = new Map();
-  const cooccurrenceCounts = new Map();
-
-  for (const rec of records) {
-    const concepts = docConceptTerms(rec, 15, dict);
-    for (const c of concepts) {
-      conceptDocCounts.set(c, (conceptDocCounts.get(c) || 0) + 1);
-    }
-    if (concepts.length >= 2) {
-      const sorted = [...concepts].sort();
-      for (let i = 0; i < sorted.length; i++) {
-        for (let j = i + 1; j < sorted.length; j++) {
-          const key = `${sorted[i]}|||${sorted[j]}`;
-          cooccurrenceCounts.set(key, (cooccurrenceCounts.get(key) || 0) + 1);
-        }
-      }
-    }
-  }
-
-  // Take top 20 concepts by doc count
-  const topConcepts = Array.from(conceptDocCounts.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 20)
-    .map(([c]) => c);
-  const topSet = new Set(topConcepts);
-
-  const gaps = [];
-  for (let i = 0; i < topConcepts.length; i++) {
-    for (let j = i + 1; j < topConcepts.length; j++) {
-      const a = topConcepts[i];
-      const b = topConcepts[j];
-      const key = a < b ? `${a}|||${b}` : `${b}|||${a}`;
-      const cooccurrence = cooccurrenceCounts.get(key) || 0;
-      const countA = conceptDocCounts.get(a) || 0;
-      const countB = conceptDocCounts.get(b) || 0;
-      const gapScore = (countA * countB) / (cooccurrence + 1);
-      gaps.push({ conceptA: a, conceptB: b, countA, countB, cooccurrence, gapScore });
-    }
-  }
-
-  return gaps
-    .sort((a, b) => b.gapScore - a.gapScore)
-    .slice(0, topN);
-}
-
 function buildSupervisorNetwork(records, minEdge = 1) {
   const nodeMap = new Map(); // name -> docCount
   const edgeMap = new Map(); // "A|||B" -> { weight, docs }
@@ -805,8 +816,8 @@ function buildSupervisorNetwork(records, minEdge = 1) {
   return { nodes, edges };
 }
 
-function buildCitationCooccurrenceNetwork() {
-  const rows = getCitationCooccurrence(100);
+async function buildCitationCooccurrenceNetwork() {
+  const rows = await getCitationCooccurrence(100);
   const nodeMap = new Map();
 
   for (const row of rows) {
@@ -868,52 +879,49 @@ function buildMethodologyTopicMatrix(records, topics) {
 
 export async function collectMetrics(options = {}) {
   await ensureStorage();
-  getDb();
+  await getDb();
 
-  const maxRecords = Number(options.maxRecords || 200);
-  const pageSize = Number(options.pageSize || 20);
-  const scanLimit = Number(options.scanLimit || Math.max(maxRecords * 10, 1000));
-  const subjectLimit = Number(options.subjectLimit || 25);
-  const baseUrl = options.baseUrl || DEFAULT_BASE_URL;
-  const requestedIndex = options.index !== undefined ? options.index : DEFAULT_INDEX;
-  const apiKey = options.apiKey || DEFAULT_API_KEY;
-  const query = options.query === undefined ? DEFAULT_QUERY : options.query;
-  const term = options.term === undefined ? DEFAULT_TERM : options.term;
-  const source = ensureSourceFields(options.source === undefined ? DEFAULT_SOURCE : options.source);
-  const downloadFiles = options.downloadFiles === undefined ? DEFAULT_DOWNLOAD_FILES : Boolean(options.downloadFiles);
-  const forceDownload = Boolean(options.forceDownload);
-  const recomputeFromCache = Boolean(options.recomputeFromCache);
+  const {
+    maxRecords, pageSize, scanLimit, subjectLimit, baseUrl, requestedIndex,
+    apiKey, query, term, source, downloadFiles, forceDownload, recomputeFromCache
+  } = buildMetricsSourceOptions(options);
 
   const index = requestedIndex ? await resolveIndexName(baseUrl, requestedIndex, apiKey) : null;
   const conceptDict = loadConceptDictionary();
   const records = [];
   let apiTotal = null; // populated from first response
 
-  for (let from = 0; from < scanLimit; from += pageSize) {
-    const payload = await fetchPage({ baseUrl, index, apiKey, from, pageSize, query, term, source });
-    const docs = extractHits(payload);
+  if (Array.isArray(options.cachedDocuments)) {
+    records.push(...options.cachedDocuments);
+  } else {
+    for (let from = 0; from < scanLimit; from += pageSize) {
+      const payload = await fetchPage({ baseUrl, index, apiKey, from, pageSize, query, term, source });
+      const docs = extractHits(payload);
 
-    // Capture the API-reported total on the first page
-    if (apiTotal === null) {
-      apiTotal = payload?.data?.hits?.total ?? null;
+      // Capture the API-reported total on the first page
+      if (apiTotal === null) {
+        apiTotal = payload?.data?.hits?.total ?? null;
+      }
+
+      if (!docs.length) break;
+      records.push(...docs.map((doc) => normalizeRecord(doc, conceptDict)));
+      if (records.length >= maxRecords) break;
+
+      // Stop when we've fetched everything the API has
+      if (apiTotal !== null && records.length >= Math.min(apiTotal, maxRecords)) break;
+      // Fallback: stop on a genuinely empty next page (don't stop on partial pages)
     }
-
-    if (!docs.length) break;
-    records.push(...docs.map((doc) => normalizeRecord(doc, conceptDict)));
-    if (records.length >= maxRecords) break;
-
-    // Stop when we've fetched everything the API has
-    if (apiTotal !== null && records.length >= Math.min(apiTotal, maxRecords)) break;
-    // Fallback: stop on a genuinely empty next page (don't stop on partial pages)
   }
 
   const normalizedRecords = records.slice(0, maxRecords);
 
-  await enrichDocumentsWithFileAnalysis(normalizedRecords, {
-    downloadFiles,
-    forceDownload,
-    recomputeFromCache
-  });
+  if (!options.skipFileEnrichment) {
+    await enrichDocumentsWithFileAnalysis(normalizedRecords, {
+      downloadFiles,
+      forceDownload,
+      recomputeFromCache
+    });
+  }
 
   const sourceMeta = {
     baseUrl,
@@ -929,20 +937,23 @@ export async function collectMetrics(options = {}) {
     downloadFiles,
     forceDownload,
     recomputeFromCache,
+    servedFromCache: Array.isArray(options.cachedDocuments),
     pdfCacheDir: PDF_CACHE_DIR,
     sqlitePath: SQLITE_PATH
   };
 
+  assignTfidfThemes(normalizedRecords);
+
   const metrics = buildMetrics(normalizedRecords, subjectLimit);
-  saveRunMetrics(sourceMeta, metrics);
+  await saveRunMetrics(sourceMeta, metrics);
 
   // Load BERTopic results if available
   let topicData = null;
-  if (hasTopics()) {
-    const topics = loadTopics();
-    const docTopics = loadDocumentTopics();
+  if (await hasTopics()) {
+    const topics = await loadTopics();
+    const docTopics = await loadDocumentTopics();
     // Attach topic_id and UMAP coords to each document
-    const topicCoords = loadDocumentTopicCoords();
+    const topicCoords = await loadDocumentTopicCoords();
     for (const doc of normalizedRecords) {
       const dt = docTopics.get(doc.id);
       if (dt) {
@@ -955,7 +966,7 @@ export async function collectMetrics(options = {}) {
         doc.umapY = coord.y;
       }
     }
-    const hierarchy = loadTopicHierarchy();
+    const hierarchy = await loadTopicHierarchy();
     const parentInfo = hierarchy ? buildParentClusters(hierarchy, topics) : null;
     topicData = {
       topics,
@@ -988,9 +999,8 @@ export async function collectMetrics(options = {}) {
     termCooccurrence: buildTermCooccurrence(normalizedRecords),
     conceptTimeline: buildConceptTimeline(normalizedRecords),
     methodologyConceptMatrix: buildMethodologyConceptMatrix(normalizedRecords),
-    researchGaps: buildResearchGaps(normalizedRecords),
     supervisorNetwork: buildSupervisorNetwork(normalizedRecords),
-    citationCooccurrence: buildCitationCooccurrenceNetwork(),
+    citationCooccurrence: await buildCitationCooccurrenceNetwork(),
     methodologyTopicMatrix: topicData ? buildMethodologyTopicMatrix(normalizedRecords, topicData.topics) : null,
     topicData
   };

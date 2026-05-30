@@ -3,13 +3,13 @@ import { createPasswordHash } from '../src/auth.js';
 import crypto from 'node:crypto';
 
 await ensureStorage();
-getDb();
+await getDb();
 
 const password = crypto.randomBytes(16).toString('hex');
 const { hash, salt } = createPasswordHash(password);
 
-try { deleteUser('admin'); } catch { /* may not exist */ }
-createUser('admin', hash, salt);
+try { await deleteUser('admin'); } catch { /* may not exist */ }
+await createUser('admin', hash, salt);
 
 console.log('');
 console.log('Admin password reset.');

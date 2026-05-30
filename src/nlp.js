@@ -128,6 +128,93 @@ const LOW_SIGNAL_LOCATION_FRAGMENT_HEADS = new Set([
   'influenced', 'presents', 'presented', 'furthermore', 'suggests', 'indicates'
 ]);
 
+const LOW_SIGNAL_CONCEPT_TERMS = new Set([
+  'analysis indicated',
+  'analyses indicated',
+  'conceptual framework',
+  'data analysis',
+  'data collection',
+  'data collected',
+  'data indicated',
+  'data showed',
+  'determine whether',
+  'findings emerged',
+  'findings indicate',
+  'findings suggest',
+  'focus group',
+  'focus groups',
+  'high levels',
+  'interview data',
+  'interview protocol',
+  'interview protocols',
+  'interview schedule',
+  'interview transcripts',
+  'major findings',
+  'make meaning',
+  'results indicate',
+  'results indicated',
+  'results revealed',
+  'results showed',
+  'results suggest',
+  'results suggested',
+  'semi structured',
+  'semi structured interview',
+  'semi structured interviews',
+  'significant changes',
+  'significant correlation',
+  'significant difference',
+  'significant differences',
+  'significant effect',
+  'significant effects',
+  'significant gains',
+  'significant interaction',
+  'significant main',
+  'significant main effect',
+  'significant positive',
+  'significant relationship',
+  'significant relationships',
+  'significant treatment',
+  'statistically significant',
+  'structured interview',
+  'structured interview schedule',
+  'structured interview technique',
+  'theoretical framework',
+  'three themes',
+  'will help',
+  'wide range'
+]);
+
+const LOW_SIGNAL_CONCEPT_PATTERNS = [
+  /\b(?:results?|findings?|analys(?:is|es)|data)\s+(?:indicat(?:e|ed|es)|show(?:ed|s)?|suggest(?:ed|s)?|reveal(?:ed|s)?|emerg(?:ed|es)?|collected|collection)\b/,
+  /\b(?:significant|statistically)\s+(?:difference|differences|relationship|relationships|effect|effects|correlation|interaction|changes?|gains?|positive|treatment|main)\b/,
+  /\b(?:interview|interviews|participant|participants?)\s+(?:data|schedule|protocols?|transcripts?|responses?|conducted)\b/,
+  /\b(?:theoretical|conceptual)\s+framework\b/,
+  /\b(?:determine|investigate|examine|explore)\s+whether\b/,
+  /\b(?:first|second|third|fourth|fifth)\s+purpose\b/,
+  /\bwill\s+help\b/
+];
+
+const LOW_SIGNAL_CONCEPT_ANYWHERE_TOKENS = new Set([
+  'across', 'along', 'cannot', 'carefully', 'conducted', 'creates', 'different',
+  'diverse', 'emphasized', 'factors', 'feel', 'highlighted', 'impacting',
+  'including', 'majority', 'methods', 'numerous', 'participants', 'potential',
+  'relative', 'reported', 'respondent', 'respondents', 'subsequent', 'suitable',
+  'toward', 'towards', 'transcripts', 'whose'
+]);
+
+const LOW_SIGNAL_CONCEPT_HEAD_TOKENS = new Set([
+  'cannot', 'conducted', 'creates', 'emphasized', 'feel', 'focused', 'highlighted',
+  'included', 'interviews', 'lead', 'meaning', 'presented', 'presents', 'process',
+  'reported', 'responses', 'review', 'support', 'time', 'transcriptions',
+  'transcripts', 'whose'
+]);
+
+const NUMBER_WORDS = new Set([
+  'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
+  'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen', 'sixteen', 'seventeen',
+  'eighteen', 'nineteen', 'twenty', 'thirty', 'forty', 'fifty', 'hundred'
+]);
+
 export function toArray(value) {
   if (!value) return [];
   if (Array.isArray(value)) return value.flatMap((v) => toArray(v));
@@ -160,7 +247,7 @@ export function tokenize(text) {
     .replace(/[^a-z0-9\s-]/g, ' ')
     .split(/\s+/)
     .map((token) => token.trim())
-    .filter((token) => token.length >= 4 && !STOP_WORDS.has(token) && !/^\d{4}$/.test(token) && !/^\d+$/.test(token));
+    .filter((token) => token.length >= 4 && !STOP_WORDS.has(token) && !/^\d/.test(token));
 }
 
 export function isLowSignalConceptPhrase(phrase) {
@@ -180,6 +267,17 @@ export function isLowSignalConceptPhrase(phrase) {
   return false;
 }
 
+export function isLowSignalConceptTerm(phrase) {
+  const normalized = String(phrase || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!normalized) return true;
+  const tokens = normalized.split(/\s+/).filter(Boolean);
+  if (LOW_SIGNAL_CONCEPT_TERMS.has(normalized)) return true;
+  if (LOW_SIGNAL_CONCEPT_PATTERNS.some((pattern) => pattern.test(normalized))) return true;
+  if (tokens.some((token) => NUMBER_WORDS.has(token) || LOW_SIGNAL_CONCEPT_ANYWHERE_TOKENS.has(token))) return true;
+  if (LOW_SIGNAL_CONCEPT_HEAD_TOKENS.has(tokens[tokens.length - 1])) return true;
+  return isLowSignalConceptPhrase(normalized);
+}
+
 export function topTermsFromText(text, limit = 10) {
   const counts = new Map();
   for (const token of tokenize(text)) {
@@ -191,26 +289,59 @@ export function topTermsFromText(text, limit = 10) {
     .map(([term]) => term);
 }
 
-export function buildWordCloud(records, maxTerms = 70) {
+export function countTermsFromText(text) {
   const counts = new Map();
+  for (const token of tokenize(text)) {
+    counts.set(token, (counts.get(token) || 0) + 1);
+  }
+  return counts;
+}
+
+export function buildDocumentFrequency(records, textForRecord) {
+  const df = new Map();
   for (const rec of records) {
-    const subjects = rec.subjects.filter((s) => s !== '(Unspecified)');
-    const text = [rec.title, rec.abstract, subjects.join(' '), rec.program, rec.degree].join(' ');
-    for (const token of tokenize(text)) {
-      counts.set(token, (counts.get(token) || 0) + 1);
+    const terms = new Set(tokenize(textForRecord(rec)));
+    for (const term of terms) {
+      df.set(term, (df.get(term) || 0) + 1);
+    }
+  }
+  return df;
+}
+
+export function topTfidfTermsFromText(text, documentFrequency, documentCount, limit = 10) {
+  const counts = countTermsFromText(text);
+  return Array.from(counts.entries())
+    .map(([term, count]) => {
+      const df = documentFrequency.get(term) || 0;
+      const idf = Math.log((documentCount + 1) / (df + 1)) + 1;
+      return { term, score: count * idf, count, idf };
+    })
+    .sort((a, b) => b.score - a.score || b.count - a.count || a.term.localeCompare(b.term))
+    .slice(0, limit)
+    .map(({ term }) => term);
+}
+
+export function buildWordCloud(records, maxTerms = 70) {
+  const textForRecord = (rec) => [rec.title, rec.abstract, rec.subjects.join(' '), rec.program, rec.degree].join(' ');
+  const df = buildDocumentFrequency(records, textForRecord);
+  const scores = new Map();
+  for (const rec of records) {
+    for (const [term, count] of countTermsFromText(textForRecord(rec))) {
+      const idf = Math.log((records.length + 1) / ((df.get(term) || 0) + 1)) + 1;
+      scores.set(term, (scores.get(term) || 0) + count * idf);
     }
   }
 
-  return Array.from(counts.entries())
+  return Array.from(scores.entries())
     .sort((a, b) => b[1] - a[1])
     .slice(0, maxTerms)
-    .map(([term, count]) => ({ term, count }));
+    .map(([term, score]) => ({ term, count: Math.round(score * 10) / 10 }));
 }
 
 // Cardinal number words: skip any n-gram window containing one to prevent
 // methodology-count phrases like "three schools", "eight coordinators".
 const CARDINAL_WORDS = new Set([
-  'four', 'five', 'nine', 'three', 'seven', 'eight',
+  'one', 'two', 'three', 'four', 'five', 'six', 'seven', 'eight', 'nine', 'ten',
   'eleven', 'twelve', 'thirteen', 'fourteen', 'fifteen',
   'twenty', 'thirty', 'forty', 'fifty', 'hundred',
 ]);
@@ -293,6 +424,11 @@ export const METHODOLOGY_KEYWORDS = new Map([
   ['Longitudinal', /\blongitudinal\b/i],
   ['Content Analysis', /\bcontent\s+analysis\b/i],
   ['Discourse Analysis', /\bdiscourse\s+analysis\b/i],
+  ['Document Analysis', /\bdocument(?:ary)?\s+analysis\b/i],
+  ['Systematic Review', /\bsystematic\s+review\b/i],
+  ['Meta-Analysis', /\bmeta[- ]analysis\b/i],
+  ['Thematic Analysis', /\bthematic\s+analysis\b/i],
+  ['Historical Research', /\bhistorical\s+(?:research|analysis|study|method)\b/i],
   ['Interviews', /\binterview(?:s|ing)?\b/i],
   ['Autoethnography', /\bautoethnograph(?:y|ic)\b/i],
   ['Participatory', /\bparticipatory\b/i],
@@ -302,7 +438,14 @@ export function detectMethodologies(text) {
   const str = String(text || '');
   const matched = [];
   for (const [label, regex] of METHODOLOGY_KEYWORDS) {
-    if (regex.test(str)) matched.push(label);
+    const flags = regex.flags.includes('g') ? regex.flags : `${regex.flags}g`;
+    const matcher = new RegExp(regex.source, flags);
+    for (const match of str.matchAll(matcher)) {
+      const context = str.slice(Math.max(0, match.index - 40), match.index).toLowerCase();
+      if (/\b(?:not|no|without|neither|never|does\s+not|did\s+not|do\s+not|was\s+not|were\s+not|is\s+not|are\s+not)\b[\w\s-]{0,35}$/.test(context)) continue;
+      matched.push(label);
+      break;
+    }
   }
   return matched;
 }

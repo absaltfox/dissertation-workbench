@@ -22,10 +22,10 @@ const supervisorHeatmapEl = document.getElementById('supervisorHeatmap');
 const conceptTimelineChartEl = document.getElementById('conceptTimelineChart');
 const conceptTimelineLegendEl = document.getElementById('conceptTimelineLegend');
 const methodologyConceptHeatmapEl = document.getElementById('methodologyConceptHeatmap');
-const researchGapsListEl = document.getElementById('researchGapsList');
 const supervisorTopicPanelEl = document.getElementById('supervisorTopicPanel');
 const supervisorTopicHeatmapEl = document.getElementById('supervisorTopicHeatmap');
 const topicDistPanelEl = document.getElementById('topicDistPanel');
+const topicModelMetaEl = document.getElementById('topicModelMeta');
 const topicBarsEl = document.getElementById('topicBars');
 const topicTimelinePanelEl = document.getElementById('topicTimelinePanel');
 const topicTimelineChartEl = document.getElementById('topicTimelineChart');
@@ -61,7 +61,9 @@ const settingsForm = document.getElementById('settingsForm');
 const loadBtn = document.getElementById('loadBtn');
 const refreshBtn = document.getElementById('refreshBtn');
 const saveSettingsBtn = document.getElementById('saveSettingsBtn');
+const syncDocumentsBtn = document.getElementById('syncDocumentsBtn');
 const rebuildConceptsBtn = document.getElementById('rebuildConceptsBtn');
+const documentSyncStatusEl = document.getElementById('documentSyncStatus');
 const conceptPipelineStatusEl = document.getElementById('conceptPipelineStatus');
 const tabButtons = Array.from(document.querySelectorAll('.tab-btn'));
 const tabPanels = Array.from(document.querySelectorAll('.tab-panel'));
@@ -82,6 +84,13 @@ const loginGate = document.getElementById('loginGate');
 const adminContent = document.getElementById('adminContent');
 const loginForm = document.getElementById('loginForm');
 const loginError = document.getElementById('loginError');
+const loginMfaLabel = document.getElementById('loginMfaLabel');
+const loginMfaCode = document.getElementById('loginMfaCode');
+const mfaSetupForm = document.getElementById('mfaSetupForm');
+const mfaSetupSecret = document.getElementById('mfaSetupSecret');
+const mfaSetupToken = document.getElementById('mfaSetupToken');
+const mfaSetupCode = document.getElementById('mfaSetupCode');
+const mfaSetupError = document.getElementById('mfaSetupError');
 const adminUserLabel = document.getElementById('adminUserLabel');
 const logoutBtn = document.getElementById('logoutBtn');
 const adminTabButtons = Array.from(document.querySelectorAll('.admin-tab-btn'));
@@ -123,6 +132,7 @@ const state = {
   analyticsLoaded: false,
   analyticsLoading: false,
   user: null, // { username } or null
+  csrfToken: '',
   sortKey: null,   // 'title' | 'author' | 'year' | 'degree' | 'pages' | null
   sortDir: 'asc',  // 'asc' | 'desc'
   filterText: '',
@@ -186,6 +196,11 @@ function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function heatmapHeaderCell(label) {
+  const full = String(label || '');
+  return `<th class="heatmap-header" title="${escapeHtml(full)}"><span class="heatmap-header-label">${escapeHtml(full)}</span></th>`;
 }
 
 function escapeHtml(text) {
@@ -303,6 +318,14 @@ function setStatus(message, isError = false) {
 
 function showSpinner(show) {
   spinnerEl.hidden = !show;
+}
+
+function csrfHeaders(base = {}) {
+  return state.csrfToken ? { ...base, 'x-csrf-token': state.csrfToken } : base;
+}
+
+function jsonHeaders() {
+  return csrfHeaders({ 'content-type': 'application/json' });
 }
 
 // --- Tab navigation ---
@@ -703,7 +726,8 @@ function renderDetails() {
     ${doc.topicId != null ? (() => {
       const topic = state.payload?.topicData?.topics?.find((t) => t.topicId === doc.topicId);
       const label = doc.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || `Topic ${doc.topicId}`);
-      return `<div><p class="detail-section-title">Topic</p><div class="token-list"><span class="token topic">${escapeHtml(label)}</span></div></div>`;
+      const confidence = typeof doc.topicProbability === 'number' ? ` (${Math.round(doc.topicProbability * 100)}% confidence)` : '';
+      return `<div><p class="detail-section-title">Topic</p><div class="token-list"><span class="token topic">${escapeHtml(label)}${escapeHtml(confidence)}</span></div></div>`;
     })() : ''}
     <div>
       <p class="detail-section-title">Related Documents</p>
@@ -1191,7 +1215,7 @@ function renderSupervisorHeatmap() {
   const maxVal = Math.max(...data.matrix.flat(), 1);
 
   const headerCells = data.ngrams
-    .map((s) => `<th class="heatmap-header">${escapeHtml(s)}</th>`)
+    .map((s) => heatmapHeaderCell(s))
     .join('');
 
   const bodyRows = data.supervisors
@@ -1288,8 +1312,7 @@ function renderSupervisorTopicHeatmap() {
   const headerCells = topTopics
     .map((t) => {
       const label = topicDisplayLabel(t.label);
-      const short = label.length > 20 ? label.slice(0, 18) + '\u2026' : label;
-      return `<th class="heatmap-header" title="${escapeHtml(label)}">${escapeHtml(short)}</th>`;
+      return heatmapHeaderCell(label);
     })
     .join('');
 
@@ -1789,6 +1812,14 @@ function renderTopicDistribution() {
     return;
   }
   topicDistPanelEl.hidden = false;
+  if (topicModelMetaEl) {
+    const modelName = td.topics.find((topic) => topic.modelName)?.modelName;
+    const createdAt = td.topics.find((topic) => topic.createdAt)?.createdAt;
+    const detail = [modelName, createdAt ? `run ${new Date(createdAt).toLocaleDateString()}` : '']
+      .filter(Boolean)
+      .join('; ');
+    topicModelMetaEl.textContent = `Topics discovered by BERTopic clustering of dissertation abstracts${detail ? ` (${detail})` : ''}.`;
+  }
 
   // Show all topics except outliers at end
   const regular = td.topics.filter((t) => t.topicId !== -1);
@@ -1979,10 +2010,11 @@ function renderTopicCluster() {
       if (!doc) return;
       const topic = _topicClusterTd?.topics?.find(t => t.topicId === doc.topicId);
       const label = doc.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || '');
+      const confidence = typeof doc.topicProbability === 'number' ? ` \u00B7 ${Math.round(doc.topicProbability * 100)}% confidence` : '';
       topicClusterTooltipEl.hidden = false;
       topicClusterTooltipEl.innerHTML = `
         <div class="tooltip-title">${escapeHtml((doc.title || '').slice(0, 100))}</div>
-        <div class="tooltip-meta">${doc.year || '\u2014'} \u00B7 ${escapeHtml(label)}</div>
+        <div class="tooltip-meta">${doc.year || '\u2014'} \u00B7 ${escapeHtml(label)}${escapeHtml(confidence)}</div>
       `;
       const rect = topicClusterContainerEl.getBoundingClientRect();
       const dotRect = dot.getBoundingClientRect();
@@ -1999,10 +2031,11 @@ function renderTopicCluster() {
       if (!doc) return;
       const topic = _topicClusterTd?.topics?.find(t => t.topicId === doc.topicId);
       const label = doc.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || '');
+      const confidence = typeof doc.topicProbability === 'number' ? ` \u00B7 ${Math.round(doc.topicProbability * 100)}% confidence` : '';
       topicClusterTooltipEl.hidden = false;
       topicClusterTooltipEl.innerHTML = `
         <div class="tooltip-title">${escapeHtml((doc.title || '').slice(0, 100))}</div>
-        <div class="tooltip-meta">${doc.year || '\u2014'} \u00B7 ${escapeHtml(label)}</div>
+        <div class="tooltip-meta">${doc.year || '\u2014'} \u00B7 ${escapeHtml(label)}${escapeHtml(confidence)}</div>
       `;
       const rect = topicClusterContainerEl.getBoundingClientRect();
       const dotRect = dot.getBoundingClientRect();
@@ -3350,7 +3383,7 @@ function renderMethodologyConceptMatrix() {
   const maxVal = Math.max(...data.matrix.flat(), 1);
 
   const headerCells = data.concepts
-    .map((c) => `<th class="heatmap-header">${escapeHtml(c)}</th>`)
+    .map((c) => heatmapHeaderCell(c))
     .join('');
 
   const bodyRows = data.methodologies
@@ -3384,31 +3417,6 @@ function renderMethodologyConceptMatrix() {
       openMatchesModal(`${meth} + ${concept}`, docsForMethodologyConcept(meth, concept));
     });
   }
-}
-
-// --- Research Gaps ---
-
-function renderResearchGaps() {
-  const gaps = getAnalytics()?.researchGaps || [];
-  if (!gaps.length) {
-    if (researchGapsListEl) researchGapsListEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No research gap data available.</p>';
-    return;
-  }
-
-  const maxScore = Math.max(...gaps.map((g) => g.gapScore), 1);
-
-  researchGapsListEl.innerHTML = gaps.map((entry) => {
-    const widthPct = (entry.gapScore / maxScore) * 100;
-    const label = `${entry.conceptA} + ${entry.conceptB}`;
-    return `
-      <div class="bar-row">
-        <span class="bar-label" title="${escapeHtml(label)}">${escapeHtml(label)}</span>
-        <div class="bar-track"><div class="bar-fill gap-fill" style="width:${widthPct}%"></div></div>
-        <span class="bar-value">${formatNum(Math.round(entry.gapScore))}</span>
-      </div>
-    `;
-  }).join('');
-
 }
 
 // --- Facet filter helpers ---
@@ -3642,19 +3650,6 @@ function buildAnalytics(docs) {
     matrix: topMeths.map(meth => top10Concepts.map(concept => mcCountMap.get(`${meth}\0${concept}`) || 0))
   };
 
-  const top30 = ngramCloud.slice(0, 30).map(w => ({ term: w.term, count: w.count }));
-  const researchGaps = [];
-  for (let i = 0; i < top30.length; i++) {
-    for (let j = i + 1; j < top30.length; j++) {
-      const { term: tA, count: cA } = top30[i];
-      const { term: tB, count: cB } = top30[j];
-      const key = tA < tB ? `${tA}\0${tB}` : `${tB}\0${tA}`;
-      const cooc = pairMap.get(key) || 0;
-      researchGaps.push({ conceptA: tA, conceptB: tB, gapScore: (cA * cB) / (cooc + 1) });
-    }
-  }
-  researchGaps.sort((a, b) => b.gapScore - a.gapScore);
-
   // Recompute topic distribution from filtered docs if topicData exists
   let topicData = null;
   const srcTopics = state.payload?.topicData?.topics;
@@ -3741,7 +3736,7 @@ function buildAnalytics(docs) {
     };
   }
 
-  return { metrics, wordCloud, ngramCloud, methodologies, supervisorNgramMatrix, termCooccurrence, conceptTimeline, methodologyConceptMatrix, researchGaps: researchGaps.slice(0, 15), supervisorNetwork, citationCooccurrence, methodologyTopicMatrix, topicData };
+  return { metrics, wordCloud, ngramCloud, methodologies, supervisorNgramMatrix, termCooccurrence, conceptTimeline, methodologyConceptMatrix, supervisorNetwork, citationCooccurrence, methodologyTopicMatrix, topicData };
 }
 
 function getAnalytics() {
@@ -3772,7 +3767,6 @@ function renderAnalytics() {
   renderTopicTimeline();
   renderSupervisorTopicHeatmap();
   renderMethodologyConceptMatrix();
-  renderResearchGaps();
   if (document.querySelector('.analytics-tab-section#analytics-visualizations.active')) {
     renderTopicCluster();
     renderTopicDendrogram();
@@ -3804,7 +3798,7 @@ async function loadData({ refresh = false } = {}) {
 
   try {
     const query = new URLSearchParams(params);
-    const res = await fetch(`/api/metrics?${query.toString()}`);
+    const res = await fetch(`/api/metrics?${query.toString()}`, { headers: csrfHeaders() });
     if (!res.ok) {
       const err = await res.json();
       throw new Error(err.message || err.error || `Request failed with ${res.status}`);
@@ -3875,13 +3869,16 @@ async function checkSession() {
     if (res.ok) {
       const data = await res.json();
       state.user = { username: data.username };
+      state.csrfToken = data.csrfToken || '';
       showAdminContent();
     } else {
       state.user = null;
+      state.csrfToken = '';
       showLoginGate();
     }
   } catch {
     state.user = null;
+    state.csrfToken = '';
     showLoginGate();
   }
 }
@@ -3889,6 +3886,8 @@ async function checkSession() {
 function showLoginGate() {
   loginGate.hidden = false;
   adminContent.hidden = true;
+  loginForm.hidden = false;
+  mfaSetupForm.hidden = true;
 }
 
 function showAdminContent() {
@@ -3902,6 +3901,7 @@ async function handleLogin(e) {
   e.preventDefault();
   const username = document.getElementById('loginUsername').value.trim();
   const password = document.getElementById('loginPassword').value;
+  const mfaCode = loginMfaCode.value.trim();
 
   loginError.hidden = true;
 
@@ -3909,15 +3909,43 @@ async function handleLogin(e) {
     const res = await fetch('/api/auth/login', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ username, password })
+      body: JSON.stringify({ username, password, mfaCode })
     });
     const data = await res.json();
     if (!res.ok) {
+      if (data.mfaRequired) {
+        loginMfaLabel.hidden = false;
+        loginMfaCode.required = true;
+        loginError.textContent = data.error || 'Invalid MFA code';
+        loginError.hidden = false;
+        loginMfaCode.focus();
+        return;
+      }
       loginError.textContent = data.error || 'Login failed';
       loginError.hidden = false;
       return;
     }
+    if (data.mfaRequired) {
+      loginMfaLabel.hidden = false;
+      loginMfaCode.required = true;
+      loginError.textContent = 'Enter your authenticator code to continue.';
+      loginError.hidden = false;
+      loginMfaCode.focus();
+      return;
+    }
+    if (data.mfaSetupRequired) {
+      loginForm.hidden = true;
+      mfaSetupForm.hidden = false;
+      mfaSetupToken.value = data.setupToken || '';
+      mfaSetupSecret.textContent = data.secret || '';
+      mfaSetupError.hidden = true;
+      mfaSetupCode.focus();
+      return;
+    }
     state.user = { username: data.username };
+    state.csrfToken = data.csrfToken || '';
+    loginMfaLabel.hidden = true;
+    loginMfaCode.required = false;
     loginForm.reset();
     showAdminContent();
   } catch (err) {
@@ -3926,11 +3954,41 @@ async function handleLogin(e) {
   }
 }
 
+async function handleMfaSetup(e) {
+  e.preventDefault();
+  mfaSetupError.hidden = true;
+  try {
+    const res = await fetch('/api/auth/mfa/setup/confirm', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        setupToken: mfaSetupToken.value,
+        code: mfaSetupCode.value.trim()
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      mfaSetupError.textContent = data.error || 'MFA setup failed';
+      mfaSetupError.hidden = false;
+      return;
+    }
+    state.user = { username: document.getElementById('loginUsername').value.trim() };
+    state.csrfToken = data.csrfToken || '';
+    loginForm.reset();
+    mfaSetupForm.reset();
+    showAdminContent();
+  } catch {
+    mfaSetupError.textContent = 'Connection error';
+    mfaSetupError.hidden = false;
+  }
+}
+
 async function handleLogout() {
   try {
-    await fetch('/api/auth/logout', { method: 'POST' });
+    await fetch('/api/auth/logout', { method: 'POST', headers: csrfHeaders() });
   } catch { /* ignore */ }
   state.user = null;
+  state.csrfToken = '';
   showLoginGate();
 }
 
@@ -3957,24 +4015,64 @@ function renderUsers(users) {
   }
   el.innerHTML = `
     <table>
-      <thead><tr><th>Username</th><th>Created</th><th></th></tr></thead>
+      <thead><tr><th>Username</th><th>MFA</th><th>Created</th><th></th></tr></thead>
       <tbody>
         ${users.map((u) => `
           <tr>
             <td>${escapeHtml(u.username)}</td>
+            <td>${u.mfa_enabled ? 'Enabled' : 'Not enabled'}</td>
             <td>${new Date(u.created_at).toLocaleString()}</td>
-            <td><button class="btn danger btn-sm" data-delete-user="${escapeHtml(u.username)}">Delete</button></td>
+            <td>
+              <button class="btn ghost btn-sm" data-reset-password="${escapeHtml(u.username)}">Reset Password</button>
+              <button class="btn ghost btn-sm" data-reset-mfa="${escapeHtml(u.username)}" ${u.mfa_enabled ? '' : 'disabled'}>Reset MFA</button>
+              <button class="btn danger btn-sm" data-delete-user="${escapeHtml(u.username)}">Delete</button>
+            </td>
           </tr>
         `).join('')}
       </tbody>
     </table>
   `;
+  for (const btn of el.querySelectorAll('[data-reset-password]')) {
+    btn.addEventListener('click', async () => {
+      const username = btn.dataset.resetPassword;
+      const password = prompt(`Enter a new password for "${username}" (minimum 8 characters):`);
+      if (password === null) return;
+      try {
+        const res = await fetch(`/api/admin/users/${encodeURIComponent(username)}/password`, {
+          method: 'PUT',
+          headers: jsonHeaders(),
+          body: JSON.stringify({ password })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.errors ? data.errors.join(' ') : data.error || 'Password reset failed');
+          return;
+        }
+        alert('Password updated.');
+      } catch { alert('Connection error'); }
+    });
+  }
+  for (const btn of el.querySelectorAll('[data-reset-mfa]')) {
+    btn.addEventListener('click', async () => {
+      const username = btn.dataset.resetMfa;
+      if (!confirm(`Reset MFA for "${username}"? They will enroll again on next required login.`)) return;
+      try {
+        const res = await fetch(`/api/admin/users/${encodeURIComponent(username)}/mfa`, { method: 'DELETE', headers: csrfHeaders() });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.error || 'MFA reset failed');
+          return;
+        }
+        await loadUsers();
+      } catch { alert('Connection error'); }
+    });
+  }
   for (const btn of el.querySelectorAll('[data-delete-user]')) {
     btn.addEventListener('click', async () => {
       const username = btn.dataset.deleteUser;
       if (!confirm(`Delete user "${username}"?`)) return;
       try {
-        const res = await fetch(`/api/admin/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
+        const res = await fetch(`/api/admin/users/${encodeURIComponent(username)}`, { method: 'DELETE', headers: csrfHeaders() });
         const data = await res.json();
         if (!res.ok) {
           alert(data.error || 'Delete failed');
@@ -3995,7 +4093,7 @@ async function handleCreateUser(e) {
   try {
     const res = await fetch('/api/admin/users', {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: jsonHeaders(),
       body: JSON.stringify({ username, password })
     });
     const data = await res.json();
@@ -4033,6 +4131,7 @@ async function loadSettings() {
       : 'No API key saved (optional)';
     if (s.downloadFiles) document.getElementById('s-downloadFiles').value = s.downloadFiles;
     if (s.recomputeFromCache) document.getElementById('s-recomputeFromCache').value = s.recomputeFromCache;
+    await loadDocumentSyncStatus();
   } catch { /* ignore */ }
 }
 
@@ -4042,13 +4141,65 @@ async function handleSaveSettings() {
   try {
     const res = await fetch('/api/admin/settings', {
       method: 'PUT',
-      headers: { 'content-type': 'application/json' },
+      headers: jsonHeaders(),
       body: JSON.stringify(params)
     });
     if (res.ok) {
       setStatus('Settings saved.');
     }
   } catch { /* ignore */ }
+}
+
+function renderDocumentSyncStatus(status) {
+  if (!documentSyncStatusEl) return;
+  if (!status) {
+    documentSyncStatusEl.textContent = 'Document cache status unavailable.';
+    return;
+  }
+  const cache = status.cache || {};
+  const latest = status.latest || {};
+  const lastSynced = cache.lastSyncedAt ? new Date(cache.lastSyncedAt).toLocaleString() : 'never';
+  const running = status.running ? 'Sync running. ' : '';
+  const progress = latest.status
+    ? `Last run: ${latest.status}, ${formatNum(latest.totalSaved || 0)} saved${latest.apiTotal ? ` of ${formatNum(latest.apiTotal)}` : ''}. `
+    : '';
+  documentSyncStatusEl.textContent = `${running}${formatNum(cache.total || 0)} cached documents. ${progress}Last synced: ${lastSynced}.`;
+}
+
+async function loadDocumentSyncStatus() {
+  try {
+    const params = new URLSearchParams(getCurrentParams());
+    const res = await fetch(`/api/admin/documents/sync/status?${params.toString()}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    renderDocumentSyncStatus(data.status);
+  } catch { /* ignore */ }
+}
+
+async function handleSyncDocuments() {
+  if (!syncDocumentsBtn) return;
+  syncDocumentsBtn.disabled = true;
+  syncDocumentsBtn.textContent = 'Syncing...';
+  try {
+    const params = getCurrentParams();
+    const res = await fetch('/api/admin/documents/sync', {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify(params)
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || 'Document sync failed');
+      return;
+    }
+    renderDocumentSyncStatus(data.status);
+    setStatus(data.alreadyRunning ? 'Document sync is already running.' : 'Document sync started.');
+  } catch {
+    alert('Connection error');
+  } finally {
+    syncDocumentsBtn.disabled = false;
+    syncDocumentsBtn.textContent = 'Sync Documents';
+  }
 }
 
 function renderConceptPipelineStatus(status) {
@@ -4077,7 +4228,7 @@ async function handleRebuildConcepts() {
   rebuildConceptsBtn.disabled = true;
   rebuildConceptsBtn.textContent = 'Rebuilding...';
   try {
-    const res = await fetch('/api/admin/concepts/rebuild', { method: 'POST' });
+    const res = await fetch('/api/admin/concepts/rebuild', { method: 'POST', headers: csrfHeaders() });
     const data = await res.json();
     if (!res.ok) {
       alert(data.error || 'Concept rebuild failed');
@@ -4149,7 +4300,7 @@ function renderCache(entries) {
       btn.disabled = true;
       btn.textContent = '...';
       try {
-        const res = await fetch(`/api/admin/cache/${encodeURIComponent(docId)}/refresh`, { method: 'POST' });
+        const res = await fetch(`/api/admin/cache/${encodeURIComponent(docId)}/refresh`, { method: 'POST', headers: csrfHeaders() });
         const data = await res.json();
         if (!res.ok) {
           alert(data.error || 'Refresh failed');
@@ -4181,7 +4332,7 @@ function renderCache(entries) {
     btn.addEventListener('click', async () => {
       const docId = btn.dataset.deleteCache;
       try {
-        const res = await fetch(`/api/admin/cache/${encodeURIComponent(docId)}`, { method: 'DELETE' });
+        const res = await fetch(`/api/admin/cache/${encodeURIComponent(docId)}`, { method: 'DELETE', headers: csrfHeaders() });
         if (res.ok) await loadCache();
       } catch { /* ignore */ }
     });
@@ -4190,7 +4341,7 @@ function renderCache(entries) {
 
 async function handleRefreshCache() {
   try {
-    await fetch('/api/admin/cache/refresh', { method: 'POST' });
+    await fetch('/api/admin/cache/refresh', { method: 'POST', headers: csrfHeaders() });
     setStatus('In-memory cache cleared. Next query will re-fetch.');
   } catch { /* ignore */ }
 }
@@ -4199,7 +4350,7 @@ async function handleReparseAll() {
   reparseAllBtn.disabled = true;
   reparseAllBtn.textContent = 'Reparsing...';
   try {
-    const res = await fetch('/api/admin/reparse-all', { method: 'POST' });
+    const res = await fetch('/api/admin/reparse-all', { method: 'POST', headers: csrfHeaders() });
     const data = await res.json();
     if (!res.ok) {
       alert(data.error || 'Reparse failed');
@@ -4260,6 +4411,7 @@ refreshBtn.addEventListener('click', () => {
 });
 
 saveSettingsBtn.addEventListener('click', handleSaveSettings);
+syncDocumentsBtn.addEventListener('click', handleSyncDocuments);
 rebuildConceptsBtn.addEventListener('click', handleRebuildConcepts);
 
 for (const btn of tabButtons) {
@@ -4322,6 +4474,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 loginForm.addEventListener('submit', handleLogin);
+mfaSetupForm.addEventListener('submit', handleMfaSetup);
 logoutBtn.addEventListener('click', handleLogout);
 createUserForm.addEventListener('submit', handleCreateUser);
 refreshCacheBtn.addEventListener('click', handleRefreshCache);

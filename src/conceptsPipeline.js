@@ -356,7 +356,7 @@ export async function rebuildConceptDictionary({ trigger = 'manual' } = {}) {
   });
 
   try {
-    const docs = listAllDocumentMetadata().map((row) => row.metadata || {});
+    const docs = (await listAllDocumentMetadata()).map((row) => row.metadata || {});
     const phraseDocs = new Map(); // phrase -> set(docIndex)
     const docPhrases = [];        // docIndex -> Set<phrase> (for single-doc nesting checks)
 

@@ -3,7 +3,7 @@ import { rebuildConceptDictionary } from '../src/conceptsPipeline.js';
 
 async function main() {
   await ensureStorage();
-  getDb();
+  await getDb();
   const result = await rebuildConceptDictionary({ trigger: 'script' });
   if (!result.ok) {
     console.error(result.error || 'Concept rebuild failed');

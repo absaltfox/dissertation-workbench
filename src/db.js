@@ -1,25 +1,91 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { DatabaseSync } from 'node:sqlite';
+import { createClient } from '@libsql/client';
 import { SQLITE_PATH, PDF_CACHE_DIR } from './config.js';
 import { logger } from './logger.js';
 import { normalizePersonName, supervisorNameKey } from './supervisors.js';
+import { encryptMfaSecret, decryptMfaSecret } from './secretCrypto.js';
 
 let db;
+let schemaReady;
+
+export function getDatabaseUrl() {
+  return (process.env.TURSO_DATABASE_URL || `file:${SQLITE_PATH}`).trim();
+}
 
 export async function ensureStorage() {
   await fs.mkdir(PDF_CACHE_DIR, { recursive: true });
-  await fs.mkdir(path.dirname(SQLITE_PATH), { recursive: true });
+  if (!process.env.TURSO_DATABASE_URL) {
+    await fs.mkdir(path.dirname(SQLITE_PATH), { recursive: true });
+  }
 }
 
-export function getDb() {
-  if (db) return db;
-  db = new DatabaseSync(SQLITE_PATH);
-  db.exec(`
+export async function getDb() {
+  if (!db) {
+    db = createClient({
+      url: getDatabaseUrl(),
+      authToken: process.env.TURSO_AUTH_TOKEN,
+    });
+  }
+  if (!schemaReady) {
+    schemaReady = ensureSchema(db);
+  }
+  await schemaReady;
+  return db;
+}
+
+function changes(result) {
+  return Number(result?.rowsAffected ?? result?.changes ?? 0);
+}
+
+async function execute(sql, args = []) {
+  const client = await getDb();
+  return client.execute({ sql, args });
+}
+
+async function run(sql, args = []) {
+  const result = await execute(sql, args);
+  return { changes: changes(result) };
+}
+
+async function get(sql, args = []) {
+  const result = await execute(sql, args);
+  return result.rows[0] || null;
+}
+
+async function all(sql, args = []) {
+  const result = await execute(sql, args);
+  return result.rows;
+}
+
+async function exec(sql) {
+  const client = await getDb();
+  await client.executeMultiple(sql);
+}
+
+async function tryExec(client, sql) {
+  try {
+    await client.executeMultiple(sql);
+  } catch {
+    // Migration already applied or unsupported in the current database.
+  }
+}
+
+async function ensureSchema(client) {
+  await client.executeMultiple(`
     CREATE TABLE IF NOT EXISTS documents (
       doc_id TEXT PRIMARY KEY,
       metadata_json TEXT NOT NULL,
+      sync_key TEXT,
+      title TEXT,
+      author TEXT,
+      year INTEGER,
+      degree TEXT,
+      program TEXT,
+      source_json TEXT,
+      source_updated_at TEXT,
+      synced_at TEXT,
       updated_at TEXT NOT NULL
     );
 
@@ -45,11 +111,27 @@ export function getDb() {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS sync_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      sync_key TEXT NOT NULL,
+      source_json TEXT NOT NULL,
+      status TEXT NOT NULL,
+      total_seen INTEGER NOT NULL DEFAULT 0,
+      total_saved INTEGER NOT NULL DEFAULT 0,
+      api_total INTEGER,
+      error TEXT,
+      started_at TEXT NOT NULL,
+      finished_at TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       salt TEXT NOT NULL,
+      mfa_secret TEXT,
+      mfa_enabled INTEGER NOT NULL DEFAULT 0,
+      mfa_enabled_at TEXT,
       created_at TEXT NOT NULL
     );
 
@@ -86,6 +168,8 @@ export function getDb() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_document_citations_doc_id ON document_citations(doc_id);
+    CREATE INDEX IF NOT EXISTS idx_document_citations_citation_id ON document_citations(citation_id);
+    CREATE INDEX IF NOT EXISTS idx_document_citations_citation_doc ON document_citations(citation_id, doc_id);
 
     CREATE TABLE IF NOT EXISTS catalogue_lookups (
       citation_id INTEGER PRIMARY KEY,
@@ -126,22 +210,37 @@ export function getDb() {
     );
   `);
 
-  // Migrations — add columns to existing tables
-  try { db.exec('ALTER TABLE catalogue_lookups ADD COLUMN bib_id TEXT'); } catch {}
-  try { db.exec('ALTER TABLE citations ADD COLUMN author TEXT'); } catch {}
-  try { db.exec('ALTER TABLE citations ADD COLUMN title TEXT'); } catch {}
-  try { db.exec('ALTER TABLE citations ADD COLUMN year TEXT'); } catch {}
-  try { db.exec('ALTER TABLE citations ADD COLUMN source TEXT'); } catch {}
+  await tryExec(client, 'ALTER TABLE catalogue_lookups ADD COLUMN bib_id TEXT');
+  await tryExec(client, 'ALTER TABLE documents ADD COLUMN sync_key TEXT');
+  await tryExec(client, 'ALTER TABLE documents ADD COLUMN title TEXT');
+  await tryExec(client, 'ALTER TABLE documents ADD COLUMN author TEXT');
+  await tryExec(client, 'ALTER TABLE documents ADD COLUMN year INTEGER');
+  await tryExec(client, 'ALTER TABLE documents ADD COLUMN degree TEXT');
+  await tryExec(client, 'ALTER TABLE documents ADD COLUMN program TEXT');
+  await tryExec(client, 'ALTER TABLE documents ADD COLUMN source_json TEXT');
+  await tryExec(client, 'ALTER TABLE documents ADD COLUMN source_updated_at TEXT');
+  await tryExec(client, 'ALTER TABLE documents ADD COLUMN synced_at TEXT');
+  await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_secret TEXT');
+  await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_enabled INTEGER NOT NULL DEFAULT 0');
+  await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_enabled_at TEXT');
+  await tryExec(client, 'ALTER TABLE citations ADD COLUMN author TEXT');
+  await tryExec(client, 'ALTER TABLE citations ADD COLUMN title TEXT');
+  await tryExec(client, 'ALTER TABLE citations ADD COLUMN year TEXT');
+  await tryExec(client, 'ALTER TABLE citations ADD COLUMN source TEXT');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_sync_key ON documents(sync_key)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree ON documents(degree)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_program ON documents(program)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_citations_citation_id ON document_citations(citation_id)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_citations_citation_doc ON document_citations(citation_id, doc_id)');
 
-  const cleaned = cleanupCommitteeArtifacts(db);
+  const cleaned = await cleanupCommitteeArtifacts(client);
   if (cleaned > 0) logger.info(`Cleaned up ${cleaned} committee artefact rows`);
-
-  return db;
 }
 
-export function cleanupCommitteeArtifacts(dbInstance) {
-  const d = dbInstance || getDb();
-  return d.prepare(`
+export async function cleanupCommitteeArtifacts(dbInstance = null) {
+  const client = dbInstance || await getDb();
+  const result = await client.execute(`
     DELETE FROM committee_members
     WHERE lower(name) IN (
       'additional supervisory committee members:',
@@ -152,30 +251,106 @@ export function cleanupCommitteeArtifacts(dbInstance) {
       'supervisory committee',
       'committee members'
     )
-  `).run().changes;
+  `);
+  return changes(result);
 }
 
 // --- Document functions ---
 
-export function saveDocumentMetadata(doc) {
-  const now = new Date().toISOString();
-  getDb().prepare(`
-    INSERT INTO documents (doc_id, metadata_json, updated_at)
-    VALUES (?, ?, ?)
-    ON CONFLICT(doc_id) DO UPDATE SET
-      metadata_json = excluded.metadata_json,
-      updated_at = excluded.updated_at
-  `).run(doc.id, JSON.stringify(doc), now);
+function documentColumns(doc, syncKey = null, source = null) {
+  return {
+    syncKey,
+    title: doc.title || null,
+    author: doc.author || null,
+    year: doc.year ?? null,
+    degree: doc.degree || null,
+    program: doc.program || null,
+    sourceJson: source ? JSON.stringify(source) : null,
+    sourceUpdatedAt: source?.sourceUpdatedAt || source?.updatedAt || null,
+  };
 }
 
-export function loadDocumentMetadata(docId) {
-  const row = getDb().prepare('SELECT metadata_json FROM documents WHERE doc_id = ?').get(docId);
+export async function saveDocumentMetadata(doc, { syncKey = null, source = null } = {}) {
+  const now = new Date().toISOString();
+  const cols = documentColumns(doc, syncKey, source);
+  await run(`
+    INSERT INTO documents (
+      doc_id, metadata_json, sync_key, title, author, year, degree, program,
+      source_json, source_updated_at, synced_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(doc_id) DO UPDATE SET
+      metadata_json = excluded.metadata_json,
+      sync_key = COALESCE(excluded.sync_key, documents.sync_key),
+      title = excluded.title,
+      author = excluded.author,
+      year = excluded.year,
+      degree = excluded.degree,
+      program = excluded.program,
+      source_json = COALESCE(excluded.source_json, documents.source_json),
+      source_updated_at = COALESCE(excluded.source_updated_at, documents.source_updated_at),
+      synced_at = COALESCE(excluded.synced_at, documents.synced_at),
+      updated_at = excluded.updated_at
+  `, [
+    doc.id, JSON.stringify(doc), cols.syncKey, cols.title, cols.author, cols.year,
+    cols.degree, cols.program, cols.sourceJson, cols.sourceUpdatedAt,
+    syncKey ? now : null, now
+  ]);
+}
+
+function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now = new Date().toISOString()) {
+  const cols = documentColumns(doc, syncKey, source);
+  return {
+    sql: `
+      INSERT INTO documents (
+        doc_id, metadata_json, sync_key, title, author, year, degree, program,
+        source_json, source_updated_at, synced_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(doc_id) DO UPDATE SET
+        metadata_json = excluded.metadata_json,
+        sync_key = COALESCE(excluded.sync_key, documents.sync_key),
+        title = excluded.title,
+        author = excluded.author,
+        year = excluded.year,
+        degree = excluded.degree,
+        program = excluded.program,
+        source_json = COALESCE(excluded.source_json, documents.source_json),
+        source_updated_at = COALESCE(excluded.source_updated_at, documents.source_updated_at),
+        synced_at = COALESCE(excluded.synced_at, documents.synced_at),
+        updated_at = excluded.updated_at
+    `,
+    args: [
+      doc.id, JSON.stringify(doc), cols.syncKey, cols.title, cols.author, cols.year,
+      cols.degree, cols.program, cols.sourceJson, cols.sourceUpdatedAt,
+      syncKey ? now : null, now
+    ]
+  };
+}
+
+export async function saveDocumentMetadataBatch(items) {
+  const cleaned = (items || []).filter((item) => item?.doc?.id);
+  if (!cleaned.length) return 0;
+  const now = new Date().toISOString();
+  const client = await getDb();
+  await client.batch(
+    cleaned.map((item) => saveDocumentStatement(item.doc, {
+      syncKey: item.syncKey || null,
+      source: item.source || null,
+    }, now)),
+    'write'
+  );
+  return cleaned.length;
+}
+
+export async function loadDocumentMetadata(docId) {
+  const row = await get('SELECT metadata_json FROM documents WHERE doc_id = ?', [docId]);
   if (!row) return null;
   try { return JSON.parse(row.metadata_json); } catch { return null; }
 }
 
-export function listAllDocumentMetadata() {
-  const rows = getDb().prepare('SELECT doc_id, metadata_json FROM documents').all();
+export async function listAllDocumentMetadata() {
+  const rows = await all('SELECT doc_id, metadata_json FROM documents');
   return rows.map((row) => {
     try {
       return { docId: row.doc_id, metadata: JSON.parse(row.metadata_json) };
@@ -185,20 +360,102 @@ export function listAllDocumentMetadata() {
   }).filter(Boolean);
 }
 
+export async function listCachedDocuments({ syncKey, limit = 1000 } = {}) {
+  const args = [];
+  let sql = 'SELECT doc_id, metadata_json FROM documents';
+  if (syncKey) {
+    sql += ' WHERE sync_key = ?';
+    args.push(syncKey);
+  }
+  sql += ' ORDER BY year DESC, title LIMIT ?';
+  args.push(limit);
+  const rows = await all(sql, args);
+  return rows.map((row) => {
+    try { return JSON.parse(row.metadata_json); } catch { return null; }
+  }).filter(Boolean);
+}
+
+export async function getDocumentCacheStats(syncKey = null) {
+  const row = syncKey
+    ? await get(`
+      SELECT COUNT(*) AS total, MAX(synced_at) AS last_synced_at
+      FROM documents
+      WHERE sync_key = ?
+    `, [syncKey])
+    : await get(`
+      SELECT COUNT(*) AS total, MAX(synced_at) AS last_synced_at
+      FROM documents
+    `);
+  return {
+    total: Number(row?.total || 0),
+    lastSyncedAt: row?.last_synced_at || null,
+  };
+}
+
+export async function createSyncRun(syncKey, source) {
+  const now = new Date().toISOString();
+  const result = await execute(`
+    INSERT INTO sync_runs (sync_key, source_json, status, started_at)
+    VALUES (?, ?, 'running', ?)
+  `, [syncKey, JSON.stringify(source), now]);
+  return Number(result.lastInsertRowid || result.lastInsertRowId || 0);
+}
+
+export async function updateSyncRun(id, patch) {
+  if (!id) return;
+  const fields = [];
+  const args = [];
+  for (const [key, column] of Object.entries({
+    status: 'status',
+    totalSeen: 'total_seen',
+    totalSaved: 'total_saved',
+    apiTotal: 'api_total',
+    error: 'error',
+    finishedAt: 'finished_at',
+  })) {
+    if (Object.prototype.hasOwnProperty.call(patch, key)) {
+      fields.push(`${column} = ?`);
+      args.push(patch[key]);
+    }
+  }
+  if (!fields.length) return;
+  args.push(id);
+  await run(`UPDATE sync_runs SET ${fields.join(', ')} WHERE id = ?`, args);
+}
+
+export async function getLatestSyncRun(syncKey = null) {
+  const row = syncKey
+    ? await get('SELECT * FROM sync_runs WHERE sync_key = ? ORDER BY started_at DESC LIMIT 1', [syncKey])
+    : await get('SELECT * FROM sync_runs ORDER BY started_at DESC LIMIT 1');
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    syncKey: row.sync_key,
+    source: (() => { try { return JSON.parse(row.source_json); } catch { return null; } })(),
+    status: row.status,
+    totalSeen: Number(row.total_seen || 0),
+    totalSaved: Number(row.total_saved || 0),
+    apiTotal: row.api_total == null ? null : Number(row.api_total),
+    error: row.error || null,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at || null,
+  };
+}
+
 // --- File metric functions ---
 
-export function loadStoredFileMetric(docId) {
-  return getDb().prepare(`
+export async function loadStoredFileMetric(docId) {
+  return get(`
     SELECT doc_id, pdf_path, download_url, file_bytes, word_count, page_count,
            word_source, page_source, status, error, updated_at
     FROM file_metrics
     WHERE doc_id = ?
-  `).get(docId);
+  `, [docId]);
 }
 
-export function saveFileMetric(docId, payload) {
+export async function saveFileMetric(docId, payload) {
   const now = new Date().toISOString();
-  getDb().prepare(`
+  await run(`
     INSERT INTO file_metrics (
       doc_id, pdf_path, download_url, file_bytes, word_count, page_count,
       word_source, page_source, status, error, updated_at
@@ -214,7 +471,7 @@ export function saveFileMetric(docId, payload) {
       status = excluded.status,
       error = excluded.error,
       updated_at = excluded.updated_at
-  `).run(
+  `, [
     docId,
     payload.pdfPath || null,
     payload.downloadUrl || null,
@@ -226,24 +483,24 @@ export function saveFileMetric(docId, payload) {
     payload.status || null,
     payload.error || null,
     now
-  );
+  ]);
 }
 
-export function deleteFileMetric(docId) {
-  getDb().prepare('DELETE FROM file_metrics WHERE doc_id = ?').run(docId);
+export async function deleteFileMetric(docId) {
+  await run('DELETE FROM file_metrics WHERE doc_id = ?', [docId]);
 }
 
-export function listFileMetrics() {
-  return getDb().prepare(`
+export async function listFileMetrics() {
+  return all(`
     SELECT doc_id, pdf_path, download_url, file_bytes, word_count, page_count,
            word_source, page_source, status, error, updated_at
     FROM file_metrics
     ORDER BY updated_at DESC
-  `).all();
+  `);
 }
 
-export function getFileMetricsStats() {
-  const row = getDb().prepare(`
+export async function getFileMetricsStats() {
+  return get(`
     SELECT COUNT(*) AS total,
            SUM(CASE WHEN file_bytes IS NOT NULL THEN file_bytes ELSE 0 END) AS total_bytes,
            SUM(CASE WHEN status = 'downloaded' OR status = 'redownloaded' OR status = 'cached' OR status = 'recomputed_from_cache' THEN 1 ELSE 0 END) AS with_pdf,
@@ -251,80 +508,114 @@ export function getFileMetricsStats() {
            MIN(updated_at) AS oldest,
            MAX(updated_at) AS newest
     FROM file_metrics
-  `).get();
-  return row;
+  `);
 }
 
 // --- Run metrics functions ---
 
-export function saveRunMetrics(source, metrics) {
+export async function saveRunMetrics(source, metrics) {
   const now = new Date().toISOString();
   const runKey = crypto.createHash('sha1').update(JSON.stringify(source)).digest('hex');
-  getDb().prepare(`
+  await run(`
     INSERT INTO metric_runs (run_key, source_json, metrics_json, created_at)
     VALUES (?, ?, ?, ?)
-  `).run(runKey, JSON.stringify(source), JSON.stringify(metrics), now);
+  `, [runKey, JSON.stringify(source), JSON.stringify(metrics), now]);
 }
 
-export function listRecentRuns(limit = 50) {
-  return getDb().prepare(`
+export async function listRecentRuns(limit = 50) {
+  return all(`
     SELECT id, run_key, source_json, metrics_json, created_at
     FROM metric_runs
     ORDER BY created_at DESC
     LIMIT ?
-  `).all(limit);
+  `, [limit]);
 }
 
 // --- User functions ---
 
-export function createUser(username, passwordHash, salt) {
+export async function createUser(username, passwordHash, salt) {
   const now = new Date().toISOString();
-  getDb().prepare(`
+  await run(`
     INSERT INTO users (username, password_hash, salt, created_at)
     VALUES (?, ?, ?, ?)
-  `).run(username, passwordHash, salt, now);
+  `, [username, passwordHash, salt, now]);
   logger.info('User created', { username });
 }
 
-export function deleteUser(username) {
-  const result = getDb().prepare('DELETE FROM users WHERE username = ?').run(username);
+export async function deleteUser(username) {
+  const result = await run('DELETE FROM users WHERE username = ?', [username]);
   if (result.changes > 0) logger.info('User deleted', { username });
   return result.changes > 0;
 }
 
-export function findUserByUsername(username) {
-  return getDb().prepare('SELECT id, username, password_hash, salt, created_at FROM users WHERE username = ?').get(username);
+export async function updateUserPassword(username, passwordHash, salt) {
+  const result = await run(`
+    UPDATE users
+    SET password_hash = ?, salt = ?
+    WHERE username = ?
+  `, [passwordHash, salt, username]);
+  if (result.changes > 0) logger.info('User password updated', { username });
+  return result.changes > 0;
 }
 
-export function listUsers() {
-  return getDb().prepare('SELECT id, username, created_at FROM users ORDER BY created_at').all();
+export async function findUserByUsername(username) {
+  const user = await get(`
+    SELECT id, username, password_hash, salt, mfa_secret, mfa_enabled, mfa_enabled_at, created_at
+    FROM users
+    WHERE username = ?
+  `, [username]);
+  if (user?.mfa_secret) user.mfa_secret = decryptMfaSecret(user.mfa_secret);
+  return user;
 }
 
-export function countUsers() {
-  const row = getDb().prepare('SELECT COUNT(*) AS cnt FROM users').get();
-  return row.cnt;
+export async function listUsers() {
+  return all('SELECT id, username, mfa_enabled, mfa_enabled_at, created_at FROM users ORDER BY created_at');
+}
+
+export async function countUsers() {
+  const row = await get('SELECT COUNT(*) AS cnt FROM users');
+  return Number(row?.cnt || 0);
+}
+
+export async function setUserMfa(username, secret) {
+  const now = new Date().toISOString();
+  await run(`
+    UPDATE users
+    SET mfa_secret = ?, mfa_enabled = 1, mfa_enabled_at = ?
+    WHERE username = ?
+  `, [encryptMfaSecret(secret), now, username]);
+}
+
+export async function clearUserMfa(username) {
+  const result = await run(`
+    UPDATE users
+    SET mfa_secret = NULL, mfa_enabled = 0, mfa_enabled_at = NULL
+    WHERE username = ?
+  `, [username]);
+  if (result.changes > 0) logger.info('User MFA reset', { username });
+  return result.changes > 0;
 }
 
 // --- Settings functions ---
 
-export function getSetting(key) {
-  const row = getDb().prepare('SELECT value FROM settings WHERE key = ?').get(key);
+export async function getSetting(key) {
+  const row = await get('SELECT value FROM settings WHERE key = ?', [key]);
   return row ? row.value : null;
 }
 
-export function setSetting(key, value) {
+export async function setSetting(key, value) {
   const now = new Date().toISOString();
-  getDb().prepare(`
+  await run(`
     INSERT INTO settings (key, value, updated_at)
     VALUES (?, ?, ?)
     ON CONFLICT(key) DO UPDATE SET
       value = excluded.value,
       updated_at = excluded.updated_at
-  `).run(key, value, now);
+  `, [key, value, now]);
 }
 
-export function getAllSettings() {
-  const rows = getDb().prepare('SELECT key, value, updated_at FROM settings ORDER BY key').all();
+export async function getAllSettings() {
+  const rows = await all('SELECT key, value, updated_at FROM settings ORDER BY key');
   const obj = {};
   for (const row of rows) obj[row.key] = row.value;
   return obj;
@@ -333,7 +624,7 @@ export function getAllSettings() {
 // --- Cache integrity ---
 
 export async function checkCacheIntegrity() {
-  const entries = getDb().prepare('SELECT doc_id, pdf_path FROM file_metrics WHERE pdf_path IS NOT NULL').all();
+  const entries = await all('SELECT doc_id, pdf_path FROM file_metrics WHERE pdf_path IS NOT NULL');
   let missing = 0;
   for (const entry of entries) {
     try {
@@ -352,30 +643,8 @@ export async function checkCacheIntegrity() {
 
 // --- Committee functions ---
 
-export function saveCommitteeMembers(docId, members, source) {
+export async function saveCommitteeMembers(docId, members, source) {
   const now = new Date().toISOString();
-  const stmt = getDb().prepare(`
-    INSERT INTO committee_members (doc_id, name, role, affiliation, source, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(doc_id, name, role) DO UPDATE SET
-      affiliation = CASE
-        WHEN committee_members.source = 'api' AND excluded.source <> 'api'
-          THEN committee_members.affiliation
-        ELSE excluded.affiliation
-      END,
-      source = CASE
-        WHEN committee_members.source = 'api' AND excluded.source <> 'api'
-          THEN committee_members.source
-        ELSE excluded.source
-      END,
-      updated_at = CASE
-        WHEN committee_members.source = 'api' AND excluded.source <> 'api'
-          THEN committee_members.updated_at
-        ELSE excluded.updated_at
-      END
-  `);
-  // Second dedup layer: normalised name-key + role. The caller may also dedup by exact name,
-  // and the SQL UNIQUE(doc_id, name, role) constraint provides a final safety net.
   const seen = new Set();
   for (const member of members || []) {
     const role = member.role || null;
@@ -384,11 +653,30 @@ export function saveCommitteeMembers(docId, members, source) {
     const key = `${String(role || '')}:::${supervisorNameKey(normalizedName) || normalizedName.toLowerCase()}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    stmt.run(docId, normalizedName, role, member.affiliation || null, source, now);
+    await run(`
+      INSERT INTO committee_members (doc_id, name, role, affiliation, source, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(doc_id, name, role) DO UPDATE SET
+        affiliation = CASE
+          WHEN committee_members.source = 'api' AND excluded.source <> 'api'
+            THEN committee_members.affiliation
+          ELSE excluded.affiliation
+        END,
+        source = CASE
+          WHEN committee_members.source = 'api' AND excluded.source <> 'api'
+            THEN committee_members.source
+          ELSE excluded.source
+        END,
+        updated_at = CASE
+          WHEN committee_members.source = 'api' AND excluded.source <> 'api'
+            THEN committee_members.updated_at
+          ELSE excluded.updated_at
+        END
+    `, [docId, normalizedName, role, member.affiliation || null, source, now]);
   }
 }
 
-export function deleteCommitteeMembersByRoles(docId, roles, source = null) {
+export async function deleteCommitteeMembersByRoles(docId, roles, source = null) {
   const cleanedRoles = Array.from(new Set((roles || []).map((r) => String(r || '').trim()).filter(Boolean)));
   if (!cleanedRoles.length) return 0;
   const placeholders = cleanedRoles.map(() => '?').join(', ');
@@ -398,71 +686,65 @@ export function deleteCommitteeMembersByRoles(docId, roles, source = null) {
     sql += ' AND source = ?';
     params.push(source);
   }
-  const result = getDb().prepare(sql).run(...params);
+  const result = await run(sql, params);
   return result.changes || 0;
 }
 
-export function loadCommitteeMembers(docId) {
-  return getDb().prepare(`
+export async function loadCommitteeMembers(docId) {
+  return all(`
     SELECT name, role, affiliation, source
     FROM committee_members
     WHERE doc_id = ?
     ORDER BY id
-  `).all(docId);
+  `, [docId]);
 }
 
 // --- Citation functions ---
 
-export function saveCitations(docId, citations, hashFn) {
+export async function saveCitations(docId, citations, hashFn) {
   const now = new Date().toISOString();
-  const upsertCitation = getDb().prepare(`
-    INSERT INTO citations (citation_hash, citation_text, author, title, year, source, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(citation_hash) DO UPDATE SET
-      author = COALESCE(excluded.author, citations.author),
-      title = COALESCE(excluded.title, citations.title),
-      year = COALESCE(excluded.year, citations.year),
-      source = COALESCE(excluded.source, citations.source)
-  `);
-  const getCitationId = getDb().prepare(`
-    SELECT id FROM citations WHERE citation_hash = ?
-  `);
-  const linkCitation = getDb().prepare(`
-    INSERT INTO document_citations (doc_id, citation_id, updated_at)
-    VALUES (?, ?, ?)
-    ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
-  `);
-
   for (const item of citations) {
     const text = typeof item === 'string' ? item : item.text;
     const hash = hashFn(text);
-    upsertCitation.run(
+    await run(`
+      INSERT INTO citations (citation_hash, citation_text, author, title, year, source, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(citation_hash) DO UPDATE SET
+        author = COALESCE(excluded.author, citations.author),
+        title = COALESCE(excluded.title, citations.title),
+        year = COALESCE(excluded.year, citations.year),
+        source = COALESCE(excluded.source, citations.source)
+    `, [
       hash, text,
       (typeof item === 'string' ? null : item.author) || null,
       (typeof item === 'string' ? null : item.title) || null,
       (typeof item === 'string' ? null : item.year) || null,
       (typeof item === 'string' ? null : item.source) || null,
       now
-    );
-    const row = getCitationId.get(hash);
+    ]);
+    const row = await get('SELECT id FROM citations WHERE citation_hash = ?', [hash]);
     if (row) {
-      linkCitation.run(docId, row.id, now);
+      await run(`
+        INSERT INTO document_citations (doc_id, citation_id, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
+      `, [docId, row.id, now]);
     }
   }
 }
 
-export function loadDocumentCitations(docId) {
-  return getDb().prepare(`
+export async function loadDocumentCitations(docId) {
+  return all(`
     SELECT c.citation_text
     FROM document_citations dc
     JOIN citations c ON c.id = dc.citation_id
     WHERE dc.doc_id = ?
     ORDER BY c.id
-  `).all(docId);
+  `, [docId]);
 }
 
-export function loadDocumentCitationsWithSharing(docId) {
-  return getDb().prepare(`
+export async function loadDocumentCitationsWithSharing(docId) {
+  return all(`
     WITH doc_cites AS (
       SELECT citation_id FROM document_citations WHERE doc_id = ?
     ),
@@ -484,48 +766,45 @@ export function loadDocumentCitationsWithSharing(docId) {
     JOIN sharing s ON s.citation_id = dc.citation_id
     LEFT JOIN catalogue_lookups cl ON cl.citation_id = dc.citation_id
     ORDER BY s.total_docs DESC, c.citation_text
-  `).all(docId);
+  `, [docId]);
 }
 
-export function loadDocsByCitation(citationId) {
-  return getDb().prepare(`
+export async function loadDocsByCitation(citationId) {
+  return all(`
     SELECT d.doc_id as id, json_extract(d.metadata_json, '$.title') as title,
       json_extract(d.metadata_json, '$.author') as author
     FROM document_citations dc
     JOIN documents d ON d.doc_id = dc.doc_id
     WHERE dc.citation_id = ?
     ORDER BY title
-  `).all(citationId);
+  `, [citationId]);
 }
 
-export function clearDocumentCitations(docId) {
-  getDb().prepare('DELETE FROM document_citations WHERE doc_id = ?').run(docId);
-  // Remove orphaned citation rows (citations no longer linked to any document).
-  // catalogue_lookups has a FK to citations.id so must be cleaned first.
-  getDb().exec('DELETE FROM catalogue_lookups WHERE citation_id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
-  getDb().exec('DELETE FROM citations WHERE id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
+export async function clearDocumentCitations(docId) {
+  await run('DELETE FROM document_citations WHERE doc_id = ?', [docId]);
+  await exec('DELETE FROM catalogue_lookups WHERE citation_id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
+  await exec('DELETE FROM citations WHERE id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
 }
 
-export function clearAllCitations() {
-  getDb().exec('DELETE FROM catalogue_lookups');
-  getDb().exec('DELETE FROM document_citations');
-  getDb().exec('DELETE FROM citations');
+export async function clearAllCitations() {
+  await exec('DELETE FROM catalogue_lookups');
+  await exec('DELETE FROM document_citations');
+  await exec('DELETE FROM citations');
 }
 
-export function getCitationStats() {
-  const row = getDb().prepare(`
+export async function getCitationStats() {
+  return get(`
     SELECT
       (SELECT COUNT(*) FROM citations) AS total_citations,
       (SELECT COUNT(*) FROM document_citations) AS total_links
-  `).get();
-  return row;
+  `);
 }
 
 // --- Catalogue lookup functions ---
 
-export function saveCatalogueLookup(citationId, { hits, queryAuthor, queryTitle, bibId }) {
+export async function saveCatalogueLookup(citationId, { hits, queryAuthor, queryTitle, bibId }) {
   const now = new Date().toISOString();
-  getDb().prepare(`
+  await run(`
     INSERT INTO catalogue_lookups (citation_id, hits, query_author, query_title, bib_id, looked_up_at)
     VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(citation_id) DO UPDATE SET
@@ -534,59 +813,50 @@ export function saveCatalogueLookup(citationId, { hits, queryAuthor, queryTitle,
       query_title = excluded.query_title,
       bib_id = excluded.bib_id,
       looked_up_at = excluded.looked_up_at
-  `).run(citationId, hits ?? null, queryAuthor || null, queryTitle || null, bibId || null, now);
+  `, [citationId, hits ?? null, queryAuthor || null, queryTitle || null, bibId || null, now]);
 }
 
-export function loadCatalogueLookup(citationId) {
-  return getDb().prepare(`
+export async function loadCatalogueLookup(citationId) {
+  return get(`
     SELECT citation_id, hits, query_author, query_title, looked_up_at
     FROM catalogue_lookups
     WHERE citation_id = ?
-  `).get(citationId);
+  `, [citationId]);
 }
 
-export function getCitationForSummon(citationId) {
-  return getDb().prepare(`
+export async function getCitationForSummon(citationId) {
+  return get(`
     SELECT c.citation_text, cl.query_title, cl.query_author
     FROM citations c
     LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
     WHERE c.id = ?
-  `).get(citationId);
+  `, [citationId]);
 }
 
-export function getCatalogueLookupStats() {
-  return getDb().prepare(`
+export async function getCatalogueLookupStats() {
+  return get(`
     SELECT
       COUNT(*) AS total,
       SUM(CASE WHEN hits > 0 THEN 1 ELSE 0 END) AS found,
       SUM(CASE WHEN hits = 0 THEN 1 ELSE 0 END) AS not_found,
       SUM(CASE WHEN hits IS NULL THEN 1 ELSE 0 END) AS skipped
     FROM catalogue_lookups
-  `).get();
+  `);
 }
 
-export function listPendingLookups(limit = 100) {
-  // Include two populations:
-  // 1. Citations with no lookup row at all (truly new).
-  // 2. Citations where a previous lookup ran but stored hits=NULL with a non-null
-  //    query_title — these are Z39.50 network/timeout failures that should be retried.
-  //    Citations stored with query_title=NULL were intentionally skipped (unparseable)
-  //    and are not retried here; the improved extractor will handle them on first run.
-  return getDb().prepare(`
+export async function listPendingLookups(limit = 100) {
+  return all(`
     SELECT c.id, c.citation_text, c.author, c.title, c.year, c.source
     FROM citations c
     LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
     WHERE cl.citation_id IS NULL
        OR (cl.hits IS NULL AND cl.query_title IS NOT NULL)
     LIMIT ?
-  `).all(limit);
+  `, [limit]);
 }
 
-export function getCitationCooccurrence(limit = 100) {
-  // First find the top most-shared citations (those appearing in most dissertations),
-  // then find co-occurrence pairs among them. This keeps the graph focused on the
-  // most influential works rather than all 8k+ pairs at the minimum threshold.
-  return getDb().prepare(`
+export async function getCitationCooccurrence(limit = 100) {
+  return all(`
     WITH top_citations AS (
       SELECT citation_id, COUNT(DISTINCT doc_id) AS cnt
       FROM document_citations
@@ -610,11 +880,11 @@ export function getCitationCooccurrence(limit = 100) {
     HAVING shared >= 2
     ORDER BY shared DESC
     LIMIT ?
-  `).all(limit);
+  `, [limit]);
 }
 
-export function getTopCitedWorks(limit = 50) {
-  return getDb().prepare(`
+export async function getTopCitedWorks(limit = 50) {
+  return all(`
     SELECT c.id, c.citation_text,
       COUNT(DISTINCT dc.doc_id) AS doc_count,
       cl.hits AS catalogue_hits,
@@ -626,47 +896,47 @@ export function getTopCitedWorks(limit = 50) {
     HAVING doc_count > 1
     ORDER BY doc_count DESC, c.citation_text
     LIMIT ?
-  `).all(limit);
+  `, [limit]);
 }
 
 // --- Topic functions ---
 
-export function hasTopics() {
+export async function hasTopics() {
   try {
-    const row = getDb().prepare('SELECT 1 FROM topics LIMIT 1').get();
+    const row = await get('SELECT 1 FROM topics LIMIT 1');
     return !!row;
   } catch {
     return false;
   }
 }
 
-export function loadTopics() {
-  const rows = getDb().prepare('SELECT topic_id, label, top_terms, doc_count, model_name, created_at FROM topics ORDER BY doc_count DESC').all();
+export async function loadTopics() {
+  const rows = await all('SELECT topic_id, label, top_terms, doc_count, model_name, created_at FROM topics ORDER BY doc_count DESC');
   return rows.map((row) => ({
-    topicId: row.topic_id,
+    topicId: Number(row.topic_id),
     label: row.label,
     topTerms: (() => { try { return JSON.parse(row.top_terms); } catch { return []; } })(),
-    docCount: row.doc_count,
+    docCount: Number(row.doc_count),
     modelName: row.model_name,
     createdAt: row.created_at,
   }));
 }
 
-export function loadDocumentTopics() {
-  const rows = getDb().prepare('SELECT doc_id, topic_id, probability FROM document_topics').all();
+export async function loadDocumentTopics() {
+  const rows = await all('SELECT doc_id, topic_id, probability FROM document_topics');
   const map = new Map();
   for (const row of rows) {
-    map.set(row.doc_id, { topicId: row.topic_id, probability: row.probability });
+    map.set(row.doc_id, { topicId: Number(row.topic_id), probability: row.probability != null ? Number(row.probability) : null });
   }
   return map;
 }
 
-export function loadDocumentTopicCoords() {
+export async function loadDocumentTopicCoords() {
   try {
-    const rows = getDb().prepare('SELECT doc_id, umap_x, umap_y FROM document_topic_coords').all();
+    const rows = await all('SELECT doc_id, umap_x, umap_y FROM document_topic_coords');
     const map = new Map();
     for (const row of rows) {
-      map.set(row.doc_id, { x: row.umap_x, y: row.umap_y });
+      map.set(row.doc_id, { x: Number(row.umap_x), y: Number(row.umap_y) });
     }
     return map;
   } catch {
@@ -674,9 +944,9 @@ export function loadDocumentTopicCoords() {
   }
 }
 
-export function loadTopicHierarchy() {
+export async function loadTopicHierarchy() {
   try {
-    const row = getDb().prepare('SELECT leaf_topic_ids, linkage_json FROM topic_hierarchy_meta WHERE id = 1').get();
+    const row = await get('SELECT leaf_topic_ids, linkage_json FROM topic_hierarchy_meta WHERE id = 1');
     if (!row) return null;
     return {
       leafTopicIds: JSON.parse(row.leaf_topic_ids),
@@ -686,7 +956,7 @@ export function loadTopicHierarchy() {
 }
 
 export async function logCacheStats() {
-  const stats = getFileMetricsStats();
+  const stats = await getFileMetricsStats();
   logger.info('PDF cache stats', {
     totalEntries: stats.total,
     totalBytes: stats.total_bytes,

@@ -6,10 +6,20 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
+    "worker": "node src/worker.js",
+    "test": "node --test",
     "reset-admin": "node scripts/reset-admin.js",
-    "rebuild-concepts": "node scripts/rebuild-concepts.js"
+    "rebuild-concepts": "node scripts/rebuild-concepts.js",
+    "validate:concepts": "node scripts/validate-concepts.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.5"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.17.3",
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "supertest": "^7.2.2"
   }
 }

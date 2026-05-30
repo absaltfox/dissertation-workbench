@@ -16,6 +16,7 @@ export const FILE_CONCURRENCY = 2;
 export const PDF_DOWNLOAD_RATE_PER_MIN = Number(process.env.PDF_DOWNLOAD_RATE_PER_MIN || 0); // 0 = unlimited
 export const DATA_DIR = process.env.APP_DATA_DIR || path.join(process.cwd(), 'data');
 export const PDF_CACHE_DIR = process.env.PDF_CACHE_DIR || path.join(DATA_DIR, 'pdf-cache');
+export const GROBID_URL = process.env.GROBID_URL || 'http://localhost:8070';
 export const SQLITE_PATH = process.env.SQLITE_PATH || path.join(DATA_DIR, 'metrics.sqlite');
 export const PORT = Number(process.env.PORT || 3000);
 export const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60 * 1000);
@@ -25,6 +26,12 @@ export const TRUST_PROXY = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '')
 export const SESSION_COOKIE_SECURE = process.env.SESSION_COOKIE_SECURE
   ? /^(1|true|yes)$/i.test(process.env.SESSION_COOKIE_SECURE)
   : IS_PRODUCTION;
+export const REQUIRE_ADMIN_MFA = process.env.REQUIRE_ADMIN_MFA
+  ? /^(1|true|yes)$/i.test(process.env.REQUIRE_ADMIN_MFA)
+  : IS_PRODUCTION;
+export const API_KEY_ENCRYPTION_KEY = process.env.API_KEY_ENCRYPTION_KEY || '';
+export const MFA_SECRET_ENCRYPTION_KEY = process.env.MFA_SECRET_ENCRYPTION_KEY || '';
+export const ADMIN_BOOTSTRAP_PASSWORD = process.env.ADMIN_BOOTSTRAP_PASSWORD || '';
 export const LOGIN_WINDOW_MS = Number(process.env.LOGIN_WINDOW_MS || 15 * 60 * 1000);
 export const LOGIN_BLOCK_MS = Number(process.env.LOGIN_BLOCK_MS || 15 * 60 * 1000);
 export const LOGIN_MAX_ATTEMPTS_IP = Number(process.env.LOGIN_MAX_ATTEMPTS_IP || 25);
@@ -32,6 +39,22 @@ export const LOGIN_MAX_ATTEMPTS_USER = Number(process.env.LOGIN_MAX_ATTEMPTS_USE
 export const LOGIN_FAILURE_DELAY_MS = Number(process.env.LOGIN_FAILURE_DELAY_MS || 350);
 export const PUBLIC_MAX_RECORDS = Number(process.env.PUBLIC_MAX_RECORDS || (IS_PRODUCTION ? 300 : 2000));
 export const PUBLIC_SCAN_LIMIT = Number(process.env.PUBLIC_SCAN_LIMIT || (IS_PRODUCTION ? 5000 : 50000));
+export const DOCUMENT_SYNC_INTERVAL_MS = Number(process.env.DOCUMENT_SYNC_INTERVAL_MS || 24 * 60 * 60 * 1000);
+export const DOCUMENT_SYNC_ENABLED = process.env.DOCUMENT_SYNC_ENABLED
+  ? /^(1|true|yes)$/i.test(process.env.DOCUMENT_SYNC_ENABLED)
+  : true;
+export const DOCUMENT_SYNC_ON_START = process.env.DOCUMENT_SYNC_ON_START
+  ? /^(1|true|yes)$/i.test(process.env.DOCUMENT_SYNC_ON_START)
+  : true;
+export const DOCUMENT_SYNC_ONCE = /^(1|true|yes)$/i.test(process.env.DOCUMENT_SYNC_ONCE || '');
+export const DOCUMENT_SYNC_MAX_RECORDS = Number(process.env.DOCUMENT_SYNC_MAX_RECORDS || 0); // 0 = use scan limit
+export const CATALOGUE_LOOKUP_ON_START = process.env.CATALOGUE_LOOKUP_ON_START
+  ? /^(1|true|yes)$/i.test(process.env.CATALOGUE_LOOKUP_ON_START)
+  : true;
+export const CATALOGUE_LOOKUP_ENABLED = process.env.CATALOGUE_LOOKUP_ENABLED
+  ? /^(1|true|yes)$/i.test(process.env.CATALOGUE_LOOKUP_ENABLED)
+  : true;
+export const CATALOGUE_LOOKUP_PAGE_SIZE = Number(process.env.CATALOGUE_LOOKUP_PAGE_SIZE || 200);
 export const ALLOW_PUBLIC_DOWNLOADS = process.env.ALLOW_PUBLIC_DOWNLOADS
   ? /^(1|true|yes)$/i.test(process.env.ALLOW_PUBLIC_DOWNLOADS)
   : !IS_PRODUCTION;

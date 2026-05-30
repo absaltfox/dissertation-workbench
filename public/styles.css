@@ -518,6 +518,10 @@ tbody tr:nth-child(even) {
   overflow-y: auto;
 }
 
+.doc-modal h2 {
+  padding-right: 2rem;
+}
+
 .doc-modal-close {
   position: absolute;
   top: 0.6rem;
@@ -985,9 +989,13 @@ tbody tr:nth-child(even) {
 /* --- Heatmap --- */
 
 .heatmap-table {
+  --heatmap-label-width: 10rem;
+  --heatmap-col-width: 6rem;
+  --heatmap-header-height: 7.2rem;
   border-collapse: collapse;
-  width: 100%;
+  width: max-content;
   font-family: var(--sans);
+  table-layout: fixed;
 }
 
 .heatmap-table th,
@@ -997,33 +1005,60 @@ tbody tr:nth-child(even) {
   font-size: 0.75rem;
 }
 
-.heatmap-header {
-  writing-mode: vertical-rl;
-  text-orientation: mixed;
-  transform: rotate(180deg);
-  white-space: nowrap;
-  max-width: 2.2rem;
-  max-height: 120px;
-  overflow: hidden;
-  text-overflow: ellipsis;
+.heatmap-table .heatmap-header {
+  width: var(--heatmap-col-width);
+  min-width: var(--heatmap-col-width);
+  max-width: var(--heatmap-col-width);
+  height: var(--heatmap-header-height);
+  padding: 0.45rem 0.35rem;
+  border: 1px solid var(--line);
+  border-bottom: 0;
+  background: #fff;
+  white-space: normal;
   vertical-align: bottom;
   font-weight: 600;
   color: var(--ink-soft);
+  font-size: 0.72rem;
+  letter-spacing: 0;
+  line-height: 1.12;
+  text-transform: none;
+  overflow: hidden;
 }
 
-.heatmap-label {
+.heatmap-table .heatmap-header-label {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  min-height: calc(var(--heatmap-header-height) - 1.1rem);
+  overflow-wrap: normal;
+  text-align: center;
+}
+
+.heatmap-table .heatmap-label {
+  width: var(--heatmap-label-width);
+  min-width: var(--heatmap-label-width);
+  max-width: var(--heatmap-label-width);
   text-align: right;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 180px;
   font-weight: 600;
   color: var(--ink-soft);
 }
 
-.heatmap-cell {
+.heatmap-table tr > :first-child {
+  width: var(--heatmap-label-width);
+  min-width: var(--heatmap-label-width);
+  max-width: var(--heatmap-label-width);
+}
+
+.heatmap-table .heatmap-cell {
+  width: var(--heatmap-col-width);
+  min-width: var(--heatmap-col-width);
+  max-width: var(--heatmap-col-width);
+  height: 2.25rem;
+  padding: 0;
   text-align: center;
-  min-width: 2rem;
   font-size: 0.72rem;
   font-weight: 600;
 }
@@ -1149,6 +1184,16 @@ input:focus, select:focus {
   font-family: var(--sans);
   font-size: 0.78rem;
   color: var(--ink-soft);
+}
+
+.secret-code {
+  display: block;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--paper);
+  color: var(--ink);
+  overflow-wrap: anywhere;
 }
 
 .form-error {
@@ -1638,8 +1683,14 @@ svg[viewBox] {
   .kpis { flex-direction: column; }
   .bar-row { grid-template-columns: 1fr; }
   .admin-tabs { gap: 0.3rem; }
-  .heatmap-table { font-size: 0.7rem; }
-  .heatmap-label { max-width: 80px; }
+  .heatmap-table {
+    --heatmap-label-width: 6.5rem;
+    --heatmap-col-width: 5.2rem;
+    --heatmap-header-height: 7.4rem;
+    font-size: 0.7rem;
+  }
+  .heatmap-label,
+  .heatmap-table tr > :first-child { width: 6.5rem; min-width: 6.5rem; max-width: 6.5rem; }
 
   /* Facet filter bar: stack vertically */
   .facet-filter-controls { flex-direction: column; align-items: stretch; }

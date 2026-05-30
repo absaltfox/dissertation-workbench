@@ -164,6 +164,7 @@
 
         <article class="panel">
           <h2>Methodology Detection</h2>
+          <p class="meta" style="margin-bottom:0.5rem">Methodology signals are keyword-based and may overlap; counts are not mutually exclusive.</p>
           <div id="methodologyBars" class="bars"></div>
         </article>
 
@@ -189,7 +190,7 @@
 
         <article class="panel" id="topicDistPanel" hidden>
           <h2>Topic Distribution</h2>
-          <p class="meta" style="margin-bottom:0.5rem">Topics discovered by BERTopic clustering of dissertation abstracts.</p>
+          <p id="topicModelMeta" class="meta" style="margin-bottom:0.5rem">Topics discovered by BERTopic clustering of dissertation abstracts.</p>
           <div id="topicBars" class="bars"></div>
         </article>
 
@@ -197,12 +198,6 @@
           <h2>Topics Over Time</h2>
           <svg id="topicTimelineChart" viewBox="0 0 940 360" role="img" aria-label="Topic frequency by year"></svg>
           <div id="topicTimelineLegend" class="timeline-legend"></div>
-        </article>
-
-        <article class="panel" hidden>
-          <h2>Research Gap Suggestions</h2>
-          <p class="meta" style="margin-bottom:0.5rem">Concept pairs that are individually common but rarely co-occur &mdash; potential unexplored intersections.</p>
-          <div id="researchGapsList" class="bars"></div>
         </article>
 
         <article class="panel" hidden>
@@ -216,8 +211,9 @@
           <article class="panel" id="topicClusterPanel" hidden>
             <h2>Topic Clusters</h2>
             <p class="meta" style="margin-bottom:0.5rem">
-              Each dot is a dissertation, positioned by semantic similarity (UMAP) and
-              colored by BERTopic cluster assignment. Click a dot to view the dissertation.
+              Each dot is a dissertation, projected into two dimensions with UMAP and
+              colored by BERTopic cluster assignment. Nearby points are useful for exploration,
+              but screen distance is not a precise similarity measure. Click a dot to view the dissertation.
             </p>
             <div id="topicClusterContainer" style="position:relative">
               <svg id="topicClusterChart" viewBox="0 0 940 600" role="img"
@@ -312,7 +308,7 @@
         <div id="citation-foundational" class="citation-tab-section">
         <article class="panel">
           <h2>Foundational Works</h2>
-          <p class="meta" style="margin-bottom:0.5rem">Citations appearing across the most dissertations in the database.</p>
+          <p class="meta" style="margin-bottom:0.5rem">Citations appearing across the most dissertations in this corpus.</p>
           <div id="foundationalWorksList" class="foundational-works-list"></div>
         </article>
         </div>
@@ -395,8 +391,23 @@
               <span>Password</span>
               <input id="loginPassword" type="password" autocomplete="current-password" required />
             </label>
+            <label id="loginMfaLabel" hidden>
+              <span>MFA Code</span>
+              <input id="loginMfaCode" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" />
+            </label>
             <div id="loginError" class="form-error" hidden></div>
             <button type="submit" class="btn">Sign In</button>
+          </form>
+          <form id="mfaSetupForm" class="login-form" hidden>
+            <p class="meta">Scan this TOTP secret in your authenticator app, then enter the current code.</p>
+            <code id="mfaSetupSecret" class="secret-code"></code>
+            <input id="mfaSetupToken" type="hidden" />
+            <label>
+              <span>Authenticator Code</span>
+              <input id="mfaSetupCode" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" required />
+            </label>
+            <div id="mfaSetupError" class="form-error" hidden></div>
+            <button type="submit" class="btn">Enable MFA</button>
           </form>
         </div>
 
@@ -478,8 +489,10 @@
                   <button type="submit" id="loadBtn" class="btn">Run Query</button>
                   <button type="button" id="refreshBtn" class="btn ghost">Force Refresh</button>
                   <button type="button" id="saveSettingsBtn" class="btn ghost">Save Settings</button>
+                  <button type="button" id="syncDocumentsBtn" class="btn ghost">Sync Documents</button>
                   <button type="button" id="rebuildConceptsBtn" class="btn ghost">Rebuild Concepts</button>
                 </div>
+                <p id="documentSyncStatus" class="meta"></p>
                 <p id="conceptPipelineStatus" class="meta"></p>
               </form>
             </article>

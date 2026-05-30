@@ -18,7 +18,15 @@ let hasYazClient;
  * Extract a searchable author surname and title from an APA-style citation.
  * Returns { author: string|null, title: string|null }.
  */
-export function extractSearchTerms(citationText) {
+export function extractSearchTerms(citationText, structuredFields) {
+  // If GROBID provided structured fields, use them directly
+  if (structuredFields?.title) {
+    return {
+      author: structuredFields.author ? extractAuthorSurname(structuredFields.author) : null,
+      title: cleanTitle(structuredFields.title),
+    };
+  }
+
   if (!citationText || typeof citationText !== 'string') {
     return { author: null, title: null };
   }
@@ -320,10 +328,10 @@ export async function lookupCitation(citationText) {
 
 // --- Batch lookup ---
 
-export async function lookupCitationBatch(citationTexts, { concurrency = 1, onProgress } = {}) {
+export async function lookupCitationBatch(citationTexts, { concurrency = 1, onProgress, structuredFieldsList } = {}) {
   if (!(await checkYazAvailability())) {
-    return citationTexts.map((text) => {
-      const { author, title } = extractSearchTerms(text);
+    return citationTexts.map((text, idx) => {
+      const { author, title } = extractSearchTerms(text, structuredFieldsList?.[idx]);
       return { found: null, hits: null, author, title, skipped: true, error: 'yaz-client not available' };
     });
   }
@@ -332,7 +340,7 @@ export async function lookupCitationBatch(citationTexts, { concurrency = 1, onPr
   const items = citationTexts.map((text, idx) => ({
     idx,
     text,
-    ...extractSearchTerms(text),
+    ...extractSearchTerms(text, structuredFieldsList?.[idx]),
   }));
 
   const results = new Array(items.length);
@@ -427,15 +435,21 @@ export async function runPendingCatalogueLookups({ pageSize = 200 } = {}) {
 
   // Process in pages until no pending citations remain
   while (true) {
-    const pending = listPendingLookups(pageSize);
+    const pending = await listPendingLookups(pageSize);
     if (!pending.length) break;
 
     const texts = pending.map((row) => row.citation_text);
-    const results = await lookupCitationBatch(texts);
+    const structuredFieldsList = pending.map((row) => ({
+      author: row.author || null,
+      title: row.title || null,
+      year: row.year || null,
+      source: row.source || null,
+    }));
+    const results = await lookupCitationBatch(texts, { structuredFieldsList });
 
     for (let i = 0; i < pending.length; i++) {
       const result = results[i];
-      saveCatalogueLookup(pending[i].id, {
+      await saveCatalogueLookup(pending[i].id, {
         hits: result.hits,
         queryAuthor: result.author,
         queryTitle: result.title,

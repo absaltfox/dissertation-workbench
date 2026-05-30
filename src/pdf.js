@@ -1,9 +1,10 @@
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { PDF_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, PDF_DOWNLOAD_RATE_PER_MIN } from './config.js';
+import { PDF_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, PDF_DOWNLOAD_RATE_PER_MIN, GROBID_URL } from './config.js';
 import {
   loadStoredFileMetric, saveFileMetric, saveDocumentMetadata, saveCommitteeMembers,
   loadCommitteeMembers, saveCitations, clearDocumentCitations, loadDocumentCitations, deleteCommitteeMembersByRoles
@@ -12,6 +13,286 @@ import { logger } from './logger.js';
 import { dedupeSupervisorNames } from './supervisors.js';
 
 const execFileAsync = promisify(execFile);
+
+// --- AnyStyle availability check ---
+let _anystyleBin = undefined; // undefined = unchecked, null = not found, string = path
+
+async function resolveAnyStyleBin() {
+  if (_anystyleBin !== undefined) return _anystyleBin;
+  // Try 'anystyle' on PATH first, then common Homebrew gem bin locations
+  const candidates = [
+    'anystyle',
+    '/opt/homebrew/lib/ruby/gems/3.3.0/bin/anystyle',
+    '/opt/homebrew/lib/ruby/gems/3.2.0/bin/anystyle',
+    '/opt/homebrew/lib/ruby/gems/3.1.0/bin/anystyle',
+    '/usr/local/lib/ruby/gems/3.3.0/bin/anystyle',
+  ];
+  for (const bin of candidates) {
+    try {
+      await execFileAsync(bin, ['--version']);
+      _anystyleBin = bin;
+      logger.info(`anystyle-cli found at: ${bin}`);
+      return _anystyleBin;
+    } catch {
+      // try next
+    }
+  }
+  _anystyleBin = null;
+  logger.warn('anystyle-cli not found; citation extraction will use regex fallback');
+  return _anystyleBin;
+}
+
+/**
+ * Assemble a readable citation string from a CSL-JSON record.
+ */
+function buildCitationText(csl) {
+  const parts = [];
+
+  // Authors
+  if (csl.author?.length) {
+    parts.push(csl.author.map(a => {
+      if (a.literal) return a.literal;
+      return [a.family, a.given].filter(Boolean).join(', ');
+    }).join('; '));
+  }
+
+  // Date
+  const year = csl.issued?.['date-parts']?.[0]?.[0] || csl.date;
+  if (year) parts.push(`(${year})`);
+
+  // Title
+  if (csl.title) parts.push(csl.title);
+
+  // Container (journal, book, etc.)
+  if (csl['container-title']) parts.push(csl['container-title']);
+
+  // Volume/issue/pages
+  const vol = [csl.volume, csl.issue ? `(${csl.issue})` : ''].filter(Boolean).join('');
+  if (vol) parts.push(vol);
+  if (csl.page) parts.push(csl.page);
+
+  // Publisher
+  const pub = [csl['publisher-place'], csl.publisher].filter(Boolean).join(': ');
+  if (pub) parts.push(pub);
+
+  const text = parts.join('. ').replace(/\.\./g, '.').trim();
+  // If AnyStyle couldn't parse much, return raw note/string if available
+  if (text.length < 20) return csl.note || null;
+  // Reject fragments that aren't real citations
+  if (isJunkCitation(text)) return null;
+  return text;
+}
+
+/**
+ * Reject fragments that AnyStyle mis-identifies as standalone references.
+ * These are typically URL continuation lines, publisher-only lines, or OCR noise.
+ */
+function isJunkCitation(text) {
+  if (text.length < 25) return true;
+  const lower = text.toLowerCase().trim();
+  // URL/retrieval fragments
+  if (/^(retrieved|accessed|retreived)\s+(from|on)/i.test(lower)) return true;
+  if (/^https?:\/\//i.test(lower)) return true;
+  // Pure publisher/location lines (no author or title)
+  if (/^[A-Z][a-z]+,\s*[A-Z]{2}:\s*\w+$/i.test(text) && text.length < 60) return true;
+  return false;
+}
+
+// --- GROBID availability check ---
+let _grobidAvailable = undefined;
+
+async function isGrobidAvailable() {
+  if (_grobidAvailable !== undefined) return _grobidAvailable;
+  try {
+    const res = await fetch(`${GROBID_URL}/api/isalive`);
+    _grobidAvailable = res.ok;
+    if (res.ok) logger.info('GROBID service available');
+  } catch {
+    _grobidAvailable = false;
+    logger.warn('GROBID not available; will fall back to AnyStyle/regex');
+  }
+  return _grobidAvailable;
+}
+
+/**
+ * Parse GROBID TEI-XML output into structured citation objects.
+ * Uses regex parsing (zero deps) to extract fields from each <biblStruct> entry.
+ */
+export function parseGrobidTeiXml(xml) {
+  if (!xml) return [];
+
+  const citations = [];
+  // Split on <biblStruct boundaries
+  const entries = xml.split(/<biblStruct\b/);
+
+  for (let i = 1; i < entries.length; i++) {
+    const entry = entries[i];
+    const endIdx = entry.indexOf('</biblStruct>');
+    const block = endIdx >= 0 ? entry.slice(0, endIdx) : entry;
+
+    // Authors: all <surname> + <forename> pairs
+    const authors = [];
+    for (const am of block.matchAll(/<persName[^>]*>([\s\S]*?)<\/persName>/g)) {
+      const nameBlock = am[1];
+      const surname = nameBlock.match(/<surname>([\s\S]*?)<\/surname>/)?.[1]?.trim();
+      const forename = nameBlock.match(/<forename[^>]*>([\s\S]*?)<\/forename>/)?.[1]?.trim();
+      if (surname) {
+        authors.push([surname, forename].filter(Boolean).join(', '));
+      }
+    }
+
+    // Article title
+    const articleTitle = block.match(/<title\s+level="a"[^>]*>([\s\S]*?)<\/title>/)?.[1]?.trim();
+
+    // Journal title
+    const journalTitle = block.match(/<title\s+level="j"[^>]*>([\s\S]*?)<\/title>/)?.[1]?.trim();
+
+    // Monograph/book title
+    const bookTitle = block.match(/<title\s+level="m"[^>]*>([\s\S]*?)<\/title>/)?.[1]?.trim();
+
+    // Year
+    const year = block.match(/<date[^>]+when="(\d{4})/)?.[1]
+      || block.match(/<date>([\s\S]*?)<\/date>/)?.[1]?.match(/\d{4}/)?.[0]
+      || null;
+
+    // Volume, issue, pages
+    const volume = block.match(/<biblScope\s+unit="volume">([\s\S]*?)<\/biblScope>/)?.[1]?.trim();
+    const issue = block.match(/<biblScope\s+unit="issue">([\s\S]*?)<\/biblScope>/)?.[1]?.trim();
+    const pages = block.match(/<biblScope\s+unit="page"[^>]*>([\s\S]*?)<\/biblScope>/)?.[1]?.trim()
+      || (() => {
+        const from = block.match(/<biblScope\s+unit="page"\s+from="([^"]+)"/)?.[1];
+        const to = block.match(/<biblScope\s+unit="page"\s+to="([^"]+)"/)?.[1];
+        return from ? (to ? `${from}-${to}` : from) : null;
+      })();
+
+    // Publisher
+    const publisher = block.match(/<publisher>([\s\S]*?)<\/publisher>/)?.[1]?.trim();
+
+    // Raw reference text (if GROBID provides it)
+    const rawRef = block.match(/<note\s+type="raw_reference"[^>]*>([\s\S]*?)<\/note>/)?.[1]?.trim();
+
+    // Determine the main title and source (container)
+    const title = articleTitle || bookTitle || null;
+    const source = journalTitle || (articleTitle ? bookTitle : null) || null;
+
+    // Build citation text from structured fields
+    const textParts = [];
+    if (authors.length) textParts.push(authors.join('; '));
+    if (year) textParts.push(`(${year})`);
+    if (title) textParts.push(title);
+    if (source) textParts.push(source);
+    const vol = [volume, issue ? `(${issue})` : ''].filter(Boolean).join('');
+    if (vol) textParts.push(vol);
+    if (pages) textParts.push(pages);
+    if (publisher) textParts.push(publisher);
+
+    let text = textParts.join('. ').replace(/\.\./g, '.').trim();
+
+    // Use raw reference if structured text is too short
+    if (text.length < 20 && rawRef) text = rawRef;
+    // Skip if still too short or junk
+    if (!text || text.length < 20) continue;
+    if (isJunkCitation(text)) continue;
+
+    // Unescape XML entities
+    text = text.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+
+    const authorField = authors.length ? authors.join('; ').replace(/&amp;/g, '&') : null;
+    const titleField = title ? title.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>') : null;
+    const sourceField = source ? source.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>') : null;
+
+    citations.push({
+      text,
+      author: authorField || null,
+      title: titleField || null,
+      year: year || null,
+      source: sourceField || null,
+    });
+  }
+
+  return citations;
+}
+
+/**
+ * Extract citations from a PDF file using GROBID's processReferences endpoint.
+ * Returns an array of { text, author, title, year, source } objects,
+ * or null if GROBID is unavailable/fails (signaling caller to use text-based fallback).
+ */
+export async function parseBibliographyWithGrobid(pdfPath, { timeoutMs = 120_000 } = {}) {
+  if (!pdfPath) return null;
+  if (!(await isGrobidAvailable())) return null;
+
+  try {
+    const pdfBuffer = await fs.readFile(pdfPath);
+    const form = new FormData();
+    form.append('input', new Blob([pdfBuffer]), path.basename(pdfPath));
+    form.append('includeRawCitations', '1');
+    form.append('consolidateCitations', '0');
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    let res;
+    try {
+      res = await fetch(`${GROBID_URL}/api/processReferences`, {
+        method: 'POST',
+        body: form,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (!res.ok) {
+      logger.warn('GROBID processReferences failed', { status: res.status });
+      return null;
+    }
+
+    const teiXml = await res.text();
+    return parseGrobidTeiXml(teiXml);
+  } catch (err) {
+    logger.warn('GROBID extraction error', { error: err.message });
+    return null;
+  }
+}
+
+/**
+ * Extract citations from full text using AnyStyle ML parser.
+ * Falls back to regex-based parseBibliography() if AnyStyle is unavailable.
+ */
+export async function parseBibliographyWithAnyStyle(fullText) {
+  if (!fullText) return [];
+  const bin = await resolveAnyStyleBin();
+  if (!bin) return parseBibliography(fullText);
+
+  const tmpFile = path.join(os.tmpdir(), `anystyle-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
+  try {
+    await fs.writeFile(tmpFile, fullText, 'utf8');
+    const { stdout } = await execFileAsync(bin, ['-f', 'csl', '--stdout', 'find', tmpFile], {
+      maxBuffer: 10 * 1024 * 1024
+    });
+    const records = JSON.parse(stdout);
+    const citations = records.map(buildCitationText).filter(Boolean);
+    // Fall back to regex if AnyStyle found suspiciously few references for
+    // a document that likely has a real bibliography (long text, few hits).
+    if (citations.length === 0) return parseBibliography(fullText);
+    if (citations.length < 5 && fullText.length > 50_000) {
+      const regexCitations = parseBibliography(fullText);
+      if (regexCitations.length > citations.length * 3) {
+        logger.info('AnyStyle found few citations, using regex fallback', {
+          anystyle: citations.length, regex: regexCitations.length
+        });
+        return regexCitations;
+      }
+    }
+    return citations;
+  } catch (err) {
+    logger.warn('AnyStyle extraction failed, falling back to regex parser', { error: err.message });
+    return parseBibliography(fullText);
+  } finally {
+    await fs.unlink(tmpFile).catch(() => {});
+  }
+}
 
 // --- PDF download rate limiter ---
 // Serialized queue so concurrent workers share a single sliding window.
@@ -739,7 +1020,7 @@ async function resolveDownloadUrl(candidateUrl) {
   }
 }
 
-export function extractAndSaveParsedData(doc, fullText) {
+export async function extractAndSaveParsedData(doc, fullText, pdfPath) {
   if (!fullText) return;
 
   // --- Committee extraction ---
@@ -752,10 +1033,10 @@ export function extractAndSaveParsedData(doc, fullText) {
       const apiSupervisors = dedupeSupervisorNames(doc.supervisors || []);
       const nonSupervisorCommittee = effectiveCommittee.filter((member) => !SUPERVISOR_ROLES.has(member.role));
       if (nonSupervisorCommittee.length) {
-        saveCommitteeMembers(doc.id, nonSupervisorCommittee, 'pdf');
+        await saveCommitteeMembers(doc.id, nonSupervisorCommittee, 'pdf');
       }
-      deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'pdf');
-      saveCommitteeMembers(
+      await deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'pdf');
+      await saveCommitteeMembers(
         doc.id,
         apiSupervisors.map((name) => ({ name, role: 'Supervisor', affiliation: null })),
         'api'
@@ -764,7 +1045,7 @@ export function extractAndSaveParsedData(doc, fullText) {
       doc.supervisorsSource = 'api';
     } else {
       if (effectiveCommittee.length) {
-        saveCommitteeMembers(doc.id, effectiveCommittee, 'pdf');
+        await saveCommitteeMembers(doc.id, effectiveCommittee, 'pdf');
       }
       const parsedSupervisors = supervisorsFromCommittee(effectiveCommittee);
       if (parsedSupervisors.length) {
@@ -772,7 +1053,7 @@ export function extractAndSaveParsedData(doc, fullText) {
         doc.supervisorsSource = committee.length > 0 ? 'pdf_fallback' : 'pdf_acknowledgements';
       }
     }
-    doc.committee = loadCommitteeMembers(doc.id);
+    doc.committee = await loadCommitteeMembers(doc.id);
 
     if ((!doc.supervisors || !doc.supervisors.length) && doc.committee.length) {
       const storedSupervisors = supervisorsFromCommittee(doc.committee);
@@ -790,28 +1071,36 @@ export function extractAndSaveParsedData(doc, fullText) {
   }
 
   // --- Citation extraction (independent of committee success) ---
+  // Fallback chain: GROBID (PDF layout) → AnyStyle (text ML) → regex
   try {
-    const citations = parseBibliography(fullText);
-    clearDocumentCitations(doc.id);
-    if (citations.length) {
-      saveCitations(doc.id, citations, normalizeCitation);
+    let citations = null;
+    if (pdfPath) {
+      citations = await parseBibliographyWithGrobid(pdfPath);
     }
-    doc.citationCount = citations.length || loadDocumentCitations(doc.id).length;
+    if (!citations) {
+      const textCitations = await parseBibliographyWithAnyStyle(fullText);
+      citations = textCitations.map(text => ({ text }));
+    }
+    await clearDocumentCitations(doc.id);
+    if (citations.length) {
+      await saveCitations(doc.id, citations, normalizeCitation);
+    }
+    doc.citationCount = citations.length || (await loadDocumentCitations(doc.id)).length;
   } catch (err) {
     logger.warn('Failed to extract citations from PDF', { docId: doc.id, error: err.message });
   }
 
   try {
-    saveDocumentMetadata(doc);
+    await saveDocumentMetadata(doc);
   } catch (err) {
     logger.warn('Failed to save document metadata', { docId: doc.id, error: err.message });
   }
 }
 
-function loadStoredParsedData(doc) {
+async function loadStoredParsedData(doc) {
   try {
-    doc.committee = loadCommitteeMembers(doc.id);
-    doc.citationCount = loadDocumentCitations(doc.id).length;
+    doc.committee = await loadCommitteeMembers(doc.id);
+    doc.citationCount = (await loadDocumentCitations(doc.id)).length;
     if ((!doc.supervisors || !doc.supervisors.length) && doc.committee.length) {
       const storedSupervisors = supervisorsFromCommittee(doc.committee);
       if (storedSupervisors.length) {
@@ -831,14 +1120,14 @@ function loadStoredParsedData(doc) {
 
 export async function analyzeDocumentFile(doc, options) {
   const { downloadFiles, forceDownload, recomputeFromCache } = options;
-  const stored = loadStoredFileMetric(doc.id);
+  const stored = await loadStoredFileMetric(doc.id);
   const hasCachedPdf = stored?.pdf_path && (await fileExists(stored.pdf_path));
 
   if (recomputeFromCache) {
     if (!hasCachedPdf) {
       doc.downloadStatus = 'cache_miss';
       doc.downloadError = 'No local cached PDF available for recomputation.';
-      saveFileMetric(doc.id, {
+      await saveFileMetric(doc.id, {
         status: 'cache_miss',
         error: doc.downloadError,
         pdfPath: stored?.pdf_path || null,
@@ -867,7 +1156,7 @@ export async function analyzeDocumentFile(doc, options) {
       doc.downloadStatus = 'recomputed_from_cache';
       doc.downloadError = null;
 
-      saveFileMetric(doc.id, {
+      await saveFileMetric(doc.id, {
         status: 'recomputed_from_cache',
         error: null,
         pdfPath: stored.pdf_path,
@@ -878,12 +1167,12 @@ export async function analyzeDocumentFile(doc, options) {
         wordSource: doc.wordCountSource,
         pageSource: doc.pagesSource
       });
-      extractAndSaveParsedData(doc, analysis.fullText);
+      await extractAndSaveParsedData(doc, analysis.fullText, stored.pdf_path);
       return;
     } catch (error) {
       doc.downloadStatus = 'cache_error';
       doc.downloadError = error instanceof Error ? error.message : String(error);
-      saveFileMetric(doc.id, {
+      await saveFileMetric(doc.id, {
         status: 'cache_error',
         error: doc.downloadError,
         pdfPath: stored.pdf_path,
@@ -900,14 +1189,14 @@ export async function analyzeDocumentFile(doc, options) {
 
   if (!forceDownload && hasCachedPdf) {
     applyStoredMetricToDoc(doc, stored, 'cached');
-    loadStoredParsedData(doc);
+    await loadStoredParsedData(doc);
     return;
   }
 
   if (!downloadFiles) {
     if (hasCachedPdf) {
       applyStoredMetricToDoc(doc, stored, 'cached');
-      loadStoredParsedData(doc);
+      await loadStoredParsedData(doc);
     } else {
       doc.downloadStatus = 'skipped';
     }
@@ -942,7 +1231,7 @@ export async function analyzeDocumentFile(doc, options) {
       doc.downloadStatus = forceDownload ? 'redownloaded' : 'downloaded';
       doc.downloadError = null;
 
-      saveFileMetric(doc.id, {
+      await saveFileMetric(doc.id, {
         status: doc.downloadStatus,
         error: null,
         pdfPath: cachePath,
@@ -953,7 +1242,7 @@ export async function analyzeDocumentFile(doc, options) {
         wordSource: doc.wordCountSource,
         pageSource: doc.pagesSource
       });
-      extractAndSaveParsedData(doc, analysis.fullText);
+      await extractAndSaveParsedData(doc, analysis.fullText, cachePath);
       logger.info('PDF downloaded and analyzed', { docId: doc.id, pages: doc.pages, words: doc.wordCount });
       return;
     } catch (error) {
@@ -964,7 +1253,7 @@ export async function analyzeDocumentFile(doc, options) {
   doc.downloadStatus = 'not_found';
   if (!doc.downloadError) doc.downloadError = 'No downloadable PDF could be resolved for this record.';
 
-  saveFileMetric(doc.id, {
+  await saveFileMetric(doc.id, {
     status: 'not_found',
     error: doc.downloadError,
     pdfPath: stored?.pdf_path || null,
@@ -978,7 +1267,7 @@ export async function analyzeDocumentFile(doc, options) {
 }
 
 export async function enrichDocumentsWithFileAnalysis(documents, options) {
-  for (const doc of documents) saveDocumentMetadata(doc);
+  for (const doc of documents) await saveDocumentMetadata(doc);
 
   let cursor = 0;
   const workers = Array.from({ length: Math.max(1, FILE_CONCURRENCY) }, async () => {
@@ -986,7 +1275,7 @@ export async function enrichDocumentsWithFileAnalysis(documents, options) {
       const idx = cursor;
       cursor += 1;
       await analyzeDocumentFile(documents[idx], options);
-      saveDocumentMetadata(documents[idx]);
+      await saveDocumentMetadata(documents[idx]);
     }
   });
 
@@ -994,7 +1283,7 @@ export async function enrichDocumentsWithFileAnalysis(documents, options) {
 }
 
 export async function deleteCachedPdf(docId) {
-  const stored = loadStoredFileMetric(docId);
+  const stored = await loadStoredFileMetric(docId);
   if (stored?.pdf_path) {
     try {
       await fs.unlink(stored.pdf_path);

@@ -16,7 +16,7 @@ const DOC_IDS = [
 ];
 
 for (const docId of DOC_IDS) {
-  const doc = loadDocumentMetadata(docId);
+  const doc = await loadDocumentMetadata(docId);
   if (!doc) {
     console.log(`[SKIP] ${docId} — not found in DB`);
     continue;
@@ -24,7 +24,7 @@ for (const docId of DOC_IDS) {
   doc.id = docId;
   try {
     // Delete all existing committee entries so stale bad names are removed
-    getDb().prepare('DELETE FROM committee_members WHERE doc_id = ?').run(docId);
+    await (await getDb()).execute({ sql: 'DELETE FROM committee_members WHERE doc_id = ?', args: [docId] });
     await analyzeDocumentFile(doc, { recomputeFromCache: true });
     const committee = (doc.committee || []).map(m => `${m.name} (${m.role})`).join(', ');
     console.log(`[OK]   ${docId} — ${committee || 'no committee parsed'}`);
