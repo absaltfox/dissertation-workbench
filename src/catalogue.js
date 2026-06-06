@@ -2,6 +2,7 @@ import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { logger } from './logger.js';
 import { listPendingLookups, saveCatalogueLookup } from './db.js';
+import { buildPqfQuery } from './catalogueQuery.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -227,20 +228,6 @@ export async function checkYazAvailability() {
 }
 
 // --- Single citation lookup ---
-
-function buildPqfQuery(author, title) {
-  // Escape double quotes in values
-  const cleanTitle = title ? title.replace(/"/g, '') : null;
-  const cleanAuthor = author ? author.replace(/"/g, '') : null;
-
-  if (cleanTitle && cleanAuthor) {
-    return `@and @attr 1=4 "${cleanTitle}" @attr 1=1003 "${cleanAuthor}"`;
-  }
-  if (cleanTitle) {
-    return `@attr 1=4 "${cleanTitle}"`;
-  }
-  return null;
-}
 
 function parseHitsFromOutput(stdout) {
   const match = String(stdout).match(/Number of hits:\s*(\d+)/);

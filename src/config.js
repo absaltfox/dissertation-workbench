@@ -1,4 +1,6 @@
 import path from 'node:path';
+import fs from 'node:fs';
+import './env.js';
 
 export const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 export const DEFAULT_BASE_URL = process.env.UBC_API_BASE_URL || 'https://oc-index.library.ubc.ca';
@@ -18,11 +20,22 @@ export const DATA_DIR = process.env.APP_DATA_DIR || path.join(process.cwd(), 'da
 export const PDF_CACHE_DIR = process.env.PDF_CACHE_DIR || path.join(DATA_DIR, 'pdf-cache');
 export const GROBID_URL = process.env.GROBID_URL || 'http://localhost:8070';
 export const SQLITE_PATH = process.env.SQLITE_PATH || path.join(DATA_DIR, 'metrics.sqlite');
+export const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL || '';
+export const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN || '';
 export const PORT = Number(process.env.PORT || 3000);
 export const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60 * 1000);
 export const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024; // 200 MB
 export const DOWNLOAD_TIMEOUT_MS = 30_000; // 30 seconds
 export const TRUST_PROXY = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '');
+export const PDF_ALLOWED_HOSTS = (process.env.PDF_ALLOWED_HOSTS || 'open.library.ubc.ca,oc-index.library.ubc.ca')
+  .split(',')
+  .map((host) => host.trim().toLowerCase())
+  .filter(Boolean);
+export const PDF_ALLOW_HTTP_DOWNLOADS = process.env.PDF_ALLOW_HTTP_DOWNLOADS
+  ? /^(1|true|yes)$/i.test(process.env.PDF_ALLOW_HTTP_DOWNLOADS)
+  : !IS_PRODUCTION;
+export const BERTOPIC_PYTHON_COMMAND = process.env.BERTOPIC_PYTHON_COMMAND || 'python3';
+export const BERTOPIC_TIMEOUT_MS = Number(process.env.BERTOPIC_TIMEOUT_MS || 60 * 60 * 1000);
 export const SESSION_COOKIE_SECURE = process.env.SESSION_COOKIE_SECURE
   ? /^(1|true|yes)$/i.test(process.env.SESSION_COOKIE_SECURE)
   : IS_PRODUCTION;
@@ -67,6 +80,61 @@ export const ALLOW_PUBLIC_RECOMPUTE = process.env.ALLOW_PUBLIC_RECOMPUTE
 export const EXPOSE_ERROR_DETAILS = process.env.EXPOSE_ERROR_DETAILS
   ? /^(1|true|yes)$/i.test(process.env.EXPOSE_ERROR_DETAILS)
   : !IS_PRODUCTION;
+
+export function validateRuntimeSecrets() {
+  validateCommittedSecretHygiene();
+  if (!IS_PRODUCTION) return;
+
+  const errors = [];
+  if (!API_KEY_ENCRYPTION_KEY) {
+    errors.push('API_KEY_ENCRYPTION_KEY is required in production.');
+  }
+  if (!MFA_SECRET_ENCRYPTION_KEY) {
+    errors.push('MFA_SECRET_ENCRYPTION_KEY is required in production.');
+  }
+  if (
+    API_KEY_ENCRYPTION_KEY
+    && MFA_SECRET_ENCRYPTION_KEY
+    && API_KEY_ENCRYPTION_KEY === MFA_SECRET_ENCRYPTION_KEY
+  ) {
+    errors.push('API_KEY_ENCRYPTION_KEY and MFA_SECRET_ENCRYPTION_KEY must be different values.');
+  }
+  if (
+    TURSO_DATABASE_URL
+    && !TURSO_DATABASE_URL.startsWith('file:')
+    && !TURSO_AUTH_TOKEN
+  ) {
+    errors.push('TURSO_AUTH_TOKEN is required in production when TURSO_DATABASE_URL points to Turso/libSQL.');
+  }
+
+  if (errors.length) {
+    throw new Error(`Invalid production secret configuration: ${errors.join(' ')}`);
+  }
+}
+
+function validateCommittedSecretHygiene() {
+  const checkedFiles = [
+    '.env.production',
+    '.env.production.local',
+    'fly.toml',
+    'Dockerfile',
+    'docker-compose.yml',
+  ];
+  const secretPattern = /(sk-ant-api\d{2}-[\w-]{20,}|sk-[A-Za-z0-9_-]{20,}|ANTHROPIC_API_KEY\s*=\s*["']?[^"'\s#]+)/;
+  const offenders = [];
+
+  for (const file of checkedFiles) {
+    const filePath = path.join(process.cwd(), file);
+    if (!fs.existsSync(filePath)) continue;
+    const body = fs.readFileSync(filePath, 'utf8');
+    if (secretPattern.test(body)) offenders.push(file);
+  }
+
+  if (!offenders.length) return;
+  const message = `Secret-looking values found in production/deployment files: ${offenders.join(', ')}. Move them to the deployment secret manager.`;
+  if (IS_PRODUCTION) throw new Error(message);
+  console.warn(message);
+}
 
 export const STOP_WORDS = new Set([
   'about', 'after', 'again', 'against', 'among', 'also', 'been', 'before', 'being', 'between',

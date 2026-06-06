@@ -10,18 +10,24 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <div class="beta-ribbon">Beta</div>
     <div class="bg-shape s1"></div>
     <div class="bg-shape s2"></div>
 
     <main class="page">
       <header class="hero reveal">
-        <p class="eyebrow">UBC Open Collections</p>
-        <h1>Dissertation Intelligence Workbench</h1>
-        <p class="subtitle">Explore dissertation records, inspect related themes, and run new Open Collections queries from one interface.</p>
+        <div class="hero-title-row">
+          <h1>Dissertation Workbench</h1>
+          <span class="beta-tag">Beta</span>
+        </div>
+        <p class="subtitle">View research, explore related themes, and discover patterns across the EdD dissertation corpus from 1966 to present at UBC.</p>
+        <div class="hero-context" aria-label="Workbench context">
+          <p>The Dissertation Workbench extracts and enriches metadata from UBC Open Collections, offering new ways to consider connections between people, research, and topics.</p>
+          <p>Some metadata is calculated, including word and page counts. Themes and concepts come from n-gram analysis; topics are generated from dissertation abstracts using BERTopic. The workbench remains a work in progress, and some edge-case errors remain.</p>
+        </div>
+        <p id="refreshRule" class="refresh-rule"></p>
       </header>
 
-      <section class="status-wrap reveal">
+      <section class="status-wrap reveal" hidden>
         <div id="status" class="status">
           <span id="statusText">Ready.</span>
           <span id="spinner" class="spinner" hidden></span>
@@ -391,12 +397,20 @@
               <span>Password</span>
               <input id="loginPassword" type="password" autocomplete="current-password" required />
             </label>
-            <label id="loginMfaLabel" hidden>
-              <span>MFA Code</span>
-              <input id="loginMfaCode" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" />
-            </label>
             <div id="loginError" class="form-error" hidden></div>
             <button type="submit" class="btn">Sign In</button>
+          </form>
+          <form id="mfaChallengeForm" class="login-form" hidden>
+            <p class="meta">Enter the one-time code from your authenticator app.</p>
+            <label>
+              <span>Authenticator Code</span>
+              <input id="loginMfaCode" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" />
+            </label>
+            <div id="mfaChallengeError" class="form-error" hidden></div>
+            <div class="actions">
+              <button type="submit" class="btn">Verify Code</button>
+              <button type="button" id="mfaBackBtn" class="btn ghost">Back</button>
+            </div>
           </form>
           <form id="mfaSetupForm" class="login-form" hidden>
             <p class="meta">Scan this TOTP secret in your authenticator app, then enter the current code.</p>
@@ -409,6 +423,21 @@
             <div id="mfaSetupError" class="form-error" hidden></div>
             <button type="submit" class="btn">Enable MFA</button>
           </form>
+          <form id="passwordResetForm" class="login-form" hidden>
+            <h3>Set Password</h3>
+            <p class="meta">Enter a new password for this admin account.</p>
+            <input id="passwordResetToken" type="hidden" />
+            <label>
+              <span>New Password</span>
+              <input id="passwordResetPassword" type="password" autocomplete="new-password" required minlength="8" />
+            </label>
+            <label>
+              <span>Confirm Password</span>
+              <input id="passwordResetConfirm" type="password" autocomplete="new-password" required minlength="8" />
+            </label>
+            <div id="passwordResetError" class="form-error" hidden></div>
+            <button type="submit" class="btn">Set Password</button>
+          </form>
         </div>
 
         <!-- Admin content (shown when authenticated) -->
@@ -420,81 +449,251 @@
 
           <div class="admin-tabs">
             <button class="admin-tab-btn active" data-admin-tab="settings">Settings</button>
+            <button class="admin-tab-btn" data-admin-tab="import">Import</button>
+            <button class="admin-tab-btn" data-admin-tab="jobs">Jobs</button>
             <button class="admin-tab-btn" data-admin-tab="users">Users</button>
             <button class="admin-tab-btn" data-admin-tab="cache">Cache</button>
             <button class="admin-tab-btn" data-admin-tab="runs">Run History</button>
           </div>
 
+          <!-- Import -->
+          <div id="admin-import" class="admin-panel-section">
+            <article class="panel">
+              <h2>Open Collections Import</h2>
+              <div class="import-rules-layout">
+                <section class="import-rules-list" aria-label="Saved import rules">
+                  <div class="section-heading-row">
+                    <h3>Saved Rules</h3>
+                    <button type="button" id="newImportRuleBtn" class="btn ghost btn-sm">New Rule</button>
+                  </div>
+                  <div id="importRulesList" class="import-rule-list"></div>
+                </section>
+                <form id="importRuleForm" class="import-rule-editor">
+                  <input id="importRuleId" type="hidden" />
+                  <fieldset class="settings-section">
+                    <legend>Run Scope</legend>
+                    <div class="import-scope-row">
+                      <label>
+                        <span>Apply actions to</span>
+                        <select id="importRunScope">
+                          <option value="current" selected>Current Rule</option>
+                          <option value="checked">Checked Rules</option>
+                          <option value="all">All Rules</option>
+                        </select>
+                      </label>
+                    </div>
+                  </fieldset>
+                  <fieldset class="settings-section">
+                    <legend>Rule</legend>
+                    <div class="settings-grid">
+                      <label class="full">
+                        <span>Name</span>
+                        <input id="importRuleName" type="text" placeholder="e.g. EdD Educational Leadership" required />
+                      </label>
+                      <label>
+                        <span>Degree</span>
+                        <input id="importDegree" list="importDegreeOptions" type="text" placeholder="Any degree" />
+                        <datalist id="importDegreeOptions"></datalist>
+                      </label>
+                      <label>
+                        <span>Program</span>
+                        <input id="importProgram" list="importProgramOptions" type="text" placeholder="Any program" />
+                        <datalist id="importProgramOptions"></datalist>
+                      </label>
+                      <label class="full">
+                        <span>Affiliation</span>
+                        <input id="importAffiliation" list="importAffiliationOptions" type="text" placeholder="Any affiliation" />
+                        <datalist id="importAffiliationOptions"></datalist>
+                      </label>
+                    </div>
+                  </fieldset>
+                  <fieldset class="settings-section">
+                    <legend>Generated Query</legend>
+                    <div class="generated-query" id="importGeneratedTerm">No rule filters selected.</div>
+                    <details class="advanced-options">
+                      <summary>Advanced Open Collections Options</summary>
+                      <div class="settings-grid">
+                        <label>
+                          <span>Index</span>
+                          <input id="importIndex" type="text" placeholder="Leave blank to search all collections" />
+                        </label>
+                        <label>
+                          <span>Query (<code>q</code>)</span>
+                          <input id="importQuery" type="text" placeholder="Optional full-text query" />
+                        </label>
+                        <label class="full">
+                          <span>Source Fields</span>
+                          <input id="importSource" type="text" />
+                        </label>
+                      </div>
+                    </details>
+                  </fieldset>
+                  <div class="settings-actions import-actions">
+                    <button type="button" id="previewImportRuleBtn" class="btn ghost">Preview Rule</button>
+                    <button type="submit" id="saveImportRuleBtn" class="btn">Save Rule</button>
+                    <button type="button" id="importAllRuleBtn" class="btn ghost">Import All</button>
+                    <button type="button" id="syncDifferencesRuleBtn" class="btn ghost">Sync Differences</button>
+                    <button type="button" id="refreshMetadataRuleBtn" class="btn ghost">Refresh Metadata</button>
+                    <button type="button" id="syncMissingPdfsRuleBtn" class="btn ghost">Sync Missing PDFs</button>
+                    <button type="button" id="deleteImportRuleBtn" class="btn danger" hidden>Delete Rule</button>
+                  </div>
+                  <div id="importRulePreview" class="import-preview" aria-live="polite"></div>
+                </form>
+              </div>
+            </article>
+          </div>
+
           <!-- Settings -->
           <div id="admin-settings" class="admin-panel-section active">
             <article class="panel">
-              <h2>Query Configuration</h2>
+              <h2>Settings</h2>
               <form id="settingsForm" class="query-grid">
-                <label>
-                  <span>Index</span>
-                  <input id="s-index" type="text" value="" placeholder="Leave blank to search all collections" />
-                </label>
-                <label>
-                  <span>Query (<code>q</code>)</span>
-                  <input id="s-query" type="text" value="" placeholder="Optional full-text query" />
-                </label>
-                <label class="full">
-                  <span>Term Filter</span>
-                  <input id="s-term" type="text" value="degree.raw,Doctor of Education - EdD" />
-                </label>
-                <label class="full">
-                  <span>Source Fields</span>
-                  <input
-                    id="s-source"
-                    type="text"
-                    value="title,author,ubc_date_sort,uri,creator,supervisor,description,genre,date_available,rights,doi,affiliation,degree_theses,program_theses,scholarly_level,campus,degree,program,extent,identifier,id,subject"
-                  />
-                </label>
-                <label>
-                  <span>Max Records</span>
-                  <input id="s-maxRecords" type="number" value="9999" min="1" max="9999" step="20" />
-                </label>
-                <label>
-                  <span>Page Size</span>
-                  <input id="s-pageSize" type="number" value="20" min="1" max="100" step="5" />
-                </label>
-                <label>
-                  <span>Scan Limit</span>
-                  <input id="s-scanLimit" type="number" value="50000" min="1" max="50000" step="100" />
-                </label>
-                <label>
-                  <span>Subject Limit</span>
-                  <input id="s-subjectLimit" type="number" value="20" min="1" max="100" step="1" />
-                </label>
-                <label>
-                  <span>API Key (server-side, optional)</span>
-                  <input id="s-apiKey" type="password" autocomplete="off" />
-                </label>
-                <label>
-                  <span>Download Source Files</span>
-                  <select id="s-downloadFiles">
-                    <option value="1">Yes (count from downloaded docs)</option>
-                    <option value="0" selected>No (metadata only, faster)</option>
-                  </select>
-                </label>
-                <label>
-                  <span>Update From Local PDF Cache</span>
-                  <select id="s-recomputeFromCache">
-                    <option value="0" selected>No</option>
-                    <option value="1">Yes (recompute without redownload)</option>
-                  </select>
-                </label>
+                <input id="s-index" type="hidden" value="" />
+                <input id="s-query" type="hidden" value="" />
+                <input id="s-term" type="hidden" value="degree.raw,Doctor of Education - EdD" />
+                <input
+                  id="s-source"
+                  type="hidden"
+                  value="title,author,ubc_date_sort,uri,creator,supervisor,description,genre,date_available,rights,doi,affiliation,degree_theses,program_theses,scholarly_level,campus,degree,program,extent,identifier,id,subject"
+                />
 
-                <div class="actions full">
-                  <button type="submit" id="loadBtn" class="btn">Run Query</button>
-                  <button type="button" id="refreshBtn" class="btn ghost">Force Refresh</button>
-                  <button type="button" id="saveSettingsBtn" class="btn ghost">Save Settings</button>
-                  <button type="button" id="syncDocumentsBtn" class="btn ghost">Sync Documents</button>
-                  <button type="button" id="rebuildConceptsBtn" class="btn ghost">Rebuild Concepts</button>
-                </div>
-                <p id="documentSyncStatus" class="meta"></p>
-                <p id="conceptPipelineStatus" class="meta"></p>
+                <fieldset class="settings-section">
+                  <legend>Retrieval Limits</legend>
+                  <div class="settings-grid four-col">
+                    <label>
+                      <span>Max Records</span>
+                      <input id="s-maxRecords" type="number" value="9999" min="1" max="9999" step="20" />
+                    </label>
+                    <label>
+                      <span>Page Size</span>
+                      <input id="s-pageSize" type="number" value="20" min="1" max="100" step="5" />
+                    </label>
+                    <label>
+                      <span>Scan Limit</span>
+                      <input id="s-scanLimit" type="number" value="50000" min="1" max="50000" step="100" />
+                    </label>
+                    <label>
+                      <span>Subject Limit</span>
+                      <input id="s-subjectLimit" type="number" value="20" min="1" max="100" step="1" />
+                    </label>
+                  </div>
+                </fieldset>
+
+                <fieldset class="settings-section">
+                  <legend>File Enrichment</legend>
+                  <div class="settings-grid">
+                    <label>
+                      <span>Download PDFs When Needed</span>
+                      <select id="s-downloadFiles">
+                        <option value="1">Yes, download missing PDFs</option>
+                        <option value="0" selected>No, use metadata/cache only</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Recompute From Cached PDFs</span>
+                      <select id="s-recomputeFromCache">
+                        <option value="0" selected>No</option>
+                        <option value="1">Yes, re-analyze cached PDFs</option>
+                      </select>
+                    </label>
+                  </div>
+                </fieldset>
+
+                <fieldset class="settings-section">
+                  <legend>Access</legend>
+                  <label>
+                    <span>API Key (server-side, optional)</span>
+                    <input id="s-apiKey" type="password" autocomplete="off" />
+                  </label>
+                </fieldset>
+
+                <fieldset class="settings-section">
+                  <legend>Actions</legend>
+                  <div class="settings-actions">
+                    <div class="action-block">
+                      <h3>Save</h3>
+                      <div class="action-group">
+                        <button type="button" id="saveSettingsBtn" class="btn ghost">Save These Settings</button>
+                      </div>
+                    </div>
+                    <div class="action-block">
+                      <h3>Refresh Data</h3>
+                      <div class="action-group">
+                        <button type="button" id="rebuildConceptsBtn" class="btn ghost">Rebuild Concept Dictionary</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="settings-status-grid" aria-live="polite">
+                    <div id="documentSyncStatus" class="settings-status-card"></div>
+                    <div id="conceptPipelineStatus" class="settings-status-card"></div>
+                  </div>
+                </fieldset>
               </form>
+            </article>
+          </div>
+
+          <!-- Jobs -->
+          <div id="admin-jobs" class="admin-panel-section">
+            <article class="panel">
+              <div class="section-heading-row">
+                <h2>Operational Jobs</h2>
+                <button type="button" id="refreshJobsBtn" class="btn ghost btn-sm">Refresh Status</button>
+              </div>
+              <div class="job-controls-grid">
+                <fieldset class="settings-section">
+                  <legend>Bibliographic Lookups</legend>
+                  <p class="meta">Run pending Z39.50 catalogue lookups for citations that have not already been checked.</p>
+                  <label>
+                    <span>Batch Size</span>
+                    <input id="catalogueLookupLimit" type="number" min="1" max="1000" value="100" />
+                  </label>
+                  <div class="settings-actions row-actions">
+                    <button type="button" id="previewCatalogueLookupsBtn" class="btn ghost">Preview Pending</button>
+                    <button type="button" id="runCatalogueLookupsBtn" class="btn">Run Pending Lookups</button>
+                  </div>
+                  <div id="catalogueLookupPreview" class="import-preview" aria-live="polite"></div>
+                </fieldset>
+                <fieldset class="settings-section">
+                  <legend>Topic Modeling</legend>
+                  <p class="meta">Rebuild BERTopic topics from cached document abstracts and write topic assignments back to the database.</p>
+                  <p class="meta">This can take several minutes and requires the Python BERTopic dependencies on the server.</p>
+                  <div class="settings-actions row-actions">
+                    <button type="button" id="runBertopicBtn" class="btn">Run BERTopic</button>
+                  </div>
+                </fieldset>
+              </div>
+              <div id="jobsStatusCards" class="settings-status-grid" aria-live="polite"></div>
+              <h3>Recent Jobs</h3>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Job</th>
+                      <th>Status</th>
+                      <th>Started</th>
+                      <th>Finished</th>
+                      <th>Result</th>
+                    </tr>
+                  </thead>
+                  <tbody id="jobsTable"></tbody>
+                </table>
+              </div>
+              <h3>Import and PDF Sync Runs</h3>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>Status</th>
+                      <th>Seen</th>
+                      <th>Saved</th>
+                      <th>Started</th>
+                      <th>Finished</th>
+                    </tr>
+                  </thead>
+                  <tbody id="syncRunsTable"></tbody>
+                </table>
+              </div>
             </article>
           </div>
 
@@ -502,6 +701,26 @@
           <div id="admin-users" class="admin-panel-section">
             <article class="panel">
               <h2>Admin Users</h2>
+              <section class="settings-section">
+                <div class="section-heading-row">
+                  <h3>My Account Security</h3>
+                  <button type="button" id="setupOwnMfaBtn" class="btn ghost btn-sm">Set Up MFA</button>
+                </div>
+                <div id="ownMfaSetup" class="mfa-setup-card" hidden>
+                  <p class="meta">Scan this TOTP secret in your authenticator app, then enter the current code.</p>
+                  <code id="ownMfaSecret" class="secret-code"></code>
+                  <input id="ownMfaToken" type="hidden" />
+                  <label>
+                    <span>Authenticator Code</span>
+                    <input id="ownMfaCode" type="text" inputmode="numeric" pattern="[0-9]*" autocomplete="one-time-code" />
+                  </label>
+                  <div id="ownMfaError" class="form-error" hidden></div>
+                  <div class="actions">
+                    <button type="button" id="confirmOwnMfaBtn" class="btn btn-sm">Enable MFA</button>
+                    <button type="button" id="cancelOwnMfaBtn" class="btn ghost btn-sm">Cancel</button>
+                  </div>
+                </div>
+              </section>
               <div id="usersContent"></div>
               <hr class="section-rule" />
               <h3>Create User</h3>
@@ -511,10 +730,19 @@
                   <input id="newUsername" type="text" required minlength="3" maxlength="50" />
                 </label>
                 <label>
-                  <span>Password</span>
-                  <input id="newPassword" type="password" required minlength="8" />
+                  <span>First Name</span>
+                  <input id="newFirstName" type="text" required maxlength="100" />
+                </label>
+                <label>
+                  <span>Last Name</span>
+                  <input id="newLastName" type="text" required maxlength="100" />
+                </label>
+                <label>
+                  <span>Email Address</span>
+                  <input id="newEmail" type="email" required maxlength="254" />
                 </label>
                 <div id="createUserError" class="form-error" hidden></div>
+                <div id="createUserResetLink" class="reset-link-result" hidden></div>
                 <button type="submit" class="btn btn-sm">Create User</button>
               </form>
             </article>
@@ -525,6 +753,7 @@
             <article class="panel">
               <h2>PDF Cache</h2>
               <div id="cacheStats" class="cache-stats"></div>
+              <input id="cacheFilter" class="doc-filter" type="search" placeholder="Filter by PDF ID, title, author, or supervisor..." />
               <div class="actions" style="margin:0.5rem 0">
                 <button id="refreshCacheBtn" class="btn ghost btn-sm">Refresh Cache</button>
                 <button id="reparseAllBtn" class="btn ghost btn-sm">Reparse All PDFs</button>
@@ -534,6 +763,7 @@
                   <thead>
                     <tr>
                       <th>Doc ID</th>
+                      <th>Document</th>
                       <th>Status</th>
                       <th>Size</th>
                       <th>Pages</th>
@@ -580,6 +810,14 @@
       </p>
     </footer>
 
-    <script type="module" src="/app.js"></script>
+    <script src="/app/core.js"></script>
+    <script src="/app/documents.js"></script>
+    <script src="/app/analytics-dashboard.js"></script>
+    <script src="/app/citations.js"></script>
+    <script src="/app/topic-visuals.js"></script>
+    <script src="/app/people.js"></script>
+    <script src="/app/data.js"></script>
+    <script src="/app/admin.js"></script>
+    <script src="/app/events.js"></script>
   </body>
 </html>

@@ -2,7 +2,7 @@ import {
   CATALOGUE_LOOKUP_ENABLED, CATALOGUE_LOOKUP_ON_START, CATALOGUE_LOOKUP_PAGE_SIZE,
   DEFAULT_API_KEY, DEFAULT_INDEX, DEFAULT_QUERY, DEFAULT_SOURCE, DEFAULT_TERM,
   DOCUMENT_SYNC_ENABLED, DOCUMENT_SYNC_INTERVAL_MS, DOCUMENT_SYNC_MAX_RECORDS,
-  DOCUMENT_SYNC_ON_START, DOCUMENT_SYNC_ONCE
+  DOCUMENT_SYNC_ON_START, DOCUMENT_SYNC_ONCE, validateRuntimeSecrets
 } from './config.js';
 import { ensureStorage, getDb } from './db.js';
 import { runDocumentSync } from './sync.js';
@@ -56,6 +56,7 @@ async function runOnce({ initial = false } = {}) {
 }
 
 async function main() {
+  validateRuntimeSecrets();
   await ensureStorage();
   await getDb();
 

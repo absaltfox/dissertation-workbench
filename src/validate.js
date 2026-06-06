@@ -52,3 +52,23 @@ export function validateAdminUser(username, password) {
   }
   return { valid: errors.length === 0, errors };
 }
+
+export function validateAdminUserProfile({ username, firstName, lastName, email }) {
+  const errors = [];
+  if (!username || typeof username !== 'string') {
+    errors.push('Username is required.');
+  } else {
+    if (username.length < 3 || username.length > 50) errors.push('Username must be 3-50 characters.');
+    if (!/^[a-zA-Z0-9_-]+$/.test(username)) errors.push('Username must be alphanumeric (plus _ and -).');
+  }
+  if (!firstName || typeof firstName !== 'string' || !firstName.trim()) errors.push('First name is required.');
+  else if (firstName.trim().length > 100) errors.push('First name must be at most 100 characters.');
+  if (!lastName || typeof lastName !== 'string' || !lastName.trim()) errors.push('Last name is required.');
+  else if (lastName.trim().length > 100) errors.push('Last name must be at most 100 characters.');
+  if (!email || typeof email !== 'string' || !email.trim()) {
+    errors.push('Email address is required.');
+  } else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()) || email.trim().length > 254) {
+    errors.push('Email address must be valid.');
+  }
+  return { valid: errors.length === 0, errors };
+}

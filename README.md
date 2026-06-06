@@ -9,6 +9,16 @@ Web app for exploring UBC Open Collections dissertation records with three tabs:
 
 ## Run
 
+For local development, copy the example env file and fill in only the values you need:
+
+```bash
+cp .env.development.example .env
+```
+
+The app loads `.env` automatically when run directly with Node. Existing shell
+environment variables win over `.env` values, so Docker/Fly secrets remain
+authoritative in deployed environments.
+
 ```bash
 npm start
 ```
@@ -47,14 +57,16 @@ Supported query params:
 - `UBC_QUERY` (default empty)
 - `UBC_TERM` (default `degree.raw,Doctor of Education - EdD`)
 - `UBC_SOURCE` (comma-separated source field list)
-- `UBC_API_KEY` (optional)
+- `UBC_API_KEY` (optional; when set, this env value is authoritative and the admin UI cannot replace it)
 - `DOWNLOAD_FILES` (`1` by default; set `0` to disable downloads)
 - `FILE_CONCURRENCY` (default `2`)
-- `APP_DATA_DIR` (default `/Users/mleblanc/Documents/code/oc-papers/data`)
-- `PDF_CACHE_DIR` (default `/Users/mleblanc/Documents/code/oc-papers/data/pdf-cache`)
-- `SQLITE_PATH` (default `/Users/mleblanc/Documents/code/oc-papers/data/metrics.sqlite`)
+- `PDF_ALLOWED_HOSTS` (comma-separated download host allowlist; defaults to `open.library.ubc.ca,oc-index.library.ubc.ca`)
+- `PDF_ALLOW_HTTP_DOWNLOADS` (`1`/`0`; defaults to `0` in production, `1` in local dev)
+- `APP_DATA_DIR` (default `./data` from the current working directory)
+- `PDF_CACHE_DIR` (default `./data/pdf-cache`)
+- `SQLITE_PATH` (default `./data/metrics.sqlite`)
 - `TURSO_DATABASE_URL` (optional; when set, database reads/writes use Turso/libSQL instead of local `SQLITE_PATH`)
-- `TURSO_AUTH_TOKEN` (optional; required for protected Turso databases)
+- `TURSO_AUTH_TOKEN` (optional locally; required in production when `TURSO_DATABASE_URL` points to Turso/libSQL)
 - `CACHE_TTL_MS` (default `600000`)
 - `TRUST_PROXY` (`1`/`0`, default `0`; enable when behind reverse proxy to trust `x-forwarded-*` headers)
 - `SESSION_COOKIE_SECURE` (`1`/`0`; defaults to `1` in production, `0` otherwise)
@@ -62,6 +74,8 @@ Supported query params:
 - `API_KEY_ENCRYPTION_KEY` (required in production for stored API keys; used for AES-GCM encryption)
 - `MFA_SECRET_ENCRYPTION_KEY` (required in production for stored TOTP secrets; use a different value than `API_KEY_ENCRYPTION_KEY`)
 - `ADMIN_BOOTSTRAP_PASSWORD` (required in production when creating the initial `admin` account)
+- `ENV_FILE` (optional; load a local env file other than `.env`)
+- `SKIP_LOCAL_ENV` (`1`/`0`; set `1` to prevent automatic `.env` loading)
 - `LOGIN_WINDOW_MS` (default `900000`)
 - `LOGIN_BLOCK_MS` (default `900000`)
 - `LOGIN_MAX_ATTEMPTS_IP` (default `25`)
@@ -73,6 +87,8 @@ Supported query params:
 - `ALLOW_PUBLIC_REFRESH` (`1`/`0`; defaults to `0` in production, `1` in local dev)
 - `ALLOW_PUBLIC_RECOMPUTE` (`1`/`0`; defaults to `0` in production, `1` in local dev)
 - `EXPOSE_ERROR_DETAILS` (`1`/`0`; defaults to `0` in production, `1` in local dev)
+- `BERTOPIC_PYTHON_COMMAND` (Python executable used by the admin BERTopic job; default `python3`)
+- `BERTOPIC_TIMEOUT_MS` (admin BERTopic job timeout; default one hour)
 - `DOCUMENT_SYNC_INTERVAL_MS` (default daily)
 - `DOCUMENT_SYNC_ENABLED` (`1`/`0`; defaults to `1`)
 - `DOCUMENT_SYNC_ON_START` (`1`/`0`; defaults to `1`)
@@ -93,16 +109,26 @@ This repo includes a Docker/Fly setup with two process groups:
 
 Use Turso in production by setting `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` as Fly secrets. The Fly volume mounted at `/data` is intended for local PDF/cache files; it should not be the shared production database for multiple machines.
 
-Required production secrets include:
+Required production secrets include. Set these as Fly secrets or container
+environment variables, not in the image:
 
 ```bash
 fly secrets set \
   TURSO_DATABASE_URL=... \
   TURSO_AUTH_TOKEN=... \
+  UBC_API_KEY=... \
   ADMIN_BOOTSTRAP_PASSWORD=... \
   API_KEY_ENCRYPTION_KEY=... \
   MFA_SECRET_ENCRYPTION_KEY=...
 ```
+
+In production the app validates secret configuration at startup: the API-key
+encryption key and MFA-secret encryption key must both be present and must be
+different, and Turso deployments require `TURSO_AUTH_TOKEN`. Startup also
+checks common deployment files for committed secret-looking values and fails
+production boot if it finds them. In local development those values are optional
+so `npm start` and `npm run worker` still work outside Docker with a simple
+`.env` file.
 
 Create the volume before the first deploy if you want persistent PDF cache:
 

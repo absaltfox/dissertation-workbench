@@ -25,7 +25,7 @@ export function decryptSecret(value, keyMaterial = API_KEY_ENCRYPTION_KEY, envNa
   if (!value) return null;
   if (!String(value).startsWith(PREFIX)) {
     if (IS_PRODUCTION) {
-      throw new Error('Stored secret is not encrypted. Re-save it with API_KEY_ENCRYPTION_KEY configured.');
+      throw new Error(`Stored secret is not encrypted. Re-save it with ${envName} configured.`);
     }
     return value;
   }

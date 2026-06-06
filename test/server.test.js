@@ -59,6 +59,35 @@ test('admin routes reject unauthenticated requests', async () => {
   assert.deepEqual(res.body, { error: 'Authentication required' });
 });
 
+test('import rule routes reject unauthenticated requests', async () => {
+  await request(app)
+    .get('/api/admin/import-rules')
+    .expect('content-type', /application\/json/)
+    .expect(401);
+
+  await request(app)
+    .get('/api/admin/open-collections/facets')
+    .expect('content-type', /application\/json/)
+    .expect(401);
+
+  await request(app)
+    .post('/api/admin/import-rules/run')
+    .send({ mode: 'import_all', scope: 'all' })
+    .expect('content-type', /application\/json/)
+    .expect(401);
+
+  await request(app)
+    .get('/api/admin/jobs')
+    .expect('content-type', /application\/json/)
+    .expect(401);
+
+  await request(app)
+    .post('/api/admin/jobs/catalogue-lookup')
+    .send({ limit: 1, dryRun: true })
+    .expect('content-type', /application\/json/)
+    .expect(401);
+});
+
 test('authenticated mutations require a valid CSRF token', async () => {
   const token = createSession('admin');
   try {
@@ -82,6 +111,44 @@ test('authenticated mutations require a valid CSRF token', async () => {
   }
 });
 
+test('import rule run validates mode and scope', async () => {
+  const token = createSession('admin');
+  try {
+    const csrfToken = getSessionCsrfToken(token);
+    const invalidMode = await request(app)
+      .post('/api/admin/import-rules/run')
+      .set('Cookie', `session=${token}`)
+      .set('x-csrf-token', csrfToken)
+      .send({ mode: 'not_real', scope: 'selected', ruleIds: [] })
+      .expect('content-type', /application\/json/)
+      .expect(400);
+
+    assert.equal(invalidMode.body.error, 'Invalid import run mode.');
+
+    const invalidScope = await request(app)
+      .post('/api/admin/import-rules/run')
+      .set('Cookie', `session=${token}`)
+      .set('x-csrf-token', csrfToken)
+      .send({ mode: 'import_all', scope: 'nearby', ruleIds: [] })
+      .expect('content-type', /application\/json/)
+      .expect(400);
+
+    assert.equal(invalidScope.body.error, 'Invalid import rule scope.');
+
+    const missingPdfsMode = await request(app)
+      .post('/api/admin/import-rules/run')
+      .set('Cookie', `session=${token}`)
+      .set('x-csrf-token', csrfToken)
+      .send({ mode: 'sync_missing_pdfs', scope: 'selected', ruleIds: [] })
+      .expect('content-type', /application\/json/)
+      .expect(400);
+
+    assert.equal(missingPdfsMode.body.error, 'Select at least one import rule.');
+  } finally {
+    destroySession(token);
+  }
+});
+
 test('metrics validates query parameters before collecting data', async () => {
   const res = await request(app)
     .get('/api/metrics?maxRecords=10000')
@@ -90,4 +157,49 @@ test('metrics validates query parameters before collecting data', async () => {
 
   assert.equal(res.body.error, 'Validation failed');
   assert.deepEqual(res.body.errors, ['maxRecords must be between 1 and 9999.']);
+});
+
+test('authenticated metrics reads without CSRF fall back to public caps', async () => {
+  const token = createSession('admin');
+  try {
+    const res = await request(app)
+      .get('/api/metrics?maxRecords=9999&scanLimit=50000&downloadFiles=0&recomputeFromCache=0')
+      .set('Cookie', `session=${token}`)
+      .expect('content-type', /application\/json/);
+
+    assert.notEqual(res.status, 403);
+  } finally {
+    destroySession(token);
+  }
+});
+
+test('admin jobs endpoint exposes operational status and catalogue preview', async () => {
+  const token = createSession('admin');
+  try {
+    const csrfToken = getSessionCsrfToken(token);
+    const jobs = await request(app)
+      .get('/api/admin/jobs')
+      .set('Cookie', `session=${token}`)
+      .expect('content-type', /application\/json/)
+      .expect(200);
+
+    assert.ok(Array.isArray(jobs.body.jobs));
+    assert.ok(Array.isArray(jobs.body.syncRuns));
+    assert.ok(jobs.body.catalogueStats);
+    assert.ok(jobs.body.topicStatus);
+
+    const preview = await request(app)
+      .post('/api/admin/jobs/catalogue-lookup')
+      .set('Cookie', `session=${token}`)
+      .set('x-csrf-token', csrfToken)
+      .send({ limit: 1, dryRun: true })
+      .expect('content-type', /application\/json/)
+      .expect(200);
+
+    assert.equal(preview.body.ok, true);
+    assert.equal(preview.body.dryRun, true);
+    assert.ok(Array.isArray(preview.body.previews));
+  } finally {
+    destroySession(token);
+  }
 });

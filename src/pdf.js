@@ -11,6 +11,7 @@ import {
 } from './db.js';
 import { logger } from './logger.js';
 import { dedupeSupervisorNames } from './supervisors.js';
+import { safeFetchDownloadUrl } from './urlSafety.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -966,7 +967,7 @@ async function resolveDownloadUrl(candidateUrl) {
 
     let res;
     try {
-      res = await fetch(candidateUrl, { redirect: 'follow', signal: controller.signal });
+      res = await safeFetchDownloadUrl(candidateUrl, { signal: controller.signal });
     } finally {
       clearTimeout(timeout);
     }
@@ -999,7 +1000,7 @@ async function resolveDownloadUrl(candidateUrl) {
         const pdfTimeout = setTimeout(() => pdfController.abort(), DOWNLOAD_TIMEOUT_MS);
         let pdfRes;
         try {
-          pdfRes = await fetch(pdfUrl, { redirect: 'follow', signal: pdfController.signal });
+          pdfRes = await safeFetchDownloadUrl(pdfUrl, { signal: pdfController.signal });
         } finally {
           clearTimeout(pdfTimeout);
         }

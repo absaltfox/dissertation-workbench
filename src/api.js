@@ -147,6 +147,49 @@ export async function fetchPage({ baseUrl, index, apiKey, from, pageSize, query,
   return response.json();
 }
 
+export async function fetchSearchAggregations({ baseUrl, index, apiKey, query, term, aggregations }) {
+  const headers = { accept: 'application/json', 'content-type': 'application/json' };
+  if (apiKey) {
+    headers['x-api-key'] = apiKey;
+    headers.authorization = `Bearer ${apiKey}`;
+  }
+
+  const apiRoot = new URL('/search/8.5', baseUrl).toString();
+  const params = ['size=0', 'from=0'];
+  if (index) params.unshift(`index=${encodeURIComponent(index)}`);
+  if (query) params.push(`q=${encodeURIComponent(query)}`);
+  if (term) {
+    const encodedTerm = encodeURIComponent(term)
+      .replace(/%2C/gi, ',')
+      .replace(/%3B/gi, ';')
+      .replace(/%20/gi, '+');
+    params.push(`term=${encodedTerm}`);
+  }
+  if (apiKey) params.push(`api_key=${encodeURIComponent(apiKey)}`);
+
+  const searchUrl = `${apiRoot}?${params.join('&')}`;
+  logger.info('API aggregation fetch', { url: searchUrl.replace(/api_key=[^&]+/, 'api_key=***') });
+
+  const release = await acquireApiSlot(Boolean(apiKey));
+  let response;
+  try {
+    response = await fetch(searchUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ size: 0, aggs: aggregations }),
+    });
+  } finally {
+    release();
+  }
+
+  if (!response.ok) {
+    const body = (await response.text()).trim();
+    throw new Error(`search aggregation endpoint (${response.status}): ${body.slice(0, 240) || response.statusText}`);
+  }
+
+  return response.json();
+}
+
 export function extractHits(payload) {
   const arrays = [
     payload?.data?.hits?.hits,

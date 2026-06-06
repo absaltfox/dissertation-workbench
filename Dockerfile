@@ -13,6 +13,8 @@ RUN apt-get update \
     ca-certificates \
     poppler-utils \
     yaz \
+  && mkdir -p /data \
+  && chown -R node:node /data \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
@@ -24,5 +26,7 @@ COPY src ./src
 COPY README.md ./
 
 EXPOSE 3000
+
+USER node
 
 CMD ["npm", "start"]

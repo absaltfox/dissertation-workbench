@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createClient } from '@libsql/client';
-import { SQLITE_PATH, PDF_CACHE_DIR } from './config.js';
+import { SQLITE_PATH, PDF_CACHE_DIR, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL } from './config.js';
 import { logger } from './logger.js';
 import { normalizePersonName, supervisorNameKey } from './supervisors.js';
 import { encryptMfaSecret, decryptMfaSecret } from './secretCrypto.js';
@@ -11,12 +11,12 @@ let db;
 let schemaReady;
 
 export function getDatabaseUrl() {
-  return (process.env.TURSO_DATABASE_URL || `file:${SQLITE_PATH}`).trim();
+  return (TURSO_DATABASE_URL || `file:${SQLITE_PATH}`).trim();
 }
 
 export async function ensureStorage() {
   await fs.mkdir(PDF_CACHE_DIR, { recursive: true });
-  if (!process.env.TURSO_DATABASE_URL) {
+  if (!TURSO_DATABASE_URL) {
     await fs.mkdir(path.dirname(SQLITE_PATH), { recursive: true });
   }
 }
@@ -25,7 +25,7 @@ export async function getDb() {
   if (!db) {
     db = createClient({
       url: getDatabaseUrl(),
-      authToken: process.env.TURSO_AUTH_TOKEN,
+      authToken: TURSO_AUTH_TOKEN,
     });
   }
   if (!schemaReady) {
@@ -124,9 +124,25 @@ async function ensureSchema(client) {
       finished_at TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS admin_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      label TEXT NOT NULL,
+      status TEXT NOT NULL,
+      params_json TEXT,
+      result_json TEXT,
+      log TEXT,
+      error TEXT,
+      started_at TEXT NOT NULL,
+      finished_at TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE NOT NULL,
+      first_name TEXT,
+      last_name TEXT,
+      email TEXT,
       password_hash TEXT NOT NULL,
       salt TEXT NOT NULL,
       mfa_secret TEXT,
@@ -135,9 +151,31 @@ async function ensureSchema(client) {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+      token_hash TEXT PRIMARY KEY,
+      username TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      FOREIGN KEY (username) REFERENCES users(username)
+    );
+
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS import_rules (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      degree TEXT,
+      program TEXT,
+      affiliation TEXT,
+      requested_index TEXT,
+      query TEXT,
+      source TEXT,
+      created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
 
@@ -223,6 +261,9 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_secret TEXT');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_enabled INTEGER NOT NULL DEFAULT 0');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_enabled_at TEXT');
+  await tryExec(client, 'ALTER TABLE users ADD COLUMN first_name TEXT');
+  await tryExec(client, 'ALTER TABLE users ADD COLUMN last_name TEXT');
+  await tryExec(client, 'ALTER TABLE users ADD COLUMN email TEXT');
   await tryExec(client, 'ALTER TABLE citations ADD COLUMN author TEXT');
   await tryExec(client, 'ALTER TABLE citations ADD COLUMN title TEXT');
   await tryExec(client, 'ALTER TABLE citations ADD COLUMN year TEXT');
@@ -231,6 +272,9 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree ON documents(degree)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_program ON documents(program)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_import_rules_updated_at ON import_rules(updated_at)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_username ON password_reset_tokens(username)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_citations_citation_id ON document_citations(citation_id)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_citations_citation_doc ON document_citations(citation_id, doc_id)');
 
@@ -349,6 +393,12 @@ export async function loadDocumentMetadata(docId) {
   try { return JSON.parse(row.metadata_json); } catch { return null; }
 }
 
+export async function documentExists(docId) {
+  if (!docId) return false;
+  const row = await get('SELECT 1 AS found FROM documents WHERE doc_id = ? LIMIT 1', [docId]);
+  return Boolean(row);
+}
+
 export async function listAllDocumentMetadata() {
   const rows = await all('SELECT doc_id, metadata_json FROM documents');
   return rows.map((row) => {
@@ -442,6 +492,83 @@ export async function getLatestSyncRun(syncKey = null) {
   };
 }
 
+export async function listRecentSyncRuns(limit = 25) {
+  const rows = await all(`
+    SELECT * FROM sync_runs
+    ORDER BY started_at DESC
+    LIMIT ?
+  `, [limit]);
+  return rows.map((row) => ({
+    id: Number(row.id),
+    syncKey: row.sync_key,
+    source: (() => { try { return JSON.parse(row.source_json); } catch { return null; } })(),
+    status: row.status,
+    totalSeen: Number(row.total_seen || 0),
+    totalSaved: Number(row.total_saved || 0),
+    apiTotal: row.api_total == null ? null : Number(row.api_total),
+    error: row.error || null,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at || null,
+  }));
+}
+
+export async function createAdminJob({ type, label, params = null }) {
+  const now = new Date().toISOString();
+  const result = await execute(`
+    INSERT INTO admin_jobs (type, label, status, params_json, started_at)
+    VALUES (?, ?, 'running', ?, ?)
+  `, [type, label, params ? JSON.stringify(params) : null, now]);
+  return Number(result.lastInsertRowid || result.lastInsertRowId || 0);
+}
+
+export async function updateAdminJob(id, patch = {}) {
+  if (!id) return;
+  const fields = [];
+  const args = [];
+  for (const [key, column] of Object.entries({
+    status: 'status',
+    result: 'result_json',
+    log: 'log',
+    error: 'error',
+    finishedAt: 'finished_at',
+  })) {
+    if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+    fields.push(`${column} = ?`);
+    const value = key === 'result' && patch[key] != null
+      ? JSON.stringify(patch[key])
+      : patch[key];
+    args.push(value);
+  }
+  if (!fields.length) return;
+  args.push(id);
+  await run(`UPDATE admin_jobs SET ${fields.join(', ')} WHERE id = ?`, args);
+}
+
+export async function hasRunningAdminJob(type) {
+  const row = await get('SELECT id FROM admin_jobs WHERE type = ? AND status = ? ORDER BY started_at DESC LIMIT 1', [type, 'running']);
+  return row ? Number(row.id) : null;
+}
+
+export async function listAdminJobs(limit = 25) {
+  const rows = await all(`
+    SELECT * FROM admin_jobs
+    ORDER BY started_at DESC
+    LIMIT ?
+  `, [limit]);
+  return rows.map((row) => ({
+    id: Number(row.id),
+    type: row.type,
+    label: row.label,
+    status: row.status,
+    params: (() => { try { return row.params_json ? JSON.parse(row.params_json) : null; } catch { return null; } })(),
+    result: (() => { try { return row.result_json ? JSON.parse(row.result_json) : null; } catch { return null; } })(),
+    log: row.log || null,
+    error: row.error || null,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at || null,
+  }));
+}
+
 // --- File metric functions ---
 
 export async function loadStoredFileMetric(docId) {
@@ -491,12 +618,26 @@ export async function deleteFileMetric(docId) {
 }
 
 export async function listFileMetrics() {
-  return all(`
-    SELECT doc_id, pdf_path, download_url, file_bytes, word_count, page_count,
-           word_source, page_source, status, error, updated_at
-    FROM file_metrics
-    ORDER BY updated_at DESC
+  const rows = await all(`
+    SELECT fm.doc_id, fm.pdf_path, fm.download_url, fm.file_bytes, fm.word_count, fm.page_count,
+           fm.word_source, fm.page_source, fm.status, fm.error, fm.updated_at,
+           d.title, d.author, d.metadata_json
+    FROM file_metrics fm
+    LEFT JOIN documents d ON d.doc_id = fm.doc_id
+    ORDER BY fm.updated_at DESC
   `);
+  return rows.map((row) => {
+    let metadata = null;
+    try { metadata = row.metadata_json ? JSON.parse(row.metadata_json) : null; } catch { metadata = null; }
+    const supervisors = Array.isArray(metadata?.supervisors) ? metadata.supervisors : [];
+    return {
+      ...row,
+      title: row.title || metadata?.title || '',
+      author: row.author || metadata?.author || '',
+      supervisors,
+      metadata_json: undefined,
+    };
+  });
 }
 
 export async function getFileMetricsStats() {
@@ -533,12 +674,24 @@ export async function listRecentRuns(limit = 50) {
 
 // --- User functions ---
 
-export async function createUser(username, passwordHash, salt) {
+function tokenHash(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+export async function createUser(username, passwordHash, salt, profile = {}) {
   const now = new Date().toISOString();
   await run(`
-    INSERT INTO users (username, password_hash, salt, created_at)
-    VALUES (?, ?, ?, ?)
-  `, [username, passwordHash, salt, now]);
+    INSERT INTO users (username, first_name, last_name, email, password_hash, salt, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `, [
+    username,
+    profile.firstName || null,
+    profile.lastName || null,
+    profile.email || null,
+    passwordHash,
+    salt,
+    now
+  ]);
   logger.info('User created', { username });
 }
 
@@ -554,13 +707,19 @@ export async function updateUserPassword(username, passwordHash, salt) {
     SET password_hash = ?, salt = ?
     WHERE username = ?
   `, [passwordHash, salt, username]);
+  if (result.changes > 0) {
+    await run('UPDATE password_reset_tokens SET used_at = ? WHERE username = ? AND used_at IS NULL', [
+      new Date().toISOString(),
+      username
+    ]);
+  }
   if (result.changes > 0) logger.info('User password updated', { username });
   return result.changes > 0;
 }
 
 export async function findUserByUsername(username) {
   const user = await get(`
-    SELECT id, username, password_hash, salt, mfa_secret, mfa_enabled, mfa_enabled_at, created_at
+    SELECT id, username, first_name, last_name, email, password_hash, salt, mfa_secret, mfa_enabled, mfa_enabled_at, created_at
     FROM users
     WHERE username = ?
   `, [username]);
@@ -569,7 +728,11 @@ export async function findUserByUsername(username) {
 }
 
 export async function listUsers() {
-  return all('SELECT id, username, mfa_enabled, mfa_enabled_at, created_at FROM users ORDER BY created_at');
+  return all(`
+    SELECT id, username, first_name, last_name, email, mfa_enabled, mfa_enabled_at, created_at
+    FROM users
+    ORDER BY created_at
+  `);
 }
 
 export async function countUsers() {
@@ -596,6 +759,47 @@ export async function clearUserMfa(username) {
   return result.changes > 0;
 }
 
+export async function createPasswordResetToken(username, { ttlMs = 24 * 60 * 60 * 1000 } = {}) {
+  const token = crypto.randomBytes(32).toString('hex');
+  const now = new Date();
+  const expires = new Date(now.getTime() + ttlMs);
+  await run('UPDATE password_reset_tokens SET used_at = ? WHERE username = ? AND used_at IS NULL', [
+    now.toISOString(),
+    username
+  ]);
+  await run(`
+    INSERT INTO password_reset_tokens (token_hash, username, created_at, expires_at)
+    VALUES (?, ?, ?, ?)
+  `, [tokenHash(token), username, now.toISOString(), expires.toISOString()]);
+  logger.info('Password reset token created', { username, expiresAt: expires.toISOString() });
+  return { token, expiresAt: expires.toISOString() };
+}
+
+export async function findPasswordResetToken(token) {
+  const row = await get(`
+    SELECT token_hash, username, created_at, expires_at, used_at
+    FROM password_reset_tokens
+    WHERE token_hash = ?
+  `, [tokenHash(token)]);
+  if (!row || row.used_at) return null;
+  if (new Date(row.expires_at).getTime() <= Date.now()) return null;
+  return {
+    tokenHash: row.token_hash,
+    username: row.username,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+  };
+}
+
+export async function consumePasswordResetToken(token) {
+  const result = await run(`
+    UPDATE password_reset_tokens
+    SET used_at = ?
+    WHERE token_hash = ? AND used_at IS NULL
+  `, [new Date().toISOString(), tokenHash(token)]);
+  return result.changes > 0;
+}
+
 // --- Settings functions ---
 
 export async function getSetting(key) {
@@ -619,6 +823,81 @@ export async function getAllSettings() {
   const obj = {};
   for (const row of rows) obj[row.key] = row.value;
   return obj;
+}
+
+// --- Import rule functions ---
+
+function importRuleFromRow(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    name: row.name,
+    degree: row.degree || '',
+    program: row.program || '',
+    affiliation: row.affiliation || '',
+    index: row.requested_index || '',
+    query: row.query || '',
+    source: row.source || '',
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export async function listImportRules() {
+  const rows = await all(`
+    SELECT id, name, degree, program, affiliation, requested_index, query, source, created_at, updated_at
+    FROM import_rules
+    ORDER BY updated_at DESC, name
+  `);
+  return rows.map(importRuleFromRow);
+}
+
+export async function getImportRule(id) {
+  const row = await get(`
+    SELECT id, name, degree, program, affiliation, requested_index, query, source, created_at, updated_at
+    FROM import_rules
+    WHERE id = ?
+  `, [id]);
+  return importRuleFromRow(row);
+}
+
+export async function saveImportRule(rule) {
+  const now = new Date().toISOString();
+  const id = rule.id || crypto.randomUUID();
+  const existing = await get('SELECT created_at FROM import_rules WHERE id = ?', [id]);
+  const createdAt = existing?.created_at || now;
+  await run(`
+    INSERT INTO import_rules (
+      id, name, degree, program, affiliation, requested_index, query, source, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      degree = excluded.degree,
+      program = excluded.program,
+      affiliation = excluded.affiliation,
+      requested_index = excluded.requested_index,
+      query = excluded.query,
+      source = excluded.source,
+      updated_at = excluded.updated_at
+  `, [
+    id,
+    rule.name,
+    rule.degree || null,
+    rule.program || null,
+    rule.affiliation || null,
+    rule.index || null,
+    rule.query || null,
+    rule.source || null,
+    createdAt,
+    now,
+  ]);
+  return getImportRule(id);
+}
+
+export async function deleteImportRule(id) {
+  const result = await run('DELETE FROM import_rules WHERE id = ?', [id]);
+  return result.changes > 0;
 }
 
 // --- Cache integrity ---
@@ -842,6 +1121,20 @@ export async function getCatalogueLookupStats() {
       SUM(CASE WHEN hits IS NULL THEN 1 ELSE 0 END) AS skipped
     FROM catalogue_lookups
   `);
+}
+
+export async function getTopicBuildStatus() {
+  const topicRow = await get('SELECT COUNT(*) AS total, MAX(created_at) AS created_at FROM topics');
+  const docRow = await get('SELECT COUNT(DISTINCT doc_id) AS total FROM document_topics');
+  const coordRow = await get('SELECT COUNT(*) AS total FROM document_topic_coords');
+  const hierarchyRow = await get('SELECT created_at FROM topic_hierarchy_meta WHERE id = 1');
+  return {
+    topics: Number(topicRow?.total || 0),
+    createdAt: topicRow?.created_at || null,
+    assignedDocuments: Number(docRow?.total || 0),
+    coordinates: Number(coordRow?.total || 0),
+    hierarchyCreatedAt: hierarchyRow?.created_at || null,
+  };
 }
 
 export async function listPendingLookups(limit = 100) {

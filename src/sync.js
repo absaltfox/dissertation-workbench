@@ -4,15 +4,18 @@ import {
 } from './config.js';
 import { fetchPage, extractHits, resolveIndexName } from './api.js';
 import {
-  createSyncRun, getDocumentCacheStats, getLatestSyncRun, saveDocumentMetadataBatch,
-  updateSyncRun
+  createSyncRun, documentExists, getDocumentCacheStats, getLatestSyncRun,
+  loadStoredFileMetric, saveDocumentMetadata, saveDocumentMetadataBatch, updateSyncRun
 } from './db.js';
 import {
   buildDocumentSyncKey, buildMetricsSourceOptions, ensureSourceFields, normalizeRecord
 } from './metrics.js';
 import { logger } from './logger.js';
+import { analyzeDocumentFile } from './pdf.js';
+import { DOCUMENT_SYNC_MODES, filterSyncItemsForMode as filterSyncItemsForModeWithExists } from './syncModes.js';
 
 const runningSyncs = new Map();
+export { DOCUMENT_SYNC_MODES };
 
 function publicSource(source) {
   const {
@@ -51,10 +54,14 @@ function sourceUpdatedAt(raw) {
   return raw?.updated_at || raw?.updatedAt || raw?.date_updated || raw?.dateModified || null;
 }
 
-async function runSync(syncKey, source, apiKey, runId) {
+export const filterSyncItemsForMode = (items, mode, existsFn = documentExists) =>
+  filterSyncItemsForModeWithExists(items, mode, existsFn);
+
+async function runSync(syncKey, source, apiKey, runId, { mode = 'import_all' } = {}) {
   const startedAt = Date.now();
   let totalSeen = 0;
   let totalSaved = 0;
+  let totalSkipped = 0;
   let apiTotal = null;
   try {
     const index = source.requestedIndex
@@ -88,7 +95,31 @@ async function runSync(syncKey, source, apiKey, runId) {
         };
       });
       totalSeen += batch.length;
-      totalSaved += await saveDocumentMetadataBatch(batch);
+      const filtered = await filterSyncItemsForMode(batch, mode);
+      totalSkipped += filtered.skipped;
+      if (mode === 'sync_missing_pdfs') {
+        const missing = [];
+        for (const item of filtered.items) {
+          const stored = await loadStoredFileMetric(item.doc.id);
+          if (stored?.pdf_path) {
+            totalSkipped += 1;
+            continue;
+          }
+          missing.push(item);
+        }
+        for (const item of missing) {
+          await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
+          await analyzeDocumentFile(item.doc, {
+            downloadFiles: true,
+            forceDownload: false,
+            recomputeFromCache: false,
+          });
+          await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
+        }
+        totalSaved += missing.length;
+      } else {
+        totalSaved += await saveDocumentMetadataBatch(filtered.items);
+      }
       await updateSyncRun(runId, { totalSeen, totalSaved, apiTotal });
 
       if (totalSeen >= source.maxRecords) break;
@@ -104,10 +135,13 @@ async function runSync(syncKey, source, apiKey, runId) {
     });
     logger.info('Open Collections sync completed', {
       syncKey,
+      mode,
       totalSeen,
       totalSaved,
+      totalSkipped,
       seconds: Math.round((Date.now() - startedAt) / 1000),
     });
+    return { ok: true, totalSeen, totalSaved, totalSkipped, apiTotal };
   } catch (error) {
     await updateSyncRun(runId, {
       status: 'failed',
@@ -118,12 +152,14 @@ async function runSync(syncKey, source, apiKey, runId) {
       finishedAt: new Date().toISOString(),
     });
     logger.error('Open Collections sync failed', { syncKey, error: error?.message || String(error) });
+    return { ok: false, totalSeen, totalSaved, totalSkipped, apiTotal, error: error?.message || String(error) };
   } finally {
     runningSyncs.delete(syncKey);
   }
 }
 
 export async function startDocumentSync(options = {}) {
+  const mode = DOCUMENT_SYNC_MODES.has(options.mode) ? options.mode : 'import_all';
   const built = buildMetricsSourceOptions(options);
   const source = publicSource({
     ...built,
@@ -134,12 +170,13 @@ export async function startDocumentSync(options = {}) {
     return { started: false, alreadyRunning: true, syncKey, status: await getDocumentSyncStatus(syncKey) };
   }
   const runId = await createSyncRun(syncKey, source);
-  const task = runSync(syncKey, source, built.apiKey, runId);
+  const task = runSync(syncKey, source, built.apiKey, runId, { mode });
   runningSyncs.set(syncKey, task);
   return { started: true, syncKey, runId, status: await getDocumentSyncStatus(syncKey) };
 }
 
 export async function runDocumentSync(options = {}) {
+  const mode = DOCUMENT_SYNC_MODES.has(options.mode) ? options.mode : 'import_all';
   const built = buildMetricsSourceOptions(options);
   const source = publicSource({
     ...built,
@@ -147,8 +184,8 @@ export async function runDocumentSync(options = {}) {
   });
   const syncKey = buildDocumentSyncKey(source);
   const runId = await createSyncRun(syncKey, source);
-  await runSync(syncKey, source, built.apiKey, runId);
-  return { syncKey, runId, status: await getDocumentSyncStatus(syncKey) };
+  const summary = await runSync(syncKey, source, built.apiKey, runId, { mode });
+  return { syncKey, runId, mode, ...summary, status: await getDocumentSyncStatus(syncKey) };
 }
 
 export async function getDocumentSyncStatus(syncKey = null) {

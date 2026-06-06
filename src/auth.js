@@ -111,6 +111,10 @@ function createPendingMfaSetup(username) {
   return { token, secret, otpauthUrl: mfaOtpauthUrl(username, secret) };
 }
 
+export function beginMfaSetup(username) {
+  return createPendingMfaSetup(username);
+}
+
 export function createSession(username) {
   const token = crypto.randomBytes(32).toString('hex');
   const csrfToken = crypto.randomBytes(32).toString('hex');
