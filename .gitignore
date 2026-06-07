@@ -10,6 +10,8 @@ output/
 .env.development
 .env.production
 .env.*.local
+fly.toml
+
 
 # Local tooling state
 .claude/
