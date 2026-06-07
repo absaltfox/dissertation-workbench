@@ -359,29 +359,60 @@ export async function lookupCitationBatch(citationTexts, { concurrency = 1, onPr
     try {
       const stdout = await runYazClient(commands, 30_000 + batch.length * 2_000);
 
-      // Parse all "Number of hits:" lines in order
-      const hitsMatches = [...String(stdout).matchAll(/Number of hits:\s*(\d+)/g)];
-      // Parse all bib IDs (001 fields) — only present for queries with hits
-      const bibIdMatches = [...String(stdout).matchAll(/^001\s+(\d+)/gm)];
+      // Split stdout into blocks. Each block starts with a search command execution.
+      // yaz-client echoes command lines preceded by a prompt (usually "Z> ").
+      const blocks = stdout.split(/Z>\s*f\b/i);
+      const canUseBlockParsing = blocks.length >= batch.length + 1;
 
-      let bibIdx = 0;
-      for (let i = 0; i < batch.length; i++) {
-        const item = batch[i];
-        if (i < hitsMatches.length) {
-          const hits = Number(hitsMatches[i][1]);
-          let bibId = null;
-          if (hits > 0 && bibIdx < bibIdMatches.length) {
-            bibId = bibIdMatches[bibIdx][1];
-            bibIdx++;
+      if (canUseBlockParsing) {
+        for (let i = 0; i < batch.length; i++) {
+          const item = batch[i];
+          const block = blocks[i + 1] || '';
+          const hitsMatch = block.match(/Number of hits:\s*(\d+)/i);
+
+          if (hitsMatch) {
+            const hits = Number(hitsMatch[1]);
+            let bibId = null;
+            if (hits > 0) {
+              const bibMatch = block.match(/^001\s+(\d+)/m);
+              if (bibMatch) {
+                bibId = bibMatch[1];
+              }
+            }
+            results[item.idx] = { found: hits > 0, hits, author: item.author, title: item.title, bibId };
+          } else {
+            results[item.idx] = { found: null, hits: null, author: item.author, title: item.title, error: 'Missing hits in batch output block' };
           }
-          results[item.idx] = { found: hits > 0, hits, author: item.author, title: item.title, bibId };
-        } else {
-          results[item.idx] = { found: null, hits: null, author: item.author, title: item.title, error: 'Missing hits in batch output' };
-        }
 
-        if (onProgress) {
-          const completed = items.filter((_, j) => results[j] !== undefined).length;
-          onProgress(completed, items.length);
+          if (onProgress) {
+            const completed = items.filter((_, j) => results[j] !== undefined).length;
+            onProgress(completed, items.length);
+          }
+        }
+      } else {
+        // Fallback to global regex matching if prompts are missing or mismatched
+        const hitsMatches = [...String(stdout).matchAll(/Number of hits:\s*(\d+)/g)];
+        const bibIdMatches = [...String(stdout).matchAll(/^001\s+(\d+)/gm)];
+
+        let bibIdx = 0;
+        for (let i = 0; i < batch.length; i++) {
+          const item = batch[i];
+          if (i < hitsMatches.length) {
+            const hits = Number(hitsMatches[i][1]);
+            let bibId = null;
+            if (hits > 0 && bibIdx < bibIdMatches.length) {
+              bibId = bibIdMatches[bibIdx][1];
+              bibIdx++;
+            }
+            results[item.idx] = { found: hits > 0, hits, author: item.author, title: item.title, bibId };
+          } else {
+            results[item.idx] = { found: null, hits: null, author: item.author, title: item.title, error: 'Missing hits in batch output' };
+          }
+
+          if (onProgress) {
+            const completed = items.filter((_, j) => results[j] !== undefined).length;
+            onProgress(completed, items.length);
+          }
         }
       }
     } catch (err) {

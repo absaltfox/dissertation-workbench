@@ -54,140 +54,137 @@ function renderKpis() {
     .join('');
 }
 
+let pagesByYearChartInstance = null;
+
 function renderPagesByYear() {
   const rows = getAnalytics()?.metrics?.avgPagesByYear || [];
   if (!rows.length) {
-    pagesByYearChartEl.innerHTML = '<text x="16" y="40">No year/page data available.</text>';
+    pagesByYearChartEl.innerHTML = '<p class="meta">No year/page data available.</p>';
     return;
   }
 
-  const width = 940;
-  const height = 360;
-  const pad = { t: 20, r: 20, b: 40, l: 58 };
-  const xs = rows.map((d) => d.year);
-  const ys = rows.map((d) => d.mean || 0);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const maxY = Math.max(...ys, 1);
+  const canvas = pagesByYearChartEl.querySelector('canvas');
+  if (!canvas) return;
 
-  const x = (v) => pad.l + ((v - minX) / Math.max(maxX - minX, 1)) * (width - pad.l - pad.r);
-  const y = (v) => height - pad.b - (v / maxY) * (height - pad.t - pad.b);
+  if (pagesByYearChartInstance) {
+    pagesByYearChartInstance.destroy();
+  }
 
-  const points = rows.map((d) => `${x(d.year)},${y(d.mean || 0)}`).join(' ');
-
-  const yTicks = Array.from({ length: 6 }, (_, i) => {
-    const val = (maxY / 5) * i;
-    return { val, y: y(val) };
+  pagesByYearChartInstance = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: rows.map((d) => d.year),
+      datasets: [{
+        label: 'Average Page Length',
+        data: rows.map((d) => d.mean || 0),
+        borderColor: '#085a63',
+        backgroundColor: 'rgba(8, 90, 99, 0.08)',
+        borderWidth: 2,
+        tension: 0.15,
+        fill: true,
+        pointRadius: 3,
+        pointHoverRadius: 5
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false }
+      },
+      scales: {
+        x: { grid: { display: false } },
+        y: { beginAtZero: true }
+      }
+    }
   });
-
-  pagesByYearChartEl.innerHTML = `
-    ${yTicks
-      .map(
-        (tick) => `
-      <line x1="${pad.l}" y1="${tick.y}" x2="${width - pad.r}" y2="${tick.y}" stroke="rgba(8,90,99,0.12)"/>
-      <text class="axis" x="${pad.l - 8}" y="${tick.y + 4}" text-anchor="end">${formatNum(tick.val)}</text>
-    `
-      )
-      .join('')}
-    <polyline points="${points}" fill="none" stroke="#085a63" stroke-width="3" />
-    ${rows
-      .filter((_, i) => i % Math.ceil(rows.length / 12) === 0)
-      .map((row) => `<text class="axis" x="${x(row.year)}" y="${height - 10}" text-anchor="middle">${row.year}</text>`)
-      .join('')}
-  `;
 }
+
+let dissertationsByYearChartInstance = null;
 
 function renderDissertationsByYear() {
   const rows = getAnalytics()?.metrics?.byYear || [];
   if (!rows.length) {
-    dissertationsByYearChartEl.innerHTML = '<text x="16" y="40">No year data available.</text>';
+    dissertationsByYearChartEl.innerHTML = '<p class="meta">No year data available.</p>';
     return;
   }
 
-  const width = 940;
-  const height = 360;
-  const pad = { t: 20, r: 20, b: 40, l: 58 };
-  const xs = rows.map((d) => d.year);
-  const ys = rows.map((d) => d.count || 0);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const maxY = Math.max(...ys, 1);
-  const barWidth = Math.max(4, ((width - pad.l - pad.r) / Math.max(rows.length, 1)) * 0.7);
-  const barGap = (width - pad.l - pad.r) / Math.max(rows.length, 1);
+  const canvas = dissertationsByYearChartEl.querySelector('canvas');
+  if (!canvas) return;
 
-  const x = (i) => pad.l + i * barGap + (barGap - barWidth) / 2;
-  const y = (v) => height - pad.b - (v / maxY) * (height - pad.t - pad.b);
+  if (dissertationsByYearChartInstance) {
+    dissertationsByYearChartInstance.destroy();
+  }
 
-  const yTicks = Array.from({ length: 6 }, (_, i) => {
-    const val = (maxY / 5) * i;
-    return { val, y: y(val) };
+  dissertationsByYearChartInstance = new Chart(canvas, {
+    type: 'bar',
+    data: {
+      labels: rows.map((d) => d.year),
+      datasets: [{
+        label: 'Dissertations',
+        data: rows.map((d) => d.count || 0),
+        backgroundColor: '#1b808c',
+        borderRadius: 4
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false }
+      },
+      scales: {
+        x: { grid: { display: false } },
+        y: { beginAtZero: true }
+      }
+    }
   });
-
-  dissertationsByYearChartEl.innerHTML = `
-    ${yTicks
-      .map(
-        (tick) => `
-      <line x1="${pad.l}" y1="${tick.y}" x2="${width - pad.r}" y2="${tick.y}" stroke="rgba(8,90,99,0.12)"/>
-      <text class="axis" x="${pad.l - 8}" y="${tick.y + 4}" text-anchor="end">${formatNum(tick.val)}</text>
-    `
-      )
-      .join('')}
-    ${rows
-      .map(
-        (row, i) => `<rect x="${x(i)}" y="${y(row.count)}" width="${barWidth}" height="${height - pad.b - y(row.count)}" fill="var(--accent-2)" rx="2" />`
-      )
-      .join('')}
-    ${rows
-      .filter((_, i) => i % Math.ceil(rows.length / 12) === 0)
-      .map((row, _, arr) => {
-        const idx = rows.indexOf(row);
-        return `<text class="axis" x="${x(idx) + barWidth / 2}" y="${height - 10}" text-anchor="middle">${row.year}</text>`;
-      })
-      .join('')}
-  `;
 }
+
+let wordsByYearChartInstance = null;
 
 function renderWordsByYear() {
   const rows = getAnalytics()?.metrics?.byYear || [];
   if (!rows.length) {
-    wordsByYearChartEl.innerHTML = '<text x="16" y="40">No year/word data available.</text>';
+    wordsByYearChartEl.innerHTML = '<p class="meta">No year/word data available.</p>';
     return;
   }
 
-  const width = 940;
-  const height = 360;
-  const pad = { t: 20, r: 20, b: 40, l: 58 };
-  const xs = rows.map((d) => d.year);
-  const ys = rows.map((d) => d.mean || 0);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const maxY = Math.max(...ys, 1);
+  const canvas = wordsByYearChartEl.querySelector('canvas');
+  if (!canvas) return;
 
-  const x = (v) => pad.l + ((v - minX) / Math.max(maxX - minX, 1)) * (width - pad.l - pad.r);
-  const y = (v) => height - pad.b - (v / maxY) * (height - pad.t - pad.b);
+  if (wordsByYearChartInstance) {
+    wordsByYearChartInstance.destroy();
+  }
 
-  const points = rows.map((d) => `${x(d.year)},${y(d.mean || 0)}`).join(' ');
-
-  const yTicks = Array.from({ length: 6 }, (_, i) => {
-    const val = (maxY / 5) * i;
-    return { val, y: y(val) };
+  wordsByYearChartInstance = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: rows.map((d) => d.year),
+      datasets: [{
+        label: 'Mean Word Count',
+        data: rows.map((d) => d.mean || 0),
+        borderColor: '#d07a34',
+        backgroundColor: 'rgba(208, 122, 52, 0.08)',
+        borderWidth: 2,
+        tension: 0.15,
+        fill: true,
+        pointRadius: 3,
+        pointHoverRadius: 5
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false }
+      },
+      scales: {
+        x: { grid: { display: false } },
+        y: { beginAtZero: true }
+      }
+    }
   });
-
-  wordsByYearChartEl.innerHTML = `
-    ${yTicks
-      .map(
-        (tick) => `
-      <line x1="${pad.l}" y1="${tick.y}" x2="${width - pad.r}" y2="${tick.y}" stroke="rgba(8,90,99,0.12)"/>
-      <text class="axis" x="${pad.l - 8}" y="${tick.y + 4}" text-anchor="end">${formatNum(tick.val)}</text>
-    `
-      )
-      .join('')}
-    <polyline points="${points}" fill="none" stroke="var(--accent-3)" stroke-width="3" />
-    ${rows
-      .filter((_, i) => i % Math.ceil(rows.length / 12) === 0)
-      .map((row) => `<text class="axis" x="${x(row.year)}" y="${height - 10}" text-anchor="middle">${row.year}</text>`)
-      .join('')}
-  `;
 }
 
 function renderWordCloud() {
@@ -280,52 +277,73 @@ function renderSubjectBars() {
     .join('');
 }
 
+let pageTrendChartInstance = null;
+
 function renderPageTrend() {
   const rows = getAnalytics()?.metrics?.pageTrend || [];
   if (!rows.length) {
-    pageTrendChartEl.innerHTML = '<text x="16" y="40">No page trend data available.</text>';
+    pageTrendChartEl.innerHTML = '<p class="meta">No page trend data available.</p>';
     return;
   }
 
-  const width = 940;
-  const height = 360;
-  const pad = { t: 20, r: 20, b: 40, l: 58 };
-  const xs = rows.map((d) => d.year);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const maxY = Math.max(...rows.map((d) => d.max), 1);
+  const canvas = pageTrendChartEl.querySelector('canvas');
+  if (!canvas) return;
 
-  const x = (v) => pad.l + ((v - minX) / Math.max(maxX - minX, 1)) * (width - pad.l - pad.r);
-  const y = (v) => height - pad.b - (v / maxY) * (height - pad.t - pad.b);
+  if (pageTrendChartInstance) {
+    pageTrendChartInstance.destroy();
+  }
 
-  // Min/max band polygon: go forward along max, then backward along min
-  const bandTop = rows.map((d) => `${x(d.year)},${y(d.max)}`).join(' ');
-  const bandBot = [...rows].reverse().map((d) => `${x(d.year)},${y(d.min)}`).join(' ');
-  const bandPoints = `${bandTop} ${bandBot}`;
-
-  const medianPoints = rows.map((d) => `${x(d.year)},${y(d.median)}`).join(' ');
-
-  const yTicks = Array.from({ length: 6 }, (_, i) => {
-    const val = (maxY / 5) * i;
-    return { val, y: y(val) };
+  pageTrendChartInstance = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: rows.map((d) => d.year),
+      datasets: [
+        {
+          label: 'Median Pages',
+          data: rows.map((d) => d.median),
+          borderColor: '#085a63',
+          borderWidth: 3,
+          tension: 0.15,
+          fill: false,
+          pointRadius: 3,
+          pointHoverRadius: 5
+        },
+        {
+          label: 'Max Pages',
+          data: rows.map((d) => d.max),
+          borderColor: 'transparent',
+          backgroundColor: 'rgba(8, 90, 99, 0.08)',
+          pointRadius: 0,
+          fill: '+1', // fill down to Min Pages dataset at index 2
+          tension: 0.15
+        },
+        {
+          label: 'Min Pages',
+          data: rows.map((d) => d.min),
+          borderColor: 'transparent',
+          backgroundColor: 'rgba(8, 90, 99, 0.08)',
+          pointRadius: 0,
+          fill: false,
+          tension: 0.15
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          labels: {
+            filter: (item) => item.text === 'Median Pages'
+          }
+        }
+      },
+      scales: {
+        x: { grid: { display: false } },
+        y: { beginAtZero: true }
+      }
+    }
   });
-
-  pageTrendChartEl.innerHTML = `
-    ${yTicks
-      .map(
-        (tick) => `
-      <line x1="${pad.l}" y1="${tick.y}" x2="${width - pad.r}" y2="${tick.y}" stroke="rgba(8,90,99,0.12)"/>
-      <text class="axis" x="${pad.l - 8}" y="${tick.y + 4}" text-anchor="end">${formatNum(tick.val)}</text>
-    `
-      )
-      .join('')}
-    <polygon points="${bandPoints}" fill="rgba(8,90,99,0.12)" />
-    <polyline points="${medianPoints}" fill="none" stroke="#085a63" stroke-width="3" />
-    ${rows
-      .filter((_, i) => i % Math.ceil(rows.length / 12) === 0)
-      .map((row) => `<text class="axis" x="${x(row.year)}" y="${height - 10}" text-anchor="middle">${row.year}</text>`)
-      .join('')}
-  `;
 }
 
 function renderNgramCloud() {

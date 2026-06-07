@@ -1,8 +1,9 @@
 import { Router } from 'express';
 import {
   deleteImportRule, getImportRule, listAllDocumentMetadata, listImportRules,
-  saveImportRule
+  saveImportRule, createAdminJob, hasRunningAdminJob
 } from '../db.js';
+import { runImportRulesJob, isAdminJobRunning } from '../services/adminJobs.js';
 import { DEFAULT_BASE_URL, DEFAULT_SOURCE, DEFAULT_TERM } from '../config.js';
 import { fetchPage, extractHits, fetchSearchAggregations, resolveIndexName } from '../api.js';
 import { normalizeRecord } from '../metrics.js';
@@ -205,7 +206,7 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
     const body = req.body || {};
     const mode = String(body.mode || '');
     const scope = String(body.scope || 'selected');
-    const { DOCUMENT_SYNC_MODES, runDocumentSync, getDocumentSyncStatus } = await loadSyncModule();
+    const { DOCUMENT_SYNC_MODES } = await loadSyncModule();
     if (!DOCUMENT_SYNC_MODES.has(mode)) {
       res.status(400).json({ error: 'Invalid import run mode.' });
       return;
@@ -225,45 +226,23 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
       return;
     }
 
-    const apiKey = await getConfiguredApiKey();
-    const perRule = [];
-    const totals = { rulesStarted: 0, totalSeen: 0, totalSaved: 0, totalSkipped: 0 };
-    for (const rule of rules) {
-      const options = importRuleToSyncOptions(rule, {
-        mode,
-        maxRecords: body.maxRecords,
-        syncMaxRecords: body.syncMaxRecords ?? body.scanLimit,
-        pageSize: body.pageSize,
-        scanLimit: body.scanLimit,
-        apiKey,
-      });
-      const result = await runDocumentSync(options);
-      totals.rulesStarted += 1;
-      totals.totalSeen += Number(result.totalSeen || 0);
-      totals.totalSaved += Number(result.totalSaved || 0);
-      totals.totalSkipped += Number(result.totalSkipped || 0);
-      perRule.push({
-        ruleId: rule.id,
-        ruleName: rule.name,
-        syncKey: result.syncKey,
-        ok: result.ok,
-        totalSeen: result.totalSeen || 0,
-        totalSaved: result.totalSaved || 0,
-        totalSkipped: result.totalSkipped || 0,
-        apiTotal: result.apiTotal ?? null,
-        error: result.error || null,
-      });
+    const runningId = isAdminJobRunning('import_rules_sync')
+      ? (await hasRunningAdminJob('import_rules_sync'))
+      : await hasRunningAdminJob('import_rules_sync');
+    if (runningId) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
+      return;
     }
 
-    clearMetricsCache();
-    res.status(200).json({
-      ok: perRule.every((rule) => rule.ok),
-      mode,
-      scope,
-      ...totals,
-      rules: perRule,
-      status: await getDocumentSyncStatus(),
+    const jobId = await createAdminJob({
+      type: 'import_rules_sync',
+      label: 'Import Rules Sync',
+      params: { mode, scope, ruleIds: selectedIds },
     });
+
+    runImportRulesJob(jobId, { mode, scope, ruleIds: selectedIds, clearMetricsCache });
+
+    res.status(202).json({ ok: true, started: true, jobId });
   }));
 
   return router;

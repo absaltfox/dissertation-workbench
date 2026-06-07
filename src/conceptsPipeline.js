@@ -566,3 +566,11 @@ export function scheduleDailyConceptRebuild() {
     if (timer) clearTimeout(timer);
   };
 }
+
+export const _testing = {
+  stemForSim,
+  phraseSimilarity,
+  extractDocPhrases,
+  computePhraseQuality,
+  shouldKeepPhrase,
+};

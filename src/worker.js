@@ -4,7 +4,7 @@ import {
   DOCUMENT_SYNC_ENABLED, DOCUMENT_SYNC_INTERVAL_MS, DOCUMENT_SYNC_MAX_RECORDS,
   DOCUMENT_SYNC_ON_START, DOCUMENT_SYNC_ONCE, validateRuntimeSecrets
 } from './config.js';
-import { ensureStorage, getDb } from './db.js';
+import { ensureStorage, getDb, closeDb } from './db.js';
 import { runDocumentSync } from './sync.js';
 import { runPendingCatalogueLookups } from './catalogue.js';
 import { logger } from './logger.js';
@@ -24,8 +24,29 @@ function syncOptions() {
   };
 }
 
+let delayResolve = null;
+let delayTimer = null;
+
 function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => {
+    delayResolve = resolve;
+    delayTimer = setTimeout(() => {
+      delayResolve = null;
+      delayTimer = null;
+      resolve();
+    }, ms);
+  });
+}
+
+function interruptDelay() {
+  if (delayTimer) {
+    clearTimeout(delayTimer);
+    delayTimer = null;
+  }
+  if (delayResolve) {
+    delayResolve();
+    delayResolve = null;
+  }
 }
 
 async function runOnce({ initial = false } = {}) {
@@ -62,11 +83,31 @@ async function main() {
 
   process.on('SIGTERM', () => {
     stopping = true;
-    logger.info('Worker received SIGTERM; stopping after current cycle');
+    logger.info('Worker received SIGTERM; stopping');
+    interruptDelay();
   });
   process.on('SIGINT', () => {
     stopping = true;
-    logger.info('Worker received SIGINT; stopping after current cycle');
+    logger.info('Worker received SIGINT; stopping');
+    interruptDelay();
+  });
+
+  process.on('uncaughtException', async (error) => {
+    logger.error('Worker uncaught exception', { error: error.message, stack: error.stack });
+    try {
+      await closeDb();
+    } catch (_) {}
+    process.exit(1);
+  });
+
+  process.on('unhandledRejection', async (reason) => {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error ? reason.stack : undefined;
+    logger.error('Worker unhandled rejection', { message, stack });
+    try {
+      await closeDb();
+    } catch (_) {}
+    process.exit(1);
   });
 
   if ((DOCUMENT_SYNC_ENABLED && DOCUMENT_SYNC_ON_START) || (CATALOGUE_LOOKUP_ENABLED && CATALOGUE_LOOKUP_ON_START)) {
@@ -90,7 +131,16 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  logger.error('Worker crashed', { error: error?.message || String(error) });
-  process.exitCode = 1;
-});
+main()
+  .catch((error) => {
+    logger.error('Worker crashed', { error: error?.message || String(error) });
+    process.exitCode = 1;
+  })
+  .finally(async () => {
+    try {
+      await closeDb();
+      logger.info('Worker database connection closed.');
+    } catch (e) {
+      logger.error('Failed to close database on worker exit', { error: e.message });
+    }
+  });

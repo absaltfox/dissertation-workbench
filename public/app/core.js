@@ -55,6 +55,22 @@ const methTopicBubbleChartEl = document.getElementById('methTopicBubbleChart');
 const methTopicBubbleTooltipEl = document.getElementById('methTopicBubbleTooltip');
 const methTopicBubbleContainerEl = document.getElementById('methTopicBubbleContainer');
 
+// Network visualization panel elements (in-progress/optional features)
+const supervisorNetworkPanelEl = document.getElementById('supervisorNetworkPanel');
+const supervisorNetworkChartEl = document.getElementById('supervisorNetworkChart');
+const supervisorNetworkTooltipEl = document.getElementById('supervisorNetworkTooltip');
+const supervisorNetworkContainerEl = document.getElementById('supervisorNetworkContainer');
+
+const citationNetworkPanelEl = document.getElementById('citationNetworkPanel');
+const citationNetworkChartEl = document.getElementById('citationNetworkChart');
+const citationNetworkTooltipEl = document.getElementById('citationNetworkTooltip');
+const citationNetworkContainerEl = document.getElementById('citationNetworkContainer');
+
+const conceptNetworkPanelEl = document.getElementById('conceptNetworkPanel');
+const conceptNetworkChartEl = document.getElementById('conceptNetworkChart');
+const conceptNetworkTooltipEl = document.getElementById('conceptNetworkTooltip');
+const conceptNetworkContainerEl = document.getElementById('conceptNetworkContainer');
+
 const exportBibTeXBtn = document.getElementById('exportBibTeX');
 const exportRISBtn = document.getElementById('exportRIS');
 const exportCitationBibTeXBtn = document.getElementById('exportCitationBibTeX');

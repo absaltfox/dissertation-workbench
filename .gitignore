@@ -16,3 +16,9 @@ output/
 
 # OS/editor noise
 .DS_Store
+
+# Python noise
+__pycache__/
+*.pyc
+.venv/
+

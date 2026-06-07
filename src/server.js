@@ -7,7 +7,7 @@ import {
   DEFAULT_TERM, DEFAULT_SOURCE, TRUST_PROXY, validateRuntimeSecrets
 } from './config.js';
 import {
-  checkCacheIntegrity, ensureStorage, getDb, logCacheStats
+  checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb
 } from './db.js';
 import { ensureDefaultAdmin } from './auth.js';
 import { getConceptPipelineStatus, rebuildConceptDictionary, scheduleDailyConceptRebuild } from './conceptsPipeline.js';
@@ -77,6 +77,9 @@ app.use('/api', createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
 
 // --- Static files ---
 
+app.use('/vendor/chart.js', express.static(path.join(__dirname, '..', 'node_modules', 'chart.js', 'dist', 'chart.umd.js')));
+app.use('/vendor/d3.js', express.static(path.join(__dirname, '..', 'node_modules', 'd3', 'dist', 'd3.min.js')));
+
 app.get('/', (_req, res) => {
   res.sendFile(path.join(publicDir, 'index.html'));
 });
@@ -113,6 +116,8 @@ export async function start() {
   const server = app.listen(PORT, () => {
     logger.info(`UBC Dissertation Intelligence Workbench running at http://localhost:${PORT}`);
   });
+
+
 
   // Warm the in-memory metrics cache so the first browser load is served instantly.
   // Key is constructed to match exactly what the request handler produces for a default
@@ -164,6 +169,53 @@ export async function start() {
       logger.error('Startup concept rebuild failed', { error: error?.message || String(error) });
     });
   }
+
+  // Graceful shutdown helper
+  let isShuttingDown = false;
+  async function gracefulShutdown(signal) {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    logger.info(`Server shutting down due to ${signal}...`);
+    
+    if (stopDailyConceptScheduler) {
+      stopDailyConceptScheduler();
+      stopDailyConceptScheduler = null;
+    }
+    
+    server.close(() => {
+      logger.info('HTTP server closed.');
+    });
+
+    try {
+      await closeDb();
+      logger.info('Database connection closed.');
+    } catch (e) {
+      logger.error('Failed to close database during shutdown', { error: e.message });
+    }
+    
+    process.exit(0);
+  }
+
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+  process.on('uncaughtException', async (error) => {
+    logger.error('Uncaught Exception', { error: error.message, stack: error.stack });
+    try {
+      await closeDb();
+    } catch (_) {}
+    process.exit(1);
+  });
+
+  process.on('unhandledRejection', async (reason) => {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    const stack = reason instanceof Error ? reason.stack : undefined;
+    logger.error('Unhandled Rejection', { message, stack });
+    try {
+      await closeDb();
+    } catch (_) {}
+    process.exit(1);
+  });
 
   return server;
 }

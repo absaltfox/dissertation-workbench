@@ -71,37 +71,78 @@ export function normalizePersonName(raw) {
 export function supervisorNameKey(raw) {
   const normalized = normalizePersonName(raw);
   if (!normalized) return null;
-  let key = stripDiacritics(normalized)
+  return stripDiacritics(normalized)
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
 
-  // Strip middle initials: single-letter tokens between first and last word.
-  // "deirdre m kelly" → "deirdre kelly"    "thomas j sork" → "thomas sork"
-  // Two-word or single-word names are unchanged.
+export function stripMiddleInitials(key) {
+  if (!key) return '';
   const parts = key.split(' ');
   if (parts.length >= 3) {
-    key = parts.filter((p, i) =>
+    return parts.filter((p, i) =>
       i === 0 || i === parts.length - 1 || p.length > 1
     ).join(' ');
   }
   return key;
 }
 
+export function namesCompatible(key1, key2) {
+  if (key1 === key2) return true;
+  
+  const parts1 = key1.split(' ');
+  const parts2 = key2.split(' ');
+  
+  // If both have middle initials and they are different, they are incompatible
+  const hasInit1 = parts1.length >= 3 && parts1.some((p, i) => i > 0 && i < parts1.length - 1 && p.length === 1);
+  const hasInit2 = parts2.length >= 3 && parts2.some((p, i) => i > 0 && i < parts2.length - 1 && p.length === 1);
+  
+  if (hasInit1 && hasInit2) {
+    return false;
+  }
+  
+  return stripMiddleInitials(key1) === stripMiddleInitials(key2);
+}
+
 export function dedupeSupervisorNames(values = []) {
-  const seen = new Set();
   const out = [];
   for (const value of values) {
     const normalized = normalizePersonName(value);
     if (!normalized) continue;
-    const key = supervisorNameKey(normalized);
-    if (!key) continue;
-    const canonical = SUPERVISOR_CANONICAL_OVERRIDES.get(key) || normalized;
+    const baseKey = supervisorNameKey(normalized);
+    if (!baseKey) continue;
+    
+    const strippedKey = stripMiddleInitials(baseKey);
+    const canonical = SUPERVISOR_CANONICAL_OVERRIDES.get(baseKey) || 
+                      SUPERVISOR_CANONICAL_OVERRIDES.get(strippedKey) || 
+                      normalized;
+                      
     const canonicalKey = supervisorNameKey(canonical);
-    if (!canonicalKey || seen.has(canonicalKey)) continue;
-    seen.add(canonicalKey);
-    out.push(canonical);
+    if (!canonicalKey) continue;
+
+    let matchedIdx = -1;
+    for (let i = 0; i < out.length; i++) {
+      const existingKey = supervisorNameKey(out[i]);
+      if (existingKey && namesCompatible(canonicalKey, existingKey)) {
+        matchedIdx = i;
+        break;
+      }
+    }
+
+    if (matchedIdx !== -1) {
+      // If incoming name contains a middle initial/name and existing doesn't, keep the more complete one
+      const existing = out[matchedIdx];
+      const existingKey = supervisorNameKey(existing);
+      const partsExisting = existingKey.split(' ');
+      const partsIncoming = canonicalKey.split(' ');
+      if (partsIncoming.length > partsExisting.length) {
+        out[matchedIdx] = canonical;
+      }
+    } else {
+      out.push(canonical);
+    }
   }
   return out;
 }

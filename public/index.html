@@ -127,27 +127,27 @@
           <div class="analytics-left">
             <article class="panel">
               <h2>Average Page Length by Year</h2>
-              <svg id="pagesByYearChart" viewBox="0 0 940 360" role="img" aria-label="Average pages by year"></svg>
+              <div id="pagesByYearChart" class="chart-container" style="position:relative; width:100%; height:320px;"><canvas></canvas></div>
             </article>
 
             <article class="panel">
               <h2>Dissertations by Year</h2>
-              <svg id="dissertationsByYearChart" viewBox="0 0 940 360" role="img" aria-label="Dissertations by year"></svg>
+              <div id="dissertationsByYearChart" class="chart-container" style="position:relative; width:100%; height:320px;"><canvas></canvas></div>
             </article>
 
             <article class="panel">
               <h2>Mean Word Count by Year</h2>
-              <svg id="wordsByYearChart" viewBox="0 0 940 360" role="img" aria-label="Mean word count by year"></svg>
+              <div id="wordsByYearChart" class="chart-container" style="position:relative; width:100%; height:320px;"><canvas></canvas></div>
             </article>
 
             <article class="panel">
               <h2>Dissertation Length Trend (Median Pages by Year)</h2>
-              <svg id="pageTrendChart" viewBox="0 0 940 360" role="img" aria-label="Median pages by year with min/max band"></svg>
+              <div id="pageTrendChart" class="chart-container" style="position:relative; width:100%; height:320px;"><canvas></canvas></div>
             </article>
 
             <article class="panel">
               <h2>Concept Frequency Over Time</h2>
-              <svg id="conceptTimelineChart" viewBox="0 0 940 360" role="img" aria-label="Concept frequency by year"></svg>
+              <div id="conceptTimelineChart" class="chart-container" style="position:relative; width:100%; height:320px;"><canvas></canvas></div>
               <div id="conceptTimelineLegend" class="timeline-legend"></div>
             </article>
           </div>
@@ -202,7 +202,7 @@
 
         <article class="panel" id="topicTimelinePanel" hidden>
           <h2>Topics Over Time</h2>
-          <svg id="topicTimelineChart" viewBox="0 0 940 360" role="img" aria-label="Topic frequency by year"></svg>
+          <div id="topicTimelineChart" class="chart-container" style="position:relative; width:100%; height:320px;"><canvas></canvas></div>
           <div id="topicTimelineLegend" class="timeline-legend"></div>
         </article>
 
@@ -810,6 +810,8 @@
       </p>
     </footer>
 
+    <script src="/vendor/chart.js"></script>
+    <script src="/vendor/d3.js"></script>
     <script src="/app/core.js"></script>
     <script src="/app/documents.js"></script>
     <script src="/app/analytics-dashboard.js"></script>

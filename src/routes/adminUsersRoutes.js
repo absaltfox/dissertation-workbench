@@ -59,6 +59,10 @@ export function createAdminUsersRouter() {
 
   router.delete('/users/:username', asyncHandler(async (req, res) => {
     const username = req.params.username;
+    if (req.user && username === req.user.username) {
+      res.status(400).json({ error: 'Cannot delete your own admin account' });
+      return;
+    }
     if ((await countUsers()) <= 1) {
       res.status(400).json({ error: 'Cannot delete the last admin user' });
       return;

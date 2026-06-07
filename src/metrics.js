@@ -154,7 +154,8 @@ export function normalizeRecord(doc, dict = null) {
     downloadUrl: null,
     downloadStatus: 'not_attempted',
     downloadError: null,
-    fileBytes: null
+    fileBytes: null,
+    bodyWordCount: null
   };
 }
 
@@ -171,6 +172,7 @@ function buildMetrics(records, subjectLimit) {
 
   for (const rec of records) {
     const reliableWords = hasReliableWordCount(rec);
+    const activeWordCount = (rec.bodyWordCount != null) ? rec.bodyWordCount : rec.wordCount;
     const concepts = Array.from(new Set((rec.conceptTerms || []).filter(Boolean)));
     if (concepts.length) {
       const weight = 1 / concepts.length;
@@ -179,7 +181,7 @@ function buildMetrics(records, subjectLimit) {
           conceptWords.set(concept, { weightedWordSum: 0, weightSum: 0, docCount: 0 });
         }
         const entry = conceptWords.get(concept);
-        if (reliableWords) entry.weightedWordSum += rec.wordCount * weight;
+        if (reliableWords) entry.weightedWordSum += activeWordCount * weight;
         entry.weightSum += weight;
         entry.docCount += 1;
       }
@@ -188,7 +190,7 @@ function buildMetrics(records, subjectLimit) {
     if (rec.year) {
       if (!yearWords.has(rec.year)) yearWords.set(rec.year, []);
       if (!yearPages.has(rec.year)) yearPages.set(rec.year, []);
-      if (reliableWords) yearWords.get(rec.year).push(rec.wordCount);
+      if (reliableWords) yearWords.get(rec.year).push(activeWordCount);
       yearPages.get(rec.year).push(rec.pages);
     }
   }

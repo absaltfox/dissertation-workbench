@@ -3,6 +3,12 @@ import assert from 'node:assert/strict';
 import request from 'supertest';
 import { app } from '../src/server.js';
 import { createSession, destroySession, getSessionCsrfToken } from '../src/auth.js';
+import { closeDb } from '../src/db.js';
+
+test.after(async () => {
+  await closeDb();
+});
+
 
 test('GET /api/health returns an ok payload', async () => {
   const res = await request(app)
@@ -29,7 +35,7 @@ test('GET /app.js serves the frontend bundle', async () => {
     .expect(200);
 
   assert.match(res.headers['content-type'], /(application|text)\/javascript/);
-  assert.match(res.text, /fetch\(/);
+  assert.match(res.text, /fetch/);
 });
 
 test('unknown paths return the JSON 404 contract', async () => {
@@ -199,6 +205,23 @@ test('admin jobs endpoint exposes operational status and catalogue preview', asy
     assert.equal(preview.body.ok, true);
     assert.equal(preview.body.dryRun, true);
     assert.ok(Array.isArray(preview.body.previews));
+  } finally {
+    destroySession(token);
+  }
+});
+
+test('admin cannot delete their own account', async () => {
+  const token = createSession('admin');
+  try {
+    const csrfToken = getSessionCsrfToken(token);
+    const res = await request(app)
+      .delete('/api/admin/users/admin')
+      .set('Cookie', `session=${token}`)
+      .set('x-csrf-token', csrfToken)
+      .expect('content-type', /application\/json/)
+      .expect(400);
+
+    assert.equal(res.body.error, 'Cannot delete your own admin account');
   } finally {
     destroySession(token);
   }

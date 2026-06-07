@@ -1,71 +1,90 @@
 
-// --- Concept Timeline ---
+let conceptTimelineChartInstance = null;
 
 function renderConceptTimeline() {
   const data = getAnalytics()?.conceptTimeline || [];
   if (!data.length || !conceptTimelineChartEl) {
-    if (conceptTimelineChartEl) conceptTimelineChartEl.innerHTML = '<text x="16" y="40" class="axis">No concept timeline data available.</text>';
+    if (conceptTimelineChartEl) conceptTimelineChartEl.innerHTML = '<p class="meta">No concept timeline data available.</p>';
     if (conceptTimelineLegendEl) conceptTimelineLegendEl.innerHTML = '';
     return;
   }
 
-  const width = 940;
-  const height = 360;
-  const pad = { t: 20, r: 20, b: 40, l: 58 };
+  const canvas = conceptTimelineChartEl.querySelector('canvas');
+  if (!canvas) return;
 
-  // Collect all years and find ranges
+  if (conceptTimelineChartInstance) {
+    conceptTimelineChartInstance.destroy();
+  }
+
+  // Collect all years and sort them
   const allYears = new Set();
-  let maxCount = 1;
   for (const series of data) {
     for (const pt of series.data) {
       allYears.add(pt.year);
-      if (pt.count > maxCount) maxCount = pt.count;
     }
   }
   const years = Array.from(allYears).sort((a, b) => a - b);
   if (!years.length) {
-    conceptTimelineChartEl.innerHTML = '<text x="16" y="40" class="axis">No year data.</text>';
-    conceptTimelineLegendEl.innerHTML = '';
+    conceptTimelineChartEl.innerHTML = '<p class="meta">No year data.</p>';
+    if (conceptTimelineLegendEl) conceptTimelineLegendEl.innerHTML = '';
     return;
   }
 
-  const minX = years[0];
-  const maxX = years[years.length - 1];
-  const x = (v) => pad.l + ((v - minX) / Math.max(maxX - minX, 1)) * (width - pad.l - pad.r);
-  const y = (v) => height - pad.b - (v / maxCount) * (height - pad.t - pad.b);
+  const hueStep = 360 / data.length;
+  const datasets = data.map((series, idx) => {
+    const hue = Math.round(idx * hueStep);
+    const color = `hsl(${hue}, 65%, 45%)`;
+    
+    // Create a map of year -> count for this series
+    const yearMap = new Map(series.data.map(pt => [pt.year, pt.count]));
+    const seriesData = years.map(yr => yearMap.get(yr) || 0);
 
-  const yTicks = Array.from({ length: 6 }, (_, i) => {
-    const val = (maxCount / 5) * i;
-    return { val, y: y(val) };
+    return {
+      label: `${series.concept} (${series.totalDocs})`,
+      data: seriesData,
+      borderColor: color,
+      backgroundColor: `hsla(${hue}, 65%, 45%, 0.05)`,
+      borderWidth: 2,
+      tension: 0.15,
+      pointRadius: 3,
+      pointHoverRadius: 5
+    };
   });
 
-  const hueStep = 360 / data.length;
-  const lines = data.map((series, idx) => {
-    const hue = Math.round(idx * hueStep);
-    const color = `hsl(${hue} 65% 45%)`;
-    const points = series.data.map((pt) => `${x(pt.year)},${y(pt.count)}`).join(' ');
-    return `<polyline points="${points}" fill="none" stroke="${color}" stroke-width="2.5" />`;
-  }).join('');
+  conceptTimelineChartInstance = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: years,
+      datasets: datasets
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          display: true,
+          position: 'bottom',
+          labels: {
+            color: 'var(--fg)',
+            boxWidth: 12,
+            font: { size: 11 }
+          }
+        }
+      },
+      scales: {
+        x: { 
+          grid: { display: false },
+          ticks: { color: 'var(--fg)' }
+        },
+        y: { 
+          beginAtZero: true,
+          ticks: { color: 'var(--fg)' }
+        }
+      }
+    }
+  });
 
-  const xLabels = years
-    .filter((_, i) => i % Math.ceil(years.length / 12) === 0)
-    .map((yr) => `<text class="axis" x="${x(yr)}" y="${height - 10}" text-anchor="middle">${yr}</text>`)
-    .join('');
-
-  conceptTimelineChartEl.innerHTML = `
-    ${yTicks.map((tick) => `
-      <line x1="${pad.l}" y1="${tick.y}" x2="${width - pad.r}" y2="${tick.y}" stroke="rgba(8,90,99,0.12)"/>
-      <text class="axis" x="${pad.l - 8}" y="${tick.y + 4}" text-anchor="end">${formatNum(tick.val)}</text>
-    `).join('')}
-    ${lines}
-    ${xLabels}
-  `;
-
-  conceptTimelineLegendEl.innerHTML = data.map((series, idx) => {
-    const hue = Math.round(idx * hueStep);
-    const color = `hsl(${hue} 65% 45%)`;
-    return `<span class="timeline-legend-item"><span class="timeline-legend-swatch" style="background:${color}"></span>${escapeHtml(series.concept)} (${series.totalDocs})</span>`;
-  }).join('');
+  if (conceptTimelineLegendEl) conceptTimelineLegendEl.innerHTML = '';
 }
 
 // --- Topic Distribution ---
@@ -144,6 +163,8 @@ function renderTopicDistribution() {
   }
 }
 
+let topicTimelineChartInstance = null;
+
 function renderTopicTimeline() {
   const td = getAnalytics()?.topicData;
   if (!td || !td.byYear || !td.byYear.length) {
@@ -153,63 +174,80 @@ function renderTopicTimeline() {
   topicTimelinePanelEl.hidden = false;
 
   const data = td.byYear;
-  const width = 940;
-  const height = 360;
-  const pad = { t: 20, r: 20, b: 40, l: 58 };
+  const canvas = topicTimelineChartEl.querySelector('canvas');
+  if (!canvas) return;
+
+  if (topicTimelineChartInstance) {
+    topicTimelineChartInstance.destroy();
+  }
 
   const allYears = new Set();
-  let maxCount = 1;
   for (const series of data) {
     for (const pt of series.data) {
       allYears.add(pt.year);
-      if (pt.count > maxCount) maxCount = pt.count;
     }
   }
   const years = Array.from(allYears).sort((a, b) => a - b);
   if (!years.length) {
-    topicTimelineChartEl.innerHTML = '<text x="16" y="40" class="axis">No year data.</text>';
-    topicTimelineLegendEl.innerHTML = '';
+    topicTimelineChartEl.innerHTML = '<p class="meta">No year data.</p>';
+    if (topicTimelineLegendEl) topicTimelineLegendEl.innerHTML = '';
     return;
   }
 
-  const minX = years[0];
-  const maxX = years[years.length - 1];
-  const x = (v) => pad.l + ((v - minX) / Math.max(maxX - minX, 1)) * (width - pad.l - pad.r);
-  const y = (v) => height - pad.b - (v / maxCount) * (height - pad.t - pad.b);
+  const hueStep = 360 / data.length;
+  const datasets = data.map((series, idx) => {
+    const hue = Math.round(idx * hueStep);
+    const color = `hsl(${hue}, 65%, 45%)`;
+    
+    const yearMap = new Map(series.data.map(pt => [pt.year, pt.count]));
+    const seriesData = years.map(yr => yearMap.get(yr) || 0);
 
-  const yTicks = Array.from({ length: 6 }, (_, i) => {
-    const val = (maxCount / 5) * i;
-    return { val, y: y(val) };
+    return {
+      label: topicDisplayLabel(series.label),
+      data: seriesData,
+      borderColor: color,
+      backgroundColor: `hsla(${hue}, 65%, 45%, 0.05)`,
+      borderWidth: 2,
+      tension: 0.15,
+      pointRadius: 3,
+      pointHoverRadius: 5
+    };
   });
 
-  const hueStep = 360 / data.length;
-  const lines = data.map((series, idx) => {
-    const hue = Math.round(idx * hueStep);
-    const color = `hsl(${hue} 65% 45%)`;
-    const points = series.data.map((pt) => `${x(pt.year)},${y(pt.count)}`).join(' ');
-    return `<polyline points="${points}" fill="none" stroke="${color}" stroke-width="2.5" />`;
-  }).join('');
+  topicTimelineChartInstance = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels: years,
+      datasets: datasets
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          display: true,
+          position: 'bottom',
+          labels: {
+            color: 'var(--fg)',
+            boxWidth: 12,
+            font: { size: 11 }
+          }
+        }
+      },
+      scales: {
+        x: { 
+          grid: { display: false },
+          ticks: { color: 'var(--fg)' }
+        },
+        y: { 
+          beginAtZero: true,
+          ticks: { color: 'var(--fg)' }
+        }
+      }
+    }
+  });
 
-  const xLabels = years
-    .filter((_, i) => i % Math.ceil(years.length / 12) === 0)
-    .map((yr) => `<text class="axis" x="${x(yr)}" y="${height - 10}" text-anchor="middle">${yr}</text>`)
-    .join('');
-
-  topicTimelineChartEl.innerHTML = `
-    ${yTicks.map((tick) => `
-      <line x1="${pad.l}" y1="${tick.y}" x2="${width - pad.r}" y2="${tick.y}" stroke="rgba(8,90,99,0.12)"/>
-      <text class="axis" x="${pad.l - 8}" y="${tick.y + 4}" text-anchor="end">${formatNum(tick.val)}</text>
-    `).join('')}
-    ${lines}
-    ${xLabels}
-  `;
-
-  topicTimelineLegendEl.innerHTML = data.map((series, idx) => {
-    const hue = Math.round(idx * hueStep);
-    const color = `hsl(${hue} 65% 45%)`;
-    const label = topicDisplayLabel(series.label);
-    return `<span class="timeline-legend-item"><span class="timeline-legend-swatch" style="background:${color}"></span>${escapeHtml(label)}</span>`;
-  }).join('');
+  if (topicTimelineLegendEl) topicTimelineLegendEl.innerHTML = '';
 }
 
 // --- Analytics sub-tabs ---
@@ -226,6 +264,9 @@ function setActiveAnalyticsTab(tabName) {
     renderTopicDendrogram();
     renderTopicSankey();
     renderMethTopicBubble();
+    renderSupervisorNetwork();
+    renderCitationNetwork();
+    renderConceptNetwork();
   }
 }
 
@@ -255,199 +296,157 @@ function renderTopicCluster() {
 
   const xs = plotDocs.map(d => d.umapX);
   const ys = plotDocs.map(d => d.umapY);
-  const minX = Math.min(...xs), maxX = Math.max(...xs);
-  const minY = Math.min(...ys), maxY = Math.max(...ys);
-  const rangeX = maxX - minX || 1;
-  const rangeY = maxY - minY || 1;
+  const minX = d3.min(xs), maxX = d3.max(xs);
+  const minY = d3.min(ys), maxY = d3.max(ys);
 
-  const sx = v => pad.l + ((v - minX) / rangeX) * (width - pad.l - pad.r);
-  const sy = v => pad.t + ((v - minY) / rangeY) * (height - pad.t - pad.b);
+  const svg = d3.select(topicClusterChartEl)
+    .attr('viewBox', `0 0 ${width} ${height}`);
+  svg.selectAll('*').remove();
 
-  // Assign colors by topic
   const topicIds = [...new Set(plotDocs.map(d => d.topicId))].sort((a, b) => a - b);
   const hueStep = 360 / Math.max(topicIds.length, 1);
   const colorMap = new Map();
   topicIds.forEach((tid, i) => {
     colorMap.set(tid, tid === -1
-      ? 'hsl(0 0% 72%)'
-      : `hsl(${Math.round(i * hueStep)} 65% 50%)`);
+      ? 'hsl(0, 0%, 72%)'
+      : `hsl(${Math.round(i * hueStep)}, 65%, 50%)`);
   });
 
-  // Render circles
-  const circles = plotDocs.map((doc, i) => {
-    const cx = sx(doc.umapX), cy = sy(doc.umapY);
-    const color = colorMap.get(doc.topicId) || '#999';
-    return `<circle class="cluster-dot" cx="${cx}" cy="${cy}" r="4"
-      fill="${color}" fill-opacity="0.7" stroke="${color}" stroke-opacity="0.3"
-      stroke-width="1" data-idx="${i}" data-topic="${doc.topicId}" style="cursor:pointer" />`;
-  }).join('');
+  const xScale = d3.scaleLinear()
+    .domain([minX, maxX])
+    .range([pad.l, width - pad.r]);
 
-  topicClusterChartEl.innerHTML = circles;
-  _topicClusterDocs = plotDocs;
-  _topicClusterTd = td;
+  const yScale = d3.scaleLinear()
+    .domain([minY, maxY])
+    .range([pad.t, height - pad.b]);
 
-  // Attach listeners only once
-  if (!_topicClusterRendered) {
-    _topicClusterRendered = true;
+  const gContainer = svg.append('g');
 
-    topicClusterChartEl.addEventListener('mouseover', e => {
-      const dot = e.target.closest('.cluster-dot');
-      if (!dot) return;
-      const doc = _topicClusterDocs[+dot.dataset.idx];
-      if (!doc) return;
-      const topic = _topicClusterTd?.topics?.find(t => t.topicId === doc.topicId);
-      const label = doc.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || '');
-      const confidence = typeof doc.topicProbability === 'number' ? ` \u00B7 ${Math.round(doc.topicProbability * 100)}% confidence` : '';
-      topicClusterTooltipEl.hidden = false;
-      topicClusterTooltipEl.innerHTML = `
-        <div class="tooltip-title">${escapeHtml((doc.title || '').slice(0, 100))}</div>
-        <div class="tooltip-meta">${doc.year || '\u2014'} \u00B7 ${escapeHtml(label)}${escapeHtml(confidence)}</div>
-      `;
-      const rect = topicClusterContainerEl.getBoundingClientRect();
-      const dotRect = dot.getBoundingClientRect();
-      topicClusterTooltipEl.style.left = (dotRect.left - rect.left + 12) + 'px';
-      topicClusterTooltipEl.style.top = (dotRect.top - rect.top - 10) + 'px';
+  const zoom = d3.zoom()
+    .scaleExtent([0.5, 10])
+    .on('zoom', (event) => {
+      gContainer.attr('transform', event.transform);
     });
+  svg.call(zoom);
 
-    topicClusterChartEl.addEventListener('mouseout', e => {
-      if (e.target.closest('.cluster-dot')) topicClusterTooltipEl.hidden = true;
-    });
+  const dots = gContainer.selectAll('.cluster-dot')
+    .data(plotDocs)
+    .enter()
+    .append('circle')
+    .attr('class', 'cluster-dot')
+    .attr('cx', d => xScale(d.umapX))
+    .attr('cy', d => yScale(d.umapY))
+    .attr('r', 4)
+    .attr('fill', d => colorMap.get(d.topicId) || '#999')
+    .attr('fill-opacity', 0.7)
+    .attr('stroke', d => colorMap.get(d.topicId) || '#999')
+    .attr('stroke-opacity', 0.3)
+    .attr('stroke-width', 1)
+    .style('cursor', 'pointer');
 
-    addTouchTooltip(topicClusterChartEl, '.cluster-dot', (dot) => {
-      const doc = _topicClusterDocs[+dot.dataset.idx];
-      if (!doc) return;
-      const topic = _topicClusterTd?.topics?.find(t => t.topicId === doc.topicId);
-      const label = doc.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || '');
-      const confidence = typeof doc.topicProbability === 'number' ? ` \u00B7 ${Math.round(doc.topicProbability * 100)}% confidence` : '';
-      topicClusterTooltipEl.hidden = false;
-      topicClusterTooltipEl.innerHTML = `
-        <div class="tooltip-title">${escapeHtml((doc.title || '').slice(0, 100))}</div>
-        <div class="tooltip-meta">${doc.year || '\u2014'} \u00B7 ${escapeHtml(label)}${escapeHtml(confidence)}</div>
-      `;
-      const rect = topicClusterContainerEl.getBoundingClientRect();
-      const dotRect = dot.getBoundingClientRect();
-      topicClusterTooltipEl.style.left = (dotRect.left - rect.left + 12) + 'px';
-      topicClusterTooltipEl.style.top = (dotRect.top - rect.top - 10) + 'px';
-    });
+  const tooltip = d3.select(topicClusterTooltipEl);
 
-    topicClusterChartEl.addEventListener('click', e => {
-      const dot = e.target.closest('.cluster-dot');
-      if (!dot) return;
-      const doc = _topicClusterDocs[+dot.dataset.idx];
-      if (!doc) return;
-      state.selectedDocId = doc.id;
-      renderDetails();
-      docModalOverlay.hidden = false;
-    });
-  }
+  dots.on('mouseover', function(event, d) {
+    const topic = td?.topics?.find(t => t.topicId === d.topicId);
+    const label = d.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || '');
+    const confidence = typeof d.topicProbability === 'number' ? ` \u00B7 ${Math.round(d.topicProbability * 100)}% confidence` : '';
+    
+    d3.select(this)
+      .transition()
+      .duration(100)
+      .attr('r', 8)
+      .attr('fill-opacity', 1);
 
-  // Legend with toggle
+    tooltip.style('display', 'block')
+      .html(`
+        <div class="tooltip-title">${escapeHtml((d.title || '').slice(0, 100))}</div>
+        <div class="tooltip-meta">${d.year || '\u2014'} \u00B7 ${escapeHtml(label)}${escapeHtml(confidence)}</div>
+      `);
+    
+    const rect = topicClusterContainerEl.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 12) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+  })
+  .on('mousemove', function(event) {
+    const rect = topicClusterContainerEl.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 12) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+  })
+  .on('mouseout', function() {
+    d3.select(this)
+      .transition()
+      .duration(100)
+      .attr('r', 4)
+      .attr('fill-opacity', 0.7);
+
+    tooltip.style('display', 'none');
+  })
+  .on('click', function(event, d) {
+    state.selectedDocId = d.id;
+    renderDetails();
+    docModalOverlay.hidden = false;
+  });
+
   const activeTids = new Set(topicIds);
-  const legendItems = topicIds.map(tid => {
-    const topic = td.topics.find(t => t.topicId === tid);
-    const label = tid === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || `Topic ${tid}`);
-    const color = colorMap.get(tid);
-    const count = plotDocs.filter(d => d.topicId === tid).length;
-    return `<span class="scatter-legend-item" data-legend-tid="${tid}">
-      <span class="scatter-legend-swatch" style="background:${color}"></span>
-      ${escapeHtml(label)} (${count})
-    </span>`;
-  }).join('');
-  topicClusterLegendEl.innerHTML = legendItems;
+  const legendContainer = d3.select(topicClusterLegendEl);
+  legendContainer.selectAll('*').remove();
 
-  topicClusterLegendEl.onclick = e => {
-    const item = e.target.closest('.scatter-legend-item');
-    if (!item) return;
-    const tid = Number(item.dataset.legendTid);
+  const legendItems = legendContainer.selectAll('.scatter-legend-item')
+    .data(topicIds)
+    .enter()
+    .append('span')
+    .attr('class', 'scatter-legend-item')
+    .style('cursor', 'pointer')
+    .html(tid => {
+      const topic = td.topics.find(t => t.topicId === tid);
+      const label = tid === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || `Topic ${tid}`);
+      const color = colorMap.get(tid);
+      const count = plotDocs.filter(d => d.topicId === tid).length;
+      return `<span class="scatter-legend-swatch" style="background:${color}"></span>${escapeHtml(label)} (${count})`;
+    });
+
+  legendItems.on('click', function(event, tid) {
     if (activeTids.has(tid)) {
       activeTids.delete(tid);
-      item.classList.add('dimmed');
+      d3.select(this).classed('dimmed', true);
     } else {
       activeTids.add(tid);
-      item.classList.remove('dimmed');
+      d3.select(this).classed('dimmed', false);
     }
-    // Update dot visibility
-    for (const dot of topicClusterChartEl.querySelectorAll('.cluster-dot')) {
-      const dotTid = Number(dot.dataset.topic);
-      dot.setAttribute('fill-opacity', activeTids.has(dotTid) ? '0.7' : '0.05');
-      dot.setAttribute('stroke-opacity', activeTids.has(dotTid) ? '0.3' : '0.02');
-    }
-  };
+
+    dots.transition()
+      .duration(200)
+      .attr('fill-opacity', d => activeTids.has(d.topicId) ? 0.7 : 0.05)
+      .attr('stroke-opacity', d => activeTids.has(d.topicId) ? 0.3 : 0.02)
+      .style('pointer-events', d => activeTids.has(d.topicId) ? 'auto' : 'none');
+  });
 }
 
 // --- Shared force-directed layout ---
 
-function forceLayout(nodes, edges, { width, height, pad = 40, iterations = 200 }) {
-  const w = width - pad * 2;
-  const h = height - pad * 2;
-  // Initialize random positions
-  for (const n of nodes) {
-    n.x = pad + Math.random() * w;
-    n.y = pad + Math.random() * h;
-    n.vx = 0;
-    n.vy = 0;
+function drag(simulation) {
+  function dragstarted(event) {
+    if (!event.active) simulation.alphaTarget(0.3).restart();
+    event.subject.fx = event.subject.x;
+    event.subject.fy = event.subject.y;
   }
-
-  const idxMap = new Map(nodes.map((n, i) => [n.id, i]));
-  const k = Math.sqrt((w * h) / Math.max(nodes.length, 1));
-
-  for (let iter = 0; iter < iterations; iter++) {
-    const damping = 0.9 - (iter / iterations) * 0.4;
-
-    // Repulsion between all pairs
-    for (let i = 0; i < nodes.length; i++) {
-      for (let j = i + 1; j < nodes.length; j++) {
-        let dx = nodes[i].x - nodes[j].x;
-        let dy = nodes[i].y - nodes[j].y;
-        let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-        const force = (k * k) / dist;
-        const fx = (dx / dist) * force * 0.05;
-        const fy = (dy / dist) * force * 0.05;
-        nodes[i].vx += fx;
-        nodes[i].vy += fy;
-        nodes[j].vx -= fx;
-        nodes[j].vy -= fy;
-      }
-    }
-
-    // Attraction along edges
-    for (const e of edges) {
-      const si = idxMap.get(e.source);
-      const ti = idxMap.get(e.target);
-      if (si == null || ti == null) continue;
-      let dx = nodes[ti].x - nodes[si].x;
-      let dy = nodes[ti].y - nodes[si].y;
-      let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-      const force = (dist * dist) / k;
-      const fx = (dx / dist) * force * 0.01;
-      const fy = (dy / dist) * force * 0.01;
-      nodes[si].vx += fx;
-      nodes[si].vy += fy;
-      nodes[ti].vx -= fx;
-      nodes[ti].vy -= fy;
-    }
-
-    // Centering
-    const cx = width / 2, cy = height / 2;
-    for (const n of nodes) {
-      n.vx += (cx - n.x) * 0.002;
-      n.vy += (cy - n.y) * 0.002;
-    }
-
-    // Apply velocity and clamp
-    for (const n of nodes) {
-      n.vx *= damping;
-      n.vy *= damping;
-      n.x += n.vx;
-      n.y += n.vy;
-      n.x = Math.max(pad, Math.min(width - pad, n.x));
-      n.y = Math.max(pad, Math.min(height - pad, n.y));
-    }
+  
+  function dragged(event) {
+    event.subject.fx = event.x;
+    event.subject.fy = event.y;
   }
-  return nodes;
+  
+  function dragended(event) {
+    if (!event.active) simulation.alphaTarget(0);
+    event.subject.fx = null;
+    event.subject.fy = null;
+  }
+  
+  return d3.drag()
+    .on('start', dragstarted)
+    .on('drag', dragged)
+    .on('end', dragended);
 }
-
-// --- Network graph tooltip helper ---
 
 function showNetTooltip(containerEl, tooltipEl, target, html) {
   tooltipEl.hidden = false;
@@ -462,26 +461,6 @@ function showNetTooltip(containerEl, tooltipEl, target, html) {
   tooltipEl.style.top = top + 'px';
 }
 
-// --- Touch tooltip helper ---
-
-function addTouchTooltip(chartEl, selector, showFn) {
-  chartEl.addEventListener('touchstart', (e) => {
-    const el = e.target.closest(selector);
-    if (!el) return;
-    e.preventDefault();
-    showFn(el);
-  }, { passive: false });
-}
-
-document.addEventListener('touchstart', (e) => {
-  if (!e.target.closest('.scatter-tooltip') && !e.target.closest('svg[viewBox]'))
-    document.querySelectorAll('.scatter-tooltip').forEach(t => t.hidden = true);
-});
-
-// --- Topic Hierarchy Dendrogram ---
-
-let _topicDendrogramRendered = false;
-
 function renderTopicDendrogram() {
   const td = getAnalytics()?.topicData;
   if (!td?.topics?.length || !topicDendrogramChartEl) {
@@ -489,17 +468,13 @@ function renderTopicDendrogram() {
     return;
   }
 
-  // Use pre-computed hierarchy from BERTopic if available
   const hierarchy = td.hierarchy;
   if (!hierarchy?.linkage?.length || !hierarchy?.leafTopicIds?.length) {
     topicDendrogramPanelEl.hidden = true;
     return;
   }
 
-  // Build a map from topicId to topic object
   const topicMap = new Map(td.topics.map(t => [t.topicId, t]));
-
-  // leafTopicIds maps leaf index → topicId; filter to topics we actually have data for
   const leafTopicIds = hierarchy.leafTopicIds;
   const leafTopics = leafTopicIds.map(id => topicMap.get(id)).filter(Boolean);
 
@@ -509,22 +484,14 @@ function renderTopicDendrogram() {
   }
   topicDendrogramPanelEl.hidden = false;
 
-  if (_topicDendrogramRendered) return;
-  _topicDendrogramRendered = true;
-
-  // Build binary tree from scipy linkage matrix
-  // Linkage format: N-1 rows of [cluster_a, cluster_b, distance, size]
-  // Clusters 0..N-1 are leaves; clusters N..2N-2 are internal nodes (N + row_index)
   const N = leafTopicIds.length;
   const linkageRows = hierarchy.linkage;
 
-  // Create leaf nodes
   const nodes = [];
   for (let i = 0; i < N; i++) {
     const topic = topicMap.get(leafTopicIds[i]);
-    nodes.push({ leaf: true, topic, topicIdx: i });
+    nodes.push({ leaf: true, topic, topicIdx: i, name: topic?.label || `Topic ${leafTopicIds[i]}` });
   }
-  // Create internal nodes from linkage
   for (let i = 0; i < linkageRows.length; i++) {
     const [a, b, dist] = linkageRows[i];
     nodes.push({
@@ -532,181 +499,120 @@ function renderTopicDendrogram() {
       left: nodes[Math.round(a)],
       right: nodes[Math.round(b)],
       distance: dist,
+      name: `Cluster ${N + i}`
     });
   }
-  const root = nodes[nodes.length - 1];
+  const rootNode = nodes[nodes.length - 1];
 
-  // Layout: horizontal dendrogram, root on left, leaves on right
-  // Scale height by leaf count so labels don't overlap
-  const nLeavesEst = leafTopicIds.length;
-  const width = 940, height = Math.max(400, nLeavesEst * 32 + 60);
+  const width = 940, height = Math.max(400, N * 32 + 60);
   const pad = { t: 30, r: 220, b: 30, l: 40 };
   const plotW = width - pad.l - pad.r;
   const plotH = height - pad.t - pad.b;
 
-  // Update SVG viewBox for dynamic height
-  topicDendrogramChartEl.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  const svg = d3.select(topicDendrogramChartEl)
+    .attr('viewBox', `0 0 ${width} ${height}`);
+  svg.selectAll('*').remove();
 
-  // Find max distance for x-scaling
-  function maxDist(node) {
-    if (node.leaf) return 0;
-    return Math.max(node.distance, maxDist(node.left), maxDist(node.right));
-  }
-  const dMax = maxDist(root) || 1;
+  const root = d3.hierarchy(rootNode, d => d.leaf ? null : [d.left, d.right]);
 
-  // Count leaves
-  function leafCount(node) {
-    if (node.leaf) return 1;
-    return leafCount(node.left) + leafCount(node.right);
-  }
-  const nLeaves = leafCount(root);
-  const leafSpacing = plotH / (nLeaves - 1 || 1);
+  const clusterLayout = d3.cluster()
+    .size([plotH, plotW]);
+  clusterLayout(root);
 
-  // Assign y positions to leaves (evenly spaced)
-  let leafIdx = 0;
-  function assignLeafY(node) {
-    if (node.leaf) {
-      node.y = pad.t + leafIdx * leafSpacing;
-      leafIdx++;
-      return;
-    }
-    assignLeafY(node.left);
-    assignLeafY(node.right);
-    // Internal node y = midpoint of children
-    node.y = (node.left.y + node.right.y) / 2;
-  }
-  assignLeafY(root);
+  const dMax = root.data.distance || 1;
+  root.each(node => {
+    node.y = pad.l + plotW * (1 - (node.data.distance || 0) / dMax);
+    node.x = pad.t + node.x;
+  });
 
-  // x position: leaves on right, root on left
-  // x proportional to distance from leaves
-  function assignX(node) {
-    if (node.leaf) {
-      node.x = pad.l + plotW; // rightmost
-      return;
-    }
-    assignX(node.left);
-    assignX(node.right);
-    // x based on distance (higher distance = further left = closer to root)
-    node.x = pad.l + plotW * (1 - node.distance / dMax);
-  }
-  assignX(root);
+  const links = root.descendants().filter(d => d.parent);
+  svg.append('g')
+    .selectAll('path')
+    .data(links)
+    .enter()
+    .append('path')
+    .attr('d', d => `
+      M ${d.y} ${d.x}
+      L ${d.parent.y} ${d.x}
+      L ${d.parent.y} ${d.parent.x}
+    `)
+    .attr('fill', 'none')
+    .attr('stroke', '#7c8a97')
+    .attr('stroke-width', 1.5);
 
-  // Collect all branches and leaves for rendering
-  const lines = [];
-  const leaves = [];
-  function collectDrawables(node) {
-    if (node.leaf) {
-      leaves.push(node);
-      return;
-    }
-    collectDrawables(node.left);
-    collectDrawables(node.right);
-    // Horizontal lines from children to this node's x
-    // Vertical line connecting children at this node's x
-    lines.push(
-      // left child horizontal
-      `<line x1="${node.left.x}" y1="${node.left.y}" x2="${node.x}" y2="${node.left.y}" stroke="#7c8a97" stroke-width="1.5"/>`,
-      // right child horizontal
-      `<line x1="${node.right.x}" y1="${node.right.y}" x2="${node.x}" y2="${node.right.y}" stroke="#7c8a97" stroke-width="1.5"/>`,
-      // vertical connector
-      `<line x1="${node.x}" y1="${node.left.y}" x2="${node.x}" y2="${node.right.y}" stroke="#7c8a97" stroke-width="1.5"/>`
-    );
-  }
-  collectDrawables(root);
-
-  // Color by topic index
+  const leaves = root.leaves();
   const hueStep = 360 / Math.max(leaves.length, 1);
-
-  // Doc count range for circle sizing
-  const docCounts = leaves.map(l => l.topic.docCount);
-  const minDoc = Math.min(...docCounts);
-  const maxDoc = Math.max(...docCounts);
+  const docCounts = leaves.map(l => l.data.topic.docCount);
+  const minDoc = d3.min(docCounts);
+  const maxDoc = d3.max(docCounts);
   const rMin = 5, rMax = 12;
 
-  function circleR(dc) {
-    if (maxDoc === minDoc) return (rMin + rMax) / 2;
-    return rMin + (dc - minDoc) / (maxDoc - minDoc) * (rMax - rMin);
-  }
+  const rScale = d3.scaleLinear()
+    .domain([minDoc, maxDoc])
+    .range([rMin, rMax]);
 
-  const leafSvg = leaves.map((l, i) => {
-    const r = circleR(l.topic.docCount);
-    const color = `hsl(${Math.round(i * hueStep)} 65% 50%)`;
-    const label = topicDisplayLabel(l.topic.label);
-    const truncLabel = label.length > 28 ? label.slice(0, 26) + '\u2026' : label;
-    return `<circle cx="${l.x}" cy="${l.y}" r="${r}" fill="${color}" stroke="#fff" stroke-width="1.5"
-              data-dendro-idx="${i}" style="cursor:pointer"/>
-            <text x="${l.x + r + 6}" y="${l.y}" dy="0.35em" font-size="11" fill="var(--fg)"
-              data-dendro-idx="${i}" style="cursor:pointer">${escapeHtml(truncLabel)}</text>`;
-  });
+  const leafGroups = svg.append('g')
+    .selectAll('g')
+    .data(leaves)
+    .enter()
+    .append('g')
+    .attr('transform', d => `translate(${d.y},${d.x})`)
+    .style('cursor', 'pointer');
 
-  topicDendrogramChartEl.innerHTML = lines.join('') + leafSvg.join('');
+  leafGroups.append('circle')
+    .attr('r', d => rScale(d.data.topic.docCount))
+    .attr('fill', (d, i) => `hsl(${Math.round(i * hueStep)}, 65%, 50%)`)
+    .attr('stroke', '#fff')
+    .attr('stroke-width', 1.5);
 
-  // Tooltip + click handlers
-  const container = topicDendrogramContainerEl;
-  const tooltip = topicDendrogramTooltipEl;
-  const chart = topicDendrogramChartEl;
+  leafGroups.append('text')
+    .attr('x', d => rScale(d.data.topic.docCount) + 6)
+    .attr('dy', '0.35em')
+    .attr('font-size', '11')
+    .attr('fill', 'var(--fg)')
+    .text(d => {
+      const label = topicDisplayLabel(d.data.topic.label);
+      return label.length > 28 ? label.slice(0, 26) + '\u2026' : label;
+    });
 
-  chart.addEventListener('mouseover', (e) => {
-    const el = e.target.closest('[data-dendro-idx]');
-    if (!el) return;
-    const idx = +el.dataset.dendroIdx;
-    const leaf = leaves[idx];
-    if (!leaf) return;
-    const t = leaf.topic;
+  const tooltip = d3.select(topicDendrogramTooltipEl);
+
+  leafGroups.on('mouseover', function(event, d) {
+    const t = d.data.topic;
     const label = topicDisplayLabel(t.label);
-    const terms = (t.topTerms || []).slice(0, 5).map(p => p[0]).join(', ');
-    tooltip.innerHTML = `<strong>${escapeHtml(label)}</strong>
+    const terms = (t.topTerms || []).slice(0, 5).map(p => Array.isArray(p) ? p[0] : p).join(', ');
+
+    tooltip.html(`<strong>${escapeHtml(label)}</strong>
       <div class="tooltip-meta">${t.docCount} dissertation(s)</div>
-      <div class="tooltip-meta" style="margin-top:2px">Top terms: ${escapeHtml(terms)}</div>`;
-    tooltip.hidden = false;
-    const rect = container.getBoundingClientRect();
-    const svgRect = chart.getBoundingClientRect();
-    const scale = svgRect.width / 940;
-    const cx = leaf.x * scale + svgRect.left - rect.left;
-    const cy = leaf.y * scale + svgRect.top - rect.top;
-    tooltip.style.left = `${cx + 15}px`;
-    tooltip.style.top = `${cy - 10}px`;
-  });
-  chart.addEventListener('mouseout', (e) => {
-    const el = e.target.closest('[data-dendro-idx]');
-    if (el) tooltip.hidden = true;
-  });
-  addTouchTooltip(chart, '[data-dendro-idx]', (el) => {
-    const idx = +el.dataset.dendroIdx;
-    const leaf = leaves[idx];
-    if (!leaf) return;
-    const t = leaf.topic;
-    const label = topicDisplayLabel(t.label);
-    const terms = (t.topTerms || []).slice(0, 5).map(p => p[0]).join(', ');
-    tooltip.innerHTML = `<strong>${escapeHtml(label)}</strong>
-      <div class="tooltip-meta">${t.docCount} dissertation(s)</div>
-      <div class="tooltip-meta" style="margin-top:2px">Top terms: ${escapeHtml(terms)}</div>`;
-    tooltip.hidden = false;
-    const rect = container.getBoundingClientRect();
-    const svgRect = chart.getBoundingClientRect();
-    const scale = svgRect.width / 940;
-    const cx = leaf.x * scale + svgRect.left - rect.left;
-    const cy = leaf.y * scale + svgRect.top - rect.top;
-    tooltip.style.left = `${cx + 15}px`;
-    tooltip.style.top = `${cy - 10}px`;
-  });
-  chart.addEventListener('click', (e) => {
-    const el = e.target.closest('[data-dendro-idx]');
-    if (!el) return;
-    const idx = +el.dataset.dendroIdx;
-    const leaf = leaves[idx];
-    if (!leaf) return;
-    const t = leaf.topic;
-    const label = topicDisplayLabel(t.label);
-    openMatchesModal(`Topic: ${label}`, docsForTopic(t.topicId));
+      <div class="tooltip-meta" style="margin-top:2px">Top terms: ${escapeHtml(terms)}</div>`)
+      .style('display', 'block');
+
+    const rect = topicDendrogramContainerEl.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 15) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+
+    d3.select(this).select('circle')
+      .transition()
+      .duration(100)
+      .attr('r', rScale(t.docCount) + 4);
+  })
+  .on('mousemove', function(event) {
+    const rect = topicDendrogramContainerEl.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 15) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+  })
+  .on('mouseout', function(event, d) {
+    tooltip.style('display', 'none');
+    d3.select(this).select('circle')
+      .transition()
+      .duration(100)
+      .attr('r', rScale(d.data.topic.docCount));
+  })
+  .on('click', function(event, d) {
+    const label = topicDisplayLabel(d.data.topic.label);
+    openMatchesModal(`Topic: ${label}`, docsForTopic(d.data.topic.topicId));
   });
 }
-
-// --- Supervisor Network ---
-
-let _supervisorNetRendered = false;
-let _supervisorNetNodes = [];
-let _supervisorNetEdges = [];
 
 function renderSupervisorNetwork() {
   const data = getAnalytics()?.supervisorNetwork;
@@ -717,88 +623,115 @@ function renderSupervisorNetwork() {
   supervisorNetworkPanelEl.hidden = false;
 
   const width = 940, height = 600;
+  
   const nodes = data.nodes.map(n => ({ ...n }));
-  const edges = data.edges;
-  _supervisorNetNodes = nodes;
-  _supervisorNetEdges = edges;
+  const links = data.edges.map(e => ({ ...e }));
 
-  forceLayout(nodes, edges, { width, height, pad: 60 });
+  const svg = d3.select(supervisorNetworkChartEl)
+    .attr('viewBox', `0 0 ${width} ${height}`);
+  svg.selectAll('*').remove();
 
-  const maxDoc = Math.max(...nodes.map(n => n.docCount), 1);
-  const nodeMap = new Map(nodes.map(n => [n.id, n]));
-
-  const edgeSvg = edges.map(e => {
-    const s = nodeMap.get(e.source);
-    const t = nodeMap.get(e.target);
-    if (!s || !t) return '';
-    const w = Math.max(1, Math.min(6, e.weight));
-    const op = Math.min(0.6, 0.15 + e.weight * 0.1);
-    return `<line class="net-edge" x1="${s.x}" y1="${s.y}" x2="${t.x}" y2="${t.y}"
-      stroke="hsl(190 50% 50%)" stroke-width="${w}" stroke-opacity="${op}" />`;
-  }).join('');
-
-  // Only label nodes with enough connections or docs to stand out
+  const maxDoc = d3.max(nodes, n => n.docCount) || 1;
   const supEdgeDeg = new Map();
-  for (const e of edges) {
-    supEdgeDeg.set(e.source, (supEdgeDeg.get(e.source) || 0) + 1);
-    supEdgeDeg.set(e.target, (supEdgeDeg.get(e.target) || 0) + 1);
+  for (const link of links) {
+    supEdgeDeg.set(link.source, (supEdgeDeg.get(link.source) || 0) + 1);
+    supEdgeDeg.set(link.target, (supEdgeDeg.get(link.target) || 0) + 1);
   }
 
-  const nodeSvg = nodes.map((n, i) => {
-    const r = 5 + (n.docCount / maxDoc) * 14;
-    const degree = supEdgeDeg.get(n.id) || 0;
-    const showLabel = degree >= 2 || n.docCount >= 3;
-    const label = showLabel ? (n.id.length > 18 ? n.id.slice(0, 16) + '\u2026' : n.id) : '';
-    return `<circle class="net-node" cx="${n.x}" cy="${n.y}" r="${r}"
-      fill="hsl(190 60% 48%)" fill-opacity="0.75" stroke="hsl(190 60% 38%)" stroke-width="1"
-      data-idx="${i}" />${label ? `
-      <text class="net-label" x="${n.x}" y="${n.y + r + 11}">${escapeHtml(label)}</text>` : ''}`;
-  }).join('');
+  const simulation = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(links).id(d => d.id).distance(100))
+    .force('charge', d3.forceManyBody().strength(-150))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide().radius(d => 10 + (d.docCount / maxDoc) * 14));
 
-  supervisorNetworkChartEl.innerHTML = edgeSvg + nodeSvg;
+  const linkElements = svg.append('g')
+    .selectAll('line')
+    .data(links)
+    .enter()
+    .append('line')
+    .attr('class', 'net-edge')
+    .attr('stroke', 'hsl(190, 50%, 50%)')
+    .attr('stroke-width', d => Math.max(1, Math.min(6, d.weight)))
+    .attr('stroke-opacity', d => Math.min(0.6, 0.15 + d.weight * 0.1));
 
-  if (!_supervisorNetRendered) {
-    _supervisorNetRendered = true;
+  const nodeGroups = svg.append('g')
+    .selectAll('g')
+    .data(nodes)
+    .enter()
+    .append('g')
+    .style('cursor', 'pointer')
+    .call(drag(simulation));
 
-    supervisorNetworkChartEl.addEventListener('mouseover', e => {
-      const node = e.target.closest('.net-node');
-      if (!node) return;
-      const n = _supervisorNetNodes[+node.dataset.idx];
-      if (!n) return;
-      const connected = _supervisorNetEdges.filter(e => e.source === n.id || e.target === n.id)
-        .map(e => e.source === n.id ? e.target : e.source).slice(0, 5);
-      showNetTooltip(supervisorNetworkContainerEl, supervisorNetworkTooltipEl, node,
-        `<div class="tooltip-title">${escapeHtml(n.id)}</div>
-         <div class="tooltip-meta">${n.docCount} dissertation(s)${connected.length ? '<br>Connected: ' + connected.map(c => escapeHtml(c)).join(', ') : ''}</div>`);
+  nodeGroups.append('circle')
+    .attr('class', 'net-node')
+    .attr('r', d => 5 + (d.docCount / maxDoc) * 14)
+    .attr('fill', 'hsl(190, 60%, 48%)')
+    .attr('fill-opacity', 0.75)
+    .attr('stroke', 'hsl(190, 60%, 38%)')
+    .attr('stroke-width', 1);
+
+  nodeGroups.append('text')
+    .attr('class', 'net-label')
+    .attr('text-anchor', 'middle')
+    .attr('y', d => 5 + (d.docCount / maxDoc) * 14 + 14)
+    .text(d => {
+      const degree = supEdgeDeg.get(d.id) || 0;
+      const showLabel = degree >= 2 || d.docCount >= 3;
+      return showLabel ? (d.id.length > 18 ? d.id.slice(0, 16) + '\u2026' : d.id) : '';
     });
 
-    supervisorNetworkChartEl.addEventListener('mouseout', e => {
-      if (e.target.closest('.net-node')) supervisorNetworkTooltipEl.hidden = true;
-    });
+  simulation.on('tick', () => {
+    linkElements
+      .attr('x1', d => Math.max(20, Math.min(width - 20, d.source.x)))
+      .attr('y1', d => Math.max(20, Math.min(height - 20, d.source.y)))
+      .attr('x2', d => Math.max(20, Math.min(width - 20, d.target.x)))
+      .attr('y2', d => Math.max(20, Math.min(height - 20, d.target.y)));
 
-    addTouchTooltip(supervisorNetworkChartEl, '.net-node', (node) => {
-      const n = _supervisorNetNodes[+node.dataset.idx];
-      if (!n) return;
-      const connected = _supervisorNetEdges.filter(e => e.source === n.id || e.target === n.id)
-        .map(e => e.source === n.id ? e.target : e.source).slice(0, 5);
-      showNetTooltip(supervisorNetworkContainerEl, supervisorNetworkTooltipEl, node,
-        `<div class="tooltip-title">${escapeHtml(n.id)}</div>
-         <div class="tooltip-meta">${n.docCount} dissertation(s)${connected.length ? '<br>Connected: ' + connected.map(c => escapeHtml(c)).join(', ') : ''}</div>`);
-    });
+    nodeGroups
+      .attr('transform', d => {
+        d.x = Math.max(20, Math.min(width - 20, d.x));
+        d.y = Math.max(20, Math.min(height - 20, d.y));
+        return `translate(${d.x},${d.y})`;
+      });
+  });
 
-    supervisorNetworkChartEl.addEventListener('click', e => {
-      const node = e.target.closest('.net-node');
-      if (!node) return;
-      const n = _supervisorNetNodes[+node.dataset.idx];
-      if (n) openSupervisorProfile(n.id);
-    });
-  }
+  const tooltip = d3.select(supervisorNetworkTooltipEl);
+
+  nodeGroups.on('mouseover', function(event, d) {
+    const connected = links.filter(e => e.source.id === d.id || e.target.id === d.id)
+      .map(e => e.source.id === d.id ? e.target.id : e.source.id).slice(0, 5);
+    
+    tooltip.html(`<div class="tooltip-title">${escapeHtml(d.id)}</div>
+       <div class="tooltip-meta">${d.docCount} dissertation(s)${connected.length ? '<br>Connected: ' + connected.map(c => escapeHtml(c)).join(', ') : ''}</div>`)
+      .style('display', 'block');
+
+    const rect = supervisorNetworkContainerEl.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 14) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+
+    d3.select(this).select('circle')
+      .transition()
+      .duration(100)
+      .attr('fill-opacity', 1)
+      .attr('r', 5 + (d.docCount / maxDoc) * 14 + 3);
+  })
+  .on('mousemove', function(event) {
+    const rect = supervisorNetworkContainerEl.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 14) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+  })
+  .on('mouseout', function() {
+    tooltip.style('display', 'none');
+    d3.select(this).select('circle')
+      .transition()
+      .duration(100)
+      .attr('fill-opacity', 0.75)
+      .attr('r', d => 5 + (d.docCount / maxDoc) * 14);
+  })
+  .on('click', function(event, d) {
+    openSupervisorProfile(d.id);
+  });
 }
-
-// --- Citation Co-occurrence Network ---
-
-let _citationNetRendered = false;
-let _citationNetNodes = [];
 
 function renderCitationNetwork() {
   const data = getAnalytics()?.citationCooccurrence;
@@ -810,95 +743,118 @@ function renderCitationNetwork() {
 
   const width = 940, height = 600;
   const nodes = data.nodes.map(n => ({ ...n }));
-  const edges = data.edges;
-  _citationNetNodes = nodes;
+  const links = data.edges.map(e => ({ ...e }));
 
-  forceLayout(nodes, edges, { width, height, pad: 50 });
+  const svg = d3.select(citationNetworkChartEl)
+    .attr('viewBox', `0 0 ${width} ${height}`);
+  svg.selectAll('*').remove();
 
-  const maxFreq = Math.max(...nodes.map(n => n.freq), 1);
-  const nodeMap = new Map(nodes.map(n => [n.id, n]));
+  const maxFreq = d3.max(nodes, n => n.freq) || 1;
+  const edgeCount = new Map();
+  for (const link of links) {
+    edgeCount.set(link.source, (edgeCount.get(link.source) || 0) + 1);
+    edgeCount.set(link.target, (edgeCount.get(link.target) || 0) + 1);
+  }
 
-  const edgeSvg = edges.map(e => {
-    const s = nodeMap.get(e.source);
-    const t = nodeMap.get(e.target);
-    if (!s || !t) return '';
-    const w = Math.max(1, Math.min(6, e.weight));
-    const op = Math.min(0.6, 0.15 + e.weight * 0.1);
-    return `<line class="net-edge" x1="${s.x}" y1="${s.y}" x2="${t.x}" y2="${t.y}"
-      stroke="hsl(30 70% 55%)" stroke-width="${w}" stroke-opacity="${op}" />`;
-  }).join('');
-
-  // Extract "Author (Year)" from citation text for compact labels
   function citationShortLabel(text) {
-    // Try "Author, ... (Year)" or "Author, ... Year"
     const m = text.match(/^([^,(]+?)[\s,].*?\b((?:19|20)\d{2})\b/);
     if (m) return `${m[1].trim()} (${m[2]})`;
-    // Fallback: first author surname
     const surname = text.match(/^([A-Z][a-z]+)/);
     return surname ? surname[1] : text.slice(0, 15);
   }
 
-  // Only label nodes with enough connections to be readable
-  const edgeCount = new Map();
-  for (const e of edges) {
-    edgeCount.set(e.source, (edgeCount.get(e.source) || 0) + 1);
-    edgeCount.set(e.target, (edgeCount.get(e.target) || 0) + 1);
-  }
+  const simulation = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(links).id(d => d.id).distance(100))
+    .force('charge', d3.forceManyBody().strength(-150))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide().radius(d => 10 + (d.freq / maxFreq) * 14));
 
-  const nodeSvg = nodes.map((n, i) => {
-    const r = 5 + (n.freq / maxFreq) * 14;
-    const degree = edgeCount.get(n.id) || 0;
-    const showLabel = degree >= 3 || n.freq >= 3;
-    const label = showLabel ? citationShortLabel(n.label) : '';
-    return `<circle class="net-node" cx="${n.x}" cy="${n.y}" r="${r}"
-      fill="hsl(30 65% 55%)" fill-opacity="0.75" stroke="hsl(30 65% 42%)" stroke-width="1"
-      data-idx="${i}" />${label ? `
-      <text class="net-label" x="${n.x}" y="${n.y + r + 11}">${escapeHtml(label)}</text>` : ''}`;
-  }).join('');
+  const linkElements = svg.append('g')
+    .selectAll('line')
+    .data(links)
+    .enter()
+    .append('line')
+    .attr('class', 'net-edge')
+    .attr('stroke', 'hsl(30, 70%, 55%)')
+    .attr('stroke-width', d => Math.max(1, Math.min(6, d.weight)))
+    .attr('stroke-opacity', d => Math.min(0.6, 0.15 + d.weight * 0.1));
 
-  citationNetworkChartEl.innerHTML = edgeSvg + nodeSvg;
+  const nodeGroups = svg.append('g')
+    .selectAll('g')
+    .data(nodes)
+    .enter()
+    .append('g')
+    .style('cursor', 'pointer')
+    .call(drag(simulation));
 
-  if (!_citationNetRendered) {
-    _citationNetRendered = true;
+  nodeGroups.append('circle')
+    .attr('class', 'net-node')
+    .attr('r', d => 5 + (d.freq / maxFreq) * 14)
+    .attr('fill', 'hsl(30, 65%, 55%)')
+    .attr('fill-opacity', 0.75)
+    .attr('stroke', 'hsl(30, 65%, 42%)')
+    .attr('stroke-width', 1);
 
-    citationNetworkChartEl.addEventListener('mouseover', e => {
-      const node = e.target.closest('.net-node');
-      if (!node) return;
-      const n = _citationNetNodes[+node.dataset.idx];
-      if (!n) return;
-      showNetTooltip(citationNetworkContainerEl, citationNetworkTooltipEl, node,
-        `<div class="tooltip-title">${escapeHtml(n.label)}</div>
-         <div class="tooltip-meta">Cited in ${n.freq} dissertation(s)</div>`);
+  nodeGroups.append('text')
+    .attr('class', 'net-label')
+    .attr('text-anchor', 'middle')
+    .attr('y', d => 5 + (d.freq / maxFreq) * 14 + 14)
+    .text(d => {
+      const degree = edgeCount.get(d.id) || 0;
+      const showLabel = degree >= 3 || d.freq >= 3;
+      return showLabel ? citationShortLabel(d.label) : '';
     });
 
-    citationNetworkChartEl.addEventListener('mouseout', e => {
-      if (e.target.closest('.net-node')) citationNetworkTooltipEl.hidden = true;
-    });
+  simulation.on('tick', () => {
+    linkElements
+      .attr('x1', d => Math.max(20, Math.min(width - 20, d.source.x)))
+      .attr('y1', d => Math.max(20, Math.min(height - 20, d.source.y)))
+      .attr('x2', d => Math.max(20, Math.min(width - 20, d.target.x)))
+      .attr('y2', d => Math.max(20, Math.min(height - 20, d.target.y)));
 
-    addTouchTooltip(citationNetworkChartEl, '.net-node', (node) => {
-      const n = _citationNetNodes[+node.dataset.idx];
-      if (!n) return;
-      showNetTooltip(citationNetworkContainerEl, citationNetworkTooltipEl, node,
-        `<div class="tooltip-title">${escapeHtml(n.label)}</div>
-         <div class="tooltip-meta">Cited in ${n.freq} dissertation(s)</div>`);
-    });
+    nodeGroups
+      .attr('transform', d => {
+        d.x = Math.max(20, Math.min(width - 20, d.x));
+        d.y = Math.max(20, Math.min(height - 20, d.y));
+        return `translate(${d.x},${d.y})`;
+      });
+  });
 
-    citationNetworkChartEl.addEventListener('click', e => {
-      const node = e.target.closest('.net-node');
-      if (!node) return;
-      const n = _citationNetNodes[+node.dataset.idx];
-      if (!n) return;
-      // Navigate to citation explorer showing docs for this citation
-      const docs = state.payload?.documents || [];
-      openMatchesModal(`Citation: ${n.label.slice(0, 60)}`, docs);
-    });
-  }
+  const tooltip = d3.select(citationNetworkTooltipEl);
+
+  nodeGroups.on('mouseover', function(event, d) {
+    tooltip.html(`<div class="tooltip-title">${escapeHtml(d.label)}</div>
+       <div class="tooltip-meta">Cited in ${d.freq} dissertation(s)</div>`)
+      .style('display', 'block');
+
+    const rect = citationNetworkContainerEl.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 14) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+
+    d3.select(this).select('circle')
+      .transition()
+      .duration(100)
+      .attr('fill-opacity', 1)
+      .attr('r', 5 + (d.freq / maxFreq) * 14 + 3);
+  })
+  .on('mousemove', function(event) {
+    const rect = citationNetworkContainerEl.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 14) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+  })
+  .on('mouseout', function(event, d) {
+    tooltip.style('display', 'none');
+    d3.select(this).select('circle')
+      .transition()
+      .duration(100)
+      .attr('fill-opacity', 0.75)
+      .attr('r', 5 + (d.freq / maxFreq) * 14);
+  })
+  .on('click', function(event, d) {
+    const docs = state.payload?.documents || [];
+    openMatchesModal(`Citation: ${d.label.slice(0, 60)}`, docs);
+  });
 }
-
-// --- Concept Co-occurrence Network ---
-
-let _conceptNetRendered = false;
-let _conceptNetNodes = [];
 
 function renderConceptNetwork() {
   const cooc = getAnalytics()?.termCooccurrence;
@@ -908,7 +864,6 @@ function renderConceptNetwork() {
   }
   conceptNetworkPanelEl.hidden = false;
 
-  // Extract unique nodes from co-occurrence pairs
   const nodeFreqs = new Map();
   for (const pair of cooc) {
     if (!nodeFreqs.has(pair.termA)) nodeFreqs.set(pair.termA, pair.freqA || pair.count);
@@ -917,80 +872,112 @@ function renderConceptNetwork() {
 
   const width = 940, height = 600;
   const nodes = Array.from(nodeFreqs.entries()).map(([id, freq]) => ({ id, freq }));
-  const edges = cooc.map(p => ({ source: p.termA, target: p.termB, weight: p.lift || p.count }));
+  const links = cooc.map(p => ({ source: p.termA, target: p.termB, weight: p.lift || p.count }));
 
-  forceLayout(nodes, edges, { width, height, pad: 60 });
+  const svg = d3.select(conceptNetworkChartEl)
+    .attr('viewBox', `0 0 ${width} ${height}`);
+  svg.selectAll('*').remove();
 
-  const maxFreq = Math.max(...nodes.map(n => n.freq), 1);
-  const maxLift = Math.max(...edges.map(e => e.weight), 1);
-  const nodeMap = new Map(nodes.map(n => [n.id, n]));
-
-  const edgeSvg = edges.map(e => {
-    const s = nodeMap.get(e.source);
-    const t = nodeMap.get(e.target);
-    if (!s || !t) return '';
-    const w = Math.max(1, Math.min(5, (e.weight / maxLift) * 5));
-    const op = Math.min(0.6, 0.1 + (e.weight / maxLift) * 0.5);
-    return `<line class="net-edge" x1="${s.x}" y1="${s.y}" x2="${t.x}" y2="${t.y}"
-      stroke="hsl(160 45% 45%)" stroke-width="${w}" stroke-opacity="${op}" />`;
-  }).join('');
-
-  // Only label nodes with 2+ edges so the graph stays readable
+  const maxFreq = d3.max(nodes, n => n.freq) || 1;
+  const maxLift = d3.max(links, e => e.weight) || 1;
   const conceptEdgeDeg = new Map();
-  for (const e of edges) {
-    conceptEdgeDeg.set(e.source, (conceptEdgeDeg.get(e.source) || 0) + 1);
-    conceptEdgeDeg.set(e.target, (conceptEdgeDeg.get(e.target) || 0) + 1);
+  for (const link of links) {
+    conceptEdgeDeg.set(link.source, (conceptEdgeDeg.get(link.source) || 0) + 1);
+    conceptEdgeDeg.set(link.target, (conceptEdgeDeg.get(link.target) || 0) + 1);
   }
 
-  const nodeSvg = nodes.map((n, i) => {
-    const r = 5 + (n.freq / maxFreq) * 14;
-    const degree = conceptEdgeDeg.get(n.id) || 0;
-    const showLabel = degree >= 2 || n.freq >= 6;
-    const label = showLabel ? (n.id.length > 20 ? n.id.slice(0, 18) + '\u2026' : n.id) : '';
-    return `<circle class="net-node" cx="${n.x}" cy="${n.y}" r="${r}"
-      fill="hsl(160 55% 45%)" fill-opacity="0.7" stroke="hsl(160 55% 35%)" stroke-width="1"
-      data-idx="${i}" />${label ? `
-      <text class="net-label" x="${n.x}" y="${n.y + r + 11}">${escapeHtml(label)}</text>` : ''}`;
-  }).join('');
+  const simulation = d3.forceSimulation(nodes)
+    .force('link', d3.forceLink(links).id(d => d.id).distance(100))
+    .force('charge', d3.forceManyBody().strength(-150))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide().radius(d => 10 + (d.freq / maxFreq) * 14));
 
-  conceptNetworkChartEl.innerHTML = edgeSvg + nodeSvg;
-  _conceptNetNodes = nodes;
+  const linkElements = svg.append('g')
+    .selectAll('line')
+    .data(links)
+    .enter()
+    .append('line')
+    .attr('class', 'net-edge')
+    .attr('stroke', 'hsl(160, 45%, 45%)')
+    .attr('stroke-width', d => Math.max(1, Math.min(5, (d.weight / maxLift) * 5)))
+    .attr('stroke-opacity', d => Math.min(0.6, 0.1 + (d.weight / maxLift) * 0.5));
 
-  if (!_conceptNetRendered) {
-    _conceptNetRendered = true;
+  const nodeGroups = svg.append('g')
+    .selectAll('g')
+    .data(nodes)
+    .enter()
+    .append('g')
+    .style('cursor', 'pointer')
+    .call(drag(simulation));
 
-    conceptNetworkChartEl.addEventListener('mouseover', e => {
-      const node = e.target.closest('.net-node');
-      if (!node) return;
-      const n = _conceptNetNodes[+node.dataset.idx];
-      if (!n) return;
-      showNetTooltip(conceptNetworkContainerEl, conceptNetworkTooltipEl, node,
-        `<div class="tooltip-title">${escapeHtml(n.id)}</div>
-         <div class="tooltip-meta">${n.freq} document(s)</div>`);
+  nodeGroups.append('circle')
+    .attr('class', 'net-node')
+    .attr('r', d => 5 + (d.freq / maxFreq) * 14)
+    .attr('fill', 'hsl(160, 55%, 45%)')
+    .attr('fill-opacity', 0.7)
+    .attr('stroke', 'hsl(160, 55%, 35%)')
+    .attr('stroke-width', 1);
+
+  nodeGroups.append('text')
+    .attr('class', 'net-label')
+    .attr('text-anchor', 'middle')
+    .attr('y', d => 5 + (d.freq / maxFreq) * 14 + 14)
+    .text(d => {
+      const degree = conceptEdgeDeg.get(d.id) || 0;
+      const showLabel = degree >= 2 || d.freq >= 6;
+      return showLabel ? (d.id.length > 20 ? d.id.slice(0, 18) + '\u2026' : d.id) : '';
     });
 
-    conceptNetworkChartEl.addEventListener('mouseout', e => {
-      if (e.target.closest('.net-node')) conceptNetworkTooltipEl.hidden = true;
-    });
+  simulation.on('tick', () => {
+    linkElements
+      .attr('x1', d => Math.max(20, Math.min(width - 20, d.source.x)))
+      .attr('y1', d => Math.max(20, Math.min(height - 20, d.source.y)))
+      .attr('x2', d => Math.max(20, Math.min(width - 20, d.target.x)))
+      .attr('y2', d => Math.max(20, Math.min(height - 20, d.target.y)));
 
-    addTouchTooltip(conceptNetworkChartEl, '.net-node', (node) => {
-      const n = _conceptNetNodes[+node.dataset.idx];
-      if (!n) return;
-      showNetTooltip(conceptNetworkContainerEl, conceptNetworkTooltipEl, node,
-        `<div class="tooltip-title">${escapeHtml(n.id)}</div>
-         <div class="tooltip-meta">${n.freq} document(s)</div>`);
-    });
+    nodeGroups
+      .attr('transform', d => {
+        d.x = Math.max(20, Math.min(width - 20, d.x));
+        d.y = Math.max(20, Math.min(height - 20, d.y));
+        return `translate(${d.x},${d.y})`;
+      });
+  });
 
-    conceptNetworkChartEl.addEventListener('click', e => {
-      const node = e.target.closest('.net-node');
-      if (!node) return;
-      const n = _conceptNetNodes[+node.dataset.idx];
-      if (!n) return;
-      const docs = state.payload?.documents || [];
-      const matches = docs.filter(d => (d.conceptTerms || []).some(t => t.toLowerCase() === n.id.toLowerCase()));
-      openMatchesModal(`Concept: ${n.id}`, matches);
-    });
-  }
+  const tooltip = d3.select(conceptNetworkTooltipEl);
+
+  nodeGroups.on('mouseover', function(event, d) {
+    tooltip.html(`<div class="tooltip-title">${escapeHtml(d.id)}</div>
+       <div class="tooltip-meta">${d.freq} document(s)</div>`)
+      .style('display', 'block');
+
+    const rect = conceptNetworkContainerEl.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 14) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+
+    d3.select(this).select('circle')
+      .transition()
+      .duration(100)
+      .attr('fill-opacity', 1)
+      .attr('r', 5 + (d.freq / maxFreq) * 14 + 3);
+  })
+  .on('mousemove', function(event) {
+    const rect = conceptNetworkContainerEl.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 14) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+  })
+  .on('mouseout', function(event, d) {
+    tooltip.style('display', 'none');
+    d3.select(this).select('circle')
+      .transition()
+      .duration(100)
+      .attr('fill-opacity', 0.7)
+      .attr('r', 5 + (d.freq / maxFreq) * 14);
+  })
+  .on('click', function(event, d) {
+    const docs = state.payload?.documents || [];
+    const matches = docs.filter(doc => (doc.conceptTerms || []).some(t => t.toLowerCase() === d.id.toLowerCase()));
+    openMatchesModal(`Concept: ${d.id}`, matches);
+  });
 }
 
 // --- Topic Evolution Sankey ---
@@ -1007,7 +994,6 @@ function renderTopicSankey() {
   const topics = td.topics?.filter(t => t.topicId !== -1).slice(0, 8) || [];
   if (!topics.length) { topicSankeyPanelEl.hidden = true; return; }
 
-  // Collect all years across all topics
   const allYears = new Set();
   for (const t of byYear) {
     for (const d of t.data) allYears.add(d.year);
@@ -1015,7 +1001,6 @@ function renderTopicSankey() {
   const sortedYears = Array.from(allYears).sort((a, b) => a - b);
   if (sortedYears.length < 2) { topicSankeyPanelEl.hidden = true; return; }
 
-  // Bin into periods (5-year bins)
   const minYear = sortedYears[0];
   const maxYear = sortedYears[sortedYears.length - 1];
   const binSize = 5;
@@ -1025,7 +1010,6 @@ function renderTopicSankey() {
     periods.push({ start: y, end, label: `${y}\u2013${end}` });
   }
 
-  // Build period counts per topic
   const topicPeriods = byYear.map(t => {
     const yearMap = new Map(t.data.map(d => [d.year, d.count]));
     return {
@@ -1043,16 +1027,13 @@ function renderTopicSankey() {
   const pad = { t: 30, r: 30, b: 40, l: 30 };
   const colWidth = (width - pad.l - pad.r) / Math.max(periods.length - 1, 1);
 
-  // Color per topic
   const hueStep = 360 / Math.max(topicPeriods.length, 1);
-  const colorForIdx = i => `hsl(${Math.round(i * hueStep)} 60% 50%)`;
+  const colorForIdx = i => `hsl(${Math.round(i * hueStep)}, 60%, 50%)`;
 
-  // For each period, compute stacked positions
   const periodTotals = periods.map((_, pi) => topicPeriods.reduce((s, t) => s + t.counts[pi], 0));
   const maxTotal = Math.max(...periodTotals, 1);
   const availH = height - pad.t - pad.b;
 
-  // Compute stacked y positions for each topic at each period
   const stacks = periods.map((_, pi) => {
     const total = periodTotals[pi];
     const scale = total > 0 ? availH / maxTotal : 0;
@@ -1065,9 +1046,7 @@ function renderTopicSankey() {
     });
   });
 
-  let svg = '';
-
-  // Draw bands between consecutive periods
+  const bands = [];
   for (let pi = 0; pi < periods.length - 1; pi++) {
     const x1 = pad.l + pi * colWidth;
     const x2 = pad.l + (pi + 1) * colWidth;
@@ -1075,35 +1054,79 @@ function renderTopicSankey() {
       const s = stacks[pi][ti];
       const e = stacks[pi + 1][ti];
       if (s.h < 0.5 && e.h < 0.5) continue;
-      const color = colorForIdx(ti);
-      svg += `<path d="M${x1},${s.y} C${(x1 + x2) / 2},${s.y} ${(x1 + x2) / 2},${e.y} ${x2},${e.y}
-        L${x2},${e.y + e.h} C${(x1 + x2) / 2},${e.y + e.h} ${(x1 + x2) / 2},${s.y + s.h} ${x1},${s.y + s.h} Z"
-        fill="${color}" fill-opacity="0.55" stroke="${color}" stroke-opacity="0.3" stroke-width="0.5" />`;
+      bands.push({
+        x1,
+        x2,
+        s,
+        e,
+        topicIdx: ti,
+        label: topicPeriods[ti].label,
+        countStart: topicPeriods[ti].counts[pi],
+        countEnd: topicPeriods[ti].counts[pi + 1]
+      });
     }
   }
 
-  // Period labels
-  for (let pi = 0; pi < periods.length; pi++) {
-    const x = pad.l + pi * colWidth;
-    svg += `<text class="axis" x="${x}" y="${height - 10}" text-anchor="middle">${periods[pi].label}</text>`;
-  }
+  const svg = d3.select(topicSankeyChartEl)
+    .attr('viewBox', `0 0 ${width} ${height}`);
+  svg.selectAll('*').remove();
 
-  topicSankeyChartEl.innerHTML = svg;
+  const paths = svg.append('g')
+    .selectAll('path')
+    .data(bands)
+    .enter()
+    .append('path')
+    .attr('d', d => `
+      M ${d.x1} ${d.s.y}
+      C ${(d.x1 + d.x2) / 2} ${d.s.y}, ${(d.x1 + d.x2) / 2} ${d.e.y}, ${d.x2} ${d.e.y}
+      L ${d.x2} ${d.e.y + d.e.h}
+      C ${(d.x1 + d.x2) / 2} ${d.e.y + d.e.h}, ${(d.x1 + d.x2) / 2} ${d.s.y + d.s.h}, ${d.x1} ${d.s.y + d.s.h}
+      Z
+    `)
+    .attr('fill', d => colorForIdx(d.topicIdx))
+    .attr('fill-opacity', 0.55)
+    .attr('stroke', d => colorForIdx(d.topicIdx))
+    .attr('stroke-opacity', 0.3)
+    .attr('stroke-width', 0.5)
+    .style('cursor', 'pointer');
 
-  // Legend
-  topicSankeyLegendEl.innerHTML = topicPeriods.map((t, i) => {
-    const label = topicDisplayLabel(t.label);
-    return `<span class="scatter-legend-item">
+  paths.on('mouseover', function() {
+    d3.select(this)
+      .transition()
+      .duration(100)
+      .attr('fill-opacity', 0.85);
+  })
+  .on('mouseout', function() {
+    d3.select(this)
+      .transition()
+      .duration(100)
+      .attr('fill-opacity', 0.55);
+  });
+
+  svg.append('g')
+    .selectAll('text')
+    .data(periods)
+    .enter()
+    .append('text')
+    .attr('class', 'axis')
+    .attr('x', (_, pi) => pad.l + pi * colWidth)
+    .attr('y', height - 10)
+    .attr('text-anchor', 'middle')
+    .text(d => d.label);
+
+  const legendContainer = d3.select(topicSankeyLegendEl);
+  legendContainer.selectAll('*').remove();
+  
+  legendContainer.selectAll('.scatter-legend-item')
+    .data(topicPeriods)
+    .enter()
+    .append('span')
+    .attr('class', 'scatter-legend-item')
+    .html((t, i) => `
       <span class="scatter-legend-swatch" style="background:${colorForIdx(i)}"></span>
-      ${escapeHtml(label)}
-    </span>`;
-  }).join('');
+      ${escapeHtml(topicDisplayLabel(t.label))}
+    `);
 }
-
-// --- Methodology × Topic Bubble Chart ---
-
-let _methTopicRendered = false;
-let _methTopicData = null;
 
 function renderMethTopicBubble() {
   const data = getAnalytics()?.methodologyTopicMatrix;
@@ -1112,7 +1135,6 @@ function renderMethTopicBubble() {
     return;
   }
   methTopicBubblePanelEl.hidden = false;
-  _methTopicData = data;
 
   const meths = data.methodologies;
   const topics = data.topics;
@@ -1126,97 +1148,124 @@ function renderMethTopicBubble() {
   const colW = plotW / Math.max(topics.length, 1);
   const rowH = plotH / Math.max(meths.length, 1);
 
-  // Find max count for radius scaling
   let maxVal = 0;
-  for (const row of matrix) for (const v of row) if (v > maxVal) maxVal = v;
+  for (const row of matrix) {
+    for (const v of row) {
+      if (v > maxVal) maxVal = v;
+    }
+  }
   const maxR = Math.min(colW, rowH) / 2.5;
-
-  // Color per topic
   const hueStep = 360 / Math.max(topics.length, 1);
 
-  let svg = '';
-
-  // Y-axis labels (methodologies)
-  for (let mi = 0; mi < meths.length; mi++) {
-    const y = pad.t + mi * rowH + rowH / 2;
-    svg += `<text class="axis" x="${pad.l - 8}" y="${y + 3}" text-anchor="end">${escapeHtml(meths[mi])}</text>`;
-  }
-
-  // X-axis labels (topics) — rotated, word-wrapped
-  for (let ti = 0; ti < topics.length; ti++) {
-    const x = pad.l + ti * colW + colW / 2;
-    const label = topicDisplayLabel(topics[ti].label);
-    const lines = wrapLabel(label, 14);
-    const tspans = lines.map((line, li) =>
-      `<tspan x="${x}" dy="${li === 0 ? 0 : '1.1em'}">${escapeHtml(line)}</tspan>`
-    ).join('');
-    svg += `<text class="axis" x="${x}" y="${height - pad.b + 14}" text-anchor="end"
-      transform="rotate(-45 ${x} ${height - pad.b + 14})"><title>${escapeHtml(label)}</title>${tspans}</text>`;
-  }
-
-  // Bubbles
+  const bubblesData = [];
   for (let mi = 0; mi < meths.length; mi++) {
     for (let ti = 0; ti < topics.length; ti++) {
       const val = matrix[mi][ti];
-      if (!val) continue;
-      const cx = pad.l + ti * colW + colW / 2;
-      const cy = pad.t + mi * rowH + rowH / 2;
-      const r = Math.max(3, Math.sqrt(val / Math.max(maxVal, 1)) * maxR);
-      const hue = Math.round(ti * hueStep);
-      svg += `<circle class="net-node" cx="${cx}" cy="${cy}" r="${r}"
-        fill="hsl(${hue} 55% 52%)" fill-opacity="0.65" stroke="hsl(${hue} 55% 40%)" stroke-width="1"
-        data-mi="${mi}" data-ti="${ti}" />`;
+      if (val > 0) {
+        bubblesData.push({
+          mi,
+          ti,
+          val,
+          meth: meths[mi],
+          topic: topics[ti]
+        });
+      }
     }
   }
 
-  methTopicBubbleChartEl.innerHTML = svg;
+  const svg = d3.select(methTopicBubbleChartEl)
+    .attr('viewBox', `0 0 ${width} ${height}`);
+  svg.selectAll('*').remove();
 
-  if (!_methTopicRendered) {
-    _methTopicRendered = true;
+  svg.append('g')
+    .selectAll('text')
+    .data(meths)
+    .enter()
+    .append('text')
+    .attr('class', 'axis')
+    .attr('x', pad.l - 8)
+    .attr('y', (_, mi) => pad.t + mi * rowH + rowH / 2 + 3)
+    .attr('text-anchor', 'end')
+    .text(d => d);
 
-    methTopicBubbleChartEl.addEventListener('mouseover', e => {
-      const node = e.target.closest('.net-node');
-      if (!node) return;
-      const d = _methTopicData;
-      if (!d) return;
-      const mi = +node.dataset.mi;
-      const ti = +node.dataset.ti;
-      const val = d.matrix[mi]?.[ti] || 0;
-      showNetTooltip(methTopicBubbleContainerEl, methTopicBubbleTooltipEl, node,
-        `<div class="tooltip-title">${escapeHtml(d.methodologies[mi])}</div>
-         <div class="tooltip-meta">${escapeHtml(topicDisplayLabel(d.topics[ti]?.label || ''))} \u00B7 ${val} dissertation(s)</div>`);
+  const xLabels = svg.append('g')
+    .selectAll('text')
+    .data(topics)
+    .enter()
+    .append('text')
+    .attr('class', 'axis')
+    .attr('x', (_, ti) => pad.l + ti * colW + colW / 2)
+    .attr('y', height - pad.b + 14)
+    .attr('text-anchor', 'end')
+    .attr('transform', (_, ti) => {
+      const x = pad.l + ti * colW + colW / 2;
+      return `rotate(-45, ${x}, ${height - pad.b + 14})`;
     });
 
-    methTopicBubbleChartEl.addEventListener('mouseout', e => {
-      if (e.target.closest('.net-node')) methTopicBubbleTooltipEl.hidden = true;
-    });
+  xLabels.each(function(d) {
+    const el = d3.select(this);
+    const label = topicDisplayLabel(d.label);
+    const lines = wrapLabel(label, 14);
+    el.selectAll('tspan')
+      .data(lines)
+      .enter()
+      .append('tspan')
+      .attr('x', el.attr('x'))
+      .attr('dy', (_, li) => li === 0 ? 0 : '1.1em')
+      .text(l => l);
+    el.append('title').text(label);
+  });
 
-    addTouchTooltip(methTopicBubbleChartEl, '.net-node', (node) => {
-      const d = _methTopicData;
-      if (!d) return;
-      const mi = +node.dataset.mi;
-      const ti = +node.dataset.ti;
-      const val = d.matrix[mi]?.[ti] || 0;
-      showNetTooltip(methTopicBubbleContainerEl, methTopicBubbleTooltipEl, node,
-        `<div class="tooltip-title">${escapeHtml(d.methodologies[mi])}</div>
-         <div class="tooltip-meta">${escapeHtml(topicDisplayLabel(d.topics[ti]?.label || ''))} \u00B7 ${val} dissertation(s)</div>`);
-    });
+  const bubbleGroups = svg.append('g')
+    .selectAll('circle')
+    .data(bubblesData)
+    .enter()
+    .append('circle')
+    .attr('class', 'net-node')
+    .attr('cx', d => pad.l + d.ti * colW + colW / 2)
+    .attr('cy', d => pad.t + d.mi * rowH + rowH / 2)
+    .attr('r', d => Math.max(3, Math.sqrt(d.val / Math.max(maxVal, 1)) * maxR))
+    .attr('fill', d => `hsl(${Math.round(d.ti * hueStep)}, 55%, 52%)`)
+    .attr('fill-opacity', 0.65)
+    .attr('stroke', d => `hsl(${Math.round(d.ti * hueStep)}, 55%, 40%)`)
+    .attr('stroke-width', 1)
+    .style('cursor', 'pointer');
 
-    methTopicBubbleChartEl.addEventListener('click', e => {
-      const node = e.target.closest('.net-node');
-      if (!node) return;
-      const d = _methTopicData;
-      if (!d) return;
-      const mi = +node.dataset.mi;
-      const ti = +node.dataset.ti;
-      const meth = d.methodologies[mi];
-      const topicId = d.topics[ti]?.topicId;
-      const docs = state.payload?.documents || [];
-      const matches = docs.filter(doc =>
-        (doc.methodologies || []).includes(meth) && doc.topicId === topicId
-      );
-      openMatchesModal(`${meth} + ${topicDisplayLabel(d.topics[ti]?.label || '')}`, matches);
-    });
-  }
+  const tooltip = d3.select(methTopicBubbleTooltipEl);
 
+  bubbleGroups.on('mouseover', function(event, d) {
+    tooltip.html(`<div class="tooltip-title">${escapeHtml(d.meth)}</div>
+       <div class="tooltip-meta">${escapeHtml(topicDisplayLabel(d.topic?.label || ''))} \u00B7 ${d.val} dissertation(s)</div>`)
+      .style('display', 'block');
+
+    const rect = methTopicBubbleContainerEl.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 14) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+
+    d3.select(this)
+      .transition()
+      .duration(100)
+      .attr('fill-opacity', 0.95)
+      .attr('r', Math.max(3, Math.sqrt(d.val / Math.max(maxVal, 1)) * maxR) + 3);
+  })
+  .on('mousemove', function(event) {
+    const rect = methTopicBubbleContainerEl.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 14) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+  })
+  .on('mouseout', function(event, d) {
+    tooltip.style('display', 'none');
+    d3.select(this)
+      .transition()
+      .duration(100)
+      .attr('fill-opacity', 0.65)
+      .attr('r', Math.max(3, Math.sqrt(d.val / Math.max(maxVal, 1)) * maxR));
+  })
+  .on('click', function(event, d) {
+    const docs = state.payload?.documents || [];
+    const matches = docs.filter(doc =>
+      (doc.methodologies || []).includes(d.meth) && doc.topicId === d.topic.topicId
+    );
+    openMatchesModal(`${d.meth} + ${topicDisplayLabel(d.topic?.label || '')}`, matches);
+  });
 }

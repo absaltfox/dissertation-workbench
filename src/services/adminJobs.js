@@ -72,27 +72,126 @@ export function runBertopicJob(jobId, { clearMetricsCache } = {}) {
   child.stderr.on('data', (chunk) => {
     output = tailLog(output + chunk.toString());
   });
-  child.on('error', async (error) => {
+
+  let jobFinished = false;
+  const finishJob = async (status, err, result = null) => {
+    if (jobFinished) return;
+    jobFinished = true;
     clearTimeout(timer);
-    await updateAdminJob(jobId, {
-      status: 'failed',
-      log: output,
-      error: error?.message || String(error),
-      finishedAt: new Date().toISOString(),
-    });
-    runningAdminJobs.delete('bertopic');
-  });
-  child.on('close', async (code) => {
-    clearTimeout(timer);
-    const status = code === 0 && !timedOut ? 'completed' : 'failed';
     await updateAdminJob(jobId, {
       status,
       log: output,
-      error: status === 'completed' ? null : timedOut ? 'BERTopic process timed out' : `BERTopic process exited with code ${code}`,
-      result: status === 'completed' ? await getTopicBuildStatus() : null,
+      error: err,
+      result,
       finishedAt: new Date().toISOString(),
     });
-    clearMetricsCache?.();
+    if (status === 'completed') {
+      clearMetricsCache?.();
+    }
     runningAdminJobs.delete('bertopic');
+  };
+
+  child.on('error', async (error) => {
+    await finishJob('failed', error?.message || String(error));
   });
+  child.on('close', async (code) => {
+    const status = code === 0 && !timedOut ? 'completed' : 'failed';
+    const err = status === 'completed' ? null : timedOut ? 'BERTopic process timed out' : `BERTopic process exited with code ${code}`;
+    const result = status === 'completed' ? await getTopicBuildStatus() : null;
+    await finishJob(status, err, result);
+  });
+}
+
+export function runImportRulesJob(jobId, { mode, scope, ruleIds, clearMetricsCache }) {
+  runningAdminJobs.add('import_rules_sync');
+  let logOutput = `Starting import rules sync job (mode: ${mode}, scope: ${scope})\n`;
+
+  const run = async () => {
+    const { runDocumentSync } = await import('../sync.js');
+    const { listImportRules, getConfiguredApiKey } = await import('../db.js');
+    const { importRuleToSyncOptions } = await import('../importRules.js');
+
+    const allRules = await listImportRules();
+    const selectedIds = Array.isArray(ruleIds)
+      ? ruleIds.map((id) => String(id || '').trim()).filter(Boolean)
+      : [];
+    const rules = scope === 'all' ? allRules : allRules.filter((rule) => selectedIds.includes(rule.id));
+
+    if (!rules.length) {
+      throw new Error(scope === 'all' ? 'No import rules are saved.' : 'Select at least one import rule.');
+    }
+
+    logOutput += `Found ${rules.length} rule(s) to synchronize.\n`;
+    await updateAdminJob(jobId, { log: logOutput });
+
+    const apiKey = await getConfiguredApiKey();
+    const perRule = [];
+    const totals = { rulesStarted: 0, totalSeen: 0, totalSaved: 0, totalSkipped: 0 };
+
+    for (const rule of rules) {
+      logOutput += `\n[${new Date().toISOString()}] Syncing rule: "${rule.name}" (ID: ${rule.id})...\n`;
+      await updateAdminJob(jobId, { log: logOutput });
+
+      const options = importRuleToSyncOptions(rule, {
+        mode,
+        apiKey,
+      });
+
+      const result = await runDocumentSync(options);
+      totals.rulesStarted += 1;
+      totals.totalSeen += Number(result.totalSeen || 0);
+      totals.totalSaved += Number(result.totalSaved || 0);
+      totals.totalSkipped += Number(result.totalSkipped || 0);
+
+      logOutput += `Result: ${result.ok ? 'SUCCESS' : 'FAILED'} - seen: ${result.totalSeen || 0}, saved: ${result.totalSaved || 0}, skipped: ${result.totalSkipped || 0}\n`;
+      if (result.error) {
+        logOutput += `Error detail: ${result.error}\n`;
+      }
+      await updateAdminJob(jobId, { log: logOutput });
+
+      perRule.push({
+        ruleId: rule.id,
+        ruleName: rule.name,
+        syncKey: result.syncKey,
+        ok: result.ok,
+        totalSeen: result.totalSeen || 0,
+        totalSaved: result.totalSaved || 0,
+        totalSkipped: result.totalSkipped || 0,
+        apiTotal: result.apiTotal ?? null,
+        error: result.error || null,
+      });
+    }
+
+    if (clearMetricsCache) {
+      clearMetricsCache();
+    }
+
+    logOutput += `\n[${new Date().toISOString()}] All rules processed successfully.\n`;
+    await updateAdminJob(jobId, {
+      status: 'completed',
+      log: logOutput,
+      result: {
+        ok: perRule.every((r) => r.ok),
+        mode,
+        scope,
+        ...totals,
+        rules: perRule,
+      },
+      finishedAt: new Date().toISOString(),
+    });
+  };
+
+  run()
+    .catch(async (error) => {
+      logOutput += `\n[${new Date().toISOString()}] Job failed: ${error.message}\n`;
+      await updateAdminJob(jobId, {
+        status: 'failed',
+        log: logOutput,
+        error: error?.message || String(error),
+        finishedAt: new Date().toISOString(),
+      });
+    })
+    .finally(() => {
+      runningAdminJobs.delete('import_rules_sync');
+    });
 }

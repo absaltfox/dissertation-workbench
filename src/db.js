@@ -6,6 +6,7 @@ import { SQLITE_PATH, PDF_CACHE_DIR, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL } from
 import { logger } from './logger.js';
 import { normalizePersonName, supervisorNameKey } from './supervisors.js';
 import { encryptMfaSecret, decryptMfaSecret } from './secretCrypto.js';
+import { jaroWinkler } from './fuzzyMatch.js';
 
 let db;
 let schemaReady;
@@ -34,6 +35,15 @@ export async function getDb() {
   await schemaReady;
   return db;
 }
+
+export async function closeDb() {
+  if (db) {
+    await db.close();
+    db = undefined;
+    schemaReady = undefined;
+  }
+}
+
 
 function changes(result) {
   return Number(result?.rowsAffected ?? result?.changes ?? 0);
@@ -268,6 +278,7 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE citations ADD COLUMN title TEXT');
   await tryExec(client, 'ALTER TABLE citations ADD COLUMN year TEXT');
   await tryExec(client, 'ALTER TABLE citations ADD COLUMN source TEXT');
+  await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN body_word_count INTEGER');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_sync_key ON documents(sync_key)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree ON documents(degree)');
@@ -573,7 +584,7 @@ export async function listAdminJobs(limit = 25) {
 
 export async function loadStoredFileMetric(docId) {
   return get(`
-    SELECT doc_id, pdf_path, download_url, file_bytes, word_count, page_count,
+    SELECT doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count, page_count,
            word_source, page_source, status, error, updated_at
     FROM file_metrics
     WHERE doc_id = ?
@@ -584,14 +595,15 @@ export async function saveFileMetric(docId, payload) {
   const now = new Date().toISOString();
   await run(`
     INSERT INTO file_metrics (
-      doc_id, pdf_path, download_url, file_bytes, word_count, page_count,
+      doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count, page_count,
       word_source, page_source, status, error, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(doc_id) DO UPDATE SET
       pdf_path = excluded.pdf_path,
       download_url = excluded.download_url,
       file_bytes = excluded.file_bytes,
       word_count = excluded.word_count,
+      body_word_count = excluded.body_word_count,
       page_count = excluded.page_count,
       word_source = excluded.word_source,
       page_source = excluded.page_source,
@@ -604,6 +616,7 @@ export async function saveFileMetric(docId, payload) {
     payload.downloadUrl || null,
     payload.fileBytes ?? null,
     payload.wordCount ?? null,
+    payload.bodyWordCount ?? null,
     payload.pageCount ?? null,
     payload.wordSource || null,
     payload.pageSource || null,
@@ -982,32 +995,104 @@ export async function loadCommitteeMembers(docId) {
 
 export async function saveCitations(docId, citations, hashFn) {
   const now = new Date().toISOString();
+  
+  // Fetch existing citations to do quick exact matching and fuzzy matching in memory
+  const existingCitations = await all('SELECT id, citation_hash, citation_text, author, title, year FROM citations');
+  const hashMap = new Map(existingCitations.map(row => [row.citation_hash, row]));
+
   for (const item of citations) {
     const text = typeof item === 'string' ? item : item.text;
     const hash = hashFn(text);
-    await run(`
-      INSERT INTO citations (citation_hash, citation_text, author, title, year, source, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(citation_hash) DO UPDATE SET
-        author = COALESCE(excluded.author, citations.author),
-        title = COALESCE(excluded.title, citations.title),
-        year = COALESCE(excluded.year, citations.year),
-        source = COALESCE(excluded.source, citations.source)
-    `, [
-      hash, text,
-      (typeof item === 'string' ? null : item.author) || null,
-      (typeof item === 'string' ? null : item.title) || null,
-      (typeof item === 'string' ? null : item.year) || null,
-      (typeof item === 'string' ? null : item.source) || null,
-      now
-    ]);
-    const row = await get('SELECT id FROM citations WHERE citation_hash = ?', [hash]);
-    if (row) {
+    
+    let matchedId = null;
+    let matchedHash = hash;
+
+    // 1. Exact match check
+    if (hashMap.has(hash)) {
+      matchedId = hashMap.get(hash).id;
+      matchedHash = hash;
+    } else {
+      // 2. Fuzzy match check
+      const itemYear = (typeof item === 'string' ? null : item.year) || (() => {
+        const m = text.match(/\b(1[89]\d{2}|20[0-2]\d)\b/);
+        return m ? m[0] : null;
+      })();
+
+      let candidates = existingCitations;
+      if (itemYear) {
+        // Filter candidates within +/- 1 year
+        candidates = existingCitations.filter(c => {
+          if (!c.year) return true;
+          const cy = Number(c.year);
+          const iy = Number(itemYear);
+          return Math.abs(cy - iy) <= 1;
+        });
+      } else {
+        // Filter candidates sharing the first 3 letters
+        const prefix = text.trim().toLowerCase().slice(0, 3);
+        if (prefix.length === 3) {
+          candidates = existingCitations.filter(c => 
+            c.citation_text.trim().toLowerCase().startsWith(prefix)
+          );
+        }
+      }
+
+      let bestMatch = null;
+      let maxSim = 0;
+      const searchPool = candidates.length > 0 ? candidates : existingCitations;
+
+      for (const candidate of searchPool) {
+        const sim = jaroWinkler(text.toLowerCase(), candidate.citation_text.toLowerCase());
+        if (sim > maxSim) {
+          maxSim = sim;
+          bestMatch = candidate;
+        }
+      }
+
+      if (maxSim >= 0.90 && bestMatch) {
+        matchedId = bestMatch.id;
+        matchedHash = bestMatch.citation_hash;
+        logger.info('Fuzzy matched citation', {
+          incoming: text.slice(0, 50),
+          matched: bestMatch.citation_text.slice(0, 50),
+          similarity: maxSim
+        });
+      }
+    }
+
+    if (matchedId) {
       await run(`
         INSERT INTO document_citations (doc_id, citation_id, updated_at)
         VALUES (?, ?, ?)
         ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
-      `, [docId, row.id, now]);
+      `, [docId, matchedId, now]);
+    } else {
+      await run(`
+        INSERT INTO citations (citation_hash, citation_text, author, title, year, source, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(citation_hash) DO UPDATE SET
+          author = COALESCE(excluded.author, citations.author),
+          title = COALESCE(excluded.title, citations.title),
+          year = COALESCE(excluded.year, citations.year),
+          source = COALESCE(excluded.source, citations.source)
+      `, [
+        hash, text,
+        (typeof item === 'string' ? null : item.author) || null,
+        (typeof item === 'string' ? null : item.title) || null,
+        (typeof item === 'string' ? null : item.year) || null,
+        (typeof item === 'string' ? null : item.source) || null,
+        now
+      ]);
+      const row = await get('SELECT id, citation_hash, citation_text, author, title, year FROM citations WHERE citation_hash = ?', [hash]);
+      if (row) {
+        existingCitations.push(row);
+        hashMap.set(hash, row);
+        await run(`
+          INSERT INTO document_citations (doc_id, citation_id, updated_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
+        `, [docId, row.id, now]);
+      }
     }
   }
 }

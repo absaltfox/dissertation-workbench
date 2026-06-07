@@ -347,6 +347,9 @@ export function applyStoredMetricToDoc(doc, stored, statusOverride = 'cached') {
     doc.wordCount = Number(stored.word_count);
     doc.wordCountSource = stored.word_source || doc.wordCountSource;
   }
+  if (stored.body_word_count) {
+    doc.bodyWordCount = Number(stored.body_word_count);
+  }
   doc.fileBytes = stored.file_bytes ? Number(stored.file_bytes) : null;
   doc.downloadUrl = stored.download_url || null;
   doc.downloadStatus = statusOverride;
@@ -364,8 +367,30 @@ async function ensurePdftotextAvailability() {
   return hasPdftotext;
 }
 
+export function extractBodyWordCount(text) {
+  if (!text) return null;
+  const lines = text.split('\n');
+  let bibLineIndex = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (BIBLIOGRAPHY_HEADING.test(lines[i].trim())) {
+      bibLineIndex = i;
+      break;
+    }
+  }
+  let bodyText = text;
+  if (bibLineIndex !== -1) {
+    bodyText = lines.slice(0, bibLineIndex).join('\n');
+  }
+  const count = bodyText
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean).length;
+  return count || null;
+}
+
 async function extractPdfText(filePath) {
-  if (!(await ensurePdftotextAvailability())) return { text: null, wordCount: null };
+  if (!(await ensurePdftotextAvailability())) return { text: null, wordCount: null, bodyWordCount: null };
   try {
     const { stdout } = await execFileAsync('pdftotext', ['-enc', 'UTF-8', filePath, '-']);
     const text = String(stdout || '');
@@ -374,9 +399,10 @@ async function extractPdfText(filePath) {
       .trim()
       .split(' ')
       .filter(Boolean).length;
-    return { text, wordCount: wordCount || null };
+    const bodyWordCount = extractBodyWordCount(text);
+    return { text, wordCount: wordCount || null, bodyWordCount };
   } catch {
-    return { text: null, wordCount: null };
+    return { text: null, wordCount: null, bodyWordCount: null };
   }
 }
 
@@ -402,10 +428,11 @@ export async function analyzePdfAtPath(pdfPath, bytes) {
   if (!pageCount) {
     pageCount = await countPdfPagesWithPdfinfo(pdfPath);
   }
-  const { text, wordCount } = await extractPdfText(pdfPath);
+  const { text, wordCount, bodyWordCount } = await extractPdfText(pdfPath);
   return {
     pageCount: pageCount || null,
     wordCount: wordCount || null,
+    bodyWordCount: bodyWordCount || null,
     fileBytes: fileBytes.length,
     fullText: text || null
   };
@@ -711,6 +738,11 @@ export function parseCommittee(fullText) {
         } else if (!affiliation) {
           affiliation = prev;
         }
+      }
+
+      if (name && members.some((m) => m.name === name)) {
+        name = '';
+        affiliation = '';
       }
 
       // Forward-look fallback: 2018+ format has role label above name+affiliation.
@@ -1152,6 +1184,9 @@ export async function analyzeDocumentFile(doc, options) {
         doc.wordCount = analysis.wordCount;
         doc.wordCountSource = 'cached_pdf_text';
       }
+      if (analysis.bodyWordCount) {
+        doc.bodyWordCount = analysis.bodyWordCount;
+      }
       doc.fileBytes = analysis.fileBytes;
       doc.downloadUrl = stored.download_url || null;
       doc.downloadStatus = 'recomputed_from_cache';
@@ -1164,6 +1199,7 @@ export async function analyzeDocumentFile(doc, options) {
         downloadUrl: stored.download_url,
         fileBytes: analysis.fileBytes,
         wordCount: doc.wordCount,
+        bodyWordCount: doc.bodyWordCount,
         pageCount: doc.pages,
         wordSource: doc.wordCountSource,
         pageSource: doc.pagesSource
@@ -1226,6 +1262,9 @@ export async function analyzeDocumentFile(doc, options) {
         doc.wordCount = analysis.wordCount;
         doc.wordCountSource = 'downloaded_pdf_text';
       }
+      if (analysis.bodyWordCount) {
+        doc.bodyWordCount = analysis.bodyWordCount;
+      }
 
       doc.fileBytes = analysis.fileBytes;
       doc.downloadUrl = resolved.downloadUrl;
@@ -1239,6 +1278,7 @@ export async function analyzeDocumentFile(doc, options) {
         downloadUrl: resolved.downloadUrl,
         fileBytes: analysis.fileBytes,
         wordCount: doc.wordCount,
+        bodyWordCount: doc.bodyWordCount,
         pageCount: doc.pages,
         wordSource: doc.wordCountSource,
         pageSource: doc.pagesSource
