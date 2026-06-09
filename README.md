@@ -1,12 +1,26 @@
-# UBC Dissertation Intelligence Workbench (Node.js)
+# Dissertation Intelligence Workbench (Node.js)
 
-Web app for exploring UBC Open Collections dissertation records with three tabs:
+The Dissertation Workbench attempts to do number of different things at the same time. On a technical level, it is a demonstration of how a node.js app can integrate with the UBC Open Collections API, extracting metadata relating to dissertations and theses -- such as abstracts, authors, departments, etc. But in addition to that, the workbench uses the metadata and the documents themselves to create new metadata. It does this by employing a variety of different methods, including:
 
-- `Document Explorer`: record table, detailed metadata, related docs by overlapping themes
-- `Analytics Dashboard`: KPI cards, average page length by year, subject chart, abstract/theme word cloud
-- `Query Lab`: edit API parameters and rerun retrieval
-- `Admin → Query Configuration → Sync Documents`: cache Open Collections document attributes locally/Turso for faster dashboard reads
+- N-gram analysis to extract unigrams, bigrams and trigrams to describe "topics" and "concepts" in combination with TF-IDF
+- Citations are extracted using a GROBID -> Anystyle -> Regex pipeline, and are then located in UBC's collections using Z39.50
+- Basic people networks are developed, linking authors to supervisors to research topics and methodologies
+- Latent topics are derived from document abstracts using BERTopc with embeddings derived from the allenai/specter2 model 
 
+On one hand, the additional metadata and metrics are a discovery aid; new avenues appear for researchers and students looking for papers linked by supervisor, topic, methods, etc. On the other, the metadata tells the story of research at UBC. Indicating the favour (and disfavour) of different topics and methodologies among students and researchers over time. Even basic metrics such as page length or dissertations submitted by department by year become avenues for further analysis and interpretation. 
+
+The Dissertation Workbench was developed with AI assistance, using a combination of Claude Code, ChatGPT Codex, and Google Antigravity with Gemini Flash. 
+
+## Application Structure
+
+The workbench is organized into several tabbed sections.
+
+- `Document Explorer`: dissertations and theses, with document detail modals showing key metadata, themes, concepts, topic and related documents
+- `Citation Explorer`: citations by document with holdings information at UBC Library, as well as canonical texts (most frequently cited texts)
+- `Person Explorer`: people serving as supervisors, committee members, and examiners, with associated documents and themes, concepts and topics 
+- `Analytics Dashboard`: KPI cards, average page length by year, word counts over time, key themes, concepts, topics, and topics over time
+- `Admin`: configure Open Collections query scope and trigger metadata extraction jobs 
+- 
 ## Run
 
 For local development, copy the example env file and fill in only the values you need:
@@ -142,12 +156,10 @@ The Docker image installs `yaz`, so the worker can run Z39.50 catalogue checks t
 ## Notes
 
 - UBC API rate limits can apply per IP. Use smaller page sizes/record counts and an API key when needed.
-- Open Collections API keys are applied server-side only. Browser requests do not include keys in query strings.
 - Authentication uses in-memory login rate limiting to reduce brute-force risk.
 - Security response headers are enabled by default.
 - Public `downloadFiles`, `refresh`, and `recomputeFromCache` are restricted by default in production but allowed in local development.
 - App downloads each source PDF once and caches it locally.
 - Per-document attributes, PDF metrics, sync runs, and run-level metric snapshots are persisted through libSQL: local SQLite by default, or Turso when `TURSO_DATABASE_URL` is set.
 - For larger deployments, run `Sync Documents` from the admin panel first. Matching `/api/metrics` requests then read document attributes from the local/Turso cache instead of paging Open Collections during the dashboard request. `Force Refresh` still bypasses the in-memory metrics cache and can fall back to live Open Collections retrieval.
-- PDFs are only redownloaded when `refresh=1` (or \"Force Refresh\" in Query Lab) is used.
 - \"Update From Local PDF Cache\" in Query Lab recomputes counts from cached PDFs without redownloading.
