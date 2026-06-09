@@ -25,7 +25,7 @@ primary_region = "sjc"
   worker = "npm run worker"
 
 [[mounts]]
-  source = "oc_papers_data"
+  source = "dissertation_wb_data"
   destination = "/data"
   processes = ["app", "worker"]
 
