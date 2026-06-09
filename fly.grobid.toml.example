@@ -1,5 +1,5 @@
 app = "dissertation-workbench-grobid"
-primary_region = "sea"
+primary_region = "sjc"
 
 [build]
   image = "grobid/grobid:0.8.0"

@@ -1,5 +1,5 @@
 app = "dissertation-workbench"
-primary_region = "sea"
+primary_region = "sjc"
 
 [build]
   dockerfile = "Dockerfile"
