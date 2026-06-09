@@ -1,4 +1,4 @@
-app = "oc-papers"
+app = "dissertation-workbench"
 primary_region = "sea"
 
 [build]

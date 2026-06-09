@@ -1,4 +1,4 @@
-app = "oc-papers-grobid"
+app = "dissertation-workbench-grobid"
 primary_region = "sea"
 
 [build]
