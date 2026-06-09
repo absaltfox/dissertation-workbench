@@ -11,6 +11,7 @@ output/
 .env.production
 .env.*.local
 fly.toml
+fly.grobid.toml
 
 
 # Local tooling state
