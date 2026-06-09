@@ -14,7 +14,6 @@ The Dissertation Workbench was developed with AI assistance, using a combination
 ## Application Structure
 
 The browser UI is organized into these main tabs:
-
 - `Document Explorer`: retrieved dissertations and theses, with document detail modals, exports, concepts, topics, citations, and related documents.
 - `Citation Explorer`: works cited by document, UBC catalogue lookup status, and foundational works cited across the corpus.
 - `Person Explorer`: supervisors, committee members, and examiners with associated documents, roles, concepts, and topics.
