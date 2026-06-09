@@ -17,13 +17,13 @@ RUN apt-get update \
   && chown -R node:node /data \
   && rm -rf /var/lib/apt/lists/*
 
-COPY package*.json ./
+COPY --chown=node:node package*.json ./
 RUN npm ci --omit=dev
 
-COPY public ./public
-COPY scripts ./scripts
-COPY src ./src
-COPY README.md ./
+COPY --chown=node:node public ./public
+COPY --chown=node:node scripts ./scripts
+COPY --chown=node:node src ./src
+COPY --chown=node:node README.md ./
 
 EXPOSE 3000
 
