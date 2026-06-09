@@ -102,10 +102,102 @@ function isJunkCitation(text) {
 // --- GROBID availability check ---
 let _grobidAvailable = undefined;
 
-async function isGrobidAvailable() {
-  if (_grobidAvailable !== undefined) return _grobidAvailable;
+async function ensureGrobidRunning() {
+  if (!process.env.FLY_APP_NAME) return;
+
+  const companionAppName = process.env.GROBID_APP_NAME || `${process.env.FLY_APP_NAME}-grobid`;
+  const token = process.env.FLY_API_TOKEN;
+
+  if (!token) {
+    logger.warn('FLY_API_TOKEN is not set; cannot programmatically start Grobid machines via Fly Machines API.');
+    return;
+  }
+
   try {
-    const res = await fetch(`${GROBID_URL}/api/isalive`);
+    const listUrl = `http://_api.internal:4280/v1/apps/${companionAppName}/machines`;
+    logger.info(`Checking Grobid companion machines at: ${listUrl}`);
+    
+    const res = await fetch(listUrl, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      signal: AbortSignal.timeout(5000)
+    });
+
+    if (!res.ok) {
+      logger.warn(`Failed to list Grobid machines from Fly Machines API: ${res.status} ${res.statusText}`);
+      return;
+    }
+
+    const machines = await res.json();
+    if (!Array.isArray(machines) || machines.length === 0) {
+      logger.warn(`No machines found in companion app: ${companionAppName}`);
+      return;
+    }
+
+    const stoppedMachines = machines.filter(m => m.state === 'stopped' || m.state === 'suspended');
+    if (stoppedMachines.length === 0) {
+      logger.info('All Grobid companion machines are already running or starting.');
+      return;
+    }
+
+    logger.info(`Found ${stoppedMachines.length} stopped/suspended Grobid machine(s). Starting them...`);
+    for (const machine of stoppedMachines) {
+      const startUrl = `http://_api.internal:4280/v1/apps/${companionAppName}/machines/${machine.id}/start`;
+      try {
+        const startRes = await fetch(startUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json'
+          },
+          signal: AbortSignal.timeout(5000)
+        });
+        if (startRes.ok) {
+          logger.info(`Successfully initiated start for Grobid machine ${machine.id}`);
+        } else {
+          logger.warn(`Failed to start Grobid machine ${machine.id}: ${startRes.status} ${startRes.statusText}`);
+        }
+      } catch (err) {
+        logger.error(`Error starting Grobid machine ${machine.id}: ${err.message}`);
+      }
+    }
+
+    // Wait for Grobid to become healthy/responsive
+    const maxWaitMs = 60_000;
+    const intervalMs = 2000;
+    const start = Date.now();
+    logger.info('Waiting for Grobid service to become responsive...');
+    
+    while (Date.now() - start < maxWaitMs) {
+      try {
+        const aliveRes = await fetch(`${GROBID_URL}/api/isalive`, { signal: AbortSignal.timeout(2000) });
+        if (aliveRes.ok) {
+          logger.info(`Grobid service is up and responsive after ${Math.round((Date.now() - start) / 1000)}s`);
+          _grobidAvailable = true;
+          return;
+        }
+      } catch {
+        // Not ready yet, ignore and keep polling
+      }
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+    logger.warn('Grobid service failed to become responsive within 60s');
+  } catch (err) {
+    logger.error(`Failed to ensure Grobid is running: ${err.message}`);
+  }
+}
+
+async function isGrobidAvailable() {
+  if (_grobidAvailable === true) return true;
+
+  if (process.env.FLY_APP_NAME) {
+    await ensureGrobidRunning();
+  }
+
+  try {
+    const res = await fetch(`${GROBID_URL}/api/isalive`, { signal: AbortSignal.timeout(3000) });
     _grobidAvailable = res.ok;
     if (res.ok) logger.info('GROBID service available');
   } catch {

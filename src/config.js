@@ -18,7 +18,12 @@ export const FILE_CONCURRENCY = 2;
 export const PDF_DOWNLOAD_RATE_PER_MIN = Number(process.env.PDF_DOWNLOAD_RATE_PER_MIN || 0); // 0 = unlimited
 export const DATA_DIR = process.env.APP_DATA_DIR || path.join(process.cwd(), 'data');
 export const PDF_CACHE_DIR = process.env.PDF_CACHE_DIR || path.join(DATA_DIR, 'pdf-cache');
-export const GROBID_URL = process.env.GROBID_URL || 'http://localhost:8070';
+export const GROBID_URL = process.env.GROBID_URL || (
+  process.env.FLY_APP_NAME
+    ? `http://${process.env.FLY_APP_NAME}-grobid.internal:8070`
+    : 'http://localhost:8070'
+);
+
 export const SQLITE_PATH = process.env.SQLITE_PATH || path.join(DATA_DIR, 'metrics.sqlite');
 export const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL || '';
 export const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN || '';
