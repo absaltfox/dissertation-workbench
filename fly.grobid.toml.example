@@ -2,7 +2,7 @@ app = "dissertation-workbench-grobid"
 primary_region = "sjc"
 
 [build]
-  image = "grobid/grobid:0.8.0"
+  image = "grobid/grobid:0.8.0-crf"
 
 [http_service]
   internal_port = 8070
