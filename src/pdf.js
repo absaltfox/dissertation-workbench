@@ -4,7 +4,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { PDF_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, PDF_DOWNLOAD_RATE_PER_MIN, GROBID_URL } from './config.js';
+import {
+  PDF_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS,
+  PDF_DOWNLOAD_RATE_PER_MIN, PDF_BLOCK_COOLDOWN_MS, GROBID_URL
+} from './config.js';
 import {
   loadStoredFileMetric, saveFileMetric, saveDocumentMetadata, saveCommitteeMembers,
   loadCommitteeMembers, saveCitations, clearDocumentCitations, loadDocumentCitations, deleteCommitteeMembersByRoles
@@ -391,6 +394,48 @@ export async function parseBibliographyWithAnyStyle(fullText) {
 // Serialized queue so concurrent workers share a single sliding window.
 const _downloadTimestamps = [];
 let _downloadRateTail = Promise.resolve();
+let _downloadBlockedUntil = 0;
+let _downloadBlockReason = '';
+
+function activeDownloadBlock(now = Date.now()) {
+  if (!_downloadBlockedUntil || now >= _downloadBlockedUntil) {
+    _downloadBlockedUntil = 0;
+    _downloadBlockReason = '';
+    return null;
+  }
+  return {
+    reason: _downloadBlockReason,
+    remainingMs: _downloadBlockedUntil - now,
+    blockedUntil: new Date(_downloadBlockedUntil).toISOString(),
+  };
+}
+
+function pauseDownloadsAfterBlock(reason, url) {
+  if (!PDF_BLOCK_COOLDOWN_MS) return;
+  _downloadBlockedUntil = Date.now() + PDF_BLOCK_COOLDOWN_MS;
+  _downloadBlockReason = reason;
+  logger.warn('PDF downloads paused after block page', {
+    url,
+    cooldownSeconds: Math.round(PDF_BLOCK_COOLDOWN_MS / 1000),
+    blockedUntil: new Date(_downloadBlockedUntil).toISOString(),
+  });
+}
+
+async function saveBlockedFileMetric(doc, stored, error) {
+  doc.downloadStatus = 'blocked';
+  doc.downloadError = error;
+  await saveFileMetric(doc.id, {
+    status: 'blocked',
+    error,
+    pdfPath: stored?.pdf_path || null,
+    downloadUrl: stored?.download_url || null,
+    fileBytes: stored?.file_bytes || null,
+    wordCount: stored?.word_count || null,
+    pageCount: stored?.page_count || null,
+    wordSource: stored?.word_source || null,
+    pageSource: stored?.page_source || null
+  });
+}
 
 async function acquireDownloadSlot() {
   if (!PDF_DOWNLOAD_RATE_PER_MIN) return; // 0 = unlimited
@@ -1084,6 +1129,16 @@ function hasApiSupervisors(doc) {
   return dedupeSupervisorNames(doc?.supervisors || []).length > 0;
 }
 
+export function detectDownloadBlockPage(html) {
+  const text = String(html || '').toLowerCase();
+  return (
+    text.includes('your request was blocked because our system detected unusual activity')
+    || text.includes('ubc cybersecurity block page')
+    || (text.includes('sorry for the inconvenience') && text.includes('reference id:'))
+    || (text.includes('f5') && text.includes('the requested url was rejected'))
+  );
+}
+
 async function resolveDownloadUrl(candidateUrl) {
   try {
     const controller = new AbortController();
@@ -1116,6 +1171,12 @@ async function resolveDownloadUrl(candidateUrl) {
     if (!contentType.includes('html')) return null;
 
     const html = await res.text();
+    if (detectDownloadBlockPage(html)) {
+      return {
+        error: 'UBC/F5 security block page returned instead of a PDF. The download may need slower retries or UBC allowlisting for the Fly egress IP.',
+      };
+    }
+
     const matches = Array.from(html.matchAll(/href=["']([^"']+\.pdf[^"']*)["']/gi)).map((m) => m[1]);
     for (const href of matches) {
       try {
@@ -1130,7 +1191,17 @@ async function resolveDownloadUrl(candidateUrl) {
         }
         if (!pdfRes.ok) continue;
         const pdfType = pdfRes.headers.get('content-type') || '';
-        if (!pdfType.includes('pdf') && !/\.pdf($|\?)/i.test(pdfRes.url || pdfUrl)) continue;
+        if (!pdfType.includes('pdf') && !/\.pdf($|\?)/i.test(pdfRes.url || pdfUrl)) {
+          if (pdfType.includes('html')) {
+            const pdfHtml = await pdfRes.text();
+            if (detectDownloadBlockPage(pdfHtml)) {
+              return {
+                error: 'UBC/F5 security block page returned instead of a linked PDF. The download may need slower retries or UBC allowlisting for the Fly egress IP.',
+              };
+            }
+          }
+          continue;
+        }
         const bytes = Buffer.from(await pdfRes.arrayBuffer());
         if (bytes.length > MAX_DOWNLOAD_BYTES) continue;
         return { downloadUrl: pdfRes.url || pdfUrl, bytes };
@@ -1332,11 +1403,28 @@ export async function analyzeDocumentFile(doc, options) {
     return;
   }
 
+  const downloadBlock = activeDownloadBlock();
+  if (downloadBlock) {
+    const waitSeconds = Math.ceil(downloadBlock.remainingMs / 1000);
+    await saveBlockedFileMetric(
+      doc,
+      stored,
+      `${downloadBlock.reason} PDF downloads are paused for another ${waitSeconds}s after a UBC/F5 block page.`
+    );
+    return;
+  }
+
   await acquireDownloadSlot();
   logger.info('Downloading PDF', { docId: doc.id, candidates: doc.downloadCandidates.length });
 
   for (const candidate of doc.downloadCandidates) {
     const resolved = await resolveDownloadUrl(candidate);
+    if (resolved?.error) {
+      logger.warn('PDF download blocked', { docId: doc.id, url: candidate, error: resolved.error });
+      pauseDownloadsAfterBlock(resolved.error, candidate);
+      await saveBlockedFileMetric(doc, stored, resolved.error);
+      return;
+    }
     if (!resolved) continue;
 
     const fileHash = crypto.createHash('sha1').update(resolved.downloadUrl).digest('hex');

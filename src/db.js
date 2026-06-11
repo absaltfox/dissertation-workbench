@@ -658,7 +658,7 @@ export async function getFileMetricsStats() {
     SELECT COUNT(*) AS total,
            SUM(CASE WHEN file_bytes IS NOT NULL THEN file_bytes ELSE 0 END) AS total_bytes,
            SUM(CASE WHEN status = 'downloaded' OR status = 'redownloaded' OR status = 'cached' OR status = 'recomputed_from_cache' THEN 1 ELSE 0 END) AS with_pdf,
-           SUM(CASE WHEN status = 'not_found' OR status = 'cache_miss' THEN 1 ELSE 0 END) AS failed,
+           SUM(CASE WHEN status = 'not_found' OR status = 'cache_miss' OR status = 'blocked' THEN 1 ELSE 0 END) AS failed,
            MIN(updated_at) AS oldest,
            MAX(updated_at) AS newest
     FROM file_metrics

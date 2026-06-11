@@ -1,6 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseAcknowledgements, parseCommittee, parseBibliography, extractBodyWordCount } from '../src/pdf.js';
+import {
+  detectDownloadBlockPage,
+  parseAcknowledgements,
+  parseCommittee,
+  parseBibliography,
+  extractBodyWordCount
+} from '../src/pdf.js';
+
+test('detectDownloadBlockPage identifies UBC/F5 security block HTML', () => {
+  const html = `
+    <h4>Sorry for the inconvenience.</h4>
+    <p>Your request was blocked because our system detected unusual activity.</p>
+    <p>Reference ID: ITSA - <12345></p>
+  `;
+
+  assert.equal(detectDownloadBlockPage(html), true);
+  assert.equal(detectDownloadBlockPage('<html><a href="/file.pdf">Download</a></html>'), false);
+});
 
 test('parseAcknowledgements extracts supervisors, co-supervisors, and committee members', () => {
   // Test case 1: Singular supervisor and committee members listing

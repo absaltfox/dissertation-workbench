@@ -196,6 +196,7 @@ Use `.env.development.example` and `.env.production.example` as the canonical te
 - `PDF_ALLOWED_HOSTS`: download host allowlist, default `open.library.ubc.ca,oc-index.library.ubc.ca`.
 - `PDF_ALLOW_HTTP_DOWNLOADS`: defaults to `1` in development and `0` in production.
 - `PDF_DOWNLOAD_RATE_PER_MIN`: optional PDF download throttle; `0` means unlimited.
+- `PDF_BLOCK_COOLDOWN_MS`: pauses further PDF downloads after a UBC/F5 block page is detected, default `900000`.
 - `CACHE_TTL_MS`: in-memory metrics cache TTL, default `600000`.
 - `TRUST_PROXY`: set `1` behind Fly/reverse proxies.
 - `SESSION_COOKIE_SECURE`: defaults to `1` in production and `0` otherwise.
