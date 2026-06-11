@@ -20,6 +20,12 @@ async function getPublicAdminSettings() {
   };
 }
 
+/**
+ * Creates admin user and settings endpoints.
+ *
+ * Mounted behind admin auth and CSRF protection. Secret settings are never
+ * returned directly; API-key responses expose only configured/env-managed state.
+ */
 export function createAdminUsersRouter() {
   const router = Router();
 
@@ -44,6 +50,8 @@ export function createAdminUsersRouter() {
       res.status(409).json({ error: 'Username already exists' });
       return;
     }
+    // New users should enter through the reset flow, so the stored temporary
+    // password is intentionally random and never returned to the browser.
     const temporaryPassword = crypto.randomUUID() + crypto.randomUUID();
     const { hash, salt } = createPasswordHash(temporaryPassword);
     await createUser(profile.username, hash, salt, profile);

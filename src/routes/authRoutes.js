@@ -66,6 +66,13 @@ setInterval(() => {
   cleanupLimiterMap(failedLoginsByUser, now);
 }, Math.max(60_000, Math.floor(LOGIN_WINDOW_MS / 2))).unref();
 
+/**
+ * Creates authentication endpoints for admin sessions.
+ *
+ * Login and MFA setup confirmation happen before a trusted session exists, so
+ * the global CSRF middleware explicitly lets those routes through. The router
+ * applies IP/user login throttling and returns CSRF tokens with valid sessions.
+ */
 export function createAuthRouter({ getClientIp }) {
   const router = Router();
 
@@ -103,6 +110,8 @@ export function createAuthRouter({ getClientIp }) {
         return;
       }
       if (result.mfaSetupRequired) {
+        // First production login can require MFA enrollment before a normal
+        // session exists; the setup token is short-lived and confirmed below.
         res.status(200).json({
           ok: false,
           mfaSetupRequired: true,

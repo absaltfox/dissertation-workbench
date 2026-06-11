@@ -111,6 +111,72 @@ Supported query params:
 
 Open Collections API keys are applied server-side. Browser requests do not need to include keys.
 
+### Public Endpoints
+
+These endpoints are available to the browser without an admin session. Expensive metrics options are still capped or blocked by the public guardrail settings listed below.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/health` | Health check with `{ ok, timestamp }`. |
+| `GET` | `/api/metrics` | Builds or reads dissertation metrics for the current Open Collections query. |
+| `GET` | `/api/documents/:docId/citations` | Returns citations for one cached document, including sharing counts. |
+| `GET` | `/api/citations/top?limit=50` | Returns the most-cited works, capped at 200. |
+| `GET` | `/api/citations/:citationId/documents` | Returns documents that cite a stored citation. |
+| `GET` | `/api/citations/:citationId/summon-check` | Checks UBC Summon holdings for a stored citation. Returns `502` if Summon lookup fails. |
+
+### Auth Endpoints
+
+Authentication uses an HTTP-only session cookie plus an `x-csrf-token` header for state-changing authenticated requests. Login and MFA setup confirmation are exempt from CSRF because they happen before a trusted session exists.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/auth/login` | Starts or completes admin login. May return `mfaRequired` or `mfaSetupRequired`. |
+| `POST` | `/api/auth/mfa/setup/confirm` | Confirms first-time MFA setup and creates a session. |
+| `POST` | `/api/auth/password-reset/confirm` | Consumes a password-reset token and stores a new password. |
+| `POST` | `/api/auth/logout` | Destroys the active session and clears the cookie. Requires CSRF when authenticated. |
+| `GET` | `/api/auth/session` | Returns the current admin username and CSRF token, or `401`. |
+
+### Admin Endpoints
+
+All `/api/admin/*` endpoints require an authenticated admin session. `POST`, `PUT`, and `DELETE` requests also require the `x-csrf-token` header returned by login/session endpoints.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/admin/users` | Lists admin users. |
+| `POST` | `/api/admin/users` | Creates an admin user and returns a password-reset URL. |
+| `DELETE` | `/api/admin/users/:username` | Deletes an admin user; the current and last remaining admin cannot be deleted. |
+| `PUT` | `/api/admin/users/:username/password` | Sets an admin user's password. |
+| `POST` | `/api/admin/users/:username/password-reset` | Creates a password-reset URL for an admin user. |
+| `POST` | `/api/admin/me/mfa/setup` | Starts MFA setup for the current admin. |
+| `DELETE` | `/api/admin/users/:username/mfa` | Clears MFA for an admin user. |
+| `GET` | `/api/admin/settings` | Returns non-secret admin settings plus API-key status. |
+| `PUT` | `/api/admin/settings` | Updates admin settings; `apiKey` is ignored when env-managed. |
+| `GET` | `/api/admin/import-rules` | Lists saved Open Collections import rules. |
+| `POST` | `/api/admin/import-rules` | Validates and saves an import rule. |
+| `PUT` | `/api/admin/import-rules/:id` | Updates an import rule. |
+| `DELETE` | `/api/admin/import-rules/:id` | Deletes an import rule. |
+| `GET` | `/api/admin/open-collections/facets` | Returns live Open Collections facet counts, falling back to local cached metadata. |
+| `GET` | `/api/admin/import-rules/preview` | Previews an import rule with sample records and scan-limit warnings. |
+| `POST` | `/api/admin/import-rules/sync` | Runs one import rule immediately and clears the metrics cache. |
+| `POST` | `/api/admin/import-rules/run` | Starts a background import-rules job for selected or all rules; returns `202`. |
+| `GET` | `/api/admin/jobs` | Returns recent admin jobs, sync runs, catalogue stats, topic status, and concept status. |
+| `POST` | `/api/admin/jobs/catalogue-lookup` | Starts a background Z39.50 lookup job, or returns a dry-run preview. |
+| `POST` | `/api/admin/jobs/bertopic` | Starts a background BERTopic rebuild job. |
+| `GET` | `/api/admin/documents/sync/status` | Returns global or query-specific document sync status. |
+| `POST` | `/api/admin/documents/sync` | Starts document sync for request body/query options and clears metrics cache. |
+| `GET` | `/api/admin/concepts/status` | Returns concept pipeline status. |
+| `POST` | `/api/admin/concepts/rebuild` | Rebuilds the concept dictionary; returns `409` if a rebuild cannot start. |
+| `GET` | `/api/admin/catalogue-lookup/stats` | Returns stored catalogue lookup statistics. |
+| `POST` | `/api/admin/catalogue-lookup` | Runs pending catalogue lookups synchronously, or previews with `dryRun=1`. |
+| `GET` | `/api/admin/cache` | Lists cached file-metric entries. |
+| `GET` | `/api/admin/cache/stats` | Returns file-metric cache statistics. |
+| `POST` | `/api/admin/cache/refresh` | Clears only the in-memory metrics cache. |
+| `POST` | `/api/admin/cache/:docId/refresh` | Redownloads/reanalyzes one document and clears metrics cache. |
+| `DELETE` | `/api/admin/cache/:docId` | Deletes cached PDF and file metrics for one document. |
+| `POST` | `/api/admin/reparse-all` | Re-extracts committee/citation data from cached PDFs and reruns catalogue lookups. |
+| `POST` | `/api/admin/reparse-committee` | Re-extracts committee data for cached PDFs missing committee records. |
+| `GET` | `/api/admin/runs` | Returns recent import/sync runs. |
+
 ## Core Environment Variables
 
 Use `.env.development.example` and `.env.production.example` as the canonical templates. Important settings:
@@ -234,4 +300,3 @@ In production, startup validates secret configuration. The API-key encryption ke
 - Pending citation catalogue lookups use Z39.50 through `yaz-client`.
 - BERTopic reads cached document abstracts from the database, uses `allenai/specter2_base`, and writes topic assignments back to the database.
 - Per-document attributes, PDF metrics, sync runs, citations, catalogue lookups, admin jobs, users, and run-level metric snapshots are persisted through libSQL: local SQLite by default, or Turso when `TURSO_DATABASE_URL` is set.
-

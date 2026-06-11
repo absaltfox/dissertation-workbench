@@ -11,6 +11,13 @@ import { parseBooleanParam, parseNumberParam, validateMetricsParams } from '../v
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
 import { hasValidCsrf } from '../middleware/adminAuth.js';
 
+/**
+ * Creates the public metrics router.
+ *
+ * Public requests are capped by configured guardrails. Authenticated admins with
+ * a valid CSRF token may request refresh/recompute/file-enrichment work.
+ * `metricsInflight` deduplicates identical expensive collection requests.
+ */
 export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncModule }) {
   const router = Router();
 
@@ -52,6 +59,9 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       res.status(403).json({ error: 'Invalid CSRF token' });
       return;
     }
+    // Treat admin-only work as privileged only when both the session and CSRF
+    // token are valid; a bare session cookie is not enough for expensive writes
+    // or refresh-like behavior.
     const isAdminRequest = hasAdminCsrf;
     if (!isAdminRequest && downloadFiles && !ALLOW_PUBLIC_DOWNLOADS) {
       res.status(403).json({ error: 'downloadFiles is restricted to authenticated admin sessions.' });
@@ -100,6 +110,8 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       const { getSyncKeyForOptions } = await loadSyncModule();
       const syncKey = getSyncKeyForOptions(sourceOptions);
       const cacheStats = await getDocumentCacheStats(syncKey);
+      // Cached document metadata lets the dashboard avoid paging Open
+      // Collections and re-running PDF enrichment during ordinary reads.
       const canUseDocumentCache = !refresh && !recomputeFromCache && cacheStats.total > 0;
       const cachedDocuments = canUseDocumentCache
         ? await listCachedDocuments({ syncKey, limit: effectiveMaxRecords })

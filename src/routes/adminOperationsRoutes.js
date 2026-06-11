@@ -12,6 +12,13 @@ import { parseBooleanParam, parseNumberParam } from '../validate.js';
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
 import { logger } from '../logger.js';
 
+/**
+ * Creates admin operational endpoints for sync, cache, catalogue, and reparsing.
+ *
+ * Mounted behind admin auth and CSRF protection. Most mutating operations clear
+ * the in-memory metrics cache because file metrics, parsed citations, or source
+ * document metadata may have changed.
+ */
 export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache }) {
   const router = Router();
 
@@ -117,6 +124,8 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
       res.status(404).json({ error: 'Document not found in metadata store' });
       return;
     }
+    // Force a fresh PDF pass for this document, then invalidate dashboard
+    // metrics that may have used stale page/word/citation values.
     await deleteCachedPdf(docId);
     await analyzeDocumentFile(doc, { downloadFiles: true, forceDownload: true, recomputeFromCache: false });
     clearMetricsCache();
@@ -142,6 +151,8 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
   }));
 
   router.post('/reparse-all', asyncHandler(async (_req, res) => {
+    // Reparse-all intentionally rebuilds citation state from cached PDFs; the
+    // catalogue lookup pass below repopulates lookup status for new citations.
     await clearAllCitations();
     const entries = (await listFileMetrics()).filter((e) => e.pdf_path);
     let processed = 0;

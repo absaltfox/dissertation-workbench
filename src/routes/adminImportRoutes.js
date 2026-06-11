@@ -71,6 +71,13 @@ function readAggregationBuckets(payload, key) {
   })).filter((bucket) => bucket.value);
 }
 
+/**
+ * Creates admin endpoints for Open Collections import-rule management.
+ *
+ * Mounted behind `requireAdmin`; mutating requests also pass the global CSRF
+ * middleware. Import and preview routes lazy-load sync code because it pulls in
+ * the heavier PDF/metrics pipeline.
+ */
 export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
   const router = Router();
 
@@ -136,6 +143,8 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
         },
       });
     } catch (error) {
+      // Facets are a convenience for building import rules. When the upstream
+      // API is unavailable, cached metadata is still useful and keeps Admin usable.
       logger.warn('Open Collections facet lookup failed; using local cache', { error: error?.message || String(error) });
       res.status(200).json({
         source: 'cache',
@@ -240,6 +249,8 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
       params: { mode, scope, ruleIds: selectedIds },
     });
 
+    // Long-running imports continue in the background; the job table is the
+    // source of truth for progress after this 202 response.
     runImportRulesJob(jobId, { mode, scope, ruleIds: selectedIds, clearMetricsCache });
 
     res.status(202).json({ ok: true, started: true, jobId });

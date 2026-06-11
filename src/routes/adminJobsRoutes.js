@@ -9,6 +9,13 @@ import { parseBooleanParam, parseNumberParam } from '../validate.js';
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
 import { isAdminJobRunning, runBertopicJob, runCatalogueLookupJob } from '../services/adminJobs.js';
 
+/**
+ * Creates admin job orchestration endpoints.
+ *
+ * Mounted behind admin auth and CSRF protection. Job-start endpoints return
+ * `202` once a durable admin job exists; work then continues asynchronously and
+ * progress is read back through `/api/admin/jobs`.
+ */
 export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
   const router = Router();
 
@@ -63,6 +70,7 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
       label: 'Z39.50 Catalogue Lookups',
       params: { limit, pendingOnly: true },
     });
+    // Run out-of-band so catalogue lookups do not hold the HTTP connection open.
     runCatalogueLookupJob(jobId, limit);
     res.status(202).json({ ok: true, started: true, jobId });
   }));
@@ -80,6 +88,7 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
       label: 'BERTopic Rebuild',
       params: { script: 'scripts/build-topics.py' },
     });
+    // BERTopic rebuilds shell out to the Python pipeline and can take minutes.
     runBertopicJob(jobId, { clearMetricsCache });
     res.status(202).json({ ok: true, started: true, jobId });
   }));

@@ -6,6 +6,12 @@ import {
 import { parseNumberParam } from '../validate.js';
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
 
+/**
+ * Creates read-only browser endpoints for citation exploration.
+ *
+ * These routes do not require an admin session. They expose stored citation
+ * data and perform one bounded Summon holdings check for a selected citation.
+ */
 export function createPublicRouter() {
   const router = Router();
 
@@ -42,6 +48,8 @@ export function createPublicRouter() {
       return;
     }
 
+    // Prefer structured lookup terms from the catalogue parser; fall back to a
+    // short raw citation query so malformed citations cannot produce huge URLs.
     const q = row.query_title
       ? `Title:(${row.query_title})${row.query_author ? ` AND Author:(${row.query_author})` : ''}`
       : String(row.citation_text || '').slice(0, 200);
