@@ -19,15 +19,11 @@ primary_region = "sjc"
   CATALOGUE_LOOKUP_ENABLED = "1"
   CATALOGUE_LOOKUP_ON_START = "1"
   CATALOGUE_LOOKUP_PAGE_SIZE = "200"
-
-[processes]
-  app = "npm start"
-  worker = "npm run worker"
+  PUBLIC_MAX_RECORDS = "2000"
 
 [[mounts]]
   source = "dissertation_wb_data"
   destination = "/data"
-  processes = ["app", "worker"]
 
 [http_service]
   internal_port = 3000
@@ -35,7 +31,6 @@ primary_region = "sjc"
   auto_stop_machines = "stop"
   auto_start_machines = true
   min_machines_running = 1
-  processes = ["app"]
 
   [http_service.concurrency]
     type = "requests"
@@ -43,13 +38,6 @@ primary_region = "sjc"
     hard_limit = 100
 
 [[vm]]
-  processes = ["app"]
-  memory = "1gb"
-  cpu_kind = "shared"
-  cpus = 1
-
-[[vm]]
-  processes = ["worker"]
   memory = "1gb"
   cpu_kind = "shared"
   cpus = 1
