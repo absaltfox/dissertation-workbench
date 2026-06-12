@@ -431,17 +431,56 @@ export async function listAllDocumentMetadata() {
 
 export async function listCachedDocuments({ syncKey, limit = 1000 } = {}) {
   const args = [];
-  let sql = 'SELECT doc_id, metadata_json FROM documents';
+  let sql = `
+    SELECT d.doc_id, d.metadata_json,
+           fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
+           fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error
+    FROM documents d
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+  `;
   if (syncKey) {
-    sql += ' WHERE sync_key = ?';
+    sql += ' WHERE d.sync_key = ?';
     args.push(syncKey);
   }
-  sql += ' ORDER BY year DESC, title LIMIT ?';
+  sql += ' ORDER BY d.year DESC, d.title LIMIT ?';
   args.push(limit);
   const rows = await all(sql, args);
   return rows.map((row) => {
-    try { return JSON.parse(row.metadata_json); } catch { return null; }
+    try {
+      const doc = JSON.parse(row.metadata_json);
+      return applyStoredFileMetricToDocument(doc, row);
+    } catch {
+      return null;
+    }
   }).filter(Boolean);
+}
+
+function applyStoredFileMetricToDocument(doc, row) {
+  if (!doc || !row) return doc;
+  if (row.page_count != null) {
+    doc.pages = Number(row.page_count);
+    doc.pagesSource = row.page_source || doc.pagesSource;
+  }
+  if (row.word_count != null) {
+    doc.wordCount = Number(row.word_count);
+    doc.wordCountSource = row.word_source || doc.wordCountSource;
+  }
+  if (row.body_word_count != null) {
+    doc.bodyWordCount = Number(row.body_word_count);
+  }
+  if (row.file_bytes != null) {
+    doc.fileBytes = Number(row.file_bytes);
+  }
+  if (row.download_url != null) {
+    doc.downloadUrl = row.download_url;
+  }
+  if (row.status != null) {
+    doc.downloadStatus = row.status;
+  }
+  if (row.error != null) {
+    doc.downloadError = row.error;
+  }
+  return doc;
 }
 
 export async function getDocumentCacheStats(syncKey = null) {

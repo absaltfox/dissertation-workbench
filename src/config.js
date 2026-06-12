@@ -25,6 +25,7 @@ export const GROBID_URL = process.env.GROBID_URL || (
     ? `http://${process.env.FLY_APP_NAME}-grobid.internal:8070`
     : 'http://localhost:8070'
 );
+export const GROBID_STARTUP_WAIT_MS = Number(process.env.GROBID_STARTUP_WAIT_MS || 7 * 60 * 1000);
 
 export const SQLITE_PATH = process.env.SQLITE_PATH || path.join(DATA_DIR, 'metrics.sqlite');
 export const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL || '';

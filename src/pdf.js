@@ -6,7 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS,
-  PDF_DOWNLOAD_RATE_PER_MIN, GROBID_URL
+  PDF_DOWNLOAD_RATE_PER_MIN, GROBID_URL, GROBID_STARTUP_WAIT_MS
 } from './config.js';
 import {
   loadStoredFileMetric, saveFileMetric, saveDocumentMetadata, saveCommitteeMembers,
@@ -167,7 +167,7 @@ async function ensureGrobidRunning() {
     }
 
     // Wait for Grobid to become healthy/responsive
-    const maxWaitMs = 60_000;
+    const maxWaitMs = GROBID_STARTUP_WAIT_MS;
     const intervalMs = 2000;
     const start = Date.now();
     logger.info('Waiting for Grobid service to become responsive...');
@@ -185,7 +185,7 @@ async function ensureGrobidRunning() {
       }
       await new Promise(r => setTimeout(r, intervalMs));
     }
-    logger.warn('Grobid service failed to become responsive within 60s');
+    logger.warn(`Grobid service failed to become responsive within ${Math.round(maxWaitMs / 1000)}s`);
   } catch (err) {
     logger.error(`Failed to ensure Grobid is running: ${err.message}`);
   }

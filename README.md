@@ -223,6 +223,7 @@ Optional enrichment services:
 
 - `GROBID_URL`: GROBID endpoint. Defaults to `http://localhost:8070`, or `http://${FLY_APP_NAME}-grobid.internal:8070` on Fly.
 - `GROBID_APP_NAME`: Fly companion app name for GROBID auto-start checks; defaults to `${FLY_APP_NAME}-grobid`.
+- `GROBID_STARTUP_WAIT_MS`: max wait for a cold-starting GROBID companion service, default `420000` (7 minutes).
 - `FLY_API_TOKEN`: optional token used on Fly to start/check a stopped companion GROBID machine.
 - `BERTOPIC_PYTHON_COMMAND`: Python executable for BERTopic jobs, default `python3`.
 - `BERTOPIC_TIMEOUT_MS`: BERTopic job timeout, default one hour.
@@ -283,7 +284,7 @@ fly deploy
 fly deploy -c fly.grobid.toml
 ```
 
-Make sure the GROBID app name matches the `GROBID_URL` convention or set `GROBID_URL`/`GROBID_APP_NAME` explicitly.
+Make sure the GROBID app name matches the `GROBID_URL` convention or set `GROBID_URL`/`GROBID_APP_NAME` explicitly. The companion app should run with at least 4 GB of memory; the provided `fly.grobid.toml` uses 2 shared CPUs so Fly accepts the 4 GB allocation.
 
 In production, startup validates secret configuration. The API-key encryption key and MFA-secret encryption key must both be present and different, and Turso deployments require `TURSO_AUTH_TOKEN`. Startup also checks common deployment files for committed secret-looking values and fails production boot if it finds them.
 
