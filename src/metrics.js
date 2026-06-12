@@ -49,6 +49,11 @@ function unique(values) {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
+const MIN_RELIABLE_WORD_COUNT = 1000;
+const MIN_RELIABLE_PAGE_COUNT = 10;
+const UNRELIABLE_WORD_SOURCES = new Set(['metadata_text']);
+const UNRELIABLE_PAGE_SOURCES = new Set(['estimated_from_metadata_words']);
+
 function extractOcId(value) {
   const text = String(value || '').trim();
   if (!text) return null;
@@ -71,10 +76,11 @@ export function ensureSourceFields(sourceValue) {
     .map((part) => part.trim())
     .filter(Boolean);
   const seen = new Set(parts.map((part) => part.toLowerCase()));
-  for (const field of ['id', 'identifier', 'uri']) {
-    if (!seen.has(field)) {
+  for (const field of ['id', 'identifier', 'uri', 'digitalResourceOriginalRecord']) {
+    const key = field.toLowerCase();
+    if (!seen.has(key)) {
       parts.push(field);
-      seen.add(field);
+      seen.add(key);
     }
   }
   return parts.join(',');
@@ -106,6 +112,10 @@ export function normalizeRecord(doc, dict = null) {
   const uri = flattenText(firstPresent(doc, ['uri', 'URI', 'isShownAt', 'identifier', 'Identifier']));
   const rights = flattenText(firstPresent(doc, ['rights', 'Rights']));
   const doi = flattenText(firstPresent(doc, ['doi', 'DOI']));
+  const originalRecordUrl = flattenText(firstPresent(doc, [
+    'digitalResourceOriginalRecord', 'DigitalResourceOriginalRecord',
+    'digital_resource_original_record', 'originalRecord', 'OriginalRecord'
+  ]));
   const campus = flattenText(firstPresent(doc, ['campus', 'Campus']));
   const scholarlyLevel = flattenText(firstPresent(doc, ['scholarly_level', 'scholarlyLevel', 'ScholarlyLevel']));
   const downloadCandidates = collectCandidateUrls(doc, rawId, doi);
@@ -150,6 +160,7 @@ export function normalizeRecord(doc, dict = null) {
     methodologies,
     conceptTerms,
     uri,
+    originalRecordUrl,
     downloadCandidates,
     downloadUrl: null,
     downloadStatus: 'not_attempted',
@@ -159,10 +170,18 @@ export function normalizeRecord(doc, dict = null) {
   };
 }
 
-// Word count is unreliable when the PDF exists but text extraction failed (scan-only):
-// the stored count is just the abstract length, not the dissertation length.
-function hasReliableWordCount(rec) {
-  return rec.wordCountSource !== 'metadata_text' || !rec.fileBytes;
+export function hasReliableWordCount(rec) {
+  const count = Number((rec.bodyWordCount != null) ? rec.bodyWordCount : rec.wordCount);
+  return Number.isFinite(count)
+    && count >= MIN_RELIABLE_WORD_COUNT
+    && !UNRELIABLE_WORD_SOURCES.has(rec.wordCountSource);
+}
+
+export function hasReliablePageCount(rec) {
+  const count = Number(rec.pages);
+  return Number.isFinite(count)
+    && count >= MIN_RELIABLE_PAGE_COUNT
+    && !UNRELIABLE_PAGE_SOURCES.has(rec.pagesSource);
 }
 
 function buildMetrics(records, subjectLimit) {
@@ -172,16 +191,25 @@ function buildMetrics(records, subjectLimit) {
 
   for (const rec of records) {
     const reliableWords = hasReliableWordCount(rec);
+    const reliablePages = hasReliablePageCount(rec);
     const activeWordCount = (rec.bodyWordCount != null) ? rec.bodyWordCount : rec.wordCount;
     const concepts = Array.from(new Set((rec.conceptTerms || []).filter(Boolean)));
     if (concepts.length) {
       const weight = 1 / concepts.length;
       for (const concept of concepts) {
         if (!conceptWords.has(concept)) {
-          conceptWords.set(concept, { weightedWordSum: 0, weightSum: 0, docCount: 0 });
+          conceptWords.set(concept, {
+            weightedWordSum: 0,
+            reliableWeightSum: 0,
+            weightSum: 0,
+            docCount: 0
+          });
         }
         const entry = conceptWords.get(concept);
-        if (reliableWords) entry.weightedWordSum += activeWordCount * weight;
+        if (reliableWords) {
+          entry.weightedWordSum += activeWordCount * weight;
+          entry.reliableWeightSum += weight;
+        }
         entry.weightSum += weight;
         entry.docCount += 1;
       }
@@ -191,7 +219,7 @@ function buildMetrics(records, subjectLimit) {
       if (!yearWords.has(rec.year)) yearWords.set(rec.year, []);
       if (!yearPages.has(rec.year)) yearPages.set(rec.year, []);
       if (reliableWords) yearWords.get(rec.year).push(activeWordCount);
-      yearPages.get(rec.year).push(rec.pages);
+      if (reliablePages) yearPages.get(rec.year).push(rec.pages);
     }
   }
 
@@ -200,20 +228,23 @@ function buildMetrics(records, subjectLimit) {
       concept,
       docCount: values.docCount,
       weightedDocEquivalent: values.weightSum,
-      weightedMean: values.weightSum ? (values.weightedWordSum / values.weightSum) : null
+      weightedMean: values.reliableWeightSum ? (values.weightedWordSum / values.reliableWeightSum) : null
     }))
     .sort((a, b) => b.docCount - a.docCount || (b.weightedMean || 0) - (a.weightedMean || 0))
     .slice(0, subjectLimit);
 
   const byYear = Array.from(yearWords.entries())
+    .filter(([, values]) => values.length)
     .map(([year, values]) => ({ year: Number(year), ...stats(values) }))
     .sort((a, b) => a.year - b.year);
 
   const avgPagesByYear = Array.from(yearPages.entries())
+    .filter(([, values]) => values.length)
     .map(([year, values]) => ({ year: Number(year), ...stats(values) }))
     .sort((a, b) => a.year - b.year);
 
   const pageTrend = Array.from(yearPages.entries())
+    .filter(([, values]) => values.length)
     .map(([year, values]) => ({
       year: Number(year),
       median: median(values),
@@ -225,8 +256,8 @@ function buildMetrics(records, subjectLimit) {
 
   return {
     recordCount: records.length,
-    overallWordCount: stats(records.filter(hasReliableWordCount).map((r) => r.wordCount)),
-    overallPageCount: stats(records.map((r) => r.pages)),
+    overallWordCount: stats(records.filter(hasReliableWordCount).map((r) => (r.bodyWordCount != null) ? r.bodyWordCount : r.wordCount)),
+    overallPageCount: stats(records.filter(hasReliablePageCount).map((r) => r.pages)),
     overallCharCount: stats(records.map((r) => r.charCount)),
     byConcept,
     byYear,

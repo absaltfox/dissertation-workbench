@@ -665,7 +665,8 @@ async function handleRunImportRules(mode, button) {
         ruleIds,
         maxRecords: document.getElementById('s-maxRecords')?.value || '9999',
         pageSize: document.getElementById('s-pageSize')?.value || '20',
-        scanLimit: document.getElementById('s-scanLimit')?.value || '50000'
+        scanLimit: document.getElementById('s-scanLimit')?.value || '50000',
+        downloadFiles: document.getElementById('s-downloadFiles')?.value || '0'
       })
     });
     const data = await res.json();

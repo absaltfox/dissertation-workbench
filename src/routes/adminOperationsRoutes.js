@@ -54,6 +54,7 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
       syncMaxRecords: body.syncMaxRecords ?? body.scanLimit ?? getQueryValue(req, 'scanLimit'),
       pageSize: body.pageSize ?? getQueryValue(req, 'pageSize'),
       scanLimit: body.scanLimit ?? getQueryValue(req, 'scanLimit'),
+      downloadFiles: parseBooleanParam(body.downloadFiles ?? getQueryValue(req, 'downloadFiles'), true),
       apiKey: await getConfiguredApiKey(),
     };
     const { startDocumentSync } = await loadSyncModule();

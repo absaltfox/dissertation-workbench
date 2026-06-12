@@ -28,6 +28,7 @@ function publicSource(source) {
     maxRecords = 9999,
     syncMaxRecords = null,
     scanLimit = 50_000,
+    downloadFiles = true,
   } = source;
   return {
     baseUrl,
@@ -38,6 +39,7 @@ function publicSource(source) {
     pageSize,
     maxRecords: Number(syncMaxRecords || scanLimit || maxRecords),
     scanLimit,
+    downloadFiles: Boolean(downloadFiles),
   };
 }
 
@@ -110,7 +112,7 @@ async function runSync(syncKey, source, apiKey, runId, { mode = 'import_all' } =
         for (const item of missing) {
           await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
           await analyzeDocumentFile(item.doc, {
-            downloadFiles: true,
+            downloadFiles: source.downloadFiles,
             forceDownload: false,
             recomputeFromCache: false,
           });

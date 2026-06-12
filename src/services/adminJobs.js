@@ -102,13 +102,14 @@ export function runBertopicJob(jobId, { clearMetricsCache } = {}) {
   });
 }
 
-export function runImportRulesJob(jobId, { mode, scope, ruleIds, clearMetricsCache }) {
+export function runImportRulesJob(jobId, { mode, scope, ruleIds, downloadFiles = true, clearMetricsCache }) {
   runningAdminJobs.add('import_rules_sync');
   let logOutput = `Starting import rules sync job (mode: ${mode}, scope: ${scope})\n`;
 
   const run = async () => {
     const { runDocumentSync } = await import('../sync.js');
-    const { listImportRules, getConfiguredApiKey } = await import('../db.js');
+    const { listImportRules } = await import('../db.js');
+    const { getConfiguredApiKey } = await import('../secrets.js');
     const { importRuleToSyncOptions } = await import('../importRules.js');
 
     const allRules = await listImportRules();
@@ -134,6 +135,7 @@ export function runImportRulesJob(jobId, { mode, scope, ruleIds, clearMetricsCac
 
       const options = importRuleToSyncOptions(rule, {
         mode,
+        downloadFiles,
         apiKey,
       });
 

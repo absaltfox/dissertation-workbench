@@ -52,6 +52,29 @@ function populateFacetFilters() {
 // --- Client-side analytics builder (used when facet filters are active) ---
 
 function buildAnalytics(docs) {
+  const MIN_RELIABLE_WORD_COUNT = 1000;
+  const MIN_RELIABLE_PAGE_COUNT = 10;
+  const unreliableWordSources = new Set(['metadata_text']);
+  const unreliablePageSources = new Set(['estimated_from_metadata_words']);
+
+  function activeWordCount(doc) {
+    return doc.bodyWordCount != null ? doc.bodyWordCount : doc.wordCount;
+  }
+
+  function hasReliableWordCount(doc) {
+    const count = Number(activeWordCount(doc));
+    return Number.isFinite(count)
+      && count >= MIN_RELIABLE_WORD_COUNT
+      && !unreliableWordSources.has(doc.wordCountSource);
+  }
+
+  function hasReliablePageCount(doc) {
+    const count = Number(doc.pages);
+    return Number.isFinite(count)
+      && count >= MIN_RELIABLE_PAGE_COUNT
+      && !unreliablePageSources.has(doc.pagesSource);
+  }
+
   function statsOf(arr) {
     if (!arr.length) return { count: 0, min: null, max: null, mean: null, median: null };
     const s = [...arr].sort((a, b) => a - b);
@@ -82,13 +105,16 @@ function buildAnalytics(docs) {
     const { year, pages, wordCount,
       themes = [], conceptTerms = [],
       methodologies: meths = [], supervisors: sups = [] } = doc;
+    const reliableWords = hasReliableWordCount(doc);
+    const reliablePages = hasReliablePageCount(doc);
+    const weightedWordCount = reliableWords ? activeWordCount(doc) : null;
 
     if (year) {
       if (!byYearCountMap.has(year)) {
         byYearPagesMap.set(year, []); byYearWordsMap.set(year, []); byYearCountMap.set(year, 0);
       }
-      if (pages) byYearPagesMap.get(year).push(pages);
-      if (wordCount) byYearWordsMap.get(year).push(wordCount);
+      if (reliablePages) byYearPagesMap.get(year).push(pages);
+      if (reliableWords) byYearWordsMap.get(year).push(weightedWordCount);
       byYearCountMap.set(year, byYearCountMap.get(year) + 1);
     }
 
@@ -96,9 +122,13 @@ function buildAnalytics(docs) {
 
     for (const t of conceptTerms) {
       ngramMap.set(t, (ngramMap.get(t) || 0) + 1);
-      if (!conceptDocMap.has(t)) conceptDocMap.set(t, { sum: 0, count: 0 });
+      if (!conceptDocMap.has(t)) conceptDocMap.set(t, { sum: 0, count: 0, docCount: 0 });
       const e = conceptDocMap.get(t);
-      e.sum += wordCount || 0; e.count += 1;
+      e.docCount += 1;
+      if (reliableWords) {
+        e.sum += weightedWordCount;
+        e.count += 1;
+      }
       if (year) {
         if (!conceptYearMap.has(t)) conceptYearMap.set(t, new Map());
         const ym = conceptYearMap.get(t);
@@ -132,25 +162,26 @@ function buildAnalytics(docs) {
   const byYear = sortedYears.map(year => {
     const ws = statsOf(byYearWordsMap.get(year));
     return { year, count: byYearCountMap.get(year), mean: ws.mean, min: ws.min, max: ws.max };
-  });
+  }).filter(row => row.mean != null);
 
   const avgPagesByYear = sortedYears.map(year => {
     const ps = statsOf(byYearPagesMap.get(year));
     return { year, mean: ps.mean, min: ps.min, max: ps.max, count: ps.count };
-  });
+  }).filter(row => row.count > 0);
 
   const pageTrend = sortedYears.map(year => {
     const ps = statsOf(byYearPagesMap.get(year));
     return { year, median: ps.median, min: ps.min, max: ps.max, count: ps.count };
-  });
+  }).filter(row => row.count > 0);
 
   const byConcept = Array.from(conceptDocMap.entries())
-    .map(([concept, { sum, count }]) => ({ concept, weightedMean: count ? Math.round(sum / count) : 0, docCount: count }))
+    .map(([concept, { sum, count, docCount }]) => ({ concept, weightedMean: count ? Math.round(sum / count) : null, docCount }))
+    .filter(row => row.weightedMean != null)
     .sort((a, b) => b.weightedMean - a.weightedMean)
     .slice(0, 20);
 
-  const overallPageCount = statsOf(docs.map(d => d.pages).filter(Boolean));
-  const overallWordCount = statsOf(docs.map(d => d.wordCount).filter(Boolean));
+  const overallPageCount = statsOf(docs.filter(hasReliablePageCount).map(d => d.pages));
+  const overallWordCount = statsOf(docs.filter(hasReliableWordCount).map(activeWordCount));
 
   const metrics = { recordCount: docs.length, byYear, avgPagesByYear, pageTrend, byConcept, overallPageCount, overallWordCount };
 

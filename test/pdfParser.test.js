@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   detectDownloadBlockPage,
+  fetchFullTextForDocument,
   parseAcknowledgements,
   parseCommittee,
   parseBibliography,
@@ -17,6 +18,53 @@ test('detectDownloadBlockPage identifies UBC/F5 security block HTML', () => {
 
   assert.equal(detectDownloadBlockPage(html), true);
   assert.equal(detectDownloadBlockPage('<html><a href="/file.pdf">Download</a></html>'), false);
+});
+
+test('fetchFullTextForDocument retrieves cIRcle TEXT bitstream from original record URL', async () => {
+  const originalFetch = globalThis.fetch;
+  const longText = `A dissertation full text\n${'education '.repeat(200)}`;
+  const requested = [];
+
+  globalThis.fetch = async (url) => {
+    const textUrl = String(url);
+    requested.push(textUrl);
+    if (textUrl.includes('/rest/handle/2429/93916')) {
+      return {
+        ok: true,
+        json: async () => ({ id: 119703 }),
+      };
+    }
+    if (textUrl.includes('/rest/items/119703/bitstreams')) {
+      return {
+        ok: true,
+        json: async () => ([
+          { id: 512600, bundleName: 'ORIGINAL', mimeType: 'application/pdf', name: 'doc.pdf' },
+          { id: 512974, bundleName: 'TEXT', mimeType: 'text/plain', name: 'doc.pdf.txt' },
+        ]),
+      };
+    }
+    if (textUrl.includes('/rest/bitstreams/512974/retrieve')) {
+      return {
+        ok: true,
+        headers: new Headers({ 'content-type': 'text/plain; charset=UTF-8' }),
+        text: async () => longText,
+      };
+    }
+    return { ok: false };
+  };
+
+  try {
+    const text = await fetchFullTextForDocument({
+      id: '1.0451810',
+      originalRecordUrl: 'http://circle.library.ubc.ca/rest/handle/2429/93916?expand=metadata',
+    });
+
+    assert.equal(text, longText);
+    assert.ok(requested[0].startsWith('https://circle.library.ubc.ca/rest/handle/2429/93916'));
+    assert.ok(requested.some((url) => url.includes('/rest/bitstreams/512974/retrieve')));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('parseAcknowledgements extracts supervisors, co-supervisors, and committee members', () => {

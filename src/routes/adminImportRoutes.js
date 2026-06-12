@@ -8,7 +8,7 @@ import { DEFAULT_BASE_URL, DEFAULT_SOURCE, DEFAULT_TERM } from '../config.js';
 import { fetchPage, extractHits, fetchSearchAggregations, resolveIndexName } from '../api.js';
 import { normalizeRecord } from '../metrics.js';
 import { getConfiguredApiKey } from '../secrets.js';
-import { parseNumberParam } from '../validate.js';
+import { parseBooleanParam, parseNumberParam } from '../validate.js';
 import { asyncHandler } from '../middleware/http.js';
 import {
   IMPORT_RULE_FIELDS, buildImportRuleTerm, importRuleToSyncOptions,
@@ -203,6 +203,7 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
       syncMaxRecords: body.syncMaxRecords ?? body.scanLimit,
       pageSize: body.pageSize,
       scanLimit: body.scanLimit,
+      downloadFiles: parseBooleanParam(body.downloadFiles, true),
       apiKey: await getConfiguredApiKey(),
     });
     const { startDocumentSync } = await loadSyncModule();
@@ -246,12 +247,18 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
     const jobId = await createAdminJob({
       type: 'import_rules_sync',
       label: 'Import Rules Sync',
-      params: { mode, scope, ruleIds: selectedIds },
+      params: { mode, scope, ruleIds: selectedIds, downloadFiles: parseBooleanParam(body.downloadFiles, true) },
     });
 
     // Long-running imports continue in the background; the job table is the
     // source of truth for progress after this 202 response.
-    runImportRulesJob(jobId, { mode, scope, ruleIds: selectedIds, clearMetricsCache });
+    runImportRulesJob(jobId, {
+      mode,
+      scope,
+      ruleIds: selectedIds,
+      downloadFiles: parseBooleanParam(body.downloadFiles, true),
+      clearMetricsCache
+    });
 
     res.status(202).json({ ok: true, started: true, jobId });
   }));

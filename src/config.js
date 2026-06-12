@@ -11,7 +11,8 @@ export const DEFAULT_TERM = process.env.UBC_TERM || 'degree.raw,Doctor of Educat
 export const DEFAULT_SOURCE = process.env.UBC_SOURCE || [
   'title', 'author', 'ubc_date_sort', 'uri', 'creator', 'supervisor', 'description', 'genre',
   'date_available', 'rights', 'doi', 'affiliation', 'degree_theses', 'program_theses',
-  'scholarly_level', 'campus', 'degree', 'program', 'extent', 'identifier', 'id', 'subject'
+  'scholarly_level', 'campus', 'degree', 'program', 'extent', 'identifier', 'id', 'subject',
+  'digitalResourceOriginalRecord'
 ].join(',');
 export const DEFAULT_DOWNLOAD_FILES = process.env.DOWNLOAD_FILES !== '0';
 export const FILE_CONCURRENCY = 2;

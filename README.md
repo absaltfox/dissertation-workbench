@@ -100,7 +100,7 @@ Supported query params:
 - `index`: Open Collections index name/id. If omitted, code defaults to `UBC_INDEX`; the development env template sets `UBC_INDEX=24`.
 - `query`: optional Open Collections `q` query string.
 - `term`: Open Collections term filter. Default is `UBC_TERM`, usually `degree.raw,Doctor of Education - EdD`.
-- `source`: comma-separated source field list. The app ensures `id`, `identifier`, and `uri` are included.
+- `source`: comma-separated source field list. The app ensures `id`, `identifier`, `uri`, and `digitalResourceOriginalRecord` are included.
 - `maxRecords`: default `200`; anonymous public requests are capped by `PUBLIC_MAX_RECORDS`.
 - `pageSize`: default `20`, maximum `100`.
 - `scanLimit`: default `max(1000, maxRecords * 10)`; anonymous public requests are capped by `PUBLIC_SCAN_LIMIT`.
@@ -192,7 +192,7 @@ Use `.env.development.example` and `.env.production.example` as the canonical te
 - `SQLITE_PATH`: local SQLite/libSQL file path, default `${APP_DATA_DIR}/metrics.sqlite`.
 - `TURSO_DATABASE_URL`: optional remote libSQL/Turso URL. If omitted, local SQLite is used.
 - `TURSO_AUTH_TOKEN`: required in production when `TURSO_DATABASE_URL` points to Turso/libSQL.
-- `DOWNLOAD_FILES`: default `1`; set `0` to avoid automatic PDF downloads by default.
+- `DOWNLOAD_FILES`: default `1`; set `0` to avoid automatic PDF downloads by default. When PDF downloads are disabled or blocked, the app can still enrich records from cIRcle full-text bitstreams exposed through `digitalResourceOriginalRecord`.
 - `PDF_ALLOWED_HOSTS`: download host allowlist, default `open.library.ubc.ca,oc-index.library.ubc.ca`.
 - `PDF_ALLOW_HTTP_DOWNLOADS`: defaults to `1` in development and `0` in production.
 - `PDF_DOWNLOAD_RATE_PER_MIN`: optional PDF download throttle; `0` means unlimited.

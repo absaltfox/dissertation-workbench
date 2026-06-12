@@ -575,6 +575,152 @@ export async function analyzePdfAtPath(pdfPath, bytes) {
   };
 }
 
+function wordCountFromText(text) {
+  const count = String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(Boolean).length;
+  return count || null;
+}
+
+function estimatePagesFromWords(wordCount) {
+  const count = Number(wordCount);
+  if (!Number.isFinite(count) || count <= 0) return null;
+  return Math.max(1, Math.round(count / 300));
+}
+
+function originalRecordRestUrl(doc) {
+  const rawUrl = String(doc?.originalRecordUrl || '').trim();
+  if (!rawUrl) return null;
+
+  try {
+    const url = new URL(rawUrl);
+    if (url.hostname !== 'circle.library.ubc.ca') return null;
+    if (!url.pathname.startsWith('/rest/handle/')) return null;
+    url.protocol = 'https:';
+    url.searchParams.set('expand', 'all');
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+function dspaceRestUrl(pathname) {
+  const url = new URL('https://circle.library.ubc.ca');
+  url.pathname = pathname;
+  return url;
+}
+
+async function fetchJsonWithTimeout(url) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return null;
+    return await res.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchTextWithTimeout(url) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) return null;
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('text/plain') && !contentType.includes('text/')) return null;
+    return await res.text();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function chooseDspaceTextBitstream(bitstreams) {
+  return (bitstreams || []).find((bitstream) => {
+    const mime = String(bitstream?.mimeType || '').toLowerCase();
+    const bundle = String(bitstream?.bundleName || '').toUpperCase();
+    const name = String(bitstream?.name || '').toLowerCase();
+    return mime.startsWith('text/plain') || bundle === 'TEXT' || name.endsWith('.pdf.txt');
+  }) || null;
+}
+
+export async function fetchFullTextForDocument(doc) {
+  const recordUrl = originalRecordRestUrl(doc);
+  if (!recordUrl) return null;
+
+  try {
+    const record = await fetchJsonWithTimeout(recordUrl);
+    if (!record) return null;
+
+    let bitstreams = Array.isArray(record.bitstreams) ? record.bitstreams : [];
+    if (!bitstreams.length && record.id) {
+      const bitstreamUrl = dspaceRestUrl(`/rest/items/${record.id}/bitstreams`);
+      bitstreams = await fetchJsonWithTimeout(bitstreamUrl) || [];
+    }
+
+    const textBitstream = chooseDspaceTextBitstream(bitstreams);
+    const id = textBitstream?.id;
+    if (!id) return null;
+
+    const retrieveUrl = dspaceRestUrl(`/rest/bitstreams/${id}/retrieve`);
+    const fullText = await fetchTextWithTimeout(retrieveUrl);
+    return fullText && fullText.length > 1000 ? fullText : null;
+  } catch (err) {
+    logger.warn('Failed to fetch cIRcle full-text bitstream', {
+      docId: doc?.id,
+      error: err?.message || String(err)
+    });
+    return null;
+  }
+}
+
+async function analyzeDocumentFullText(doc, fullText, { stored = null, status = 'full_text', error = null } = {}) {
+  const wordCount = wordCountFromText(fullText);
+  const bodyWordCount = extractBodyWordCount(fullText);
+  const pageCount = estimatePagesFromWords(bodyWordCount || wordCount);
+  if (!wordCount || !pageCount) return false;
+
+  doc.wordCount = wordCount;
+  doc.wordCountSource = 'dspace_full_text';
+  if (bodyWordCount) doc.bodyWordCount = bodyWordCount;
+  doc.pages = pageCount;
+  doc.pagesSource = 'estimated_from_full_text_words';
+  doc.fileBytes = stored?.file_bytes ? Number(stored.file_bytes) : null;
+  doc.downloadUrl = stored?.download_url || null;
+  doc.downloadStatus = status;
+  doc.downloadError = error;
+
+  await saveFileMetric(doc.id, {
+    status,
+    error,
+    pdfPath: stored?.pdf_path || null,
+    downloadUrl: stored?.download_url || null,
+    fileBytes: stored?.file_bytes || null,
+    wordCount: doc.wordCount,
+    bodyWordCount: doc.bodyWordCount || null,
+    pageCount: doc.pages,
+    wordSource: doc.wordCountSource,
+    pageSource: doc.pagesSource
+  });
+  await extractAndSaveParsedData(doc, fullText, null);
+  logger.info('Document analyzed from cIRcle full-text bitstream', {
+    docId: doc.id,
+    pages: doc.pages,
+    words: doc.wordCount,
+    status
+  });
+  return true;
+}
+
+async function analyzeDocumentFullTextFallback(doc, stored, { status = 'full_text', error = null } = {}) {
+  const fullText = await fetchFullTextForDocument(doc);
+  if (!fullText) return false;
+  return analyzeDocumentFullText(doc, fullText, { stored, status, error });
+}
+
 // --- Committee & Bibliography Parsing ---
 
 const ROLE_PATTERNS = [
@@ -1321,6 +1467,10 @@ export async function analyzeDocumentFile(doc, options) {
 
   if (recomputeFromCache) {
     if (!hasCachedPdf) {
+      if (await analyzeDocumentFullTextFallback(doc, stored, {
+        status: 'full_text',
+        error: null
+      })) return;
       doc.downloadStatus = 'cache_miss';
       doc.downloadError = 'No local cached PDF available for recomputation.';
       await saveFileMetric(doc.id, {
@@ -1398,6 +1548,10 @@ export async function analyzeDocumentFile(doc, options) {
       applyStoredMetricToDoc(doc, stored, 'cached');
       await loadStoredParsedData(doc);
     } else {
+      if (await analyzeDocumentFullTextFallback(doc, stored, {
+        status: 'full_text',
+        error: null
+      })) return;
       doc.downloadStatus = 'skipped';
     }
     return;
@@ -1406,6 +1560,10 @@ export async function analyzeDocumentFile(doc, options) {
   const downloadBlock = activeDownloadBlock();
   if (downloadBlock) {
     const waitSeconds = Math.ceil(downloadBlock.remainingMs / 1000);
+    if (await analyzeDocumentFullTextFallback(doc, stored, {
+      status: 'full_text_fallback',
+      error: `${downloadBlock.reason} PDF downloads are paused for another ${waitSeconds}s after a UBC/F5 block page.`
+    })) return;
     await saveBlockedFileMetric(
       doc,
       stored,
@@ -1422,6 +1580,10 @@ export async function analyzeDocumentFile(doc, options) {
     if (resolved?.error) {
       logger.warn('PDF download blocked', { docId: doc.id, url: candidate, error: resolved.error });
       pauseDownloadsAfterBlock(resolved.error, candidate);
+      if (await analyzeDocumentFullTextFallback(doc, stored, {
+        status: 'full_text_fallback',
+        error: resolved.error
+      })) return;
       await saveBlockedFileMetric(doc, stored, resolved.error);
       return;
     }
@@ -1470,6 +1632,11 @@ export async function analyzeDocumentFile(doc, options) {
       doc.downloadError = error instanceof Error ? error.message : String(error);
     }
   }
+
+  if (await analyzeDocumentFullTextFallback(doc, stored, {
+    status: 'full_text_fallback',
+    error: doc.downloadError || 'No downloadable PDF could be resolved for this record.'
+  })) return;
 
   doc.downloadStatus = 'not_found';
   if (!doc.downloadError) doc.downloadError = 'No downloadable PDF could be resolved for this record.';

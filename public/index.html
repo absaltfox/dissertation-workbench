@@ -554,7 +554,7 @@
                 <input
                   id="s-source"
                   type="hidden"
-                  value="title,author,ubc_date_sort,uri,creator,supervisor,description,genre,date_available,rights,doi,affiliation,degree_theses,program_theses,scholarly_level,campus,degree,program,extent,identifier,id,subject"
+                  value="title,author,ubc_date_sort,uri,creator,supervisor,description,genre,date_available,rights,doi,affiliation,degree_theses,program_theses,scholarly_level,campus,degree,program,extent,identifier,id,subject,digitalResourceOriginalRecord"
                 />
 
                 <fieldset class="settings-section">
@@ -583,10 +583,10 @@
                   <legend>File Enrichment</legend>
                   <div class="settings-grid">
                     <label>
-                      <span>Download PDFs When Needed</span>
+                      <span>PDF Download Enrichment</span>
                       <select id="s-downloadFiles">
-                        <option value="1">Yes, download missing PDFs</option>
-                        <option value="0" selected>No, use metadata/cache only</option>
+                        <option value="1">On, download missing PDFs</option>
+                        <option value="0" selected>Off, use cache/full text only</option>
                       </select>
                     </label>
                     <label>
