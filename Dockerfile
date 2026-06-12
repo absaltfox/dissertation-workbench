@@ -7,6 +7,7 @@ ENV PORT=3000
 ENV APP_DATA_DIR=/data
 ENV SQLITE_PATH=/data/metrics.sqlite
 ENV PDF_CACHE_DIR=/data/pdf-cache
+ENV FULL_TEXT_CACHE_DIR=/data/full-text-cache
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \

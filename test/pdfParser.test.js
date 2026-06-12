@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
 import {
   detectDownloadBlockPage,
+  fetchPdfForDocument,
   fetchFullTextForDocument,
   parseAcknowledgements,
   parseCommittee,
@@ -54,16 +56,100 @@ test('fetchFullTextForDocument retrieves cIRcle TEXT bitstream from original rec
   };
 
   try {
-    const text = await fetchFullTextForDocument({
+    const result = await fetchFullTextForDocument({
       id: '1.0451810',
       originalRecordUrl: 'http://circle.library.ubc.ca/rest/handle/2429/93916?expand=metadata',
     });
 
-    assert.equal(text, longText);
+    assert.equal(result.fullText, longText);
+    assert.equal(result.cacheHit, false);
+    assert.ok(result.fullTextPath.endsWith('.txt'));
+    assert.equal(await fs.readFile(result.fullTextPath, 'utf8'), longText);
     assert.ok(requested[0].startsWith('https://circle.library.ubc.ca/rest/handle/2429/93916'));
     assert.ok(requested.some((url) => url.includes('/rest/bitstreams/512974/retrieve')));
+    await fs.unlink(result.fullTextPath).catch(() => {});
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('fetchPdfForDocument retrieves ORIGINAL PDF bitstream from cIRcle REST', async () => {
+  const originalFetch = globalThis.fetch;
+  const pdfBytes = Buffer.from('%PDF-1.3\n%%EOF');
+  const requested = [];
+
+  globalThis.fetch = async (url) => {
+    const textUrl = String(url);
+    requested.push(textUrl);
+    if (textUrl.includes('/rest/handle/2429/93916')) {
+      return {
+        ok: true,
+        json: async () => ({ id: 119703 }),
+      };
+    }
+    if (textUrl.includes('/rest/items/119703/bitstreams')) {
+      return {
+        ok: true,
+        json: async () => ([
+          { id: 512974, bundleName: 'TEXT', mimeType: 'text/plain', name: 'doc.pdf.txt' },
+          { id: 512600, bundleName: 'ORIGINAL', mimeType: 'application/pdf', name: 'doc.pdf' },
+        ]),
+      };
+    }
+    if (textUrl.includes('/rest/bitstreams/512600/retrieve')) {
+      return {
+        ok: true,
+        url: textUrl,
+        headers: new Headers({
+          'content-type': 'application/pdf',
+          'content-length': String(pdfBytes.length),
+        }),
+        arrayBuffer: async () => pdfBytes.buffer.slice(pdfBytes.byteOffset, pdfBytes.byteOffset + pdfBytes.byteLength),
+      };
+    }
+    return { ok: false };
+  };
+
+  try {
+    const result = await fetchPdfForDocument({
+      id: '1.0451810',
+      originalRecordUrl: 'http://circle.library.ubc.ca/rest/handle/2429/93916?expand=metadata',
+    });
+
+    assert.equal(result.bitstreamId, 512600);
+    assert.equal(result.downloadUrl, 'https://circle.library.ubc.ca/rest/bitstreams/512600/retrieve');
+    assert.deepEqual(result.bytes, pdfBytes);
+    assert.ok(requested.some((url) => url.includes('/rest/bitstreams/512600/retrieve')));
+    assert.equal(requested.some((url) => url.includes('/media/download/pdf/')), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('fetchFullTextForDocument uses cached full text without network access', async () => {
+  const originalFetch = globalThis.fetch;
+  const cachedPath = new URL(`../data/full-text-cache/test-${Date.now()}.txt`, import.meta.url);
+  const cachedText = `Cached dissertation text\n${'school '.repeat(200)}`;
+  await fs.mkdir(new URL('../data/full-text-cache/', import.meta.url), { recursive: true });
+  await fs.writeFile(cachedPath, cachedText, 'utf8');
+  globalThis.fetch = async () => {
+    throw new Error('network should not be called for cached full text');
+  };
+
+  try {
+    const result = await fetchFullTextForDocument({
+      id: 'cached-doc',
+      originalRecordUrl: 'http://circle.library.ubc.ca/rest/handle/2429/93916?expand=metadata',
+    }, {
+      full_text_path: cachedPath.pathname,
+      full_text_source_url: 'https://circle.library.ubc.ca/rest/bitstreams/512974/retrieve',
+    });
+
+    assert.equal(result.fullText, cachedText);
+    assert.equal(result.cacheHit, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    await fs.unlink(cachedPath).catch(() => {});
   }
 });
 

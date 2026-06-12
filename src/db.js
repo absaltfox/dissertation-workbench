@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createClient } from '@libsql/client';
-import { SQLITE_PATH, PDF_CACHE_DIR, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL } from './config.js';
+import { SQLITE_PATH, PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL } from './config.js';
 import { logger } from './logger.js';
 import { normalizePersonName, supervisorNameKey } from './supervisors.js';
 import { encryptMfaSecret, decryptMfaSecret } from './secretCrypto.js';
@@ -17,6 +17,7 @@ export function getDatabaseUrl() {
 
 export async function ensureStorage() {
   await fs.mkdir(PDF_CACHE_DIR, { recursive: true });
+  await fs.mkdir(FULL_TEXT_CACHE_DIR, { recursive: true });
   if (!TURSO_DATABASE_URL) {
     await fs.mkdir(path.dirname(SQLITE_PATH), { recursive: true });
   }
@@ -105,6 +106,10 @@ async function ensureSchema(client) {
       download_url TEXT,
       file_bytes INTEGER,
       word_count INTEGER,
+      body_word_count INTEGER,
+      full_text_path TEXT,
+      full_text_bytes INTEGER,
+      full_text_source_url TEXT,
       page_count INTEGER,
       word_source TEXT,
       page_source TEXT,
@@ -279,6 +284,9 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE citations ADD COLUMN year TEXT');
   await tryExec(client, 'ALTER TABLE citations ADD COLUMN source TEXT');
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN body_word_count INTEGER');
+  await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_path TEXT');
+  await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_bytes INTEGER');
+  await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_source_url TEXT');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_sync_key ON documents(sync_key)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree ON documents(degree)');
@@ -584,7 +592,8 @@ export async function listAdminJobs(limit = 25) {
 
 export async function loadStoredFileMetric(docId) {
   return get(`
-    SELECT doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count, page_count,
+    SELECT doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count,
+           full_text_path, full_text_bytes, full_text_source_url, page_count,
            word_source, page_source, status, error, updated_at
     FROM file_metrics
     WHERE doc_id = ?
@@ -595,15 +604,19 @@ export async function saveFileMetric(docId, payload) {
   const now = new Date().toISOString();
   await run(`
     INSERT INTO file_metrics (
-      doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count, page_count,
+      doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count,
+      full_text_path, full_text_bytes, full_text_source_url, page_count,
       word_source, page_source, status, error, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(doc_id) DO UPDATE SET
       pdf_path = excluded.pdf_path,
       download_url = excluded.download_url,
       file_bytes = excluded.file_bytes,
       word_count = excluded.word_count,
       body_word_count = excluded.body_word_count,
+      full_text_path = excluded.full_text_path,
+      full_text_bytes = excluded.full_text_bytes,
+      full_text_source_url = excluded.full_text_source_url,
       page_count = excluded.page_count,
       word_source = excluded.word_source,
       page_source = excluded.page_source,
@@ -617,6 +630,9 @@ export async function saveFileMetric(docId, payload) {
     payload.fileBytes ?? null,
     payload.wordCount ?? null,
     payload.bodyWordCount ?? null,
+    payload.fullTextPath || null,
+    payload.fullTextBytes ?? null,
+    payload.fullTextSourceUrl || null,
     payload.pageCount ?? null,
     payload.wordSource || null,
     payload.pageSource || null,
@@ -632,7 +648,8 @@ export async function deleteFileMetric(docId) {
 
 export async function listFileMetrics() {
   const rows = await all(`
-    SELECT fm.doc_id, fm.pdf_path, fm.download_url, fm.file_bytes, fm.word_count, fm.page_count,
+    SELECT fm.doc_id, fm.pdf_path, fm.download_url, fm.file_bytes, fm.word_count,
+           fm.body_word_count, fm.full_text_path, fm.full_text_bytes, fm.full_text_source_url, fm.page_count,
            fm.word_source, fm.page_source, fm.status, fm.error, fm.updated_at,
            d.title, d.author, d.metadata_json
     FROM file_metrics fm
@@ -658,6 +675,7 @@ export async function getFileMetricsStats() {
     SELECT COUNT(*) AS total,
            SUM(CASE WHEN file_bytes IS NOT NULL THEN file_bytes ELSE 0 END) AS total_bytes,
            SUM(CASE WHEN status = 'downloaded' OR status = 'redownloaded' OR status = 'cached' OR status = 'recomputed_from_cache' THEN 1 ELSE 0 END) AS with_pdf,
+           SUM(CASE WHEN word_source = 'dspace_full_text' THEN 1 ELSE 0 END) AS with_full_text,
            SUM(CASE WHEN status = 'not_found' OR status = 'cache_miss' OR status = 'blocked' THEN 1 ELSE 0 END) AS failed,
            MIN(updated_at) AS oldest,
            MAX(updated_at) AS newest

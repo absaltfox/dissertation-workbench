@@ -105,9 +105,8 @@ Supported query params:
 - `pageSize`: default `20`, maximum `100`.
 - `scanLimit`: default `max(1000, maxRecords * 10)`; anonymous public requests are capped by `PUBLIC_SCAN_LIMIT`.
 - `subjectLimit`: default `25`.
-- `downloadFiles`: `1`/`0`, default `1`. Restricted in production unless allowed or requested by an authenticated admin session.
-- `recomputeFromCache`: `1`/`0`, default `0`. Recomputes metrics from cached PDFs without redownloading.
-- `refresh=1`: bypasses the in-memory metrics cache and enables force-refresh behavior.
+- `downloadFiles` and `recomputeFromCache` are ignored by this read-only dashboard endpoint. PDF downloads, cIRcle full-text fetches, and file recomputation only run through Admin-triggered sync/cache actions.
+- `refresh=1`: bypasses the in-memory metrics cache. It does not force PDF or full-text enrichment.
 
 Open Collections API keys are applied server-side. Browser requests do not need to include keys.
 
@@ -189,14 +188,12 @@ Use `.env.development.example` and `.env.production.example` as the canonical te
 - `UBC_API_KEY`: optional Open Collections API key. When set in env, it is authoritative and the admin UI cannot replace it.
 - `APP_DATA_DIR`: data directory, default `./data`.
 - `PDF_CACHE_DIR`: PDF cache directory, default `${APP_DATA_DIR}/pdf-cache`.
+- `FULL_TEXT_CACHE_DIR`: extracted cIRcle full-text cache directory, default `${APP_DATA_DIR}/full-text-cache`.
 - `SQLITE_PATH`: local SQLite/libSQL file path, default `${APP_DATA_DIR}/metrics.sqlite`.
 - `TURSO_DATABASE_URL`: optional remote libSQL/Turso URL. If omitted, local SQLite is used.
 - `TURSO_AUTH_TOKEN`: required in production when `TURSO_DATABASE_URL` points to Turso/libSQL.
-- `DOWNLOAD_FILES`: default `1`; set `0` to avoid automatic PDF downloads by default. When PDF downloads are disabled or blocked, the app can still enrich records from cIRcle full-text bitstreams exposed through `digitalResourceOriginalRecord`.
-- `PDF_ALLOWED_HOSTS`: download host allowlist, default `open.library.ubc.ca,oc-index.library.ubc.ca`.
-- `PDF_ALLOW_HTTP_DOWNLOADS`: defaults to `1` in development and `0` in production.
-- `PDF_DOWNLOAD_RATE_PER_MIN`: optional PDF download throttle; `0` means unlimited.
-- `PDF_BLOCK_COOLDOWN_MS`: pauses further PDF downloads after a UBC/F5 block page is detected, default `900000`.
+- `DOWNLOAD_FILES`: default `1`; set `0` to avoid automatic PDF downloads by default. PDF enrichment uses cIRcle REST `ORIGINAL` bitstreams exposed through `digitalResourceOriginalRecord`; full-text fallback uses cIRcle `TEXT` bitstreams.
+- `PDF_DOWNLOAD_RATE_PER_MIN`: optional cIRcle REST PDF download throttle; `0` means unlimited.
 - `CACHE_TTL_MS`: in-memory metrics cache TTL, default `600000`.
 - `TRUST_PROXY`: set `1` behind Fly/reverse proxies.
 - `SESSION_COOKIE_SECURE`: defaults to `1` in production and `0` otherwise.

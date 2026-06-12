@@ -165,15 +165,22 @@ test('metrics validates query parameters before collecting data', async () => {
   assert.deepEqual(res.body.errors, ['maxRecords must be between 1 and 9999.']);
 });
 
-test('authenticated metrics reads without CSRF fall back to public caps', async () => {
+test('authenticated metrics reads ignore file enrichment params without CSRF', async () => {
   const token = createSession('admin');
   try {
     const res = await request(app)
-      .get('/api/metrics?maxRecords=9999&scanLimit=50000&downloadFiles=0&recomputeFromCache=0')
+      .get('/api/metrics?maxRecords=9999&scanLimit=50000&downloadFiles=1&recomputeFromCache=1')
       .set('Cookie', `session=${token}`)
       .expect('content-type', /application\/json/);
 
     assert.notEqual(res.status, 403);
+    assert.equal(res.body.source.readOnlyFileEnrichment, true);
+    assert.equal(res.body.source.downloadFiles, false);
+    assert.equal(res.body.source.recomputeFromCache, false);
+    assert.deepEqual(res.body.source.ignoredFileEnrichmentParams, {
+      downloadFiles: true,
+      recomputeFromCache: true,
+    });
   } finally {
     destroySession(token);
   }

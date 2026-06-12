@@ -2,7 +2,6 @@ import { logger } from './logger.js';
 import { toArray } from './nlp.js';
 
 const resolvedIndexCache = new Map();
-const DIRECT_PDF_SUFFIX_LIMIT = 10;
 
 // --- Upstream UBC API rate limiter (serialized queue) ---
 const apiCallTimestamps = [];
@@ -53,33 +52,8 @@ function unique(values) {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
-function addDirectPdfCandidates(candidates, collectionId, itemId) {
-  const encodedId = encodeURIComponent(itemId);
-  for (let suffix = 1; suffix <= DIRECT_PDF_SUFFIX_LIMIT; suffix++) {
-    candidates.push(`https://open.library.ubc.ca/media/download/pdf/${collectionId}/${encodedId}/${suffix}`);
-  }
-}
-
 export function collectCandidateUrls(doc, id, doi) {
   const candidates = [];
-
-  // Build a collection-specific direct PDF URL using the Elasticsearch index name
-  // (e.g. "dsp.831-2022-11-13" → collection 831, URL: /media/download/pdf/831/{id}/1).
-  // Some Open Collections records expose the dissertation as a later file number,
-  // so try a bounded range instead of assuming /1, /2, or /3 covers every item.
-  const indexMatch = String(doc?.__oc_index || '').match(/dsp\.(\d+)/);
-  if (indexMatch && id) {
-    const collNum = indexMatch[1];
-    addDirectPdfCandidates(candidates, collNum, id);
-  }
-
-  if (doi) {
-    const suffix = doi.split('/').pop();
-    if (suffix) {
-      candidates.push(`https://open.library.ubc.ca/media/download/pdf/24/${suffix}`);
-      addDirectPdfCandidates(candidates, '24', suffix);
-    }
-  }
 
   for (const key of [
     'URI', 'uri', 'isShownAt', 'IsShownAt', 'hasView', 'HasView',

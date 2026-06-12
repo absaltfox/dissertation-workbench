@@ -59,6 +59,15 @@ function sourceUpdatedAt(raw) {
 export const filterSyncItemsForMode = (items, mode, existsFn = documentExists) =>
   filterSyncItemsForModeWithExists(items, mode, existsFn);
 
+function hasCachedEnrichmentMetric(stored) {
+  return Boolean(stored?.pdf_path)
+    || (
+      stored?.word_source === 'dspace_full_text'
+      && Number(stored.word_count) > 0
+      && Number(stored.page_count) > 0
+    );
+}
+
 async function runSync(syncKey, source, apiKey, runId, { mode = 'import_all' } = {}) {
   const startedAt = Date.now();
   let totalSeen = 0;
@@ -103,7 +112,7 @@ async function runSync(syncKey, source, apiKey, runId, { mode = 'import_all' } =
         const missing = [];
         for (const item of filtered.items) {
           const stored = await loadStoredFileMetric(item.doc.id);
-          if (stored?.pdf_path) {
+          if (hasCachedEnrichmentMetric(stored)) {
             totalSkipped += 1;
             continue;
           }

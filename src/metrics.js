@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   DEFAULT_BASE_URL, DEFAULT_INDEX, DEFAULT_API_KEY, DEFAULT_QUERY,
-  DEFAULT_TERM, DEFAULT_SOURCE, DEFAULT_DOWNLOAD_FILES, PDF_CACHE_DIR, SQLITE_PATH, DATA_DIR
+  DEFAULT_TERM, DEFAULT_SOURCE, DEFAULT_DOWNLOAD_FILES, PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, SQLITE_PATH, DATA_DIR
 } from './config.js';
 import { ensureStorage, getDb, saveRunMetrics, hasTopics, loadTopics, loadDocumentTopics, loadDocumentTopicCoords, loadTopicHierarchy, getCitationCooccurrence } from './db.js';
 import {
@@ -972,6 +972,7 @@ export async function collectMetrics(options = {}) {
     recomputeFromCache,
     servedFromCache: Array.isArray(options.cachedDocuments),
     pdfCacheDir: PDF_CACHE_DIR,
+    fullTextCacheDir: FULL_TEXT_CACHE_DIR,
     sqlitePath: SQLITE_PATH
   };
 

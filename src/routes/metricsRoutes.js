@@ -1,8 +1,7 @@
 import { Router } from 'express';
 import { collectMetrics } from '../metrics.js';
 import {
-  ALLOW_PUBLIC_DOWNLOADS, ALLOW_PUBLIC_RECOMPUTE, ALLOW_PUBLIC_REFRESH,
-  CACHE_TTL_MS, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT
+  ALLOW_PUBLIC_REFRESH, CACHE_TTL_MS, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT
 } from '../config.js';
 import { getDocumentCacheStats, listCachedDocuments } from '../db.js';
 import { authenticate } from '../auth.js';
@@ -14,8 +13,10 @@ import { hasValidCsrf } from '../middleware/adminAuth.js';
 /**
  * Creates the public metrics router.
  *
- * Public requests are capped by configured guardrails. Authenticated admins with
- * a valid CSRF token may request refresh/recompute/file-enrichment work.
+ * Public requests are capped by configured guardrails. This route is read-only
+ * for file enrichment: it may read cached PDF/full-text metrics, but it never
+ * downloads PDFs, fetches cIRcle full text, or recomputes cached files. Admin
+ * jobs and cache actions own those mutating enrichment paths.
  * `metricsInflight` deduplicates identical expensive collection requests.
  */
 export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncModule }) {
@@ -49,12 +50,14 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const source = getQueryValue(req, 'source') || undefined;
     const configuredApiKey = await getConfiguredApiKey();
     const apiKey = configuredApiKey || undefined;
-    const downloadFiles = parseBooleanParam(getQueryValue(req, 'downloadFiles'), true);
-    const recomputeFromCache = parseBooleanParam(getQueryValue(req, 'recomputeFromCache'), false);
+    const requestedDownloadFiles = parseBooleanParam(getQueryValue(req, 'downloadFiles'), false);
+    const requestedRecomputeFromCache = parseBooleanParam(getQueryValue(req, 'recomputeFromCache'), false);
+    const downloadFiles = false;
+    const recomputeFromCache = false;
     const refresh = getQueryValue(req, 'refresh') === '1';
     const user = authenticate(req);
     const hasAdminCsrf = Boolean(user) && hasValidCsrf(req, user);
-    const needsAdminPrivileges = refresh || recomputeFromCache || downloadFiles;
+    const needsAdminPrivileges = refresh;
     if (user && !hasAdminCsrf && needsAdminPrivileges) {
       res.status(403).json({ error: 'Invalid CSRF token' });
       return;
@@ -63,16 +66,8 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     // token are valid; a bare session cookie is not enough for expensive writes
     // or refresh-like behavior.
     const isAdminRequest = hasAdminCsrf;
-    if (!isAdminRequest && downloadFiles && !ALLOW_PUBLIC_DOWNLOADS) {
-      res.status(403).json({ error: 'downloadFiles is restricted to authenticated admin sessions.' });
-      return;
-    }
     if (!isAdminRequest && refresh && !ALLOW_PUBLIC_REFRESH) {
       res.status(403).json({ error: 'refresh is restricted to authenticated admin sessions.' });
-      return;
-    }
-    if (!isAdminRequest && recomputeFromCache && !ALLOW_PUBLIC_RECOMPUTE) {
-      res.status(403).json({ error: 'recomputeFromCache is restricted to authenticated admin sessions.' });
       return;
     }
     const effectiveMaxRecords = isAdminRequest ? maxRecords : Math.min(maxRecords, PUBLIC_MAX_RECORDS);
@@ -104,7 +99,7 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
         maxRecords: effectiveMaxRecords, pageSize, scanLimit: effectiveScanLimit, subjectLimit,
         index, query, term, source, apiKey,
         downloadFiles,
-        forceDownload: refresh,
+        forceDownload: false,
         recomputeFromCache
       };
       const { getSyncKeyForOptions } = await loadSyncModule();
@@ -119,7 +114,7 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       const payload = await collectMetrics({
         ...sourceOptions,
         cachedDocuments,
-        skipFileEnrichment: Boolean(cachedDocuments),
+        skipFileEnrichment: true,
       });
       if (cachedDocuments) {
         payload.source.documentCache = {
@@ -128,6 +123,11 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
           lastSyncedAt: cacheStats.lastSyncedAt,
         };
       }
+      payload.source.readOnlyFileEnrichment = true;
+      payload.source.ignoredFileEnrichmentParams = {
+        downloadFiles: requestedDownloadFiles,
+        recomputeFromCache: requestedRecomputeFromCache,
+      };
       metricsCache.set(cacheKey, { timestamp: Date.now(), payload });
       return payload;
     };

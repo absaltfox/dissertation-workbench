@@ -19,6 +19,7 @@ export const FILE_CONCURRENCY = 2;
 export const PDF_DOWNLOAD_RATE_PER_MIN = Number(process.env.PDF_DOWNLOAD_RATE_PER_MIN || 0); // 0 = unlimited
 export const DATA_DIR = process.env.APP_DATA_DIR || path.join(process.cwd(), 'data');
 export const PDF_CACHE_DIR = process.env.PDF_CACHE_DIR || path.join(DATA_DIR, 'pdf-cache');
+export const FULL_TEXT_CACHE_DIR = process.env.FULL_TEXT_CACHE_DIR || path.join(DATA_DIR, 'full-text-cache');
 export const GROBID_URL = process.env.GROBID_URL || (
   process.env.FLY_APP_NAME
     ? `http://${process.env.FLY_APP_NAME}-grobid.internal:8070`
@@ -32,7 +33,6 @@ export const PORT = Number(process.env.PORT || 3000);
 export const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60 * 1000);
 export const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024; // 200 MB
 export const DOWNLOAD_TIMEOUT_MS = 30_000; // 30 seconds
-export const PDF_BLOCK_COOLDOWN_MS = Number(process.env.PDF_BLOCK_COOLDOWN_MS || 15 * 60 * 1000);
 export const TRUST_PROXY = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '');
 export const PDF_ALLOWED_HOSTS = (process.env.PDF_ALLOWED_HOSTS || 'open.library.ubc.ca,oc-index.library.ubc.ca')
   .split(',')
