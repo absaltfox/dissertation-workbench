@@ -143,6 +143,7 @@ export async function start() {
     downloadFiles: false,
     forceDownload: false,
     recomputeFromCache: false,
+    skipFileEnrichment: true,
   }).then((payload) => {
     // Key must match what a default anonymous browser request produces so the
     // first page load is served from cache without a round-trip to the UBC API.
