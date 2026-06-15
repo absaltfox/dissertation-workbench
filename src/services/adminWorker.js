@@ -46,6 +46,28 @@ async function flyRequest(path, options = {}) {
   return res.json();
 }
 
+function workerStartPublicMessage(error) {
+  const message = error?.message || String(error);
+  if (message.includes('FLY_API_TOKEN is required')) {
+    return 'Admin workers are configured for Fly, but FLY_API_TOKEN is not set.';
+  }
+  if (message.includes('Fly Machines API 401') || message.includes('Fly Machines API 403')) {
+    return 'Fly rejected the configured FLY_API_TOKEN. Update the Fly secret with a token that can create and destroy Machines for this app.';
+  }
+  if (message.includes('Fly Machines API')) {
+    return 'Fly could not start the admin worker. Check the app logs for the Machines API response.';
+  }
+  return 'The admin worker could not be started. Check the app logs for details.';
+}
+
+function adminWorkerStartError(error) {
+  const wrapped = new Error(workerStartPublicMessage(error));
+  wrapped.statusCode = 503;
+  wrapped.publicMessage = wrapped.message;
+  wrapped.cause = error;
+  return wrapped;
+}
+
 async function resolveWorkerImage() {
   if (WORKER_IMAGE) return WORKER_IMAGE;
   if (!FLY_APP_NAME || !FLY_MACHINE_ID) {
@@ -143,7 +165,12 @@ function startLocalWorker(jobId, token) {
 
 export async function createAndStartAdminWorkerJob({ type, label, params = null }) {
   const token = crypto.randomBytes(32).toString('hex');
-  const runnerType = shouldUseFly() ? 'fly' : 'local';
+  let runnerType;
+  try {
+    runnerType = shouldUseFly() ? 'fly' : 'local';
+  } catch (error) {
+    throw adminWorkerStartError(error);
+  }
   const jobId = await createAdminJob({
     type,
     label,
@@ -165,7 +192,7 @@ export async function createAndStartAdminWorkerJob({ type, label, params = null 
       error: error?.message || String(error),
       finishedAt: new Date().toISOString(),
     });
-    throw error;
+    throw adminWorkerStartError(error);
   }
   return { jobId, runnerType };
 }

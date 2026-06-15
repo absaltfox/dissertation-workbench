@@ -191,7 +191,7 @@ test('production auto mode fails closed without Fly API token', async () => {
       await createAndStartAdminWorkerJob({ type: 'document_sync', label: 'Should Fail', params: {} });
       process.exit(1);
     } catch (error) {
-      if (!/FLY_API_TOKEN is required/.test(error.message)) {
+      if (error.statusCode !== 503 || !/FLY_API_TOKEN is not set/.test(error.message)) {
         console.error(error.message);
         process.exit(2);
       }

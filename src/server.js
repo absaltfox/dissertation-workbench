@@ -96,9 +96,12 @@ app.use((_req, res) => {
 app.use((error, req, res, _next) => {
   logger.error('Request error', { path: req.path, error: error.message });
   if (res.headersSent) return;
-  res.status(500).json({
-    error: 'Internal server error',
-    message: EXPOSE_ERROR_DETAILS && error instanceof Error ? error.message : 'Unexpected error'
+  const statusCode = Number(error?.statusCode || error?.status || 500);
+  const safeStatus = statusCode >= 400 && statusCode < 600 ? statusCode : 500;
+  const publicMessage = error?.publicMessage || (EXPOSE_ERROR_DETAILS && error instanceof Error ? error.message : null);
+  res.status(safeStatus).json({
+    error: safeStatus === 503 ? 'Service unavailable' : 'Internal server error',
+    message: publicMessage || 'Unexpected error'
   });
 });
 
