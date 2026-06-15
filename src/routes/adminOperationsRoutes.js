@@ -143,6 +143,22 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
     res.status(202).json({ ok: true, started: true, ...result });
   }));
 
+  router.post('/cache/:docId/reanalyze', asyncHandler(async (req, res) => {
+    const docId = req.params.docId;
+    const doc = await loadDocumentMetadata(docId);
+    if (!doc) {
+      res.status(404).json({ error: 'Document not found in metadata store' });
+      return;
+    }
+    const result = await createAndStartAdminWorkerJob({
+      type: 'cache_reanalyze_doc',
+      label: `Reanalyze Cached PDF: ${doc.title || docId}`,
+      params: { docId },
+    });
+    clearMetricsCache();
+    res.status(202).json({ ok: true, started: true, ...result });
+  }));
+
   router.delete('/cache/:docId', asyncHandler(async (req, res) => {
     const docId = req.params.docId;
     await deleteCachedPdf(docId);

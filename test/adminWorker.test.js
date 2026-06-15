@@ -11,6 +11,7 @@ let testDataDir;
 let buildFlyWorkerMachinePayload;
 let cancelAdminWorkerJob;
 let WorkerArtifactClient;
+let runImportPdfAdminJob;
 let analyzeDocumentFile;
 let appendAdminJobLog;
 let claimAdminJob;
@@ -22,6 +23,8 @@ let hashAdminJobToken;
 let heartbeatAdminJob;
 let finishAdminJob;
 let loadStoredFileMetric;
+let saveDocumentMetadata;
+let saveFileMetric;
 let validateAdminJobArtifactToken;
 
 test.before(async () => {
@@ -35,6 +38,7 @@ test.before(async () => {
 
   ({ buildFlyWorkerMachinePayload, cancelAdminWorkerJob } = await import('../src/services/adminWorker.js'));
   ({ WorkerArtifactClient } = await import('../src/workerArtifacts.js'));
+  ({ runImportPdfAdminJob } = await import('../src/services/importPdfJobRunner.js'));
   ({ analyzeDocumentFile } = await import('../src/pdf.js'));
   ({
     appendAdminJobLog,
@@ -47,6 +51,8 @@ test.before(async () => {
     heartbeatAdminJob,
     finishAdminJob,
     loadStoredFileMetric,
+    saveDocumentMetadata,
+    saveFileMetric,
     validateAdminJobArtifactToken,
   } = await import('../src/db.js'));
 });
@@ -178,6 +184,71 @@ test('Fly worker cancel preserves running state when machine destroy fails', asy
   assert.equal(job.status, 'running');
   assert.equal(job.runnerState, 'kill_failed');
   assert.equal(await validateAdminJobArtifactToken(jobId, token, { docId: 'fly-cancel-doc' }), true);
+});
+
+test('cache reanalysis job recomputes from cached PDF without downloading', async () => {
+  await ensureStorage();
+  const docId = `cached-reanalysis-${Date.now()}`;
+  const durablePdfPath = `/web/pdf-cache/${docId}.pdf`;
+  await saveDocumentMetadata({
+    id: docId,
+    title: 'Cached Reanalysis Fixture',
+    author: 'Worker Tester',
+    supervisors: [],
+  });
+  await saveFileMetric(docId, {
+    status: 'cached',
+    pdfPath: durablePdfPath,
+    downloadUrl: 'https://example.test/cached.pdf',
+    fileBytes: 43,
+    wordCount: 1,
+    pageCount: 1,
+    wordSource: 'old',
+    pageSource: 'old',
+  });
+  const jobId = await createAdminJob({
+    type: 'cache_reanalyze_doc',
+    label: 'Cached Reanalysis Test',
+    params: { docId },
+    runnerType: 'local',
+  });
+  const originalFetch = globalThis.fetch;
+  let downloadedFromArtifact = false;
+  globalThis.fetch = async () => {
+    throw new Error('network should not be used for cached reanalysis');
+  };
+
+  try {
+    const result = await runImportPdfAdminJob(await getAdminJob(jobId), {
+      artifactClient: {
+        downloadPdfToTemp: async (requestedDocId) => {
+          assert.equal(requestedDocId, docId);
+          downloadedFromArtifact = true;
+          const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-cached-reanalysis-'));
+          const pdfPath = path.join(dir, 'cached.pdf');
+          await fs.writeFile(pdfPath, Buffer.from('%PDF-1.4\n1 0 obj\n<< /Type /Page >>\nendobj\n'));
+          return {
+            path: pdfPath,
+            cleanup: async () => fs.rm(dir, { recursive: true, force: true }),
+          };
+        },
+      },
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.docId, docId);
+    assert.equal(result.status, 'recomputed_from_cache');
+    assert.equal(downloadedFromArtifact, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'completed');
+  assert.match(job.log, /Reanalyzing cached PDF\/full-text/);
+  const stored = await loadStoredFileMetric(docId);
+  assert.equal(stored.status, 'recomputed_from_cache');
+  assert.equal(stored.pdf_path, durablePdfPath);
 });
 
 test('production auto mode fails closed without Fly API token', async () => {

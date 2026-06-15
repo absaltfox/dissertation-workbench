@@ -18,8 +18,21 @@ export function getDatabaseUrl() {
 export async function ensureStorage() {
   await fs.mkdir(PDF_CACHE_DIR, { recursive: true });
   await fs.mkdir(FULL_TEXT_CACHE_DIR, { recursive: true });
+  await verifyWritableDirectory(PDF_CACHE_DIR);
+  await verifyWritableDirectory(FULL_TEXT_CACHE_DIR);
   if (!TURSO_DATABASE_URL) {
     await fs.mkdir(path.dirname(SQLITE_PATH), { recursive: true });
+    await verifyWritableDirectory(path.dirname(SQLITE_PATH));
+  }
+}
+
+async function verifyWritableDirectory(dir) {
+  const filePath = path.join(dir, `.write-test-${process.pid}-${Date.now()}`);
+  try {
+    await fs.writeFile(filePath, '');
+    await fs.unlink(filePath);
+  } catch (error) {
+    throw new Error(`Storage directory is not writable: ${dir} (${error?.message || String(error)})`);
   }
 }
 

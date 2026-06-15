@@ -1677,6 +1677,13 @@ input:focus, select:focus {
   margin-bottom: 0.5rem;
 }
 
+.cache-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  min-width: 13rem;
+}
+
 /* --- Links --- */
 
 a {

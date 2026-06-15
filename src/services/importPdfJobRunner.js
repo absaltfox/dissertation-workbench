@@ -134,6 +134,40 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     return result;
   }
 
+  if (job.type === 'cache_reanalyze_doc') {
+    const docId = params.docId;
+    const doc = await loadDocumentMetadata(docId);
+    if (!doc) throw new Error('Document not found in metadata store');
+    await log(job.id, `Reanalyzing cached PDF/full-text for ${docId}.`);
+    await analyzeDocumentFile(doc, {
+      downloadFiles: false,
+      forceDownload: false,
+      recomputeFromCache: true,
+      artifactClient,
+    });
+    const result = {
+      ok: doc.downloadStatus !== 'cache_miss' && doc.downloadStatus !== 'cache_error',
+      docId,
+      status: doc.downloadStatus,
+      pages: doc.pages,
+      pagesSource: doc.pagesSource,
+      wordCount: doc.wordCount,
+      wordCountSource: doc.wordCountSource,
+      fileBytes: doc.fileBytes,
+      downloadUrl: doc.downloadUrl,
+      downloadError: doc.downloadError || null,
+    };
+    clearMetricsCache?.();
+    await finishAdminJob(job.id, {
+      status: result.ok ? 'completed' : 'failed',
+      result,
+      error: result.ok ? null : result.downloadError || 'Cached PDF/full-text reanalysis failed.',
+      finishedAt: new Date().toISOString(),
+    });
+    await log(job.id, `Cached reanalysis finished for ${docId}: ${result.status || 'unknown'}.`);
+    return result;
+  }
+
   if (job.type === 'reparse_all') {
     await log(job.id, 'Starting cached PDF reparse.');
     await clearAllCitations();
