@@ -667,6 +667,14 @@ export async function updateAdminJob(id, patch = {}) {
   await run(`UPDATE admin_jobs SET ${fields.join(', ')} WHERE id = ?`, args);
 }
 
+export async function finishAdminJob(id, patch = {}) {
+  await updateAdminJob(id, {
+    ...patch,
+    artifactTokenHash: null,
+    finishedAt: patch.finishedAt || new Date().toISOString(),
+  });
+}
+
 export async function appendAdminJobLog(id, line, limit = 12000) {
   if (!id) return;
   const row = await get('SELECT log FROM admin_jobs WHERE id = ?', [id]);
@@ -698,9 +706,22 @@ export async function heartbeatAdminJob(id, runnerState = 'running') {
   });
 }
 
-export async function validateAdminJobArtifactToken(id, token) {
-  const row = await get('SELECT artifact_token_hash FROM admin_jobs WHERE id = ?', [id]);
+export async function validateAdminJobArtifactToken(id, token, { docId = null } = {}) {
+  const row = await get(`
+    SELECT status, params_json, artifact_token_hash, timeout_at, cancelled_at, finished_at
+    FROM admin_jobs
+    WHERE id = ?
+  `, [id]);
   if (!row?.artifact_token_hash || !token) return false;
+  if (row.status !== 'running' || row.finished_at || row.cancelled_at) return false;
+  if (row.timeout_at && Date.parse(row.timeout_at) <= Date.now()) return false;
+
+  if (docId) {
+    let params = null;
+    try { params = row.params_json ? JSON.parse(row.params_json) : null; } catch { params = null; }
+    if (params?.docId && String(params.docId) !== String(docId)) return false;
+  }
+
   const expected = Buffer.from(row.artifact_token_hash, 'hex');
   const actual = Buffer.from(hashAdminJobToken(token), 'hex');
   return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);

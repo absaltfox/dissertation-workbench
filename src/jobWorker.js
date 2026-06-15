@@ -1,5 +1,5 @@
 import {
-  appendAdminJobLog, claimAdminJob, closeDb, ensureStorage, getAdminJob,
+  appendAdminJobLog, claimAdminJob, closeDb, ensureStorage, finishAdminJob, getAdminJob,
   heartbeatAdminJob, updateAdminJob
 } from './db.js';
 import { ADMIN_WORKER_TIMEOUT_MS } from './config.js';
@@ -15,7 +15,7 @@ async function finishFailure(error, status = 'failed') {
   const message = error?.message || String(error);
   await appendAdminJobLog(jobId, `Worker ${status}: ${message}\n`);
   const now = new Date().toISOString();
-  await updateAdminJob(jobId, {
+  await finishAdminJob(jobId, {
     status,
     runnerState: status,
     error: message,
@@ -56,7 +56,8 @@ async function main() {
   } catch (error) {
     const status = error?.message === 'Admin worker timed out' ? 'timed_out' : 'failed';
     await finishFailure(error, status);
-    process.exitCode = 1;
+    await closeDb().catch(() => {});
+    process.exit(status === 'timed_out' ? 124 : 1);
   } finally {
     clearInterval(heartbeat);
   }

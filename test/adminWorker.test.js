@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 let testDataDir;
 let buildFlyWorkerMachinePayload;
+let cancelAdminWorkerJob;
 let WorkerArtifactClient;
 let analyzeDocumentFile;
 let appendAdminJobLog;
@@ -19,6 +20,7 @@ let ensureStorage;
 let getAdminJob;
 let hashAdminJobToken;
 let heartbeatAdminJob;
+let finishAdminJob;
 let loadStoredFileMetric;
 let validateAdminJobArtifactToken;
 
@@ -31,7 +33,7 @@ test.before(async () => {
   process.env.FULL_TEXT_CACHE_DIR = path.join(testDataDir, 'full-text-cache');
   process.env.NODE_ENV = 'test';
 
-  ({ buildFlyWorkerMachinePayload } = await import('../src/services/adminWorker.js'));
+  ({ buildFlyWorkerMachinePayload, cancelAdminWorkerJob } = await import('../src/services/adminWorker.js'));
   ({ WorkerArtifactClient } = await import('../src/workerArtifacts.js'));
   ({ analyzeDocumentFile } = await import('../src/pdf.js'));
   ({
@@ -43,6 +45,7 @@ test.before(async () => {
     getAdminJob,
     hashAdminJobToken,
     heartbeatAdminJob,
+    finishAdminJob,
     loadStoredFileMetric,
     validateAdminJobArtifactToken,
   } = await import('../src/db.js'));
@@ -88,7 +91,8 @@ test('admin worker job lifecycle helpers claim once, heartbeat, log, and validat
   });
 
   assert.equal(await validateAdminJobArtifactToken(jobId, 'wrong-token'), false);
-  assert.equal(await validateAdminJobArtifactToken(jobId, token), true);
+  assert.equal(await validateAdminJobArtifactToken(jobId, token, { docId: 'wrong-doc' }), false);
+  assert.equal(await validateAdminJobArtifactToken(jobId, token, { docId: 'lifecycle-doc' }), true);
 
   const claimed = await claimAdminJob(jobId, 'runner-1');
   assert.equal(claimed.id, jobId);
@@ -104,6 +108,9 @@ test('admin worker job lifecycle helpers claim once, heartbeat, log, and validat
   assert.equal(updated.runnerState, 'still-running');
   assert.ok(updated.heartbeatAt);
   assert.match(updated.log, /hello worker/);
+
+  await finishAdminJob(jobId, { status: 'completed', runnerState: 'completed' });
+  assert.equal(await validateAdminJobArtifactToken(jobId, token, { docId: 'lifecycle-doc' }), false);
 });
 
 test('one-shot job worker claims unsupported jobs and marks them failed', async () => {
@@ -144,6 +151,65 @@ test('one-shot job worker claims unsupported jobs and marks them failed', async 
   assert.match(job.log, /Worker claimed job/);
 });
 
+test('Fly worker cancel preserves running state when machine destroy fails', async () => {
+  await ensureStorage();
+  const token = `fly-cancel-token-${Date.now()}`;
+  const jobId = await createAdminJob({
+    type: 'cache_refresh_doc',
+    label: 'Fly Cancel Failure',
+    params: { docId: 'fly-cancel-doc' },
+    artifactTokenHash: hashAdminJobToken(token),
+    timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+    runnerType: 'fly',
+  });
+  await claimAdminJob(jobId, 'fly-machine-1');
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('nope', { status: 500 });
+  try {
+    const result = await cancelAdminWorkerJob(jobId);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /Fly worker destroy failed/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'running');
+  assert.equal(job.runnerState, 'kill_failed');
+  assert.equal(await validateAdminJobArtifactToken(jobId, token, { docId: 'fly-cancel-doc' }), true);
+});
+
+test('production auto mode fails closed without Fly API token', async () => {
+  const script = `
+    process.env.SKIP_LOCAL_ENV = '1';
+    process.env.NODE_ENV = 'production';
+    process.env.FLY_APP_NAME = 'dissertation-workbench';
+    delete process.env.FLY_API_TOKEN;
+    const { createAndStartAdminWorkerJob } = await import('./src/services/adminWorker.js');
+    try {
+      await createAndStartAdminWorkerJob({ type: 'document_sync', label: 'Should Fail', params: {} });
+      process.exit(1);
+    } catch (error) {
+      if (!/FLY_API_TOKEN is required/.test(error.message)) {
+        console.error(error.message);
+        process.exit(2);
+      }
+    }
+  `;
+  await execFileAsync(process.execPath, ['--input-type=module', '-e', script], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      SKIP_LOCAL_ENV: '1',
+      NODE_ENV: 'production',
+      FLY_APP_NAME: 'dissertation-workbench',
+      FLY_API_TOKEN: '',
+    },
+    timeout: 30_000,
+  });
+});
+
 test('worker artifact client downloads cached PDFs to temp files and uploads artifacts', async () => {
   const requests = [];
   const originalFetch = globalThis.fetch;
@@ -163,7 +229,7 @@ test('worker artifact client downloads cached PDFs to temp files and uploads art
     if (req.method === 'GET' && req.path === '/api/internal/jobs/7/artifacts/pdf/doc-1') {
       return new Response(Buffer.from('%PDF test'), {
         status: 200,
-        headers: { 'content-type': 'application/pdf', 'x-artifact-path': '/web/cache/doc-1.pdf' },
+        headers: { 'content-type': 'application/pdf' },
       });
     }
     if (req.method === 'GET' && req.path === '/api/internal/jobs/7/artifacts/full-text/doc-1') {
@@ -200,7 +266,7 @@ test('worker artifact client downloads cached PDFs to temp files and uploads art
 
     const pdf = await client.downloadPdfToTemp('doc-1');
     assert.equal(await fs.readFile(pdf.path, 'utf8'), '%PDF test');
-    assert.equal(pdf.pdfPath, '/web/cache/doc-1.pdf');
+    assert.equal(pdf.pdfPath, null);
     await pdf.cleanup();
 
     const fullText = await client.downloadFullText('doc-1');

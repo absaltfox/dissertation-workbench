@@ -7,7 +7,7 @@ import {
   FLY_WORKER_REGION, IS_PRODUCTION, WORKER_IMAGE
 } from '../config.js';
 import {
-  appendAdminJobLog, createAdminJob, getAdminJob, hashAdminJobToken,
+  appendAdminJobLog, createAdminJob, finishAdminJob, getAdminJob, hashAdminJobToken,
   updateAdminJob
 } from '../db.js';
 
@@ -20,7 +20,13 @@ function isoAfter(ms) {
 function shouldUseFly() {
   if (ADMIN_WORKER_MODE === 'fly') return true;
   if (ADMIN_WORKER_MODE === 'local') return false;
-  return Boolean(IS_PRODUCTION && FLY_APP_NAME && FLY_API_TOKEN);
+  if (IS_PRODUCTION && FLY_APP_NAME) {
+    if (!FLY_API_TOKEN) {
+      throw new Error('FLY_API_TOKEN is required for production on-demand workers. Set ADMIN_WORKER_MODE=local only for an explicit local fallback.');
+    }
+    return true;
+  }
+  return false;
 }
 
 async function flyRequest(path, options = {}) {
@@ -153,7 +159,7 @@ export async function createAndStartAdminWorkerJob({ type, label, params = null 
       startLocalWorker(jobId, token);
     }
   } catch (error) {
-    await updateAdminJob(jobId, {
+    await finishAdminJob(jobId, {
       status: 'failed',
       runnerState: 'failed_to_start',
       error: error?.message || String(error),
@@ -176,6 +182,8 @@ export async function cancelAdminWorkerJob(jobId) {
       });
     } catch (error) {
       await appendAdminJobLog(jobId, `Fly worker destroy failed: ${error?.message || String(error)}\n`);
+      await updateAdminJob(jobId, { runnerState: 'kill_failed' });
+      return { ok: false, error: `Fly worker destroy failed: ${error?.message || String(error)}` };
     }
   }
 
@@ -190,7 +198,7 @@ export async function cancelAdminWorkerJob(jobId) {
   }
 
   const now = new Date().toISOString();
-  await updateAdminJob(jobId, {
+  await finishAdminJob(jobId, {
     status: 'cancelled',
     runnerState: 'cancelled',
     cancelledAt: now,

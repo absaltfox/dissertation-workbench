@@ -7,7 +7,7 @@ import request from 'supertest';
 import { app } from '../src/server.js';
 import { createSession, destroySession, getSessionCsrfToken } from '../src/auth.js';
 import {
-  closeDb, createAdminJob, hashAdminJobToken, saveFileMetric
+  closeDb, createAdminJob, finishAdminJob, hashAdminJobToken, saveFileMetric
 } from '../src/db.js';
 
 test.after(async () => {
@@ -249,13 +249,19 @@ test('internal worker artifact endpoints require token and stream cache files', 
     .expect('content-type', /application\/json/)
     .expect(401);
 
+  await request(app)
+    .get(`/api/internal/jobs/${jobId}/artifacts/pdf/not-the-job-doc`)
+    .set('authorization', `Bearer ${token}`)
+    .expect('content-type', /application\/json/)
+    .expect(401);
+
   const download = await request(app)
     .get(`/api/internal/jobs/${jobId}/artifacts/pdf/artifact-doc`)
     .set('authorization', `Bearer ${token}`)
     .expect('content-type', /application\/pdf/)
     .expect(200);
   assert.equal(download.text || download.body.toString('utf8'), '%PDF-1.4\n');
-  assert.equal(download.headers['x-artifact-path'], pdfPath);
+  assert.equal(download.headers['x-artifact-path'], undefined);
 
   const upload = await request(app)
     .put(`/api/internal/jobs/${jobId}/artifacts/full-text/artifact-doc`)
@@ -267,6 +273,13 @@ test('internal worker artifact endpoints require token and stream cache files', 
     .expect(200);
   assert.match(upload.body.fullTextPath, /full-text-cache/);
   assert.equal(upload.body.fullTextSourceUrl, 'https://example.test/full.txt');
+
+  await finishAdminJob(jobId, { status: 'completed', runnerState: 'completed' });
+  await request(app)
+    .get(`/api/internal/jobs/${jobId}/artifacts/pdf/artifact-doc`)
+    .set('authorization', `Bearer ${token}`)
+    .expect('content-type', /application\/json/)
+    .expect(401);
 
   await fs.rm(dir, { recursive: true, force: true });
 });

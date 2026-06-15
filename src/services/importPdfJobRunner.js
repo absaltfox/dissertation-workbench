@@ -1,6 +1,6 @@
 import {
-  appendAdminJobLog, clearAllCitations, getDb, listFileMetrics, listImportRules,
-  loadCommitteeMembers, loadDocumentMetadata, updateAdminJob
+  appendAdminJobLog, clearAllCitations, finishAdminJob, getDb, listFileMetrics, listImportRules,
+  loadCommitteeMembers, loadDocumentMetadata
 } from '../db.js';
 import {
   analyzeDocumentFile, analyzePdfAtPath, deleteCachedPdf, extractAndSaveParsedData
@@ -38,7 +38,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       artifactClient,
     });
     clearMetricsCache?.();
-    await updateAdminJob(job.id, {
+    await finishAdminJob(job.id, {
       status: result.ok ? 'completed' : 'failed',
       result,
       error: result.ok ? null : result.error || 'Document sync failed',
@@ -90,7 +90,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     }
     const result = { ok: perRule.every((item) => item.ok), mode: params.mode, scope: params.scope, ...totals, rules: perRule };
     clearMetricsCache?.();
-    await updateAdminJob(job.id, {
+    await finishAdminJob(job.id, {
       status: result.ok ? 'completed' : 'failed',
       result,
       error: result.ok ? null : 'One or more import rules failed.',
@@ -125,7 +125,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       downloadError: doc.downloadError || null,
     };
     clearMetricsCache?.();
-    await updateAdminJob(job.id, {
+    await finishAdminJob(job.id, {
       status: 'completed',
       result,
       finishedAt: new Date().toISOString(),
@@ -157,7 +157,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     const catalogueLookups = await runPendingCatalogueLookups();
     const result = { ok: true, processed, committees: withCommittee, citations: totalCitations, catalogueLookups };
     clearMetricsCache?.();
-    await updateAdminJob(job.id, {
+    await finishAdminJob(job.id, {
       status: 'completed',
       result,
       finishedAt: new Date().toISOString(),
@@ -198,7 +198,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     }
     const result = { ok: true, processed, withCommittee };
     clearMetricsCache?.();
-    await updateAdminJob(job.id, {
+    await finishAdminJob(job.id, {
       status: 'completed',
       result,
       finishedAt: new Date().toISOString(),

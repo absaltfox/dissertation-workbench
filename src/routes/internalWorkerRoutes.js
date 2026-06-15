@@ -21,12 +21,12 @@ function validDocId(value) {
 }
 
 async function requireWorkerToken(req, res, next) {
-  if (!await validateAdminJobArtifactToken(req.params.jobId, bearerToken(req))) {
-    res.status(401).json({ error: 'Invalid worker artifact token' });
-    return;
-  }
   if (!validDocId(req.params.docId)) {
     res.status(400).json({ error: 'Invalid document id' });
+    return;
+  }
+  if (!await validateAdminJobArtifactToken(req.params.jobId, bearerToken(req), { docId: req.params.docId })) {
+    res.status(401).json({ error: 'Invalid worker artifact token' });
     return;
   }
   next();
@@ -40,7 +40,6 @@ async function sendArtifact(res, filePath, contentType) {
   try {
     const bytes = await fs.readFile(filePath);
     res.set('content-type', contentType);
-    res.set('x-artifact-path', filePath);
     res.status(200).send(bytes);
   } catch {
     res.status(404).json({ error: 'Artifact not found' });
