@@ -593,8 +593,43 @@ function fullTextCachePathForDoc(doc) {
   return path.join(FULL_TEXT_CACHE_DIR, `${hash}.txt`);
 }
 
-async function readCachedFullText(stored) {
+function pdfCachePathForDoc(docId, downloadUrl = '') {
+  const seed = String(downloadUrl || docId || '');
+  const hash = crypto.createHash('sha1').update(seed).digest('hex');
+  return path.join(PDF_CACHE_DIR, `${hash}.pdf`);
+}
+
+export async function savePdfArtifactForDoc(docId, bytes, { downloadUrl = '' } = {}) {
+  await fs.mkdir(PDF_CACHE_DIR, { recursive: true });
+  const pdfPath = pdfCachePathForDoc(docId, downloadUrl);
+  await fs.writeFile(pdfPath, bytes);
+  return { pdfPath, fileBytes: bytes.length };
+}
+
+export async function saveFullTextArtifactForDoc(docId, fullText, { sourceUrl = '' } = {}) {
+  await fs.mkdir(FULL_TEXT_CACHE_DIR, { recursive: true });
+  const fullTextPath = fullTextCachePathForDoc({ id: docId });
+  await fs.writeFile(fullTextPath, fullText, 'utf8');
+  return {
+    fullTextPath,
+    fullTextBytes: Buffer.byteLength(fullText, 'utf8'),
+    fullTextSourceUrl: sourceUrl || null
+  };
+}
+
+async function readCachedFullText(doc, stored, artifactClient = null) {
   if (!stored?.full_text_path) return null;
+  if (artifactClient) {
+    const remote = await artifactClient.downloadFullText(doc.id);
+    if (!remote?.fullText || remote.fullText.length <= 1000) return null;
+    return {
+      fullText: remote.fullText,
+      fullTextPath: remote.fullTextPath || stored.full_text_path,
+      fullTextBytes: remote.fullTextBytes || Buffer.byteLength(remote.fullText, 'utf8'),
+      fullTextSourceUrl: stored.full_text_source_url || null,
+      cacheHit: true
+    };
+  }
   try {
     const fullText = await fs.readFile(stored.full_text_path, 'utf8');
     if (fullText.length <= 1000) return null;
@@ -610,15 +645,11 @@ async function readCachedFullText(stored) {
   }
 }
 
-async function writeCachedFullText(doc, fullText, sourceUrl) {
-  await fs.mkdir(FULL_TEXT_CACHE_DIR, { recursive: true });
-  const fullTextPath = fullTextCachePathForDoc(doc);
-  await fs.writeFile(fullTextPath, fullText, 'utf8');
-  return {
-    fullTextPath,
-    fullTextBytes: Buffer.byteLength(fullText, 'utf8'),
-    fullTextSourceUrl: sourceUrl || null
-  };
+async function writeCachedFullText(doc, fullText, sourceUrl, artifactClient = null) {
+  if (artifactClient) {
+    return artifactClient.uploadFullText(doc.id, fullText, sourceUrl);
+  }
+  return saveFullTextArtifactForDoc(doc.id, fullText, { sourceUrl });
 }
 
 async function fetchJsonWithTimeout(url) {
@@ -705,8 +736,8 @@ function chooseDspacePdfBitstream(bitstreams) {
   }) || null;
 }
 
-export async function fetchFullTextForDocument(doc, stored = null) {
-  const cached = await readCachedFullText(stored);
+export async function fetchFullTextForDocument(doc, stored = null, { artifactClient = null } = {}) {
+  const cached = await readCachedFullText(doc, stored, artifactClient);
   if (cached) return cached;
 
   const recordUrl = originalRecordRestUrl(doc);
@@ -722,7 +753,7 @@ export async function fetchFullTextForDocument(doc, stored = null) {
     const retrieveUrl = dspaceRestUrl(`/rest/bitstreams/${id}/retrieve`);
     const fullText = await fetchTextWithTimeout(retrieveUrl);
     if (!fullText || fullText.length <= 1000) return null;
-    const cachedText = await writeCachedFullText(doc, fullText, retrieveUrl.toString());
+    const cachedText = await writeCachedFullText(doc, fullText, retrieveUrl.toString(), artifactClient);
     return {
       fullText,
       ...cachedText,
@@ -805,8 +836,8 @@ async function analyzeDocumentFullText(doc, fullText, { stored = null, status = 
   return true;
 }
 
-async function analyzeDocumentFullTextFallback(doc, stored, { status = 'full_text', error = null } = {}) {
-  const result = await fetchFullTextForDocument(doc, stored);
+async function analyzeDocumentFullTextFallback(doc, stored, { status = 'full_text', error = null, artifactClient = null } = {}) {
+  const result = await fetchFullTextForDocument(doc, stored, { artifactClient });
   if (!result?.fullText) return false;
   return analyzeDocumentFullText(doc, result.fullText, {
     stored: {
@@ -820,8 +851,8 @@ async function analyzeDocumentFullTextFallback(doc, stored, { status = 'full_tex
   });
 }
 
-async function analyzeCachedFullText(doc, stored, { status = 'full_text_recomputed', error = null } = {}) {
-  const cached = await readCachedFullText(stored);
+async function analyzeCachedFullText(doc, stored, { status = 'full_text_recomputed', error = null, artifactClient = null } = {}) {
+  const cached = await readCachedFullText(doc, stored, artifactClient);
   if (cached?.fullText) {
     return analyzeDocumentFullText(doc, cached.fullText, { stored, status, error });
   }
@@ -1495,16 +1526,17 @@ async function loadStoredParsedData(doc) {
 }
 
 export async function analyzeDocumentFile(doc, options) {
-  const { downloadFiles, forceDownload, recomputeFromCache } = options;
+  const { downloadFiles, forceDownload, recomputeFromCache, artifactClient = null } = options;
   const stored = await loadStoredFileMetric(doc.id);
-  const hasCachedPdf = stored?.pdf_path && (await fileExists(stored.pdf_path));
+  const hasCachedPdf = stored?.pdf_path && (artifactClient || (await fileExists(stored.pdf_path)));
   const hasCachedFullTextMetric = hasStoredFullTextMetric(stored);
 
   if (recomputeFromCache) {
     if (!hasCachedPdf) {
       if (await analyzeCachedFullText(doc, stored, {
         status: 'full_text_recomputed',
-        error: null
+        error: null,
+        artifactClient
       })) return;
       doc.downloadStatus = 'cache_miss';
       doc.downloadError = 'No local cached PDF or full-text file available for recomputation.';
@@ -1525,7 +1557,9 @@ export async function analyzeDocumentFile(doc, options) {
     }
 
     try {
-      const analysis = await analyzePdfAtPath(stored.pdf_path);
+      const remotePdf = artifactClient ? await artifactClient.downloadPdfToTemp(doc.id) : null;
+      const analysisPath = remotePdf?.path || stored.pdf_path;
+      const analysis = await analyzePdfAtPath(analysisPath);
       if (analysis.pageCount) {
         doc.pages = analysis.pageCount;
         doc.pagesSource = 'cached_pdf';
@@ -1555,7 +1589,8 @@ export async function analyzeDocumentFile(doc, options) {
         wordSource: doc.wordCountSource,
         pageSource: doc.pagesSource
       });
-      await extractAndSaveParsedData(doc, analysis.fullText, stored.pdf_path);
+      await extractAndSaveParsedData(doc, analysis.fullText, analysisPath);
+      if (remotePdf?.cleanup) await remotePdf.cleanup();
       return;
     } catch (error) {
       doc.downloadStatus = 'cache_error';
@@ -1597,7 +1632,8 @@ export async function analyzeDocumentFile(doc, options) {
     } else {
       if (await analyzeDocumentFullTextFallback(doc, stored, {
         status: 'full_text',
-        error: null
+        error: null,
+        artifactClient
       })) return;
       doc.downloadStatus = 'skipped';
     }
@@ -1609,12 +1645,25 @@ export async function analyzeDocumentFile(doc, options) {
 
   const resolved = await fetchPdfForDocument(doc);
   if (resolved) {
-    const fileHash = crypto.createHash('sha1').update(resolved.downloadUrl).digest('hex');
-    const cachePath = path.join(PDF_CACHE_DIR, `${fileHash}.pdf`);
+    const cachePath = pdfCachePathForDoc(doc.id, resolved.downloadUrl);
+    let analysisPath = cachePath;
+    let durablePdfPath = cachePath;
+    let cleanupAnalysisPath = null;
 
     try {
-      await fs.writeFile(cachePath, resolved.bytes);
-      const analysis = await analyzePdfAtPath(cachePath, resolved.bytes);
+      if (artifactClient) {
+        const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-pdf-'));
+        analysisPath = path.join(tmpDir, `${crypto.randomUUID()}.pdf`);
+        cleanupAnalysisPath = async () => {
+          try { await fs.rm(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+        };
+        await fs.writeFile(analysisPath, resolved.bytes);
+        const storedArtifact = await artifactClient.uploadPdf(doc.id, resolved.bytes, resolved.downloadUrl);
+        durablePdfPath = storedArtifact.pdfPath || durablePdfPath;
+      } else {
+        await fs.writeFile(cachePath, resolved.bytes);
+      }
+      const analysis = await analyzePdfAtPath(analysisPath, resolved.bytes);
 
       if (analysis.pageCount) {
         doc.pages = analysis.pageCount;
@@ -1636,7 +1685,7 @@ export async function analyzeDocumentFile(doc, options) {
       await saveFileMetric(doc.id, {
         status: doc.downloadStatus,
         error: null,
-        pdfPath: cachePath,
+        pdfPath: durablePdfPath,
         downloadUrl: resolved.downloadUrl,
         fileBytes: analysis.fileBytes,
         wordCount: doc.wordCount,
@@ -1646,22 +1695,25 @@ export async function analyzeDocumentFile(doc, options) {
         wordSource: doc.wordCountSource,
         pageSource: doc.pagesSource
       });
-      await extractAndSaveParsedData(doc, analysis.fullText, cachePath);
+      await extractAndSaveParsedData(doc, analysis.fullText, analysisPath);
       logger.info('PDF downloaded and analyzed', {
         docId: doc.id,
         bitstreamId: resolved.bitstreamId,
         pages: doc.pages,
         words: doc.wordCount
       });
+      if (cleanupAnalysisPath) await cleanupAnalysisPath();
       return;
     } catch (error) {
+      if (cleanupAnalysisPath) await cleanupAnalysisPath();
       doc.downloadError = error instanceof Error ? error.message : String(error);
     }
   }
 
   if (await analyzeDocumentFullTextFallback(doc, stored, {
     status: 'full_text_fallback',
-    error: doc.downloadError || 'No downloadable PDF could be resolved for this record.'
+    error: doc.downloadError || 'No downloadable PDF could be resolved for this record.',
+    artifactClient
   })) return;
 
   doc.downloadStatus = 'not_found';

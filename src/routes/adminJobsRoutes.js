@@ -8,6 +8,7 @@ import { getConceptPipelineStatus } from '../conceptsPipeline.js';
 import { parseBooleanParam, parseNumberParam } from '../validate.js';
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
 import { isAdminJobRunning, runBertopicJob, runCatalogueLookupJob } from '../services/adminJobs.js';
+import { cancelAdminWorkerJob } from '../services/adminWorker.js';
 
 /**
  * Creates admin job orchestration endpoints.
@@ -91,6 +92,21 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
     // BERTopic rebuilds shell out to the Python pipeline and can take minutes.
     runBertopicJob(jobId, { clearMetricsCache });
     res.status(202).json({ ok: true, started: true, jobId });
+  }));
+
+  router.post('/jobs/:id/cancel', asyncHandler(async (req, res) => {
+    const jobId = Number(req.params.id || 0);
+    if (!jobId) {
+      res.status(400).json({ error: 'Invalid job id' });
+      return;
+    }
+    const result = await cancelAdminWorkerJob(jobId);
+    if (!result.ok) {
+      res.status(result.error === 'Job not found' ? 404 : 409).json(result);
+      return;
+    }
+    clearMetricsCache();
+    res.status(200).json(result);
   }));
 
   return router;

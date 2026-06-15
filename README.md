@@ -58,7 +58,7 @@ Open [http://localhost:3000](http://localhost:3000).
 
 On first local boot, the app creates an `admin` user with a random password and prints it to the terminal. Sign in with that password and change it in the admin UI. In production, the first admin password comes from `ADMIN_BOOTSTRAP_PASSWORD`.
 
-Run the background worker in a second terminal when you want scheduled document sync and pending Z39.50 catalogue lookup processing:
+Admin-triggered import/PDF jobs run through on-demand local child workers by default. You can still run the legacy scheduled worker in a second terminal when you specifically want scheduled document sync or pending Z39.50 catalogue lookup processing:
 
 ```bash
 npm run worker
@@ -83,7 +83,7 @@ The public `/api/metrics` endpoint can fetch directly from Open Collections, but
 2. Sign in to `Admin`.
 3. Configure/import Open Collections rules in `Admin -> Import`.
 4. Run an import job, usually `Import all` for a new database or `Sync differences` afterward.
-5. Let `npm run worker` process scheduled syncs and pending catalogue lookups, or run jobs manually from `Admin -> Jobs`.
+5. Run import/PDF jobs from the Admin UI; on-demand workers process the heavy work outside the web server. Use `npm run worker` only for legacy scheduled sync/catalogue lookup cycles.
 
 When matching documents already exist in the local/Turso cache, `/api/metrics` reads cached document attributes instead of paging Open Collections during dashboard requests. `refresh=1` bypasses the in-memory metrics cache and can force live retrieval/redownloads depending on request options.
 
@@ -207,14 +207,21 @@ Use `.env.development.example` and `.env.production.example` as the canonical te
 
 Worker-specific settings:
 
-- `DOCUMENT_SYNC_ENABLED`: default `1`.
-- `DOCUMENT_SYNC_ON_START`: default `1`.
+- `DOCUMENT_SYNC_ENABLED`: defaults to `0` in production and `1` otherwise.
+- `DOCUMENT_SYNC_ON_START`: defaults to `0` in production and `1` otherwise.
 - `DOCUMENT_SYNC_ONCE`: run one worker cycle and exit.
 - `DOCUMENT_SYNC_INTERVAL_MS`: default daily.
 - `DOCUMENT_SYNC_INDEX`, `DOCUMENT_SYNC_QUERY`, `DOCUMENT_SYNC_TERM`, `DOCUMENT_SYNC_SOURCE`, `DOCUMENT_SYNC_API_KEY`: optional worker-specific Open Collections overrides.
 - `DOCUMENT_SYNC_SCAN_LIMIT`: default `50000`.
 - `DOCUMENT_SYNC_MAX_RECORDS`: `0` means use scan limit.
 - `DOCUMENT_SYNC_PAGE_SIZE`: default `100`.
+- `ADMIN_WORKER_MODE`: `auto`, `fly`, or `local`; `auto` uses temporary Fly Machines in production when Fly credentials are available and local child processes otherwise.
+- `ADMIN_WORKER_TIMEOUT_MS`: default `21600000` (6 hours).
+- `ADMIN_WORKER_GRACE_MS`: default `30000`.
+- `WORKER_IMAGE`: optional image override for temporary Fly workers; if omitted, the app tries to reuse the current Fly machine image.
+- `WORKER_ARTIFACT_BASE_URL`: optional base URL workers use for web-owned artifact streaming.
+- `WORKER_FORCE_ARTIFACT_API`: set `1` to test artifact streaming locally instead of direct shared filesystem access.
+- `FLY_WORKER_MEMORY_MB`, `FLY_WORKER_CPUS`, `FLY_WORKER_CPU_KIND`, `FLY_WORKER_REGION`: temporary Fly worker sizing and placement.
 - `CATALOGUE_LOOKUP_ENABLED`: default `1`.
 - `CATALOGUE_LOOKUP_ON_START`: default `1`.
 - `CATALOGUE_LOOKUP_PAGE_SIZE`: default `200`.
@@ -231,12 +238,12 @@ Optional enrichment services:
 
 ## Fly.io and Turso Deployment
 
-The repo includes a Docker/Fly setup with two process groups:
+The repo includes a Docker/Fly setup with an Express web/API process and on-demand admin workers:
 
 - `app`: Express web/API process.
-- `worker`: long-running document sync and Z39.50 catalogue lookup process.
+- temporary admin workers: created for import/PDF jobs, then stopped or auto-destroyed when complete.
 
-Use Turso for the shared production database. The Fly volume mounted at `/data` is best treated as PDF/cache storage, not as a multi-machine shared database.
+Use Turso for the shared production database. The Fly volume mounted at `/data` is owned by the web machine for PDF/full-text cache storage; temporary workers stream cached artifacts from the web process and upload new artifacts back before saving durable paths.
 
 1. Create a Turso database and token, then keep the database URL and auth token for Fly secrets.
 

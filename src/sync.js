@@ -68,7 +68,7 @@ function hasCachedEnrichmentMetric(stored) {
     );
 }
 
-async function runSync(syncKey, source, apiKey, runId, { mode = 'import_all' } = {}) {
+async function runSync(syncKey, source, apiKey, runId, { mode = 'import_all', artifactClient = null } = {}) {
   const startedAt = Date.now();
   let totalSeen = 0;
   let totalSaved = 0;
@@ -124,6 +124,7 @@ async function runSync(syncKey, source, apiKey, runId, { mode = 'import_all' } =
             downloadFiles: source.downloadFiles,
             forceDownload: false,
             recomputeFromCache: false,
+            artifactClient,
           });
           await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
         }
@@ -181,7 +182,7 @@ export async function startDocumentSync(options = {}) {
     return { started: false, alreadyRunning: true, syncKey, status: await getDocumentSyncStatus(syncKey) };
   }
   const runId = await createSyncRun(syncKey, source);
-  const task = runSync(syncKey, source, built.apiKey, runId, { mode });
+  const task = runSync(syncKey, source, built.apiKey, runId, { mode, artifactClient: options.artifactClient || null });
   runningSyncs.set(syncKey, task);
   return { started: true, syncKey, runId, status: await getDocumentSyncStatus(syncKey) };
 }
@@ -195,7 +196,7 @@ export async function runDocumentSync(options = {}) {
   });
   const syncKey = buildDocumentSyncKey(source);
   const runId = await createSyncRun(syncKey, source);
-  const summary = await runSync(syncKey, source, built.apiKey, runId, { mode });
+  const summary = await runSync(syncKey, source, built.apiKey, runId, { mode, artifactClient: options.artifactClient || null });
   return { syncKey, runId, mode, ...summary, status: await getDocumentSyncStatus(syncKey) };
 }
 

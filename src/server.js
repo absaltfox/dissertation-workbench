@@ -1,13 +1,15 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { collectMetrics } from './metrics.js';
+import { buildDocumentSyncKey, collectMetrics } from './metrics.js';
 import {
   PORT, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT, EXPOSE_ERROR_DETAILS,
-  DEFAULT_TERM, DEFAULT_SOURCE, TRUST_PROXY, validateRuntimeSecrets
+  DEFAULT_BASE_URL, DEFAULT_INDEX, DEFAULT_QUERY, DEFAULT_TERM, DEFAULT_SOURCE,
+  TRUST_PROXY, validateRuntimeSecrets
 } from './config.js';
 import {
-  checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb
+  checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb,
+  getDocumentCacheStats, listCachedDocuments
 } from './db.js';
 import { ensureDefaultAdmin } from './auth.js';
 import { getConceptPipelineStatus, rebuildConceptDictionary, scheduleDailyConceptRebuild } from './conceptsPipeline.js';
@@ -21,6 +23,7 @@ import { createAdminJobsRouter } from './routes/adminJobsRoutes.js';
 import { createAdminImportRouter } from './routes/adminImportRoutes.js';
 import { createAdminOperationsRouter } from './routes/adminOperationsRoutes.js';
 import { createAdminUsersRouter } from './routes/adminUsersRoutes.js';
+import { createInternalWorkerRouter } from './routes/internalWorkerRoutes.js';
 import { createMetricsRouter } from './routes/metricsRoutes.js';
 import { createPublicRouter } from './routes/publicRoutes.js';
 
@@ -72,6 +75,7 @@ app.use('/api/admin', requireAdmin, createAdminUsersRouter());
 app.use('/api/admin', requireAdmin, createAdminImportRouter({ loadSyncModule, clearMetricsCache }));
 app.use('/api/admin', requireAdmin, createAdminOperationsRouter({ loadSyncModule, clearMetricsCache }));
 app.use('/api/admin', requireAdmin, createAdminJobsRouter({ loadSyncModule, clearMetricsCache }));
+app.use('/api/internal', createInternalWorkerRouter());
 app.use('/api', createPublicRouter());
 app.use('/api', createMetricsRouter({ metricsCache, metricsInflight, loadSyncModule }));
 
@@ -132,18 +136,46 @@ export async function start() {
   const _warmupMaxRecords = PUBLIC_MAX_RECORDS;
   const _warmupScanLimit = PUBLIC_SCAN_LIMIT;
   const _warmupSubjectLimit = 20; // mirrors s-subjectLimit input default
-  collectMetrics({
-    maxRecords: _warmupMaxRecords,
-    pageSize: 20,
-    scanLimit: _warmupScanLimit,
-    subjectLimit: _warmupSubjectLimit,
-    apiKey: _warmupApiKey || undefined,
+  const _warmupSyncKey = buildDocumentSyncKey({
+    baseUrl: DEFAULT_BASE_URL,
+    requestedIndex: DEFAULT_INDEX,
+    query: DEFAULT_QUERY,
     term: DEFAULT_TERM,
     source: DEFAULT_SOURCE,
-    downloadFiles: false,
-    forceDownload: false,
-    recomputeFromCache: false,
-    skipFileEnrichment: true,
+  });
+  Promise.resolve().then(async () => {
+    const cacheStats = await getDocumentCacheStats(_warmupSyncKey);
+    const cachedDocuments = cacheStats.total > 0
+      ? await listCachedDocuments({ syncKey: _warmupSyncKey, limit: _warmupMaxRecords })
+      : null;
+    const payload = await collectMetrics({
+      maxRecords: _warmupMaxRecords,
+      pageSize: 20,
+      scanLimit: _warmupScanLimit,
+      subjectLimit: _warmupSubjectLimit,
+      apiKey: _warmupApiKey || undefined,
+      term: DEFAULT_TERM,
+      source: DEFAULT_SOURCE,
+      downloadFiles: false,
+      forceDownload: false,
+      recomputeFromCache: false,
+      cachedDocuments,
+      skipFileEnrichment: true,
+    });
+
+    if (cachedDocuments) {
+      payload.source.documentCache = {
+        syncKey: _warmupSyncKey,
+        recordsAvailable: cacheStats.total,
+        lastSyncedAt: cacheStats.lastSyncedAt,
+      };
+    }
+    payload.source.readOnlyFileEnrichment = true;
+    payload.source.ignoredFileEnrichmentParams = {
+      downloadFiles: false,
+      recomputeFromCache: false,
+    };
+    return payload;
   }).then((payload) => {
     // Key must match what a default anonymous browser request produces so the
     // first page load is served from cache without a round-trip to the UBC API.

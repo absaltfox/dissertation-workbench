@@ -1,9 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
 import request from 'supertest';
 import { app } from '../src/server.js';
 import { createSession, destroySession, getSessionCsrfToken } from '../src/auth.js';
-import { closeDb } from '../src/db.js';
+import {
+  closeDb, createAdminJob, hashAdminJobToken, saveFileMetric
+} from '../src/db.js';
 
 test.after(async () => {
   await closeDb();
@@ -215,6 +220,55 @@ test('admin jobs endpoint exposes operational status and catalogue preview', asy
   } finally {
     destroySession(token);
   }
+});
+
+test('internal worker artifact endpoints require token and stream cache files', async () => {
+  const token = 'artifact-token-test';
+  const jobId = await createAdminJob({
+    type: 'cache_refresh_doc',
+    label: 'Artifact Test',
+    params: { docId: 'artifact-doc' },
+    artifactTokenHash: hashAdminJobToken(token),
+  });
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-artifacts-test-'));
+  const pdfPath = path.join(dir, 'cached.pdf');
+  await fs.writeFile(pdfPath, Buffer.from('%PDF-1.4\n', 'utf8'));
+  await saveFileMetric('artifact-doc', {
+    status: 'cached',
+    pdfPath,
+    downloadUrl: 'https://example.test/doc.pdf',
+    fileBytes: 9,
+    wordCount: 10,
+    pageCount: 1,
+    wordSource: 'test',
+    pageSource: 'test',
+  });
+
+  await request(app)
+    .get(`/api/internal/jobs/${jobId}/artifacts/pdf/artifact-doc`)
+    .expect('content-type', /application\/json/)
+    .expect(401);
+
+  const download = await request(app)
+    .get(`/api/internal/jobs/${jobId}/artifacts/pdf/artifact-doc`)
+    .set('authorization', `Bearer ${token}`)
+    .expect('content-type', /application\/pdf/)
+    .expect(200);
+  assert.equal(download.text || download.body.toString('utf8'), '%PDF-1.4\n');
+  assert.equal(download.headers['x-artifact-path'], pdfPath);
+
+  const upload = await request(app)
+    .put(`/api/internal/jobs/${jobId}/artifacts/full-text/artifact-doc`)
+    .set('authorization', `Bearer ${token}`)
+    .set('content-type', 'text/plain')
+    .set('x-source-url', 'https://example.test/full.txt')
+    .send('A long enough full text body for artifact storage.')
+    .expect('content-type', /application\/json/)
+    .expect(200);
+  assert.match(upload.body.fullTextPath, /full-text-cache/);
+  assert.equal(upload.body.fullTextSourceUrl, 'https://example.test/full.txt');
+
+  await fs.rm(dir, { recursive: true, force: true });
 });
 
 test('admin cannot delete their own account', async () => {

@@ -148,6 +148,14 @@ async function ensureSchema(client) {
       result_json TEXT,
       log TEXT,
       error TEXT,
+      runner_type TEXT,
+      runner_id TEXT,
+      runner_state TEXT,
+      heartbeat_at TEXT,
+      timeout_at TEXT,
+      cancelled_at TEXT,
+      artifact_token_hash TEXT,
+      claimed_at TEXT,
       started_at TEXT NOT NULL,
       finished_at TEXT
     );
@@ -264,6 +272,14 @@ async function ensureSchema(client) {
   `);
 
   await tryExec(client, 'ALTER TABLE catalogue_lookups ADD COLUMN bib_id TEXT');
+  await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN runner_type TEXT');
+  await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN runner_id TEXT');
+  await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN runner_state TEXT');
+  await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN heartbeat_at TEXT');
+  await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN timeout_at TEXT');
+  await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN cancelled_at TEXT');
+  await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN artifact_token_hash TEXT');
+  await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN claimed_at TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN sync_key TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN title TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN author TEXT');
@@ -570,12 +586,53 @@ export async function listRecentSyncRuns(limit = 25) {
   }));
 }
 
-export async function createAdminJob({ type, label, params = null }) {
+export function hashAdminJobToken(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+function parseAdminJobRow(row) {
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    type: row.type,
+    label: row.label,
+    status: row.status,
+    params: (() => { try { return row.params_json ? JSON.parse(row.params_json) : null; } catch { return null; } })(),
+    result: (() => { try { return row.result_json ? JSON.parse(row.result_json) : null; } catch { return null; } })(),
+    log: row.log || null,
+    error: row.error || null,
+    runnerType: row.runner_type || null,
+    runnerId: row.runner_id || null,
+    runnerState: row.runner_state || null,
+    heartbeatAt: row.heartbeat_at || null,
+    timeoutAt: row.timeout_at || null,
+    cancelledAt: row.cancelled_at || null,
+    claimedAt: row.claimed_at || null,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at || null,
+  };
+}
+
+export async function createAdminJob({
+  type, label, params = null, artifactTokenHash = null, timeoutAt = null, runnerType = null
+}) {
   const now = new Date().toISOString();
   const result = await execute(`
-    INSERT INTO admin_jobs (type, label, status, params_json, started_at)
-    VALUES (?, ?, 'running', ?, ?)
-  `, [type, label, params ? JSON.stringify(params) : null, now]);
+    INSERT INTO admin_jobs (
+      type, label, status, params_json, artifact_token_hash, timeout_at,
+      runner_type, runner_state, started_at
+    )
+    VALUES (?, ?, 'running', ?, ?, ?, ?, ?, ?)
+  `, [
+    type,
+    label,
+    params ? JSON.stringify(params) : null,
+    artifactTokenHash,
+    timeoutAt,
+    runnerType,
+    runnerType ? 'queued' : null,
+    now
+  ]);
   return Number(result.lastInsertRowid || result.lastInsertRowId || 0);
 }
 
@@ -588,6 +645,14 @@ export async function updateAdminJob(id, patch = {}) {
     result: 'result_json',
     log: 'log',
     error: 'error',
+    runnerType: 'runner_type',
+    runnerId: 'runner_id',
+    runnerState: 'runner_state',
+    heartbeatAt: 'heartbeat_at',
+    timeoutAt: 'timeout_at',
+    cancelledAt: 'cancelled_at',
+    artifactTokenHash: 'artifact_token_hash',
+    claimedAt: 'claimed_at',
     finishedAt: 'finished_at',
   })) {
     if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
@@ -602,6 +667,45 @@ export async function updateAdminJob(id, patch = {}) {
   await run(`UPDATE admin_jobs SET ${fields.join(', ')} WHERE id = ?`, args);
 }
 
+export async function appendAdminJobLog(id, line, limit = 12000) {
+  if (!id) return;
+  const row = await get('SELECT log FROM admin_jobs WHERE id = ?', [id]);
+  const previous = row?.log || '';
+  const text = `${previous}${previous && !previous.endsWith('\n') ? '\n' : ''}${String(line || '')}`;
+  const tailed = text.length > limit ? text.slice(text.length - limit) : text;
+  await updateAdminJob(id, { log: tailed });
+}
+
+export async function getAdminJob(id) {
+  const row = await get('SELECT * FROM admin_jobs WHERE id = ?', [id]);
+  return parseAdminJobRow(row);
+}
+
+export async function claimAdminJob(id, runnerId = null) {
+  const now = new Date().toISOString();
+  const result = await run(`
+    UPDATE admin_jobs
+    SET claimed_at = ?, runner_id = COALESCE(?, runner_id), runner_state = 'running', heartbeat_at = ?
+    WHERE id = ? AND status = 'running' AND claimed_at IS NULL
+  `, [now, runnerId, now, id]);
+  return result.changes > 0 ? getAdminJob(id) : null;
+}
+
+export async function heartbeatAdminJob(id, runnerState = 'running') {
+  await updateAdminJob(id, {
+    heartbeatAt: new Date().toISOString(),
+    runnerState,
+  });
+}
+
+export async function validateAdminJobArtifactToken(id, token) {
+  const row = await get('SELECT artifact_token_hash FROM admin_jobs WHERE id = ?', [id]);
+  if (!row?.artifact_token_hash || !token) return false;
+  const expected = Buffer.from(row.artifact_token_hash, 'hex');
+  const actual = Buffer.from(hashAdminJobToken(token), 'hex');
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
 export async function hasRunningAdminJob(type) {
   const row = await get('SELECT id FROM admin_jobs WHERE type = ? AND status = ? ORDER BY started_at DESC LIMIT 1', [type, 'running']);
   return row ? Number(row.id) : null;
@@ -613,18 +717,7 @@ export async function listAdminJobs(limit = 25) {
     ORDER BY started_at DESC
     LIMIT ?
   `, [limit]);
-  return rows.map((row) => ({
-    id: Number(row.id),
-    type: row.type,
-    label: row.label,
-    status: row.status,
-    params: (() => { try { return row.params_json ? JSON.parse(row.params_json) : null; } catch { return null; } })(),
-    result: (() => { try { return row.result_json ? JSON.parse(row.result_json) : null; } catch { return null; } })(),
-    log: row.log || null,
-    error: row.error || null,
-    startedAt: row.started_at,
-    finishedAt: row.finished_at || null,
-  }));
+  return rows.map(parseAdminJobRow);
 }
 
 // --- File metric functions ---

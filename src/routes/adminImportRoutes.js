@@ -1,9 +1,9 @@
 import { Router } from 'express';
 import {
   deleteImportRule, getImportRule, listAllDocumentMetadata, listImportRules,
-  saveImportRule, createAdminJob, hasRunningAdminJob
+  saveImportRule, hasRunningAdminJob
 } from '../db.js';
-import { runImportRulesJob, isAdminJobRunning } from '../services/adminJobs.js';
+import { createAndStartAdminWorkerJob } from '../services/adminWorker.js';
 import { DEFAULT_BASE_URL, DEFAULT_SOURCE, DEFAULT_TERM } from '../config.js';
 import { fetchPage, extractHits, fetchSearchAggregations, resolveIndexName } from '../api.js';
 import { normalizeRecord } from '../metrics.js';
@@ -236,31 +236,20 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
       return;
     }
 
-    const runningId = isAdminJobRunning('import_rules_sync')
-      ? (await hasRunningAdminJob('import_rules_sync'))
-      : await hasRunningAdminJob('import_rules_sync');
+    const runningId = await hasRunningAdminJob('import_rules_sync');
     if (runningId) {
       res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
       return;
     }
 
-    const jobId = await createAdminJob({
+    const result = await createAndStartAdminWorkerJob({
       type: 'import_rules_sync',
       label: 'Import Rules Sync',
       params: { mode, scope, ruleIds: selectedIds, downloadFiles: parseBooleanParam(body.downloadFiles, true) },
     });
 
-    // Long-running imports continue in the background; the job table is the
-    // source of truth for progress after this 202 response.
-    runImportRulesJob(jobId, {
-      mode,
-      scope,
-      ruleIds: selectedIds,
-      downloadFiles: parseBooleanParam(body.downloadFiles, true),
-      clearMetricsCache
-    });
-
-    res.status(202).json({ ok: true, started: true, jobId });
+    clearMetricsCache();
+    res.status(202).json({ ok: true, started: true, ...result });
   }));
 
   return router;

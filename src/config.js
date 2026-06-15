@@ -44,6 +44,21 @@ export const PDF_ALLOW_HTTP_DOWNLOADS = process.env.PDF_ALLOW_HTTP_DOWNLOADS
   : !IS_PRODUCTION;
 export const BERTOPIC_PYTHON_COMMAND = process.env.BERTOPIC_PYTHON_COMMAND || 'python3';
 export const BERTOPIC_TIMEOUT_MS = Number(process.env.BERTOPIC_TIMEOUT_MS || 60 * 60 * 1000);
+export const ADMIN_WORKER_TIMEOUT_MS = Number(process.env.ADMIN_WORKER_TIMEOUT_MS || 6 * 60 * 60 * 1000);
+export const ADMIN_WORKER_GRACE_MS = Number(process.env.ADMIN_WORKER_GRACE_MS || 30_000);
+export const ADMIN_WORKER_MODE = process.env.ADMIN_WORKER_MODE || 'auto';
+export const WORKER_IMAGE = process.env.WORKER_IMAGE || process.env.FLY_IMAGE_REF || '';
+export const WORKER_ARTIFACT_BASE_URL = process.env.WORKER_ARTIFACT_BASE_URL || '';
+export const WORKER_FORCE_ARTIFACT_API = /^(1|true|yes)$/i.test(process.env.WORKER_FORCE_ARTIFACT_API || '');
+export const FLY_API_HOSTNAME = process.env.FLY_API_HOSTNAME || 'https://api.machines.dev';
+export const FLY_API_TOKEN = process.env.FLY_API_TOKEN || '';
+export const FLY_APP_NAME = process.env.FLY_APP_NAME || '';
+export const FLY_MACHINE_ID = process.env.FLY_MACHINE_ID || '';
+export const FLY_REGION = process.env.FLY_REGION || process.env.PRIMARY_REGION || '';
+export const FLY_WORKER_MEMORY_MB = Number(process.env.FLY_WORKER_MEMORY_MB || 2048);
+export const FLY_WORKER_CPUS = Number(process.env.FLY_WORKER_CPUS || 1);
+export const FLY_WORKER_CPU_KIND = process.env.FLY_WORKER_CPU_KIND || 'shared';
+export const FLY_WORKER_REGION = process.env.FLY_WORKER_REGION || FLY_REGION || '';
 export const SESSION_COOKIE_SECURE = process.env.SESSION_COOKIE_SECURE
   ? /^(1|true|yes)$/i.test(process.env.SESSION_COOKIE_SECURE)
   : IS_PRODUCTION;
@@ -63,10 +78,10 @@ export const PUBLIC_SCAN_LIMIT = Number(process.env.PUBLIC_SCAN_LIMIT || (IS_PRO
 export const DOCUMENT_SYNC_INTERVAL_MS = Number(process.env.DOCUMENT_SYNC_INTERVAL_MS || 24 * 60 * 60 * 1000);
 export const DOCUMENT_SYNC_ENABLED = process.env.DOCUMENT_SYNC_ENABLED
   ? /^(1|true|yes)$/i.test(process.env.DOCUMENT_SYNC_ENABLED)
-  : true;
+  : !IS_PRODUCTION;
 export const DOCUMENT_SYNC_ON_START = process.env.DOCUMENT_SYNC_ON_START
   ? /^(1|true|yes)$/i.test(process.env.DOCUMENT_SYNC_ON_START)
-  : true;
+  : !IS_PRODUCTION;
 export const DOCUMENT_SYNC_ONCE = /^(1|true|yes)$/i.test(process.env.DOCUMENT_SYNC_ONCE || '');
 export const DOCUMENT_SYNC_MAX_RECORDS = Number(process.env.DOCUMENT_SYNC_MAX_RECORDS || 0); // 0 = use scan limit
 export const CATALOGUE_LOOKUP_ON_START = process.env.CATALOGUE_LOOKUP_ON_START

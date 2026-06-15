@@ -1,16 +1,16 @@
 import { Router } from 'express';
 import {
-  clearAllCitations, deleteFileMetric, getCatalogueLookupStats, getDb,
+  deleteFileMetric, getCatalogueLookupStats,
   getFileMetricsStats, listFileMetrics, listPendingLookups, listRecentRuns,
-  loadCommitteeMembers, loadDocumentMetadata
+  loadDocumentMetadata, hasRunningAdminJob
 } from '../db.js';
-import { deleteCachedPdf, analyzeDocumentFile, analyzePdfAtPath, extractAndSaveParsedData } from '../pdf.js';
+import { deleteCachedPdf } from '../pdf.js';
 import { getConceptPipelineStatus, rebuildConceptDictionary } from '../conceptsPipeline.js';
 import { extractSearchTerms, runPendingCatalogueLookups } from '../catalogue.js';
 import { getConfiguredApiKey } from '../secrets.js';
 import { parseBooleanParam, parseNumberParam } from '../validate.js';
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
-import { logger } from '../logger.js';
+import { createAndStartAdminWorkerJob } from '../services/adminWorker.js';
 
 /**
  * Creates admin operational endpoints for sync, cache, catalogue, and reparsing.
@@ -57,10 +57,19 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
       downloadFiles: parseBooleanParam(body.downloadFiles ?? getQueryValue(req, 'downloadFiles'), true),
       apiKey: await getConfiguredApiKey(),
     };
-    const { startDocumentSync } = await loadSyncModule();
-    const result = await startDocumentSync(options);
+    const runningId = await hasRunningAdminJob('document_sync');
+    if (runningId) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
+      return;
+    }
+    const result = await createAndStartAdminWorkerJob({
+      type: 'document_sync',
+      label: 'Open Collections Metadata Sync',
+      params: { options },
+    });
     clearMetricsCache();
-    res.status(202).json({ ok: true, ...result });
+    const { getDocumentSyncStatus } = await loadSyncModule();
+    res.status(202).json({ ok: true, started: true, ...result, status: await getDocumentSyncStatus() });
   }));
 
   router.get('/concepts/status', asyncHandler(async (_req, res) => {
@@ -125,23 +134,13 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
       res.status(404).json({ error: 'Document not found in metadata store' });
       return;
     }
-    // Force a fresh PDF pass for this document, then invalidate dashboard
-    // metrics that may have used stale page/word/citation values.
-    await deleteCachedPdf(docId);
-    await analyzeDocumentFile(doc, { downloadFiles: true, forceDownload: true, recomputeFromCache: false });
-    clearMetricsCache();
-    res.status(200).json({
-      ok: true,
-      docId,
-      status: doc.downloadStatus,
-      pages: doc.pages,
-      pagesSource: doc.pagesSource,
-      wordCount: doc.wordCount,
-      wordCountSource: doc.wordCountSource,
-      fileBytes: doc.fileBytes,
-      downloadUrl: doc.downloadUrl,
-      downloadError: doc.downloadError
+    const result = await createAndStartAdminWorkerJob({
+      type: 'cache_refresh_doc',
+      label: `Refresh PDF Analysis: ${doc.title || docId}`,
+      params: { docId },
     });
+    clearMetricsCache();
+    res.status(202).json({ ok: true, started: true, ...result });
   }));
 
   router.delete('/cache/:docId', asyncHandler(async (req, res) => {
@@ -152,65 +151,33 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
   }));
 
   router.post('/reparse-all', asyncHandler(async (_req, res) => {
-    // Reparse-all intentionally rebuilds citation state from cached PDFs; the
-    // catalogue lookup pass below repopulates lookup status for new citations.
-    await clearAllCitations();
-    const entries = (await listFileMetrics()).filter((e) => e.pdf_path);
-    let processed = 0;
-    let withCommittee = 0;
-    let totalCitations = 0;
-
-    for (const entry of entries) {
-      try {
-        const analysis = await analyzePdfAtPath(entry.pdf_path);
-        if (!analysis.fullText) continue;
-        processed++;
-
-        const doc = await loadDocumentMetadata(entry.doc_id) || { id: entry.doc_id, supervisors: [] };
-        await extractAndSaveParsedData(doc, analysis.fullText);
-        if (doc.committee?.length) withCommittee++;
-        if (doc.citationCount) totalCitations += Number(doc.citationCount);
-      } catch (err) {
-        logger.warn('Reparse failed for doc', { docId: entry.doc_id, error: err.message });
-      }
+    const runningId = await hasRunningAdminJob('reparse_all');
+    if (runningId) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
+      return;
     }
-
-    const lookupStats = await runPendingCatalogueLookups();
-
+    const result = await createAndStartAdminWorkerJob({
+      type: 'reparse_all',
+      label: 'Reparse All Cached PDFs',
+      params: {},
+    });
     clearMetricsCache();
-    res.status(200).json({ ok: true, processed, committees: withCommittee, citations: totalCitations, catalogueLookups: lookupStats });
+    res.status(202).json({ ok: true, started: true, ...result });
   }));
 
   router.post('/reparse-committee', asyncHandler(async (_req, res) => {
-    const targetResult = await (await getDb()).execute({
-      sql: `
-      SELECT fm.doc_id, fm.pdf_path
-      FROM file_metrics fm
-      WHERE fm.pdf_path IS NOT NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM committee_members cm WHERE cm.doc_id = fm.doc_id
-      )
-    `});
-    const targets = targetResult.rows;
-
-    let processed = 0, withCommittee = 0;
-    for (const row of targets) {
-      const doc = await loadDocumentMetadata(row.doc_id);
-      if (!doc) continue;
-      try {
-        const analysis = await analyzePdfAtPath(row.pdf_path);
-        if (analysis?.fullText) {
-          const before = (await loadCommitteeMembers(row.doc_id)).length;
-          await extractAndSaveParsedData(doc, analysis.fullText);
-          const after = (await loadCommitteeMembers(row.doc_id)).length;
-          if (after > before) withCommittee++;
-        }
-      } catch { /* skip individual failures */ }
-      processed++;
+    const runningId = await hasRunningAdminJob('reparse_committee');
+    if (runningId) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
+      return;
     }
-
+    const result = await createAndStartAdminWorkerJob({
+      type: 'reparse_committee',
+      label: 'Reparse Missing Committees',
+      params: {},
+    });
     clearMetricsCache();
-    res.status(200).json({ ok: true, processed, withCommittee });
+    res.status(202).json({ ok: true, started: true, ...result });
   }));
 
   router.get('/runs', asyncHandler(async (_req, res) => {

@@ -1,6 +1,8 @@
 
 // --- Auth ---
 
+let jobsPollTimer = null;
+
 async function checkSession() {
   try {
     const res = await fetch('/api/auth/session');
@@ -890,7 +892,29 @@ function summarizeJobResult(job) {
   if (job.type === 'bertopic') {
     return `${formatNum(result.topics || 0)} topics, ${formatNum(result.assignedDocuments || 0)} documents`;
   }
+  if (job.type === 'document_sync' || job.type === 'import_rules_sync') {
+    return `${formatNum(result.totalSaved || 0)} saved, ${formatNum(result.totalSkipped || 0)} skipped`;
+  }
+  if (job.type === 'cache_refresh_doc') {
+    return result.docId ? `${escapeHtml(result.docId)}: ${escapeHtml(result.status || job.status || '-')}` : '-';
+  }
+  if (job.type === 'reparse_all') {
+    return `${formatNum(result.processed || 0)} processed, ${formatNum(result.citations || 0)} citations`;
+  }
+  if (job.type === 'reparse_committee') {
+    return `${formatNum(result.processed || 0)} processed, ${formatNum(result.withCommittee || 0)} with committee`;
+  }
   return Object.keys(result).length ? JSON.stringify(result) : '-';
+}
+
+function workerJobDetail(job) {
+  const parts = [];
+  if (job.runnerType) parts.push(job.runnerType);
+  if (job.runnerId) parts.push(job.runnerId);
+  if (job.runnerState) parts.push(job.runnerState);
+  if (job.timeoutAt && job.status === 'running') parts.push(`timeout ${formatJobDate(job.timeoutAt)}`);
+  if (job.heartbeatAt && job.status === 'running') parts.push(`heartbeat ${formatJobDate(job.heartbeatAt)}`);
+  return parts.join(' · ');
 }
 
 function renderJobs(data = {}) {
@@ -925,6 +949,13 @@ function renderJobs(data = {}) {
 
   if (jobsTableEl) {
     const jobs = data.jobs || [];
+    const hasRunning = jobs.some((job) => job.status === 'running');
+    if (hasRunning && !jobsPollTimer) {
+      jobsPollTimer = setInterval(loadJobs, 5000);
+    } else if (!hasRunning && jobsPollTimer) {
+      clearInterval(jobsPollTimer);
+      jobsPollTimer = null;
+    }
     jobsTableEl.innerHTML = jobs.length
       ? jobs.map((job) => `
         <tr>
@@ -932,10 +963,38 @@ function renderJobs(data = {}) {
           <td>${escapeHtml(job.status || '-')}</td>
           <td>${escapeHtml(formatJobDate(job.startedAt))}</td>
           <td>${escapeHtml(formatJobDate(job.finishedAt))}</td>
-          <td title="${escapeHtml(job.log || '')}">${escapeHtml(summarizeJobResult(job))}</td>
+          <td title="${escapeHtml(job.log || '')}">
+            ${escapeHtml(summarizeJobResult(job))}
+            ${workerJobDetail(job) ? `<div class="meta">${escapeHtml(workerJobDetail(job))}</div>` : ''}
+          </td>
+          <td>
+            ${job.status === 'running' && job.runnerType ? `<button class="btn danger btn-sm" data-cancel-job="${job.id}">Cancel</button>` : ''}
+          </td>
         </tr>
       `).join('')
-      : '<tr><td colspan="5">No jobs have run yet.</td></tr>';
+      : '<tr><td colspan="6">No jobs have run yet.</td></tr>';
+
+    for (const btn of jobsTableEl.querySelectorAll('[data-cancel-job]')) {
+      btn.addEventListener('click', async () => {
+        if (!confirm('Cancel this worker job?')) return;
+        btn.disabled = true;
+        try {
+          const res = await fetch(`/api/admin/jobs/${encodeURIComponent(btn.dataset.cancelJob)}/cancel`, {
+            method: 'POST',
+            headers: csrfHeaders(),
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            alert(data.error || 'Job could not be cancelled.');
+            return;
+          }
+          setStatus('Worker job cancelled.');
+          await loadJobs();
+        } catch {
+          alert('Connection error');
+        }
+      });
+    }
   }
 
   if (syncRunsTableEl) {
@@ -1119,19 +1178,8 @@ function renderCache(entries) {
           alert(data.error || 'PDF redownload and analysis failed');
           return;
         }
-        // Update in-memory document state so Explorer reflects new metrics
-        const localDoc = (state.payload?.documents || []).find((d) => d.id === docId);
-        if (localDoc) {
-          if (data.pages != null) { localDoc.pages = data.pages; localDoc.pagesSource = data.pagesSource; }
-          if (data.wordCount != null) { localDoc.wordCount = data.wordCount; localDoc.wordCountSource = data.wordCountSource; }
-          localDoc.fileBytes = data.fileBytes ?? localDoc.fileBytes;
-          localDoc.downloadUrl = data.downloadUrl ?? localDoc.downloadUrl;
-          localDoc.downloadStatus = data.status;
-          localDoc.downloadError = data.downloadError ?? null;
-          renderDocuments();
-        }
-        setStatus(`PDF redownloaded and analyzed for ${docId} (${data.status})`);
-        await loadCache();
+        setStatus(data.alreadyRunning ? 'A worker job is already running.' : `PDF refresh worker started for ${docId}.`);
+        await loadJobs();
       } catch {
         alert('Connection error');
       } finally {
@@ -1169,7 +1217,8 @@ async function handleReparseAll() {
       alert(data.error || 'Reparse failed');
       return;
     }
-    setStatus(`Reparsed ${data.processed} PDFs. Found committees in ${data.committees}, citations in ${data.citations}.`);
+    setStatus(data.alreadyRunning ? 'A reparse worker is already running.' : 'Reparse worker started.');
+    await loadJobs();
   } catch {
     alert('Connection error');
   } finally {
