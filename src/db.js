@@ -169,6 +169,7 @@ async function ensureSchema(client) {
       cancelled_at TEXT,
       artifact_token_hash TEXT,
       claimed_at TEXT,
+      progress_json TEXT,
       started_at TEXT NOT NULL,
       finished_at TEXT
     );
@@ -293,6 +294,7 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN cancelled_at TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN artifact_token_hash TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN claimed_at TEXT');
+  await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN progress_json TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN sync_key TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN title TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN author TEXT');
@@ -617,6 +619,7 @@ function parseAdminJobRow(row) {
     runnerType: row.runner_type || null,
     runnerId: row.runner_id || null,
     runnerState: row.runner_state || null,
+    progress: (() => { try { return row.progress_json ? JSON.parse(row.progress_json) : null; } catch { return null; } })(),
     heartbeatAt: row.heartbeat_at || null,
     timeoutAt: row.timeout_at || null,
     cancelledAt: row.cancelled_at || null,
@@ -666,12 +669,15 @@ export async function updateAdminJob(id, patch = {}) {
     cancelledAt: 'cancelled_at',
     artifactTokenHash: 'artifact_token_hash',
     claimedAt: 'claimed_at',
+    progress: 'progress_json',
     finishedAt: 'finished_at',
   })) {
     if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
     fields.push(`${column} = ?`);
     const value = key === 'result' && patch[key] != null
       ? JSON.stringify(patch[key])
+      : key === 'progress' && patch[key] != null
+        ? JSON.stringify(patch[key])
       : patch[key];
     args.push(value);
   }
@@ -713,9 +719,21 @@ export async function claimAdminJob(id, runnerId = null) {
 }
 
 export async function heartbeatAdminJob(id, runnerState = 'running') {
-  await updateAdminJob(id, {
+  const patch = {
     heartbeatAt: new Date().toISOString(),
-    runnerState,
+  };
+  if (runnerState != null) patch.runnerState = runnerState;
+  await updateAdminJob(id, patch);
+}
+
+export async function updateAdminJobProgress(id, progress = {}) {
+  await updateAdminJob(id, {
+    progress: {
+      ...progress,
+      updatedAt: new Date().toISOString(),
+    },
+    heartbeatAt: new Date().toISOString(),
+    runnerState: progress.currentTask || progress.phase || 'running',
   });
 }
 
@@ -1177,12 +1195,25 @@ export async function loadCommitteeMembers(docId) {
 
 // --- Citation functions ---
 
-export async function saveCitations(docId, citations, hashFn) {
+export async function saveCitations(docId, citations, hashFn, { onProgress = null } = {}) {
   const now = new Date().toISOString();
   
   // Fetch existing citations to do quick exact matching and fuzzy matching in memory
   const existingCitations = await all('SELECT id, citation_hash, citation_text, author, title, year FROM citations');
   const hashMap = new Map(existingCitations.map(row => [row.citation_hash, row]));
+  const counts = {
+    processed: 0,
+    total: citations.length,
+    exactMatches: 0,
+    fuzzyMatches: 0,
+    newCitations: 0,
+  };
+  await onProgress?.({
+    phase: 'citation_matching',
+    label: 'Matching citations',
+    status: 'running',
+    counts,
+  });
 
   for (const item of citations) {
     const text = typeof item === 'string' ? item : item.text;
@@ -1190,11 +1221,13 @@ export async function saveCitations(docId, citations, hashFn) {
     
     let matchedId = null;
     let matchedHash = hash;
+    let matchedBy = null;
 
     // 1. Exact match check
     if (hashMap.has(hash)) {
       matchedId = hashMap.get(hash).id;
       matchedHash = hash;
+      matchedBy = 'exact';
     } else {
       // 2. Fuzzy match check
       const itemYear = (typeof item === 'string' ? null : item.year) || (() => {
@@ -1236,6 +1269,7 @@ export async function saveCitations(docId, citations, hashFn) {
       if (maxSim >= 0.90 && bestMatch) {
         matchedId = bestMatch.id;
         matchedHash = bestMatch.citation_hash;
+        matchedBy = 'fuzzy';
         logger.info('Fuzzy matched citation', {
           incoming: text.slice(0, 50),
           matched: bestMatch.citation_text.slice(0, 50),
@@ -1245,12 +1279,15 @@ export async function saveCitations(docId, citations, hashFn) {
     }
 
     if (matchedId) {
+      if (matchedBy === 'exact') counts.exactMatches += 1;
+      if (matchedBy === 'fuzzy') counts.fuzzyMatches += 1;
       await run(`
         INSERT INTO document_citations (doc_id, citation_id, updated_at)
         VALUES (?, ?, ?)
         ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
       `, [docId, matchedId, now]);
     } else {
+      counts.newCitations += 1;
       await run(`
         INSERT INTO citations (citation_hash, citation_text, author, title, year, source, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -1277,6 +1314,15 @@ export async function saveCitations(docId, citations, hashFn) {
           ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
         `, [docId, row.id, now]);
       }
+    }
+    counts.processed += 1;
+    if (counts.processed === counts.total || counts.processed % 10 === 0) {
+      await onProgress?.({
+        phase: 'citation_matching',
+        label: 'Matching citations',
+        status: counts.processed === counts.total ? 'completed' : 'running',
+        counts: { ...counts },
+      });
     }
   }
 }

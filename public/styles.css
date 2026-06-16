@@ -1684,6 +1684,53 @@ input:focus, select:focus {
   min-width: 13rem;
 }
 
+.job-progress {
+  margin-top: 0.4rem;
+  font-family: var(--sans);
+}
+
+.job-progress-current {
+  color: var(--ink);
+  font-weight: 700;
+  font-size: 0.8rem;
+}
+
+.job-progress-steps {
+  display: grid;
+  gap: 0.25rem;
+  margin-top: 0.3rem;
+}
+
+.job-progress-step {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.28rem 0.45rem;
+  align-items: baseline;
+  color: var(--ink-soft);
+  font-size: 0.75rem;
+}
+
+.job-progress-step span {
+  min-width: 4.8rem;
+  color: var(--accent);
+  font-weight: 700;
+  text-transform: capitalize;
+}
+
+.job-progress-step.completed span {
+  color: #347a45;
+}
+
+.job-progress-step strong {
+  color: var(--ink);
+  font-size: 0.76rem;
+}
+
+.job-progress-step em,
+.job-progress-step small {
+  font-style: normal;
+}
+
 /* --- Links --- */
 
 a {

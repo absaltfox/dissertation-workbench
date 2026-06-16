@@ -35,7 +35,7 @@ async function main() {
 
   await appendAdminJobLog(jobId, `Worker claimed job ${jobId}.\n`);
   const heartbeat = setInterval(() => {
-    heartbeatAdminJob(jobId).catch(() => {});
+    heartbeatAdminJob(jobId, null).catch(() => {});
   }, 15_000);
   heartbeat.unref();
 

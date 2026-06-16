@@ -917,6 +917,44 @@ function workerJobDetail(job) {
   return parts.join(' · ');
 }
 
+function formatJobCounts(counts = {}) {
+  const parts = [];
+  if (counts.processed != null && counts.total != null) {
+    parts.push(`${formatNum(counts.processed)} / ${formatNum(counts.total)}`);
+  }
+  if (counts.citations != null) parts.push(`${formatNum(counts.citations)} citations`);
+  if (counts.fuzzyMatches != null) parts.push(`${formatNum(counts.fuzzyMatches)} fuzzy`);
+  if (counts.exactMatches != null) parts.push(`${formatNum(counts.exactMatches)} exact`);
+  if (counts.newCitations != null) parts.push(`${formatNum(counts.newCitations)} new`);
+  if (counts.pages != null) parts.push(`${formatNum(counts.pages)} pages`);
+  if (counts.words != null) parts.push(`${formatNum(counts.words)} words`);
+  if (counts.saved != null) parts.push(`${formatNum(counts.saved)} saved`);
+  return parts.join(' · ');
+}
+
+function renderJobProgress(job) {
+  const progress = job.progress || {};
+  const tasks = Array.isArray(progress.tasks) ? progress.tasks : [];
+  if (!progress.currentTask && !tasks.length) return '';
+  const visibleTasks = tasks.slice(-5);
+  return `
+    <div class="job-progress">
+      ${progress.currentTask ? `<div class="job-progress-current">${escapeHtml(progress.currentTask)}</div>` : ''}
+      ${visibleTasks.length ? `<div class="job-progress-steps">
+        ${visibleTasks.map((task) => {
+          const counts = formatJobCounts(task.counts || {});
+          return `<div class="job-progress-step ${escapeHtml(task.status || 'running')}">
+            <span>${escapeHtml(task.status || 'running')}</span>
+            <strong>${escapeHtml(task.label || task.key || 'Task')}</strong>
+            ${task.detail ? `<em>${escapeHtml(task.detail)}</em>` : ''}
+            ${counts ? `<small>${escapeHtml(counts)}</small>` : ''}
+          </div>`;
+        }).join('')}
+      </div>` : ''}
+    </div>
+  `;
+}
+
 function renderJobs(data = {}) {
   const catalogue = data.catalogueStats || {};
   const topic = data.topicStatus || {};
@@ -965,6 +1003,7 @@ function renderJobs(data = {}) {
           <td>${escapeHtml(formatJobDate(job.finishedAt))}</td>
           <td title="${escapeHtml(job.log || '')}">
             ${escapeHtml(summarizeJobResult(job))}
+            ${renderJobProgress(job)}
             ${workerJobDetail(job) ? `<div class="meta">${escapeHtml(workerJobDetail(job))}</div>` : ''}
           </td>
           <td>

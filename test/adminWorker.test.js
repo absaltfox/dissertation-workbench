@@ -24,6 +24,7 @@ let heartbeatAdminJob;
 let finishAdminJob;
 let loadStoredFileMetric;
 let saveDocumentMetadata;
+let saveCitations;
 let saveFileMetric;
 let validateAdminJobArtifactToken;
 
@@ -52,6 +53,7 @@ test.before(async () => {
     finishAdminJob,
     loadStoredFileMetric,
     saveDocumentMetadata,
+    saveCitations,
     saveFileMetric,
     validateAdminJobArtifactToken,
   } = await import('../src/db.js'));
@@ -246,9 +248,34 @@ test('cache reanalysis job recomputes from cached PDF without downloading', asyn
   const job = await getAdminJob(jobId);
   assert.equal(job.status, 'completed');
   assert.match(job.log, /Reanalyzing cached PDF\/full-text/);
+  assert.equal(job.progress?.phase, 'complete');
+  assert.ok(Array.isArray(job.progress?.tasks));
   const stored = await loadStoredFileMetric(docId);
   assert.equal(stored.status, 'recomputed_from_cache');
   assert.equal(stored.pdf_path, durablePdfPath);
+});
+
+test('citation matching progress reports processed and fuzzy counts', async () => {
+  const hashFn = (text) => String(text || '').toLowerCase();
+  await saveCitations('citation-progress-seed', [
+    { text: 'Smith, John. 2020. Educational Leadership in Canada.' },
+  ], hashFn);
+
+  const events = [];
+  await saveCitations('citation-progress-doc', [
+    { text: 'Smith, Jon. 2020. Educational Leadership in Canada.' },
+    { text: 'Nguyen, A. 2021. Community Schools and Care.' },
+  ], hashFn, {
+    onProgress: async (event) => events.push(event),
+  });
+
+  const final = events.at(-1);
+  assert.equal(final.phase, 'citation_matching');
+  assert.equal(final.status, 'completed');
+  assert.equal(final.counts.processed, 2);
+  assert.equal(final.counts.total, 2);
+  assert.equal(final.counts.fuzzyMatches, 1);
+  assert.equal(final.counts.newCitations, 1);
 });
 
 test('production auto mode fails closed without Fly API token', async () => {

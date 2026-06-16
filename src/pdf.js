@@ -797,7 +797,10 @@ export async function fetchPdfForDocument(doc) {
   }
 }
 
-async function analyzeDocumentFullText(doc, fullText, { stored = null, status = 'full_text', error = null } = {}) {
+async function analyzeDocumentFullText(doc, fullText, {
+  stored = null, status = 'full_text', error = null, onProgress = null
+} = {}) {
+  await onProgress?.({ phase: 'full_text_analysis', label: 'Analyzing full-text bitstream', status: 'running' });
   const wordCount = wordCountFromText(fullText);
   const bodyWordCount = extractBodyWordCount(fullText);
   const pageCount = estimatePagesFromWords(bodyWordCount || wordCount);
@@ -826,7 +829,13 @@ async function analyzeDocumentFullText(doc, fullText, { stored = null, status = 
     wordSource: doc.wordCountSource,
     pageSource: doc.pagesSource
   });
-  await extractAndSaveParsedData(doc, fullText, null);
+  await onProgress?.({
+    phase: 'full_text_analysis',
+    label: 'Full-text bitstream analysis',
+    status: 'completed',
+    counts: { pages: doc.pages || 0, words: doc.wordCount || 0 },
+  });
+  await extractAndSaveParsedData(doc, fullText, null, { onProgress });
   logger.info('Document analyzed from cIRcle full-text bitstream', {
     docId: doc.id,
     pages: doc.pages,
@@ -836,7 +845,9 @@ async function analyzeDocumentFullText(doc, fullText, { stored = null, status = 
   return true;
 }
 
-async function analyzeDocumentFullTextFallback(doc, stored, { status = 'full_text', error = null, artifactClient = null } = {}) {
+async function analyzeDocumentFullTextFallback(doc, stored, {
+  status = 'full_text', error = null, artifactClient = null, onProgress = null
+} = {}) {
   const result = await fetchFullTextForDocument(doc, stored, { artifactClient });
   if (!result?.fullText) return false;
   return analyzeDocumentFullText(doc, result.fullText, {
@@ -847,14 +858,17 @@ async function analyzeDocumentFullTextFallback(doc, stored, { status = 'full_tex
       full_text_source_url: result.fullTextSourceUrl || stored?.full_text_source_url || null
     },
     status,
-    error
+    error,
+    onProgress,
   });
 }
 
-async function analyzeCachedFullText(doc, stored, { status = 'full_text_recomputed', error = null, artifactClient = null } = {}) {
+async function analyzeCachedFullText(doc, stored, {
+  status = 'full_text_recomputed', error = null, artifactClient = null, onProgress = null
+} = {}) {
   const cached = await readCachedFullText(doc, stored, artifactClient);
   if (cached?.fullText) {
-    return analyzeDocumentFullText(doc, cached.fullText, { stored, status, error });
+    return analyzeDocumentFullText(doc, cached.fullText, { stored, status, error, onProgress });
   }
   if (hasStoredFullTextMetric(stored)) {
     await applyStoredFullTextMetric(doc, stored);
@@ -1427,10 +1441,11 @@ export function detectDownloadBlockPage(html) {
   );
 }
 
-export async function extractAndSaveParsedData(doc, fullText, pdfPath) {
+export async function extractAndSaveParsedData(doc, fullText, pdfPath, { onProgress = null } = {}) {
   if (!fullText) return;
 
   // --- Committee extraction ---
+  await onProgress?.({ phase: 'committee', label: 'Extracting committee information', status: 'running' });
   try {
     const committee = parseCommittee(fullText);
     // Fall back to acknowledgements-based parsing when the certify-page parser finds nothing
@@ -1476,9 +1491,16 @@ export async function extractAndSaveParsedData(doc, fullText, pdfPath) {
   } catch (err) {
     logger.warn('Failed to extract committee from PDF', { docId: doc.id, error: err.message });
   }
+  await onProgress?.({
+    phase: 'committee',
+    label: 'Committee extraction',
+    status: 'completed',
+    counts: { committeeMembers: doc.committee?.length || 0 },
+  });
 
   // --- Citation extraction (independent of committee success) ---
   // Fallback chain: GROBID (PDF layout) → AnyStyle (text ML) → regex
+  await onProgress?.({ phase: 'citation_extraction', label: 'Extracting bibliography citations', status: 'running' });
   try {
     let citations = null;
     if (pdfPath) {
@@ -1488,9 +1510,15 @@ export async function extractAndSaveParsedData(doc, fullText, pdfPath) {
       const textCitations = await parseBibliographyWithAnyStyle(fullText);
       citations = textCitations.map(text => ({ text }));
     }
+    await onProgress?.({
+      phase: 'citation_extraction',
+      label: 'Citation extraction',
+      status: 'completed',
+      counts: { citations: citations.length },
+    });
     await clearDocumentCitations(doc.id);
     if (citations.length) {
-      await saveCitations(doc.id, citations, normalizeCitation);
+      await saveCitations(doc.id, citations, normalizeCitation, { onProgress });
     }
     doc.citationCount = citations.length || (await loadDocumentCitations(doc.id)).length;
   } catch (err) {
@@ -1526,18 +1554,30 @@ async function loadStoredParsedData(doc) {
 }
 
 export async function analyzeDocumentFile(doc, options) {
-  const { downloadFiles, forceDownload, recomputeFromCache, artifactClient = null } = options;
+  const { downloadFiles, forceDownload, recomputeFromCache, artifactClient = null, onProgress = null } = options;
+  await onProgress?.({ phase: 'cache_lookup', label: 'Checking cached file metrics', status: 'running' });
   const stored = await loadStoredFileMetric(doc.id);
   const hasCachedPdf = stored?.pdf_path && (artifactClient || (await fileExists(stored.pdf_path)));
   const hasCachedFullTextMetric = hasStoredFullTextMetric(stored);
+  await onProgress?.({
+    phase: 'cache_lookup',
+    label: 'Checked cached file metrics',
+    status: 'completed',
+    counts: { cachedPdf: hasCachedPdf ? 1 : 0, cachedFullText: hasCachedFullTextMetric ? 1 : 0 },
+  });
 
   if (recomputeFromCache) {
     if (!hasCachedPdf) {
+      await onProgress?.({ phase: 'full_text', label: 'Analyzing cached full text', status: 'running' });
       if (await analyzeCachedFullText(doc, stored, {
         status: 'full_text_recomputed',
         error: null,
-        artifactClient
-      })) return;
+        artifactClient,
+        onProgress
+      })) {
+        await onProgress?.({ phase: 'full_text', label: 'Cached full-text analysis', status: 'completed' });
+        return;
+      }
       doc.downloadStatus = 'cache_miss';
       doc.downloadError = 'No local cached PDF or full-text file available for recomputation.';
       await saveFileMetric(doc.id, {
@@ -1557,8 +1597,11 @@ export async function analyzeDocumentFile(doc, options) {
     }
 
     try {
+      await onProgress?.({ phase: 'artifact_download', label: 'Streaming cached PDF from web cache', status: 'running' });
       const remotePdf = artifactClient ? await artifactClient.downloadPdfToTemp(doc.id) : null;
       const analysisPath = remotePdf?.path || stored.pdf_path;
+      await onProgress?.({ phase: 'artifact_download', label: 'Cached PDF available for analysis', status: 'completed' });
+      await onProgress?.({ phase: 'pdf_analysis', label: 'Analyzing cached PDF text', status: 'running' });
       const analysis = await analyzePdfAtPath(analysisPath);
       if (analysis.pageCount) {
         doc.pages = analysis.pageCount;
@@ -1589,7 +1632,13 @@ export async function analyzeDocumentFile(doc, options) {
         wordSource: doc.wordCountSource,
         pageSource: doc.pagesSource
       });
-      await extractAndSaveParsedData(doc, analysis.fullText, analysisPath);
+      await onProgress?.({
+        phase: 'pdf_analysis',
+        label: 'Cached PDF text analysis',
+        status: 'completed',
+        counts: { pages: doc.pages || 0, words: doc.wordCount || 0 },
+      });
+      await extractAndSaveParsedData(doc, analysis.fullText, analysisPath, { onProgress });
       if (remotePdf?.cleanup) await remotePdf.cleanup();
       return;
     } catch (error) {
@@ -1633,7 +1682,8 @@ export async function analyzeDocumentFile(doc, options) {
       if (await analyzeDocumentFullTextFallback(doc, stored, {
         status: 'full_text',
         error: null,
-        artifactClient
+        artifactClient,
+        onProgress
       })) return;
       doc.downloadStatus = 'skipped';
     }
@@ -1642,9 +1692,16 @@ export async function analyzeDocumentFile(doc, options) {
 
   await acquireDownloadSlot();
   logger.info('Downloading PDF from cIRcle REST bitstreams', { docId: doc.id });
+  await onProgress?.({ phase: 'pdf_download', label: 'Downloading PDF from cIRcle', status: 'running' });
 
   const resolved = await fetchPdfForDocument(doc);
   if (resolved) {
+    await onProgress?.({
+      phase: 'pdf_download',
+      label: 'Downloaded PDF from cIRcle',
+      status: 'completed',
+      counts: { bytes: resolved.bytes?.length || 0 },
+    });
     const cachePath = pdfCachePathForDoc(doc.id, resolved.downloadUrl);
     let analysisPath = cachePath;
     let durablePdfPath = cachePath;
@@ -1652,6 +1709,7 @@ export async function analyzeDocumentFile(doc, options) {
 
     try {
       if (artifactClient) {
+        await onProgress?.({ phase: 'artifact_upload', label: 'Uploading PDF to web cache', status: 'running' });
         const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-pdf-'));
         analysisPath = path.join(tmpDir, `${crypto.randomUUID()}.pdf`);
         cleanupAnalysisPath = async () => {
@@ -1660,9 +1718,16 @@ export async function analyzeDocumentFile(doc, options) {
         await fs.writeFile(analysisPath, resolved.bytes);
         const storedArtifact = await artifactClient.uploadPdf(doc.id, resolved.bytes, resolved.downloadUrl);
         durablePdfPath = storedArtifact.pdfPath || durablePdfPath;
+        await onProgress?.({
+          phase: 'artifact_upload',
+          label: 'Uploaded PDF to web cache',
+          status: 'completed',
+          counts: { bytes: resolved.bytes?.length || 0 },
+        });
       } else {
         await fs.writeFile(cachePath, resolved.bytes);
       }
+      await onProgress?.({ phase: 'pdf_analysis', label: 'Analyzing downloaded PDF text', status: 'running' });
       const analysis = await analyzePdfAtPath(analysisPath, resolved.bytes);
 
       if (analysis.pageCount) {
@@ -1695,7 +1760,13 @@ export async function analyzeDocumentFile(doc, options) {
         wordSource: doc.wordCountSource,
         pageSource: doc.pagesSource
       });
-      await extractAndSaveParsedData(doc, analysis.fullText, analysisPath);
+      await onProgress?.({
+        phase: 'pdf_analysis',
+        label: 'Downloaded PDF text analysis',
+        status: 'completed',
+        counts: { pages: doc.pages || 0, words: doc.wordCount || 0 },
+      });
+      await extractAndSaveParsedData(doc, analysis.fullText, analysisPath, { onProgress });
       logger.info('PDF downloaded and analyzed', {
         docId: doc.id,
         bitstreamId: resolved.bitstreamId,
@@ -1710,11 +1781,16 @@ export async function analyzeDocumentFile(doc, options) {
     }
   }
 
+  await onProgress?.({ phase: 'full_text', label: 'Falling back to cIRcle full text', status: 'running' });
   if (await analyzeDocumentFullTextFallback(doc, stored, {
     status: 'full_text_fallback',
     error: doc.downloadError || 'No downloadable PDF could be resolved for this record.',
-    artifactClient
-  })) return;
+    artifactClient,
+    onProgress
+  })) {
+    await onProgress?.({ phase: 'full_text', label: 'Full-text fallback analysis', status: 'completed' });
+    return;
+  }
 
   doc.downloadStatus = 'not_found';
   if (!doc.downloadError) doc.downloadError = 'No downloadable PDF could be resolved for this record.';
