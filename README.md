@@ -231,7 +231,7 @@ Optional enrichment services:
 - `GROBID_URL`: GROBID endpoint. Defaults to `http://localhost:8070`, or `http://${FLY_APP_NAME}-grobid.internal:8070` on Fly.
 - `GROBID_APP_NAME`: Fly companion app name for GROBID auto-start checks; defaults to `${FLY_APP_NAME}-grobid`.
 - `GROBID_STARTUP_WAIT_MS`: max wait for a cold-starting GROBID companion service, default `420000` (7 minutes).
-- `FLY_API_TOKEN`: optional token used on Fly to start/check a stopped companion GROBID machine.
+- `GROBID_FLY_API_TOKEN`: optional token used on Fly to start/check a stopped companion GROBID machine. Falls back to `FLY_API_TOKEN` when unset.
 - `BERTOPIC_PYTHON_COMMAND`: Python executable for BERTopic jobs, default `python3`.
 - `BERTOPIC_TIMEOUT_MS`: BERTopic job timeout, default one hour.
 - `ANTHROPIC_API_KEY`: optional; `scripts/build-topics.py` uses it to generate human-readable topic labels.
@@ -276,8 +276,10 @@ fly secrets set \
 If you deploy the optional GROBID companion app and want the Node app to wake/check it through Fly's internal Machines API, also set:
 
 ```bash
-fly secrets set FLY_API_TOKEN=...
+fly secrets set GROBID_FLY_API_TOKEN=...
 ```
+
+Use a token that can manage the GROBID companion app. The main app's `FLY_API_TOKEN` is still used for temporary admin worker machines and may be scoped only to the main app.
 
 5. Deploy the Node app:
 

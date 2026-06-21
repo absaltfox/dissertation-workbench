@@ -52,6 +52,7 @@ export const WORKER_ARTIFACT_BASE_URL = process.env.WORKER_ARTIFACT_BASE_URL || 
 export const WORKER_FORCE_ARTIFACT_API = /^(1|true|yes)$/i.test(process.env.WORKER_FORCE_ARTIFACT_API || '');
 export const FLY_API_HOSTNAME = process.env.FLY_API_HOSTNAME || 'https://api.machines.dev';
 export const FLY_API_TOKEN = process.env.FLY_API_TOKEN || '';
+export const GROBID_FLY_API_TOKEN = process.env.GROBID_FLY_API_TOKEN || FLY_API_TOKEN;
 export const FLY_APP_NAME = process.env.FLY_APP_NAME || '';
 export const FLY_MACHINE_ID = process.env.FLY_MACHINE_ID || '';
 export const FLY_REGION = process.env.FLY_REGION || process.env.PRIMARY_REGION || '';

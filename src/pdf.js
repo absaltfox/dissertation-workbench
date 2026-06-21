@@ -6,7 +6,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS,
-  PDF_DOWNLOAD_RATE_PER_MIN, GROBID_URL, GROBID_STARTUP_WAIT_MS
+  PDF_DOWNLOAD_RATE_PER_MIN, GROBID_URL, GROBID_STARTUP_WAIT_MS, GROBID_FLY_API_TOKEN
 } from './config.js';
 import {
   loadStoredFileMetric, saveFileMetric, saveDocumentMetadata, saveCommitteeMembers,
@@ -108,10 +108,10 @@ async function ensureGrobidRunning() {
   if (!process.env.FLY_APP_NAME) return;
 
   const companionAppName = process.env.GROBID_APP_NAME || `${process.env.FLY_APP_NAME}-grobid`;
-  const token = process.env.FLY_API_TOKEN;
+  const token = GROBID_FLY_API_TOKEN;
 
   if (!token) {
-    logger.warn('FLY_API_TOKEN is not set; cannot programmatically start Grobid machines via Fly Machines API.');
+    logger.warn('GROBID_FLY_API_TOKEN is not set; cannot programmatically start Grobid machines via Fly Machines API.');
     return;
   }
 
