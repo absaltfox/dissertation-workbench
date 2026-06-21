@@ -898,7 +898,13 @@ function summarizeJobResult(job) {
   if (job.type === 'cache_refresh_doc' || job.type === 'cache_reanalyze_doc') {
     return result.docId ? `${escapeHtml(result.docId)}: ${escapeHtml(result.status || job.status || '-')}` : '-';
   }
+  if (job.type === 'cache_reextract_citations_doc') {
+    return result.docId ? `${escapeHtml(result.docId)}: ${formatNum(result.citations || 0)} citations` : '-';
+  }
   if (job.type === 'reparse_all') {
+    return `${formatNum(result.processed || 0)} processed, ${formatNum(result.committees || 0)} with committee`;
+  }
+  if (job.type === 'reparse_citations') {
     return `${formatNum(result.processed || 0)} processed, ${formatNum(result.citations || 0)} citations`;
   }
   if (job.type === 'reparse_committee') {
@@ -926,6 +932,7 @@ function formatJobCounts(counts = {}) {
   if (counts.fuzzyMatches != null) parts.push(`${formatNum(counts.fuzzyMatches)} fuzzy`);
   if (counts.exactMatches != null) parts.push(`${formatNum(counts.exactMatches)} exact`);
   if (counts.newCitations != null) parts.push(`${formatNum(counts.newCitations)} new`);
+  if (counts.withCommittee != null) parts.push(`${formatNum(counts.withCommittee)} with committee`);
   if (counts.pages != null) parts.push(`${formatNum(counts.pages)} pages`);
   if (counts.words != null) parts.push(`${formatNum(counts.words)} words`);
   if (counts.saved != null) parts.push(`${formatNum(counts.saved)} saved`);
@@ -1199,7 +1206,8 @@ function renderCache(entries) {
       <td>${formatNum(e.word_count)}</td>
       <td>${e.updated_at ? new Date(e.updated_at).toLocaleDateString() : '-'}</td>
       <td class="cache-actions">
-        <button class="btn ghost btn-sm" data-reanalyze-cache="${escapeHtml(e.doc_id)}">Reanalyze Cached PDF</button>
+        <button class="btn ghost btn-sm" data-reanalyze-cache="${escapeHtml(e.doc_id)}">Reanalyze Metrics</button>
+        <button class="btn ghost btn-sm" data-reextract-citations="${escapeHtml(e.doc_id)}">Re-extract Citations</button>
         <button class="btn ghost btn-sm" data-refresh-cache="${escapeHtml(e.doc_id)}">Redownload &amp; Analyze</button>
         <button class="btn danger btn-sm" data-delete-cache="${escapeHtml(e.doc_id)}">Del</button>
       </td>
@@ -1241,13 +1249,36 @@ function renderCache(entries) {
           alert(data.error || 'Cached PDF reanalysis failed');
           return;
         }
-        setStatus(data.alreadyRunning ? 'A worker job is already running.' : `Cached PDF reanalysis worker started for ${docId}.`);
+        setStatus(data.alreadyRunning ? 'A worker job is already running.' : `Cached PDF metrics reanalysis worker started for ${docId}.`);
         await loadJobs();
       } catch {
         alert('Connection error');
       } finally {
         btn.disabled = false;
-        btn.textContent = 'Reanalyze Cached PDF';
+        btn.textContent = 'Reanalyze Metrics';
+      }
+    });
+  }
+
+  for (const btn of el.querySelectorAll('[data-reextract-citations]')) {
+    btn.addEventListener('click', async () => {
+      const docId = btn.dataset.reextractCitations;
+      btn.disabled = true;
+      btn.textContent = 'Extracting...';
+      try {
+        const res = await fetch(`/api/admin/cache/${encodeURIComponent(docId)}/citations/reextract`, { method: 'POST', headers: csrfHeaders() });
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.error || 'Citation re-extraction failed');
+          return;
+        }
+        setStatus(data.alreadyRunning ? 'A worker job is already running.' : `Citation re-extraction worker started for ${docId}.`);
+        await loadJobs();
+      } catch {
+        alert('Connection error');
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Re-extract Citations';
       }
     });
   }
@@ -1280,13 +1311,33 @@ async function handleReparseAll() {
       alert(data.error || 'Reparse failed');
       return;
     }
-    setStatus(data.alreadyRunning ? 'A reparse worker is already running.' : 'Reparse worker started.');
+    setStatus(data.alreadyRunning ? 'A document reparse worker is already running.' : 'Document reparse worker started.');
     await loadJobs();
   } catch {
     alert('Connection error');
   } finally {
     reparseAllBtn.disabled = false;
-    reparseAllBtn.textContent = 'Reparse All PDFs';
+    reparseAllBtn.textContent = 'Reparse Documents';
+  }
+}
+
+async function handleReparseCitations() {
+  reparseCitationsBtn.disabled = true;
+  reparseCitationsBtn.textContent = 'Extracting...';
+  try {
+    const res = await fetch('/api/admin/reparse-citations', { method: 'POST', headers: csrfHeaders() });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || 'Citation re-extraction failed');
+      return;
+    }
+    setStatus(data.alreadyRunning ? 'A citation re-extraction worker is already running.' : 'Citation re-extraction worker started.');
+    await loadJobs();
+  } catch {
+    alert('Connection error');
+  } finally {
+    reparseCitationsBtn.disabled = false;
+    reparseCitationsBtn.textContent = 'Re-extract Citations';
   }
 }
 

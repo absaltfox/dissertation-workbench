@@ -153,6 +153,7 @@ const cancelOwnMfaBtn = document.getElementById('cancelOwnMfaBtn');
 const refreshCacheBtn = document.getElementById('refreshCacheBtn');
 const cacheFilterEl = document.getElementById('cacheFilter');
 const reparseAllBtn = document.getElementById('reparseAllBtn');
+const reparseCitationsBtn = document.getElementById('reparseCitationsBtn');
 const refreshJobsBtn = document.getElementById('refreshJobsBtn');
 const catalogueLookupLimitEl = document.getElementById('catalogueLookupLimit');
 const previewCatalogueLookupsBtn = document.getElementById('previewCatalogueLookupsBtn');

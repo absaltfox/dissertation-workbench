@@ -152,7 +152,23 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
     }
     const result = await createAndStartAdminWorkerJob({
       type: 'cache_reanalyze_doc',
-      label: `Reanalyze Cached PDF: ${doc.title || docId}`,
+      label: `Reanalyze Cached PDF Metrics: ${doc.title || docId}`,
+      params: { docId },
+    });
+    clearMetricsCache();
+    res.status(202).json({ ok: true, started: true, ...result });
+  }));
+
+  router.post('/cache/:docId/citations/reextract', asyncHandler(async (req, res) => {
+    const docId = req.params.docId;
+    const doc = await loadDocumentMetadata(docId);
+    if (!doc) {
+      res.status(404).json({ error: 'Document not found in metadata store' });
+      return;
+    }
+    const result = await createAndStartAdminWorkerJob({
+      type: 'cache_reextract_citations_doc',
+      label: `Re-extract Citations: ${doc.title || docId}`,
       params: { docId },
     });
     clearMetricsCache();
@@ -174,7 +190,22 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
     }
     const result = await createAndStartAdminWorkerJob({
       type: 'reparse_all',
-      label: 'Reparse All Cached PDFs',
+      label: 'Reparse Cached PDF Document Data',
+      params: {},
+    });
+    clearMetricsCache();
+    res.status(202).json({ ok: true, started: true, ...result });
+  }));
+
+  router.post('/reparse-citations', asyncHandler(async (_req, res) => {
+    const runningId = await hasRunningAdminJob('reparse_citations');
+    if (runningId) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
+      return;
+    }
+    const result = await createAndStartAdminWorkerJob({
+      type: 'reparse_citations',
+      label: 'Re-extract Cached PDF Citations',
       params: {},
     });
     clearMetricsCache();

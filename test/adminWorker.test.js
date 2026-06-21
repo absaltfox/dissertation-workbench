@@ -22,11 +22,41 @@ let getAdminJob;
 let hashAdminJobToken;
 let heartbeatAdminJob;
 let finishAdminJob;
+let loadDocumentCitations;
 let loadStoredFileMetric;
 let saveDocumentMetadata;
 let saveCitations;
 let saveFileMetric;
 let validateAdminJobArtifactToken;
+
+async function writeTextPdf(filePath, lines) {
+  const escapedLines = lines.map((line) => String(line).replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)'));
+  const textOps = escapedLines
+    .map((line, index) => `${index === 0 ? '' : '0 -18 Td ' }(${line}) Tj`)
+    .join('\n');
+  const stream = `BT /F1 12 Tf 72 720 Td ${textOps} ET`;
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>',
+    '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+  ];
+  let body = '%PDF-1.4\n';
+  const offsets = [0];
+  for (let i = 0; i < objects.length; i += 1) {
+    offsets.push(Buffer.byteLength(body));
+    body += `${i + 1} 0 obj\n${objects[i]}\nendobj\n`;
+  }
+  const xrefOffset = Buffer.byteLength(body);
+  body += `xref\n0 ${objects.length + 1}\n`;
+  body += '0000000000 65535 f \n';
+  for (let i = 1; i < offsets.length; i += 1) {
+    body += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+  }
+  body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  await fs.writeFile(filePath, body, 'binary');
+}
 
 test.before(async () => {
   testDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-worker-tests-'));
@@ -51,6 +81,7 @@ test.before(async () => {
     hashAdminJobToken,
     heartbeatAdminJob,
     finishAdminJob,
+    loadDocumentCitations,
     loadStoredFileMetric,
     saveDocumentMetadata,
     saveCitations,
@@ -253,6 +284,105 @@ test('cache reanalysis job recomputes from cached PDF without downloading', asyn
   const stored = await loadStoredFileMetric(docId);
   assert.equal(stored.status, 'recomputed_from_cache');
   assert.equal(stored.pdf_path, durablePdfPath);
+});
+
+test('cached document reparse does not clear or extract citations', async () => {
+  await ensureStorage();
+  const docId = `reparse-no-citations-${Date.now()}`;
+  const pdfPath = path.join(testDataDir, `${docId}.pdf`);
+  await fs.writeFile(pdfPath, Buffer.from('%PDF-1.4\n%%EOF'));
+  await saveDocumentMetadata({
+    id: docId,
+    title: 'Reparse Without Citations Fixture',
+    author: 'Worker Tester',
+    supervisors: [],
+  });
+  await saveFileMetric(docId, {
+    status: 'cached',
+    pdfPath,
+    downloadUrl: 'https://example.test/no-citations.pdf',
+    fileBytes: 14,
+    wordCount: 10,
+    pageCount: 1,
+    wordSource: 'existing',
+    pageSource: 'existing',
+  });
+  await saveCitations(docId, [
+    { text: 'Existing, C. (2020). Citation should remain.' },
+  ], (text) => String(text).toLowerCase());
+  const jobId = await createAdminJob({
+    type: 'reparse_all',
+    label: 'Reparse Without Citations Test',
+    params: {},
+    runnerType: 'local',
+  });
+
+  const result = await runImportPdfAdminJob(await getAdminJob(jobId));
+  const citations = await loadDocumentCitations(docId);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.citations, 0);
+  assert.equal(citations.length, 1);
+  assert.equal(citations[0].citation_text, 'Existing, C. (2020). Citation should remain.');
+});
+
+test('citation re-extraction job leaves file metrics untouched', async () => {
+  await ensureStorage();
+  const docId = `citation-only-${Date.now()}`;
+  const pdfPath = path.join(testDataDir, `${docId}.pdf`);
+  await writeTextPdf(pdfPath, [
+    'Introduction',
+    'REFERENCES',
+    'Smith, J. (2020). Teaching schools with care. Education Press.',
+  ]);
+  await saveDocumentMetadata({
+    id: docId,
+    title: 'Citation Only Fixture',
+    author: 'Worker Tester',
+    supervisors: [],
+  });
+  await saveFileMetric(docId, {
+    status: 'cached',
+    pdfPath,
+    downloadUrl: 'https://example.test/citation-only.pdf',
+    fileBytes: 12345,
+    wordCount: 777,
+    bodyWordCount: 700,
+    pageCount: 88,
+    wordSource: 'existing_words',
+    pageSource: 'existing_pages',
+  });
+  const before = await loadStoredFileMetric(docId);
+  const jobId = await createAdminJob({
+    type: 'cache_reextract_citations_doc',
+    label: 'Citation Only Test',
+    params: { docId },
+    runnerType: 'local',
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error('GROBID disabled for citation-only test');
+  };
+
+  try {
+    const result = await runImportPdfAdminJob(await getAdminJob(jobId));
+    const after = await loadStoredFileMetric(docId);
+    const citations = await loadDocumentCitations(docId);
+
+    assert.equal(result.ok, true);
+    assert.equal(after.status, before.status);
+    assert.equal(after.pdf_path, before.pdf_path);
+    assert.equal(after.download_url, before.download_url);
+    assert.equal(after.file_bytes, before.file_bytes);
+    assert.equal(after.word_count, before.word_count);
+    assert.equal(after.body_word_count, before.body_word_count);
+    assert.equal(after.page_count, before.page_count);
+    assert.equal(after.word_source, before.word_source);
+    assert.equal(after.page_source, before.page_source);
+    assert.ok(citations.some((row) => row.citation_text.includes('Smith, J. (2020). Teaching schools with care')));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('citation matching progress reports processed and fuzzy counts', async () => {

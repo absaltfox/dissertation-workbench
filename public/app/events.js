@@ -110,6 +110,7 @@ cacheFilterEl?.addEventListener('input', () => {
   renderCache(state.cacheEntries);
 });
 reparseAllBtn.addEventListener('click', handleReparseAll);
+reparseCitationsBtn?.addEventListener('click', handleReparseCitations);
 refreshJobsBtn?.addEventListener('click', loadJobs);
 previewCatalogueLookupsBtn?.addEventListener('click', handlePreviewCatalogueLookups);
 runCatalogueLookupsBtn?.addEventListener('click', handleRunCatalogueLookups);

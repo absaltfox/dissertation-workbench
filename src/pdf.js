@@ -798,7 +798,8 @@ export async function fetchPdfForDocument(doc) {
 }
 
 async function analyzeDocumentFullText(doc, fullText, {
-  stored = null, status = 'full_text', error = null, onProgress = null
+  stored = null, status = 'full_text', error = null, onProgress = null,
+  extractCommittee = true, extractCitations = true
 } = {}) {
   await onProgress?.({ phase: 'full_text_analysis', label: 'Analyzing full-text bitstream', status: 'running' });
   const wordCount = wordCountFromText(fullText);
@@ -835,7 +836,7 @@ async function analyzeDocumentFullText(doc, fullText, {
     status: 'completed',
     counts: { pages: doc.pages || 0, words: doc.wordCount || 0 },
   });
-  await extractAndSaveParsedData(doc, fullText, null, { onProgress });
+  await extractAndSaveParsedData(doc, fullText, null, { onProgress, extractCommittee, extractCitations });
   logger.info('Document analyzed from cIRcle full-text bitstream', {
     docId: doc.id,
     pages: doc.pages,
@@ -846,7 +847,8 @@ async function analyzeDocumentFullText(doc, fullText, {
 }
 
 async function analyzeDocumentFullTextFallback(doc, stored, {
-  status = 'full_text', error = null, artifactClient = null, onProgress = null
+  status = 'full_text', error = null, artifactClient = null, onProgress = null,
+  extractCommittee = true, extractCitations = true
 } = {}) {
   const result = await fetchFullTextForDocument(doc, stored, { artifactClient });
   if (!result?.fullText) return false;
@@ -860,15 +862,20 @@ async function analyzeDocumentFullTextFallback(doc, stored, {
     status,
     error,
     onProgress,
+    extractCommittee,
+    extractCitations,
   });
 }
 
 async function analyzeCachedFullText(doc, stored, {
-  status = 'full_text_recomputed', error = null, artifactClient = null, onProgress = null
+  status = 'full_text_recomputed', error = null, artifactClient = null, onProgress = null,
+  extractCommittee = true, extractCitations = true
 } = {}) {
   const cached = await readCachedFullText(doc, stored, artifactClient);
   if (cached?.fullText) {
-    return analyzeDocumentFullText(doc, cached.fullText, { stored, status, error, onProgress });
+    return analyzeDocumentFullText(doc, cached.fullText, {
+      stored, status, error, onProgress, extractCommittee, extractCitations
+    });
   }
   if (hasStoredFullTextMetric(stored)) {
     await applyStoredFullTextMetric(doc, stored);
@@ -1441,88 +1448,94 @@ export function detectDownloadBlockPage(html) {
   );
 }
 
-export async function extractAndSaveParsedData(doc, fullText, pdfPath, { onProgress = null } = {}) {
+export async function extractAndSaveParsedData(doc, fullText, pdfPath, {
+  onProgress = null, extractCommittee = true, extractCitations = true
+} = {}) {
   if (!fullText) return;
 
   // --- Committee extraction ---
-  await onProgress?.({ phase: 'committee', label: 'Extracting committee information', status: 'running' });
-  try {
-    const committee = parseCommittee(fullText);
-    // Fall back to acknowledgements-based parsing when the certify-page parser finds nothing
-    const effectiveCommittee = committee.length > 0 ? committee : parseAcknowledgements(fullText);
+  if (extractCommittee) {
+    await onProgress?.({ phase: 'committee', label: 'Extracting committee information', status: 'running' });
+    try {
+      const committee = parseCommittee(fullText);
+      // Fall back to acknowledgements-based parsing when the certify-page parser finds nothing
+      const effectiveCommittee = committee.length > 0 ? committee : parseAcknowledgements(fullText);
 
-    if (hasApiSupervisors(doc)) {
-      const apiSupervisors = dedupeSupervisorNames(doc.supervisors || []);
-      const nonSupervisorCommittee = effectiveCommittee.filter((member) => !SUPERVISOR_ROLES.has(member.role));
-      if (nonSupervisorCommittee.length) {
-        await saveCommitteeMembers(doc.id, nonSupervisorCommittee, 'pdf');
+      if (hasApiSupervisors(doc)) {
+        const apiSupervisors = dedupeSupervisorNames(doc.supervisors || []);
+        const nonSupervisorCommittee = effectiveCommittee.filter((member) => !SUPERVISOR_ROLES.has(member.role));
+        if (nonSupervisorCommittee.length) {
+          await saveCommitteeMembers(doc.id, nonSupervisorCommittee, 'pdf');
+        }
+        await deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'pdf');
+        await saveCommitteeMembers(
+          doc.id,
+          apiSupervisors.map((name) => ({ name, role: 'Supervisor', affiliation: null })),
+          'api'
+        );
+        doc.supervisors = apiSupervisors;
+        doc.supervisorsSource = 'api';
+      } else {
+        if (effectiveCommittee.length) {
+          await saveCommitteeMembers(doc.id, effectiveCommittee, 'pdf');
+        }
+        const parsedSupervisors = supervisorsFromCommittee(effectiveCommittee);
+        if (parsedSupervisors.length) {
+          doc.supervisors = parsedSupervisors;
+          doc.supervisorsSource = committee.length > 0 ? 'pdf_fallback' : 'pdf_acknowledgements';
+        }
       }
-      await deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'pdf');
-      await saveCommitteeMembers(
-        doc.id,
-        apiSupervisors.map((name) => ({ name, role: 'Supervisor', affiliation: null })),
-        'api'
-      );
-      doc.supervisors = apiSupervisors;
-      doc.supervisorsSource = 'api';
-    } else {
-      if (effectiveCommittee.length) {
-        await saveCommitteeMembers(doc.id, effectiveCommittee, 'pdf');
-      }
-      const parsedSupervisors = supervisorsFromCommittee(effectiveCommittee);
-      if (parsedSupervisors.length) {
-        doc.supervisors = parsedSupervisors;
-        doc.supervisorsSource = committee.length > 0 ? 'pdf_fallback' : 'pdf_acknowledgements';
-      }
-    }
-    doc.committee = await loadCommitteeMembers(doc.id);
+      doc.committee = await loadCommitteeMembers(doc.id);
 
-    if ((!doc.supervisors || !doc.supervisors.length) && doc.committee.length) {
-      const storedSupervisors = supervisorsFromCommittee(doc.committee);
-      if (storedSupervisors.length) {
-        doc.supervisors = storedSupervisors;
-        doc.supervisorsSource = doc.committee.some((member) =>
-          SUPERVISOR_ROLES.has(member.role) && member.source === 'api'
-        )
-          ? 'api'
-          : 'pdf_fallback';
+      if ((!doc.supervisors || !doc.supervisors.length) && doc.committee.length) {
+        const storedSupervisors = supervisorsFromCommittee(doc.committee);
+        if (storedSupervisors.length) {
+          doc.supervisors = storedSupervisors;
+          doc.supervisorsSource = doc.committee.some((member) =>
+            SUPERVISOR_ROLES.has(member.role) && member.source === 'api'
+          )
+            ? 'api'
+            : 'pdf_fallback';
+        }
       }
+    } catch (err) {
+      logger.warn('Failed to extract committee from PDF', { docId: doc.id, error: err.message });
     }
-  } catch (err) {
-    logger.warn('Failed to extract committee from PDF', { docId: doc.id, error: err.message });
+    await onProgress?.({
+      phase: 'committee',
+      label: 'Committee extraction',
+      status: 'completed',
+      counts: { committeeMembers: doc.committee?.length || 0 },
+    });
   }
-  await onProgress?.({
-    phase: 'committee',
-    label: 'Committee extraction',
-    status: 'completed',
-    counts: { committeeMembers: doc.committee?.length || 0 },
-  });
 
   // --- Citation extraction (independent of committee success) ---
   // Fallback chain: GROBID (PDF layout) → AnyStyle (text ML) → regex
-  await onProgress?.({ phase: 'citation_extraction', label: 'Extracting bibliography citations', status: 'running' });
-  try {
-    let citations = null;
-    if (pdfPath) {
-      citations = await parseBibliographyWithGrobid(pdfPath);
+  if (extractCitations) {
+    await onProgress?.({ phase: 'citation_extraction', label: 'Extracting bibliography citations', status: 'running' });
+    try {
+      let citations = null;
+      if (pdfPath) {
+        citations = await parseBibliographyWithGrobid(pdfPath);
+      }
+      if (!citations) {
+        const textCitations = await parseBibliographyWithAnyStyle(fullText);
+        citations = textCitations.map(text => ({ text }));
+      }
+      await onProgress?.({
+        phase: 'citation_extraction',
+        label: 'Citation extraction',
+        status: 'completed',
+        counts: { citations: citations.length },
+      });
+      await clearDocumentCitations(doc.id);
+      if (citations.length) {
+        await saveCitations(doc.id, citations, normalizeCitation, { onProgress });
+      }
+      doc.citationCount = citations.length || (await loadDocumentCitations(doc.id)).length;
+    } catch (err) {
+      logger.warn('Failed to extract citations from PDF', { docId: doc.id, error: err.message });
     }
-    if (!citations) {
-      const textCitations = await parseBibliographyWithAnyStyle(fullText);
-      citations = textCitations.map(text => ({ text }));
-    }
-    await onProgress?.({
-      phase: 'citation_extraction',
-      label: 'Citation extraction',
-      status: 'completed',
-      counts: { citations: citations.length },
-    });
-    await clearDocumentCitations(doc.id);
-    if (citations.length) {
-      await saveCitations(doc.id, citations, normalizeCitation, { onProgress });
-    }
-    doc.citationCount = citations.length || (await loadDocumentCitations(doc.id)).length;
-  } catch (err) {
-    logger.warn('Failed to extract citations from PDF', { docId: doc.id, error: err.message });
   }
 
   try {
@@ -1554,7 +1567,10 @@ async function loadStoredParsedData(doc) {
 }
 
 export async function analyzeDocumentFile(doc, options) {
-  const { downloadFiles, forceDownload, recomputeFromCache, artifactClient = null, onProgress = null } = options;
+  const {
+    downloadFiles, forceDownload, recomputeFromCache, artifactClient = null, onProgress = null,
+    extractCommittee = true, extractCitations = true
+  } = options;
   await onProgress?.({ phase: 'cache_lookup', label: 'Checking cached file metrics', status: 'running' });
   const stored = await loadStoredFileMetric(doc.id);
   const hasCachedPdf = stored?.pdf_path && (artifactClient || (await fileExists(stored.pdf_path)));
@@ -1573,7 +1589,9 @@ export async function analyzeDocumentFile(doc, options) {
         status: 'full_text_recomputed',
         error: null,
         artifactClient,
-        onProgress
+        onProgress,
+        extractCommittee,
+        extractCitations
       })) {
         await onProgress?.({ phase: 'full_text', label: 'Cached full-text analysis', status: 'completed' });
         return;
@@ -1638,7 +1656,9 @@ export async function analyzeDocumentFile(doc, options) {
         status: 'completed',
         counts: { pages: doc.pages || 0, words: doc.wordCount || 0 },
       });
-      await extractAndSaveParsedData(doc, analysis.fullText, analysisPath, { onProgress });
+      await extractAndSaveParsedData(doc, analysis.fullText, analysisPath, {
+        onProgress, extractCommittee, extractCitations
+      });
       if (remotePdf?.cleanup) await remotePdf.cleanup();
       return;
     } catch (error) {
@@ -1683,7 +1703,9 @@ export async function analyzeDocumentFile(doc, options) {
         status: 'full_text',
         error: null,
         artifactClient,
-        onProgress
+        onProgress,
+        extractCommittee,
+        extractCitations
       })) return;
       doc.downloadStatus = 'skipped';
     }
@@ -1766,7 +1788,9 @@ export async function analyzeDocumentFile(doc, options) {
         status: 'completed',
         counts: { pages: doc.pages || 0, words: doc.wordCount || 0 },
       });
-      await extractAndSaveParsedData(doc, analysis.fullText, analysisPath, { onProgress });
+      await extractAndSaveParsedData(doc, analysis.fullText, analysisPath, {
+        onProgress, extractCommittee, extractCitations
+      });
       logger.info('PDF downloaded and analyzed', {
         docId: doc.id,
         bitstreamId: resolved.bitstreamId,
@@ -1786,7 +1810,9 @@ export async function analyzeDocumentFile(doc, options) {
     status: 'full_text_fallback',
     error: doc.downloadError || 'No downloadable PDF could be resolved for this record.',
     artifactClient,
-    onProgress
+    onProgress,
+    extractCommittee,
+    extractCitations
   })) {
     await onProgress?.({ phase: 'full_text', label: 'Full-text fallback analysis', status: 'completed' });
     return;
