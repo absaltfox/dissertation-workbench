@@ -537,10 +537,8 @@ async function countPdfPagesWithPdfinfo(filePath) {
 
 export async function analyzePdfAtPath(pdfPath, bytes) {
   const fileBytes = bytes || (await fs.readFile(pdfPath));
-  let pageCount = countPdfPagesFromBuffer(fileBytes);
-  if (!pageCount) {
-    pageCount = await countPdfPagesWithPdfinfo(pdfPath);
-  }
+  let pageCount = await countPdfPagesWithPdfinfo(pdfPath);
+  if (!pageCount) pageCount = countPdfPagesFromBuffer(fileBytes);
   const { text, wordCount, bodyWordCount } = await extractPdfText(pdfPath);
   return {
     pageCount: pageCount || null,
