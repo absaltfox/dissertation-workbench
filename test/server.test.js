@@ -7,7 +7,8 @@ import request from 'supertest';
 import { app } from '../src/server.js';
 import { createSession, destroySession, getSessionCsrfToken } from '../src/auth.js';
 import {
-  closeDb, createAdminJob, finishAdminJob, hashAdminJobToken, saveFileMetric
+  closeDb, createAdminJob, finishAdminJob, hashAdminJobToken, saveCitations,
+  saveCommitteeMembers, saveDocumentMetadata, saveFileMetric
 } from '../src/db.js';
 
 test.after(async () => {
@@ -188,6 +189,78 @@ test('authenticated metrics reads ignore file enrichment params without CSRF', a
     });
   } finally {
     destroySession(token);
+  }
+});
+
+test('metrics reads from stored app tables without Open Collections fetches', async () => {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const docId = `stored-metrics-${suffix}`;
+
+  await saveDocumentMetadata({
+    id: docId,
+    title: 'Stored metrics route fixture',
+    author: 'Fixture Author',
+    year: 2999,
+    degree: 'Doctor of Education - EdD',
+    program: 'Testing',
+    affiliation: [],
+    pages: 1,
+    pagesSource: 'estimated_from_metadata_words',
+    wordCount: 250,
+    wordCountSource: 'metadata_text',
+    bodyWordCount: null,
+    abstract: 'Stored route fixture abstract.',
+    subjects: ['Testing'],
+    themes: [],
+    methodologies: [],
+    conceptTerms: [],
+    downloadStatus: 'not_attempted',
+    downloadError: null,
+  });
+  await saveFileMetric(docId, {
+    status: 'recomputed_from_cache',
+    error: null,
+    pdfPath: '/tmp/stored-metrics-route.pdf',
+    downloadUrl: 'https://circle.library.ubc.ca/rest/bitstreams/789/retrieve',
+    fileBytes: 1000,
+    wordCount: 50000,
+    bodyWordCount: 47000,
+    pageCount: 180,
+    wordSource: 'cached_pdf_text',
+    pageSource: 'cached_pdf',
+  });
+  await saveCitations(docId, [
+    'Fixture, A. (2020). Stored citation.',
+  ], (text) => `stored-metrics-${suffix}-${text}`);
+  await saveCommitteeMembers(docId, [
+    { name: 'Sam Supervisor', role: 'Supervisor', affiliation: 'UBC' },
+    { name: 'Una University', role: 'University Examiner', affiliation: 'UBC' },
+    { name: 'Eli External', role: 'External Examiner', affiliation: 'External University' },
+  ], 'pdf');
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => {
+    throw new Error('Open Collections fetch should not be called by /api/metrics');
+  };
+  try {
+    const res = await request(app)
+      .get('/api/metrics?index=ubctheses&term=route-test-no-sync-key&maxRecords=1&scanLimit=1')
+      .expect('content-type', /application\/json/)
+      .expect(200);
+
+    assert.equal(res.body.source.servedFromCache, true);
+    assert.equal(res.body.source.documentCache.exactSyncKeyMatch, false);
+    assert.equal(res.body.documents.length, 1);
+    assert.equal(res.body.documents[0].id, docId);
+    assert.equal(res.body.documents[0].pages, 180);
+    assert.equal(res.body.documents[0].wordCount, 50000);
+    assert.equal(res.body.documents[0].bodyWordCount, 47000);
+    assert.equal(res.body.documents[0].citationCount, 1);
+    assert.deepEqual(res.body.documents[0].supervisors, ['Sam Supervisor']);
+    assert.ok(res.body.documents[0].committee.some((member) => member.role === 'University Examiner'));
+    assert.ok(res.body.documents[0].committee.some((member) => member.role === 'External Examiner'));
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 

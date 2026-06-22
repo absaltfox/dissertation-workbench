@@ -5,6 +5,7 @@ import {
   DEFAULT_TERM, DEFAULT_SOURCE, DEFAULT_DOWNLOAD_FILES, PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, SQLITE_PATH, DATA_DIR
 } from './config.js';
 import {
+  applyCitationCountsToDocuments, applyCommitteeMembersToDocuments,
   applyStoredFileMetricsToDocuments, ensureStorage, getDb, saveRunMetrics,
   hasTopics, loadTopics, loadDocumentTopics, loadDocumentTopicCoords,
   loadTopicHierarchy, getCitationCooccurrence
@@ -914,6 +915,18 @@ function buildMethodologyTopicMatrix(records, topics) {
   };
 }
 
+function normalizeStoredRecordShape(rec) {
+  rec.supervisors = toArray(rec.supervisors);
+  rec.affiliation = toArray(rec.affiliation);
+  rec.subjects = toArray(rec.subjects);
+  if (!rec.subjects.length) rec.subjects = ['(Unspecified)'];
+  rec.themes = toArray(rec.themes);
+  rec.methodologies = toArray(rec.methodologies);
+  rec.conceptTerms = toArray(rec.conceptTerms);
+  if (rec.charCount == null) rec.charCount = String(rec.abstract || '').length;
+  return rec;
+}
+
 export async function collectMetrics(options = {}) {
   await ensureStorage();
   await getDb();
@@ -923,12 +936,15 @@ export async function collectMetrics(options = {}) {
     apiKey, query, term, source, downloadFiles, forceDownload, recomputeFromCache
   } = buildMetricsSourceOptions(options);
 
-  const index = requestedIndex ? await resolveIndexName(baseUrl, requestedIndex, apiKey) : null;
+  const usesCachedDocuments = Array.isArray(options.cachedDocuments);
+  const index = !usesCachedDocuments && requestedIndex
+    ? await resolveIndexName(baseUrl, requestedIndex, apiKey)
+    : (requestedIndex || null);
   const conceptDict = loadConceptDictionary();
   const records = [];
   let apiTotal = null; // populated from first response
 
-  if (Array.isArray(options.cachedDocuments)) {
+  if (usesCachedDocuments) {
     records.push(...options.cachedDocuments);
   } else {
     for (let from = 0; from < scanLimit; from += pageSize) {
@@ -950,7 +966,7 @@ export async function collectMetrics(options = {}) {
     }
   }
 
-  const normalizedRecords = records.slice(0, maxRecords);
+  const normalizedRecords = records.slice(0, maxRecords).map(normalizeStoredRecordShape);
 
   if (!options.skipFileEnrichment) {
     await enrichDocumentsWithFileAnalysis(normalizedRecords, {
@@ -960,6 +976,12 @@ export async function collectMetrics(options = {}) {
     });
   } else if (options.applyStoredFileMetrics) {
     await applyStoredFileMetricsToDocuments(normalizedRecords);
+  }
+  if (options.applyCitationCounts) {
+    await applyCitationCountsToDocuments(normalizedRecords);
+  }
+  if (options.applyCommitteeMembers) {
+    await applyCommitteeMembersToDocuments(normalizedRecords);
   }
 
   const sourceMeta = {
@@ -976,7 +998,7 @@ export async function collectMetrics(options = {}) {
     downloadFiles,
     forceDownload,
     recomputeFromCache,
-    servedFromCache: Array.isArray(options.cachedDocuments),
+    servedFromCache: usesCachedDocuments,
     pdfCacheDir: PDF_CACHE_DIR,
     fullTextCacheDir: FULL_TEXT_CACHE_DIR,
     sqlitePath: SQLITE_PATH

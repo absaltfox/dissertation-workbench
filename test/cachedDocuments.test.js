@@ -1,10 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  applyCitationCountsToDocuments,
+  applyCommitteeMembersToDocuments,
   applyStoredFileMetricsToDocuments,
   closeDb,
   ensureStorage,
   listCachedDocuments,
+  saveCitations,
+  saveCommitteeMembers,
   saveDocumentMetadata,
   saveFileMetric,
 } from '../src/db.js';
@@ -100,4 +104,56 @@ test('stored file metrics can overlay freshly fetched metadata records', async (
   assert.equal(docs[0].bodyWordCount, 69000);
   assert.equal(docs[0].fileBytes, 654321);
   assert.equal(docs[0].downloadStatus, 'recomputed_from_cache');
+});
+
+test('stored citation links can overlay freshly fetched metadata records', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const docId = `test-citation-count-${suffix}`;
+
+  await saveCitations(docId, [
+    'Example, A. (2020). First reference.',
+    'Example, B. (2021). Second reference.',
+  ], (text) => `test-${suffix}-${text}`);
+
+  const docs = [{
+    id: docId,
+    title: 'Citation count fixture',
+    citationCount: 0,
+  }];
+
+  await applyCitationCountsToDocuments(docs);
+
+  assert.equal(docs[0].citationCount, 2);
+});
+
+test('stored committee and examiner roles can overlay freshly fetched metadata records', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const docId = `test-committee-roles-${suffix}`;
+
+  await saveCommitteeMembers(docId, [
+    { name: 'Alex Supervisor', role: 'Supervisor', affiliation: 'UBC' },
+    { name: 'Uma Examiner', role: 'University Examiner', affiliation: 'Faculty of Education' },
+    { name: 'Evan External', role: 'External Examiner', affiliation: 'Example University' },
+    { name: 'Casey Committee', role: 'Committee Member', affiliation: 'Educational Studies' },
+  ], 'pdf');
+
+  const docs = [{
+    id: docId,
+    title: 'Committee role fixture',
+    committee: [],
+    supervisors: [],
+  }];
+
+  await applyCommitteeMembersToDocuments(docs);
+
+  assert.deepEqual(
+    docs[0].committee.map((member) => member.role),
+    ['Supervisor', 'University Examiner', 'External Examiner', 'Committee Member']
+  );
+  assert.equal(docs[0].committee.find((member) => member.role === 'External Examiner')?.name, 'Evan External');
+  assert.equal(docs[0].committee.find((member) => member.role === 'University Examiner')?.affiliation, 'Faculty of Education');
+  assert.deepEqual(docs[0].supervisors, ['Alex Supervisor']);
+  assert.equal(docs[0].supervisorsSource, 'pdf_fallback');
 });

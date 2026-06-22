@@ -104,26 +104,28 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       };
       const { getSyncKeyForOptions } = await loadSyncModule();
       const syncKey = getSyncKeyForOptions(sourceOptions);
-      const cacheStats = await getDocumentCacheStats(syncKey);
-      // Cached document metadata lets the dashboard avoid paging Open
-      // Collections and re-running PDF enrichment during ordinary reads.
-      const canUseDocumentCache = !refresh && !recomputeFromCache && cacheStats.total > 0;
-      const cachedDocuments = canUseDocumentCache
-        ? await listCachedDocuments({ syncKey, limit: effectiveMaxRecords })
-        : null;
+      const syncCacheStats = await getDocumentCacheStats(syncKey);
+      const hasExactSyncCache = syncCacheStats.total > 0;
+      const cacheStats = hasExactSyncCache ? syncCacheStats : await getDocumentCacheStats();
+      const cachedDocuments = await listCachedDocuments({
+        syncKey: hasExactSyncCache ? syncKey : null,
+        limit: effectiveMaxRecords,
+      });
       const payload = await collectMetrics({
         ...sourceOptions,
         cachedDocuments,
         skipFileEnrichment: true,
         applyStoredFileMetrics: true,
+        applyCitationCounts: true,
+        applyCommitteeMembers: true,
       });
-      if (cachedDocuments) {
-        payload.source.documentCache = {
-          syncKey,
-          recordsAvailable: cacheStats.total,
-          lastSyncedAt: cacheStats.lastSyncedAt,
-        };
-      }
+      payload.source.documentCache = {
+        syncKey: hasExactSyncCache ? syncKey : null,
+        requestedSyncKey: syncKey,
+        exactSyncKeyMatch: hasExactSyncCache,
+        recordsAvailable: cacheStats.total,
+        lastSyncedAt: cacheStats.lastSyncedAt,
+      };
       payload.source.readOnlyFileEnrichment = true;
       payload.source.ignoredFileEnrichmentParams = {
         downloadFiles: requestedDownloadFiles,

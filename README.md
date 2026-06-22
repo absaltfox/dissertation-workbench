@@ -77,7 +77,7 @@ By default, local data lives under `./data`:
 - `./data/metrics.sqlite`: local libSQL/SQLite database.
 - `./data/pdf-cache`: downloaded PDFs and PDF-derived cache files.
 
-The public `/api/metrics` endpoint can fetch directly from Open Collections, but for larger runs the preferred workflow is:
+The public `/api/metrics` endpoint is read-only and builds the dashboard from the app's local database tables. Open Collections is refreshed only through Admin-triggered import/sync jobs:
 
 1. Start `npm start`.
 2. Sign in to `Admin`.
@@ -85,7 +85,7 @@ The public `/api/metrics` endpoint can fetch directly from Open Collections, but
 4. Run an import job, usually `Import all` for a new database or `Sync differences` afterward.
 5. Run import/PDF jobs from the Admin UI; on-demand workers process the heavy work outside the web server. Use `npm run worker` only for legacy scheduled sync/catalogue lookup cycles.
 
-When matching documents already exist in the local/Turso cache, `/api/metrics` reads cached document attributes instead of paging Open Collections during dashboard requests. `refresh=1` bypasses the in-memory metrics cache and can force live retrieval/redownloads depending on request options.
+Dashboard reads never page Open Collections. If `/api/metrics` receives query parameters that match a stored sync key, it uses that stored subset; otherwise it falls back to the locally stored corpus. `refresh=1` only bypasses the web process's in-memory metrics payload cache. It does not call Open Collections, download PDFs, recompute file metrics, or extract citations/committee data.
 
 ## API
 
@@ -95,20 +95,25 @@ The main frontend endpoint is:
 GET /api/metrics
 ```
 
+`/api/metrics` is the dashboard composition endpoint. Its contract is to read local application tables and return the complete dashboard payload:
+
+- `documents`: stored document metadata from `documents`, enriched with persisted `file_metrics` page/word counts, `document_citations` counts, and `committee_members` roles such as supervisors, committee members, university examiners, and external examiners.
+- `metrics`, `wordCloud`, `ngramCloud`, `methodologies`, supervisor/person networks, topic data, and citation co-occurrence values derived from those local rows.
+- `source.documentCache`: metadata about which stored document set was used, including whether the requested sync key matched exactly.
+
+Open Collections API calls belong to Admin import/sync flows such as import-rule preview, import-rule sync, and document sync. Do not add Open Collections fetching to `/api/metrics`; use an Admin route/job to refresh local tables first.
+
 Supported query params:
 
-- `index`: Open Collections index name/id. If omitted, code defaults to `UBC_INDEX`; the development env template sets `UBC_INDEX=24`.
-- `query`: optional Open Collections `q` query string.
-- `term`: Open Collections term filter. Default is `UBC_TERM`, usually `degree.raw,Doctor of Education - EdD`.
-- `source`: comma-separated source field list. The app ensures `id`, `identifier`, `uri`, and `digitalResourceOriginalRecord` are included.
+- `index`, `query`, `term`, `source`: identify the preferred stored sync key. They do not trigger live Open Collections reads from this endpoint.
 - `maxRecords`: default `200`; anonymous public requests are capped by `PUBLIC_MAX_RECORDS`.
 - `pageSize`: default `20`, maximum `100`.
 - `scanLimit`: default `max(1000, maxRecords * 10)`; anonymous public requests are capped by `PUBLIC_SCAN_LIMIT`.
 - `subjectLimit`: default `25`.
 - `downloadFiles` and `recomputeFromCache` are ignored by this read-only dashboard endpoint. PDF downloads, cIRcle full-text fetches, and file recomputation only run through Admin-triggered sync/cache actions.
-- `refresh=1`: bypasses the in-memory metrics cache. It does not force PDF or full-text enrichment.
+- `refresh=1`: bypasses the in-memory metrics cache. It does not fetch upstream metadata or force PDF/full-text enrichment.
 
-Open Collections API keys are applied server-side. Browser requests do not need to include keys.
+Open Collections API keys are applied server-side for Admin import/sync work. Browser dashboard requests do not need keys.
 
 ### Public Endpoints
 
@@ -117,7 +122,7 @@ These endpoints are available to the browser without an admin session. Expensive
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/api/health` | Health check with `{ ok, timestamp }`. |
-| `GET` | `/api/metrics` | Builds or reads dissertation metrics for the current Open Collections query. |
+| `GET` | `/api/metrics` | Builds dashboard metrics from local app tables; does not fetch Open Collections. |
 | `GET` | `/api/documents/:docId/citations` | Returns citations for one cached document, including sharing counts. |
 | `GET` | `/api/citations/top?limit=50` | Returns the most-cited works, capped at 200. |
 | `GET` | `/api/citations/:citationId/documents` | Returns documents that cite a stored citation. |

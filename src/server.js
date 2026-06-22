@@ -147,10 +147,13 @@ export async function start() {
     source: DEFAULT_SOURCE,
   });
   Promise.resolve().then(async () => {
-    const cacheStats = await getDocumentCacheStats(_warmupSyncKey);
-    const cachedDocuments = cacheStats.total > 0
-      ? await listCachedDocuments({ syncKey: _warmupSyncKey, limit: _warmupMaxRecords })
-      : null;
+    const syncCacheStats = await getDocumentCacheStats(_warmupSyncKey);
+    const hasExactSyncCache = syncCacheStats.total > 0;
+    const cacheStats = hasExactSyncCache ? syncCacheStats : await getDocumentCacheStats();
+    const cachedDocuments = await listCachedDocuments({
+      syncKey: hasExactSyncCache ? _warmupSyncKey : null,
+      limit: _warmupMaxRecords,
+    });
     const payload = await collectMetrics({
       maxRecords: _warmupMaxRecords,
       pageSize: 20,
@@ -165,15 +168,17 @@ export async function start() {
       cachedDocuments,
       skipFileEnrichment: true,
       applyStoredFileMetrics: true,
+      applyCitationCounts: true,
+      applyCommitteeMembers: true,
     });
 
-    if (cachedDocuments) {
-      payload.source.documentCache = {
-        syncKey: _warmupSyncKey,
-        recordsAvailable: cacheStats.total,
-        lastSyncedAt: cacheStats.lastSyncedAt,
-      };
-    }
+    payload.source.documentCache = {
+      syncKey: hasExactSyncCache ? _warmupSyncKey : null,
+      requestedSyncKey: _warmupSyncKey,
+      exactSyncKeyMatch: hasExactSyncCache,
+      recordsAvailable: cacheStats.total,
+      lastSyncedAt: cacheStats.lastSyncedAt,
+    };
     payload.source.readOnlyFileEnrichment = true;
     payload.source.ignoredFileEnrichmentParams = {
       downloadFiles: false,

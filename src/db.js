@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { createClient } from '@libsql/client';
 import { SQLITE_PATH, PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL } from './config.js';
 import { logger } from './logger.js';
-import { normalizePersonName, supervisorNameKey } from './supervisors.js';
+import { dedupeSupervisorNames, normalizePersonName, supervisorNameKey } from './supervisors.js';
 import { encryptMfaSecret, decryptMfaSecret } from './secretCrypto.js';
 import { jaroWinkler } from './fuzzyMatch.js';
 
@@ -508,6 +508,84 @@ export async function applyStoredFileMetricsToDocuments(documents = []) {
   for (const doc of list) {
     const row = metricsByDocId.get(doc?.id);
     if (row) applyStoredFileMetricToDocument(doc, row);
+  }
+  return list;
+}
+
+export async function applyCitationCountsToDocuments(documents = []) {
+  const list = Array.isArray(documents) ? documents : [];
+  const ids = Array.from(new Set(list.map((doc) => doc?.id).filter(Boolean)));
+  if (!ids.length) return list;
+
+  const countsByDocId = new Map();
+  const chunkSize = 200;
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = await all(`
+      SELECT doc_id, COUNT(*) AS citation_count
+      FROM document_citations
+      WHERE doc_id IN (${placeholders})
+      GROUP BY doc_id
+    `, chunk);
+    for (const row of rows) countsByDocId.set(row.doc_id, Number(row.citation_count || 0));
+  }
+
+  for (const doc of list) {
+    if (doc?.id) doc.citationCount = countsByDocId.get(doc.id) || 0;
+  }
+  return list;
+}
+
+const SUPERVISOR_COMMITTEE_ROLES = new Set(['Supervisor', 'Co-Supervisor']);
+
+export async function applyCommitteeMembersToDocuments(documents = []) {
+  const list = Array.isArray(documents) ? documents : [];
+  const ids = Array.from(new Set(list.map((doc) => doc?.id).filter(Boolean)));
+  if (!ids.length) return list;
+
+  const membersByDocId = new Map(ids.map((id) => [id, []]));
+  const chunkSize = 200;
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = await all(`
+      SELECT doc_id, name, role, affiliation, source
+      FROM committee_members
+      WHERE doc_id IN (${placeholders})
+      ORDER BY doc_id, id
+    `, chunk);
+    for (const row of rows) {
+      if (!membersByDocId.has(row.doc_id)) membersByDocId.set(row.doc_id, []);
+      membersByDocId.get(row.doc_id).push({
+        name: row.name,
+        role: row.role || 'Committee Member',
+        affiliation: row.affiliation || null,
+        source: row.source || null,
+      });
+    }
+  }
+
+  for (const doc of list) {
+    if (doc?.id) {
+      doc.committee = membersByDocId.get(doc.id) || [];
+      const storedSupervisors = doc.committee
+        .filter((member) => SUPERVISOR_COMMITTEE_ROLES.has(member.role))
+        .map((member) => member.name);
+      if (storedSupervisors.length) {
+        const existingSupervisors = Array.isArray(doc.supervisors)
+          ? doc.supervisors
+          : (doc.supervisors ? [doc.supervisors] : []);
+        doc.supervisors = dedupeSupervisorNames([...existingSupervisors, ...storedSupervisors]);
+        if (!doc.supervisorsSource) {
+          doc.supervisorsSource = doc.committee.some((member) =>
+            SUPERVISOR_COMMITTEE_ROLES.has(member.role) && member.source === 'api'
+          )
+            ? 'api'
+            : 'pdf_fallback';
+        }
+      }
+    }
   }
   return list;
 }
