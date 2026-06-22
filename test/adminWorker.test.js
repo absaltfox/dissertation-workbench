@@ -319,11 +319,16 @@ test('cached document reparse does not clear or extract citations', async () => 
 
   const result = await runImportPdfAdminJob(await getAdminJob(jobId));
   const citations = await loadDocumentCitations(docId);
+  const job = await getAdminJob(jobId);
+  const pdfParseTask = job.progress?.tasks?.find((task) => task.key === 'pdf_parse');
 
   assert.equal(result.ok, true);
   assert.equal(result.citations, 0);
   assert.equal(citations.length, 1);
   assert.equal(citations[0].citation_text, 'Existing, C. (2020). Citation should remain.');
+  assert.ok(['completed', 'failed'].includes(pdfParseTask?.status));
+  assert.equal(pdfParseTask?.counts?.total > 0, true);
+  assert.ok(pdfParseTask?.detail);
 });
 
 test('citation re-extraction job leaves file metrics untouched', async () => {

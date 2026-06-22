@@ -43,24 +43,100 @@ function createProgressReporter(jobId) {
   };
 }
 
-async function analyzePdfEntry(entry, artifactClient, { keepPdfPath = false } = {}) {
+async function analyzePdfEntry(entry, artifactClient, {
+  keepPdfPath = false,
+  progress = null,
+  counts = null,
+  label = 'Parsing cached PDF text',
+} = {}) {
+  const progressCounts = counts || null;
   if (artifactClient) {
+    await progress?.({
+      phase: 'pdf_parse',
+      label: 'Fetching cached PDF for parsing',
+      detail: entry.doc_id,
+      status: 'running',
+      counts: progressCounts,
+    });
     const remote = await artifactClient.downloadPdfToTemp(entry.doc_id);
-    if (!remote?.path) return null;
+    if (!remote?.path) {
+      await progress?.({
+        phase: 'pdf_parse',
+        label: 'Cached PDF unavailable for parsing',
+        detail: entry.doc_id,
+        status: 'failed',
+        counts: progressCounts,
+      });
+      return null;
+    }
     try {
+      await progress?.({
+        phase: 'pdf_parse',
+        label,
+        detail: entry.doc_id,
+        status: 'running',
+        counts: progressCounts,
+      });
       const analysis = await analyzePdfAtPath(remote.path);
+      await progress?.({
+        phase: 'pdf_parse',
+        label: 'Parsed cached PDF text',
+        detail: entry.doc_id,
+        status: 'completed',
+        counts: {
+          ...(progressCounts || {}),
+          pages: analysis.pageCount || 0,
+          words: analysis.wordCount || 0,
+        },
+      });
       if (keepPdfPath) {
         return { ...analysis, pdfPath: remote.path, cleanup: remote.cleanup };
       }
       await remote.cleanup?.();
       return analysis;
     } catch (error) {
+      await progress?.({
+        phase: 'pdf_parse',
+        label: 'Cached PDF parsing failed',
+        detail: entry.doc_id,
+        status: 'failed',
+        counts: progressCounts,
+      });
       await remote.cleanup?.();
       throw error;
     }
   }
-  const analysis = await analyzePdfAtPath(entry.pdf_path);
-  return keepPdfPath ? { ...analysis, pdfPath: entry.pdf_path } : analysis;
+  await progress?.({
+    phase: 'pdf_parse',
+    label,
+    detail: entry.doc_id,
+    status: 'running',
+    counts: progressCounts,
+  });
+  try {
+    const analysis = await analyzePdfAtPath(entry.pdf_path);
+    await progress?.({
+      phase: 'pdf_parse',
+      label: 'Parsed cached PDF text',
+      detail: entry.doc_id,
+      status: 'completed',
+      counts: {
+        ...(progressCounts || {}),
+        pages: analysis.pageCount || 0,
+        words: analysis.wordCount || 0,
+      },
+    });
+    return keepPdfPath ? { ...analysis, pdfPath: entry.pdf_path } : analysis;
+  } catch (error) {
+    await progress?.({
+      phase: 'pdf_parse',
+      label: 'Cached PDF parsing failed',
+      detail: entry.doc_id,
+      status: 'failed',
+      counts: progressCounts,
+    });
+    throw error;
+  }
 }
 
 export async function runImportPdfAdminJob(job, { artifactClient = null, clearMetricsCache = null } = {}) {
@@ -256,7 +332,11 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     await log(job.id, `Re-extracting cached PDF citations for ${docId}.`);
     const entry = (await listFileMetrics()).find((item) => item.doc_id === docId && item.pdf_path);
     if (!entry) throw new Error('No cached PDF available for citation extraction.');
-    const analysis = await analyzePdfEntry(entry, artifactClient, { keepPdfPath: true });
+    const analysis = await analyzePdfEntry(entry, artifactClient, {
+      keepPdfPath: true,
+      progress,
+      label: 'Parsing cached PDF text for citations',
+    });
     try {
       if (!analysis?.fullText) throw new Error('Cached PDF text extraction returned no text.');
       await extractAndSaveParsedData(doc, analysis.fullText, analysis.pdfPath, {
@@ -303,7 +383,11 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
           status: 'running',
           counts: { processed, total: entries.length, withCommittee },
         });
-        const analysis = await analyzePdfEntry(entry, artifactClient);
+        const analysis = await analyzePdfEntry(entry, artifactClient, {
+          progress,
+          counts: { processed, total: entries.length, withCommittee },
+          label: 'Parsing cached PDF document data',
+        });
         if (!analysis?.fullText) continue;
         processed += 1;
         const doc = await loadDocumentMetadata(entry.doc_id) || { id: entry.doc_id, supervisors: [] };
@@ -349,7 +433,12 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
           status: 'running',
           counts: { processed, total: entries.length, citations: totalCitations },
         });
-        const analysis = await analyzePdfEntry(entry, artifactClient, { keepPdfPath: true });
+        const analysis = await analyzePdfEntry(entry, artifactClient, {
+          keepPdfPath: true,
+          progress,
+          counts: { processed, total: entries.length, citations: totalCitations },
+          label: 'Parsing cached PDF text for citations',
+        });
         try {
           if (!analysis?.fullText) continue;
           const doc = await loadDocumentMetadata(entry.doc_id) || { id: entry.doc_id, supervisors: [] };
@@ -410,7 +499,11 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
           status: 'running',
           counts: { processed, total: targets.length, withCommittee },
         });
-        const analysis = await analyzePdfEntry(row, artifactClient);
+        const analysis = await analyzePdfEntry(row, artifactClient, {
+          progress,
+          counts: { processed, total: targets.length, withCommittee },
+          label: 'Parsing cached PDF text for committee data',
+        });
         if (analysis?.fullText) {
           const before = (await loadCommitteeMembers(row.doc_id)).length;
           await extractAndSaveParsedData(doc, analysis.fullText, null, {
