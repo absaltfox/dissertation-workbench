@@ -164,6 +164,7 @@ export async function start() {
       recomputeFromCache: false,
       cachedDocuments,
       skipFileEnrichment: true,
+      applyStoredFileMetrics: true,
     });
 
     if (cachedDocuments) {

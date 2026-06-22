@@ -486,6 +486,32 @@ export async function listCachedDocuments({ syncKey, limit = 1000 } = {}) {
   }).filter(Boolean);
 }
 
+export async function applyStoredFileMetricsToDocuments(documents = []) {
+  const list = Array.isArray(documents) ? documents : [];
+  const ids = Array.from(new Set(list.map((doc) => doc?.id).filter(Boolean)));
+  if (!ids.length) return list;
+
+  const metricsByDocId = new Map();
+  const chunkSize = 200;
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = await all(`
+      SELECT doc_id, download_url, file_bytes, word_count, body_word_count,
+             page_count, word_source, page_source, status, error
+      FROM file_metrics
+      WHERE doc_id IN (${placeholders})
+    `, chunk);
+    for (const row of rows) metricsByDocId.set(row.doc_id, row);
+  }
+
+  for (const doc of list) {
+    const row = metricsByDocId.get(doc?.id);
+    if (row) applyStoredFileMetricToDocument(doc, row);
+  }
+  return list;
+}
+
 function applyStoredFileMetricToDocument(doc, row) {
   if (!doc || !row) return doc;
   if (row.page_count != null) {

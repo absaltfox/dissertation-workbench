@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  applyStoredFileMetricsToDocuments,
   closeDb,
   ensureStorage,
   listCachedDocuments,
@@ -59,4 +60,44 @@ test('cached documents overlay persisted file metrics without enrichment work', 
   assert.equal(docs[0].fileBytes, 123456);
   assert.equal(docs[0].downloadStatus, 'downloaded');
   assert.equal(docs[0].downloadError, null);
+});
+
+test('stored file metrics can overlay freshly fetched metadata records', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const docId = `test-fresh-doc-${suffix}`;
+
+  await saveFileMetric(docId, {
+    status: 'recomputed_from_cache',
+    error: null,
+    pdfPath: '/tmp/fresh-doc-overlay.pdf',
+    downloadUrl: 'https://circle.library.ubc.ca/rest/bitstreams/456/retrieve',
+    fileBytes: 654321,
+    wordCount: 71500,
+    bodyWordCount: 69000,
+    pageCount: 240,
+    wordSource: 'cached_pdf_text',
+    pageSource: 'cached_pdf',
+  });
+
+  const docs = [{
+    id: docId,
+    title: 'Fresh metadata fixture',
+    pages: 1,
+    pagesSource: 'estimated_from_metadata_words',
+    wordCount: 300,
+    wordCountSource: 'metadata_text',
+    bodyWordCount: null,
+    downloadStatus: 'not_attempted',
+  }];
+
+  await applyStoredFileMetricsToDocuments(docs);
+
+  assert.equal(docs[0].pages, 240);
+  assert.equal(docs[0].pagesSource, 'cached_pdf');
+  assert.equal(docs[0].wordCount, 71500);
+  assert.equal(docs[0].wordCountSource, 'cached_pdf_text');
+  assert.equal(docs[0].bodyWordCount, 69000);
+  assert.equal(docs[0].fileBytes, 654321);
+  assert.equal(docs[0].downloadStatus, 'recomputed_from_cache');
 });

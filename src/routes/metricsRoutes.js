@@ -115,6 +115,7 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
         ...sourceOptions,
         cachedDocuments,
         skipFileEnrichment: true,
+        applyStoredFileMetrics: true,
       });
       if (cachedDocuments) {
         payload.source.documentCache = {

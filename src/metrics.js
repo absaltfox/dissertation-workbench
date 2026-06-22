@@ -4,7 +4,11 @@ import {
   DEFAULT_BASE_URL, DEFAULT_INDEX, DEFAULT_API_KEY, DEFAULT_QUERY,
   DEFAULT_TERM, DEFAULT_SOURCE, DEFAULT_DOWNLOAD_FILES, PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, SQLITE_PATH, DATA_DIR
 } from './config.js';
-import { ensureStorage, getDb, saveRunMetrics, hasTopics, loadTopics, loadDocumentTopics, loadDocumentTopicCoords, loadTopicHierarchy, getCitationCooccurrence } from './db.js';
+import {
+  applyStoredFileMetricsToDocuments, ensureStorage, getDb, saveRunMetrics,
+  hasTopics, loadTopics, loadDocumentTopics, loadDocumentTopicCoords,
+  loadTopicHierarchy, getCitationCooccurrence
+} from './db.js';
 import {
   toArray, flattenText, extractYear, parsePageCount, buildWordCloud,
   buildMethodologyStats, extractNgrams, detectMethodologies, isLowSignalConceptPhrase,
@@ -954,6 +958,8 @@ export async function collectMetrics(options = {}) {
       forceDownload,
       recomputeFromCache
     });
+  } else if (options.applyStoredFileMetrics) {
+    await applyStoredFileMetricsToDocuments(normalizedRecords);
   }
 
   const sourceMeta = {
