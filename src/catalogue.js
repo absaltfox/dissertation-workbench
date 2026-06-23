@@ -3,15 +3,45 @@ import { promisify } from 'node:util';
 import { logger } from './logger.js';
 import { listPendingLookups, saveCatalogueLookup } from './db.js';
 import { buildPqfQuery } from './catalogueQuery.js';
+import {
+  CATALOGUE_LOOKUP_BATCH_SIZE,
+  YAZ_CLIENT_BATCH_BASE_TIMEOUT_MS,
+  YAZ_CLIENT_BATCH_ITEM_TIMEOUT_MS,
+  YAZ_CLIENT_TIMEOUT_MS,
+} from './config.js';
 
 const execFileAsync = promisify(execFile);
 
 const Z3950_HOST = 'ils.library.ubc.ca';
 const Z3950_PORT = 7090;
 const Z3950_DB = 'VOYAGER';
-const BATCH_SIZE = 50;
 
 let hasYazClient;
+
+export class CatalogueLookupCancelledError extends Error {
+  constructor(message = 'Catalogue lookup cancelled') {
+    super(message);
+    this.name = 'CatalogueLookupCancelledError';
+    this.code = 'CATALOGUE_LOOKUP_CANCELLED';
+  }
+}
+
+export function isCatalogueLookupCancelledError(error) {
+  return error?.code === 'CATALOGUE_LOOKUP_CANCELLED' || error?.name === 'AbortError';
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw new CatalogueLookupCancelledError();
+  }
+}
+
+function makeYazTimeoutError() {
+  const error = new Error('yaz-client timed out');
+  error.code = 'YAZ_TIMEOUT';
+  error.transient = true;
+  return error;
+}
 
 // --- APA citation parsing ---
 
@@ -239,17 +269,48 @@ function parseBibIdFromOutput(stdout) {
   return match ? match[1] : null;
 }
 
-function runYazClient(commands, timeoutMs = 15_000) {
+function runYazClient(commands, { timeoutMs = YAZ_CLIENT_TIMEOUT_MS, signal } = {}) {
   return new Promise((resolve, reject) => {
+    try {
+      throwIfAborted(signal);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+
     const child = spawn('yaz-client', [], { stdio: ['pipe', 'pipe', 'pipe'] });
     const chunks = [];
     let size = 0;
     const maxBuffer = 512 * 1024;
+    let settled = false;
+
+    const finish = (error, stdout = '') => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener?.('abort', onAbort);
+      if (error) reject(error);
+      else resolve(stdout);
+    };
+
+    const stopChild = () => {
+      if (!child.killed) child.kill('SIGTERM');
+      setTimeout(() => {
+        if (!child.killed) child.kill('SIGKILL');
+      }, 3_000).unref();
+    };
+
+    const onAbort = () => {
+      stopChild();
+      finish(new CatalogueLookupCancelledError());
+    };
 
     const timer = setTimeout(() => {
-      child.kill();
-      reject(new Error('yaz-client timed out'));
+      stopChild();
+      finish(makeYazTimeoutError());
     }, timeoutMs);
+    timer.unref();
+    signal?.addEventListener?.('abort', onAbort, { once: true });
 
     child.stdout.on('data', (chunk) => {
       size += chunk.length;
@@ -257,24 +318,29 @@ function runYazClient(commands, timeoutMs = 15_000) {
     });
 
     child.on('close', (code) => {
-      clearTimeout(timer);
       const stdout = Buffer.concat(chunks).toString('utf-8');
       // yaz-client exits non-zero even on success, so ignore exit code
       // and just check if we got parseable output
-      resolve(stdout);
+      finish(null, stdout);
     });
 
     child.on('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
+      err.transient = true;
+      finish(err);
     });
 
-    child.stdin.write(commands);
-    child.stdin.end();
+    try {
+      child.stdin.write(commands);
+      child.stdin.end();
+    } catch (error) {
+      error.transient = true;
+      finish(error);
+    }
   });
 }
 
-export async function lookupCitation(citationText) {
+export async function lookupCitation(citationText, { signal, runClient = runYazClient } = {}) {
+  throwIfAborted(signal);
   const { author, title } = extractSearchTerms(citationText);
 
   if (!title) {
@@ -298,7 +364,7 @@ export async function lookupCitation(citationText) {
   ].join('\n') + '\n';
 
   try {
-    const stdout = await runYazClient(commands, 15_000);
+    const stdout = await runClient(commands, { timeoutMs: YAZ_CLIENT_TIMEOUT_MS, signal });
 
     const hits = parseHitsFromOutput(stdout);
     if (hits === null) {
@@ -308,15 +374,26 @@ export async function lookupCitation(citationText) {
     const bibId = hits > 0 ? parseBibIdFromOutput(stdout) : null;
     return { found: hits > 0, hits, author, title, bibId };
   } catch (err) {
+    if (isCatalogueLookupCancelledError(err)) throw err;
     logger.warn('yaz-client lookup failed', { author, title, error: err.message });
-    return { found: null, hits: null, author, title, error: err.message };
+    return { found: null, hits: null, author, title, error: err.message, transient: Boolean(err.transient || err.code === 'YAZ_TIMEOUT') };
   }
 }
 
 // --- Batch lookup ---
 
-export async function lookupCitationBatch(citationTexts, { concurrency = 1, onProgress, structuredFieldsList } = {}) {
-  if (!(await checkYazAvailability())) {
+export async function lookupCitationBatch(citationTexts, {
+  concurrency = 1,
+  onProgress,
+  structuredFieldsList,
+  signal,
+  batchSize = CATALOGUE_LOOKUP_BATCH_SIZE,
+  isYazAvailable = checkYazAvailability,
+  runClient = runYazClient,
+} = {}) {
+  throwIfAborted(signal);
+  const effectiveBatchSize = Math.max(1, Number(batchSize) || CATALOGUE_LOOKUP_BATCH_SIZE);
+  if (!(await isYazAvailable())) {
     return citationTexts.map((text, idx) => {
       const { author, title } = extractSearchTerms(text, structuredFieldsList?.[idx]);
       return { found: null, hits: null, author, title, skipped: true, error: 'yaz-client not available' };
@@ -344,8 +421,9 @@ export async function lookupCitationBatch(citationTexts, { concurrency = 1, onPr
   }
 
   // Process queryable items in batches via single yaz-client sessions
-  for (let batchStart = 0; batchStart < queryable.length; batchStart += BATCH_SIZE) {
-    const batch = queryable.slice(batchStart, batchStart + BATCH_SIZE);
+  for (let batchStart = 0; batchStart < queryable.length; batchStart += effectiveBatchSize) {
+    throwIfAborted(signal);
+    const batch = queryable.slice(batchStart, batchStart + effectiveBatchSize);
 
     const commandLines = [`open ${Z3950_HOST}:${Z3950_PORT}/${Z3950_DB}`];
     for (const item of batch) {
@@ -357,7 +435,10 @@ export async function lookupCitationBatch(citationTexts, { concurrency = 1, onPr
     const commands = commandLines.join('\n') + '\n';
 
     try {
-      const stdout = await runYazClient(commands, 30_000 + batch.length * 2_000);
+      const stdout = await runClient(commands, {
+        timeoutMs: YAZ_CLIENT_BATCH_BASE_TIMEOUT_MS + batch.length * YAZ_CLIENT_BATCH_ITEM_TIMEOUT_MS,
+        signal,
+      });
 
       // Split stdout into blocks. Each block starts with a search command execution.
       // yaz-client echoes command lines preceded by a prompt (usually "Z> ").
@@ -416,10 +497,18 @@ export async function lookupCitationBatch(citationTexts, { concurrency = 1, onPr
         }
       }
     } catch (err) {
+      if (isCatalogueLookupCancelledError(err)) throw err;
       logger.warn('yaz-client batch lookup failed', { batchSize: batch.length, error: err.message });
       for (const item of batch) {
         if (results[item.idx] === undefined) {
-          results[item.idx] = { found: null, hits: null, author: item.author, title: item.title, error: err.message };
+          results[item.idx] = {
+            found: null,
+            hits: null,
+            author: item.author,
+            title: item.title,
+            error: err.message,
+            transient: true,
+          };
         }
       }
     }
@@ -440,19 +529,27 @@ export async function lookupCitationBatch(citationTexts, { concurrency = 1, onPr
  * Processes in pages of `pageSize` to bound memory and provide progress logging.
  * Returns summary stats { processed, found, notFound, skipped }.
  */
-export async function runPendingCatalogueLookups({ pageSize = 200 } = {}) {
-  if (!(await checkYazAvailability())) {
+export async function runPendingCatalogueLookups({
+  pageSize = 200,
+  signal,
+  lookupBatch = lookupCitationBatch,
+  isYazAvailable = checkYazAvailability,
+} = {}) {
+  throwIfAborted(signal);
+  if (!(await isYazAvailable())) {
     logger.warn('Skipping automatic catalogue lookups — yaz-client not available');
-    return { processed: 0, found: 0, notFound: 0, skipped: 0 };
+    return { processed: 0, found: 0, notFound: 0, skipped: 0, failed: 0 };
   }
 
   let totalProcessed = 0;
   let totalFound = 0;
   let totalNotFound = 0;
   let totalSkipped = 0;
+  let totalFailed = 0;
 
   // Process in pages until no pending citations remain
   while (true) {
+    throwIfAborted(signal);
     const pending = await listPendingLookups(pageSize);
     if (!pending.length) break;
 
@@ -463,10 +560,15 @@ export async function runPendingCatalogueLookups({ pageSize = 200 } = {}) {
       year: row.year || null,
       source: row.source || null,
     }));
-    const results = await lookupCitationBatch(texts, { structuredFieldsList });
+    const results = await lookupBatch(texts, { structuredFieldsList, signal });
 
     for (let i = 0; i < pending.length; i++) {
+      throwIfAborted(signal);
       const result = results[i];
+      if (!result || result.transient) {
+        totalFailed++;
+        continue;
+      }
       await saveCatalogueLookup(pending[i].id, {
         hits: result.hits,
         queryAuthor: result.author,
@@ -478,16 +580,36 @@ export async function runPendingCatalogueLookups({ pageSize = 200 } = {}) {
       else totalSkipped++;
     }
 
-    totalProcessed += pending.length;
-    logger.info('Catalogue lookup progress', { processed: totalProcessed, found: totalFound, notFound: totalNotFound, skipped: totalSkipped });
+    totalProcessed = totalFound + totalNotFound + totalSkipped;
+    logger.info('Catalogue lookup progress', {
+      processed: totalProcessed,
+      found: totalFound,
+      notFound: totalNotFound,
+      skipped: totalSkipped,
+      failed: totalFailed,
+    });
+
+    if (totalFailed > 0) {
+      const error = new Error(`YAZ lookup failed for ${totalFailed} citation(s); transient failures were not saved and can be retried.`);
+      error.code = 'YAZ_TRANSIENT_FAILURE';
+      error.transient = true;
+      error.stats = { processed: totalProcessed, found: totalFound, notFound: totalNotFound, skipped: totalSkipped, failed: totalFailed };
+      throw error;
+    }
 
     // If we got fewer than a full page, we're done
     if (pending.length < pageSize) break;
   }
 
   if (totalProcessed > 0) {
-    logger.info('Catalogue lookups complete', { processed: totalProcessed, found: totalFound, notFound: totalNotFound, skipped: totalSkipped });
+    logger.info('Catalogue lookups complete', {
+      processed: totalProcessed,
+      found: totalFound,
+      notFound: totalNotFound,
+      skipped: totalSkipped,
+      failed: totalFailed,
+    });
   }
 
-  return { processed: totalProcessed, found: totalFound, notFound: totalNotFound, skipped: totalSkipped };
+  return { processed: totalProcessed, found: totalFound, notFound: totalNotFound, skipped: totalSkipped, failed: totalFailed };
 }

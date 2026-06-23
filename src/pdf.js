@@ -1612,9 +1612,10 @@ export async function analyzeDocumentFile(doc, options) {
       return;
     }
 
+    let remotePdf = null;
     try {
       await onProgress?.({ phase: 'artifact_download', label: 'Streaming cached PDF from web cache', status: 'running' });
-      const remotePdf = artifactClient ? await artifactClient.downloadPdfToTemp(doc.id) : null;
+      remotePdf = artifactClient ? await artifactClient.downloadPdfToTemp(doc.id) : null;
       const analysisPath = remotePdf?.path || stored.pdf_path;
       await onProgress?.({ phase: 'artifact_download', label: 'Cached PDF available for analysis', status: 'completed' });
       await onProgress?.({ phase: 'pdf_analysis', label: 'Analyzing cached PDF text', status: 'running' });
@@ -1657,7 +1658,6 @@ export async function analyzeDocumentFile(doc, options) {
       await extractAndSaveParsedData(doc, analysis.fullText, analysisPath, {
         onProgress, extractCommittee, extractCitations
       });
-      if (remotePdf?.cleanup) await remotePdf.cleanup();
       return;
     } catch (error) {
       doc.downloadStatus = 'cache_error';
@@ -1676,6 +1676,8 @@ export async function analyzeDocumentFile(doc, options) {
         pageSource: stored.page_source || null
       });
       return;
+    } finally {
+      await remotePdf?.cleanup?.();
     }
   }
 

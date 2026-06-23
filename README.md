@@ -230,6 +230,10 @@ Worker-specific settings:
 - `CATALOGUE_LOOKUP_ENABLED`: default `1`.
 - `CATALOGUE_LOOKUP_ON_START`: default `1`.
 - `CATALOGUE_LOOKUP_PAGE_SIZE`: default `200`.
+- `CATALOGUE_LOOKUP_BATCH_SIZE`: default `1`; each `yaz-client` session handles one citation so slow OCR-derived queries fail independently instead of timing out a whole batch.
+- `YAZ_CLIENT_TIMEOUT_MS`: single-lookup timeout, default `15000`.
+- `YAZ_CLIENT_BATCH_BASE_TIMEOUT_MS`: batch lookup base timeout, default `30000`.
+- `YAZ_CLIENT_BATCH_ITEM_TIMEOUT_MS`: additional timeout per item in a batch, default `2000`.
 
 Optional enrichment services:
 

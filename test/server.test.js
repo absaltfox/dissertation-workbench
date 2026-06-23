@@ -161,6 +161,38 @@ test('import rule run validates mode and scope', async () => {
   }
 });
 
+test('legacy import-rule sync endpoint uses durable document sync job state', async () => {
+  const token = createSession('admin');
+  const runningJobId = await createAdminJob({
+    type: 'document_sync',
+    label: 'Existing Document Sync',
+    params: {},
+    runnerType: 'local',
+  });
+  try {
+    const csrfToken = getSessionCsrfToken(token);
+    const res = await request(app)
+      .post('/api/admin/import-rules/sync')
+      .set('Cookie', `session=${token}`)
+      .set('x-csrf-token', csrfToken)
+      .send({
+        name: 'Ad hoc sync route fixture',
+        degree: 'Doctor of Education - EdD',
+        mode: 'import_all',
+        downloadFiles: false,
+      })
+      .expect('content-type', /application\/json/)
+      .expect(202);
+
+    assert.equal(res.body.ok, true);
+    assert.equal(res.body.alreadyRunning, true);
+    assert.equal(res.body.jobId, runningJobId);
+  } finally {
+    await finishAdminJob(runningJobId, { status: 'completed', runnerState: 'completed' });
+    destroySession(token);
+  }
+});
+
 test('metrics validates query parameters before collecting data', async () => {
   const res = await request(app)
     .get('/api/metrics?maxRecords=10000')

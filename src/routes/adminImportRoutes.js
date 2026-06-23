@@ -198,7 +198,14 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
       res.status(404).json({ error: 'Import rule not found' });
       return;
     }
+    const mode = String(body.mode || 'import_all');
+    const { DOCUMENT_SYNC_MODES } = await loadSyncModule();
+    if (!DOCUMENT_SYNC_MODES.has(mode)) {
+      res.status(400).json({ error: 'Invalid import run mode.' });
+      return;
+    }
     const options = importRuleToSyncOptions(rule, {
+      mode,
       maxRecords: body.maxRecords,
       syncMaxRecords: body.syncMaxRecords ?? body.scanLimit,
       pageSize: body.pageSize,
@@ -206,10 +213,18 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
       downloadFiles: parseBooleanParam(body.downloadFiles, true),
       apiKey: await getConfiguredApiKey(),
     });
-    const { startDocumentSync } = await loadSyncModule();
-    const result = await startDocumentSync(options);
+    const runningId = await hasRunningAdminJob('document_sync');
+    if (runningId) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
+      return;
+    }
+    const result = await createAndStartAdminWorkerJob({
+      type: 'document_sync',
+      label: `Import Rule Sync: ${rule.name || 'Ad hoc rule'}`,
+      params: { options },
+    });
     clearMetricsCache();
-    res.status(202).json({ ok: true, ...result });
+    res.status(202).json({ ok: true, started: true, ...result });
   }));
 
   router.post('/import-rules/run', asyncHandler(async (req, res) => {

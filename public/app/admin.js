@@ -647,17 +647,20 @@ async function handleRunImportRules(mode, button) {
     return;
   }
   const labels = {
-    import_all: 'Import all matching records',
-    sync_differences: 'Sync only new matching records',
-    refresh_metadata: 'Refresh metadata for cached matching records',
-    sync_missing_pdfs: 'Download and analyze missing PDFs'
+    import_all: 'Import metadata',
+    sync_differences: 'Import new metadata',
+    refresh_metadata: 'Refresh existing metadata',
+    sync_missing_pdfs: 'Import and analyze PDFs'
   };
   if (!confirm(`${labels[mode]} for ${importScopeLabel()}?`)) return;
 
   button.disabled = true;
-  const originalText = button.textContent;
-  button.textContent = 'Running...';
+  const originalHtml = button.innerHTML;
+  button.innerHTML = '<span class="import-action-title">Running...</span>';
   try {
+    const downloadFiles = mode === 'sync_missing_pdfs'
+      ? '1'
+      : document.getElementById('s-downloadFiles')?.value || '0';
     const res = await fetch('/api/admin/import-rules/run', {
       method: 'POST',
       headers: jsonHeaders(),
@@ -668,7 +671,7 @@ async function handleRunImportRules(mode, button) {
         maxRecords: document.getElementById('s-maxRecords')?.value || '9999',
         pageSize: document.getElementById('s-pageSize')?.value || '20',
         scanLimit: document.getElementById('s-scanLimit')?.value || '50000',
-        downloadFiles: document.getElementById('s-downloadFiles')?.value || '0'
+        downloadFiles
       })
     });
     const data = await res.json();
@@ -683,7 +686,7 @@ async function handleRunImportRules(mode, button) {
     alert('Connection error');
   } finally {
     button.disabled = false;
-    button.textContent = originalText;
+    button.innerHTML = originalHtml;
   }
 }
 

@@ -7,7 +7,7 @@ import { extractSearchTerms } from '../catalogue.js';
 import { getConceptPipelineStatus } from '../conceptsPipeline.js';
 import { parseBooleanParam, parseNumberParam } from '../validate.js';
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
-import { isAdminJobRunning, runBertopicJob, runCatalogueLookupJob } from '../services/adminJobs.js';
+import { cancelInProcessAdminJob, isAdminJobRunning, runBertopicJob, runCatalogueLookupJob } from '../services/adminJobs.js';
 import { cancelAdminWorkerJob } from '../services/adminWorker.js';
 
 /**
@@ -98,6 +98,12 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
     const jobId = Number(req.params.id || 0);
     if (!jobId) {
       res.status(400).json({ error: 'Invalid job id' });
+      return;
+    }
+    const inProcessResult = await cancelInProcessAdminJob(jobId);
+    if (inProcessResult.ok) {
+      clearMetricsCache();
+      res.status(200).json(inProcessResult);
       return;
     }
     const result = await cancelAdminWorkerJob(jobId);

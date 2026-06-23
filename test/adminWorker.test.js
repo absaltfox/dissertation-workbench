@@ -9,21 +9,29 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 let testDataDir;
 let buildFlyWorkerMachinePayload;
+let cancelInProcessAdminJob;
 let cancelAdminWorkerJob;
+let CatalogueLookupCancelledError;
 let WorkerArtifactClient;
 let runImportPdfAdminJob;
+let runCatalogueLookupJob;
+let runPendingCatalogueLookups;
 let analyzeDocumentFile;
 let appendAdminJobLog;
 let claimAdminJob;
+let clearAllCitations;
 let closeDb;
 let createAdminJob;
 let ensureStorage;
 let getAdminJob;
 let hashAdminJobToken;
 let heartbeatAdminJob;
+let hasRunningAdminJob;
 let finishAdminJob;
 let loadDocumentCitations;
+let loadCatalogueLookup;
 let loadStoredFileMetric;
+let listPendingLookups;
 let saveDocumentMetadata;
 let saveCitations;
 let saveFileMetric;
@@ -68,21 +76,27 @@ test.before(async () => {
   process.env.NODE_ENV = 'test';
 
   ({ buildFlyWorkerMachinePayload, cancelAdminWorkerJob } = await import('../src/services/adminWorker.js'));
+  ({ cancelInProcessAdminJob, runCatalogueLookupJob } = await import('../src/services/adminJobs.js'));
+  ({ CatalogueLookupCancelledError, runPendingCatalogueLookups } = await import('../src/catalogue.js'));
   ({ WorkerArtifactClient } = await import('../src/workerArtifacts.js'));
   ({ runImportPdfAdminJob } = await import('../src/services/importPdfJobRunner.js'));
   ({ analyzeDocumentFile } = await import('../src/pdf.js'));
   ({
     appendAdminJobLog,
     claimAdminJob,
+    clearAllCitations,
     closeDb,
     createAdminJob,
     ensureStorage,
     getAdminJob,
     hashAdminJobToken,
     heartbeatAdminJob,
+    hasRunningAdminJob,
     finishAdminJob,
     loadDocumentCitations,
+    loadCatalogueLookup,
     loadStoredFileMetric,
+    listPendingLookups,
     saveDocumentMetadata,
     saveCitations,
     saveFileMetric,
@@ -150,6 +164,98 @@ test('admin worker job lifecycle helpers claim once, heartbeat, log, and validat
 
   await finishAdminJob(jobId, { status: 'completed', runnerState: 'completed' });
   assert.equal(await validateAdminJobArtifactToken(jobId, token, { docId: 'lifecycle-doc' }), false);
+});
+
+test('expired running admin jobs are timed out before they block new jobs', async () => {
+  await ensureStorage();
+  const token = `expired-worker-token-${Date.now()}`;
+  const jobId = await createAdminJob({
+    type: 'reparse_all',
+    label: 'Expired Worker Test',
+    params: {},
+    artifactTokenHash: hashAdminJobToken(token),
+    timeoutAt: new Date(Date.now() - 60_000).toISOString(),
+    runnerType: 'fly',
+  });
+
+  assert.equal(await hasRunningAdminJob('reparse_all'), null);
+
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'timed_out');
+  assert.equal(job.runnerState, 'timed_out');
+  assert.match(job.error, /timed out|heartbeating/i);
+  assert.equal(await validateAdminJobArtifactToken(jobId, token), false);
+});
+
+test('in-process catalogue lookup jobs can be cancelled cooperatively', async () => {
+  await ensureStorage();
+  const jobId = await createAdminJob({
+    type: 'catalogue_lookup',
+    label: 'Catalogue Cancel Test',
+    params: { limit: 5, pendingOnly: true },
+  });
+  let abortSeen = false;
+
+  runCatalogueLookupJob(jobId, 5, {
+    runLookup: ({ signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener('abort', () => {
+        abortSeen = true;
+        reject(new CatalogueLookupCancelledError());
+      }, { once: true });
+    }),
+  });
+
+  const result = await cancelInProcessAdminJob(jobId);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.cancelled, true);
+  assert.equal(abortSeen, true);
+
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'cancelled');
+  assert.ok(job.cancelledAt);
+  assert.ok(job.finishedAt);
+  assert.match(job.log, /cancelled by administrator/i);
+});
+
+test('transient YAZ failures are not saved as completed catalogue lookups', async () => {
+  await ensureStorage();
+  await clearAllCitations();
+  const docId = `catalogue-transient-${Date.now()}`;
+  const citationText = 'Bakke, E. Wight. (1950). Bonds of organization.';
+  await saveDocumentMetadata({
+    id: docId,
+    title: 'Catalogue Transient Fixture',
+    author: 'Worker Tester',
+    supervisors: [],
+  });
+  await saveCitations(docId, [{
+    text: citationText,
+    author: 'Bakke',
+    title: 'Bonds of organization',
+    year: '1950',
+  }], () => `catalogue-transient-hash-${docId}`);
+
+  const [pending] = await listPendingLookups(1);
+  assert.ok(pending?.id);
+
+  await assert.rejects(
+    () => runPendingCatalogueLookups({
+      pageSize: 1,
+      isYazAvailable: async () => true,
+      lookupBatch: async () => [{
+        found: null,
+        hits: null,
+        author: 'Bakke',
+        title: 'Bonds of organization',
+        error: 'yaz-client timed out',
+        transient: true,
+      }],
+    }),
+    /transient failures were not saved/
+  );
+
+  assert.equal(await loadCatalogueLookup(pending.id), null);
 });
 
 test('one-shot job worker claims unsupported jobs and marks them failed', async () => {
@@ -284,6 +390,48 @@ test('cache reanalysis job recomputes from cached PDF without downloading', asyn
   const stored = await loadStoredFileMetric(docId);
   assert.equal(stored.status, 'recomputed_from_cache');
   assert.equal(stored.pdf_path, durablePdfPath);
+});
+
+test('cache reanalysis cleans up temporary artifact PDFs after parse errors', async () => {
+  await ensureStorage();
+  const docId = `cached-reanalysis-cleanup-${Date.now()}`;
+  await saveDocumentMetadata({
+    id: docId,
+    title: 'Cached Reanalysis Cleanup Fixture',
+    author: 'Worker Tester',
+    supervisors: [],
+  });
+  await saveFileMetric(docId, {
+    status: 'cached',
+    pdfPath: `/web/pdf-cache/${docId}.pdf`,
+    downloadUrl: 'https://example.test/cached.pdf',
+    fileBytes: 43,
+    wordCount: 1,
+    pageCount: 1,
+    wordSource: 'old',
+    pageSource: 'old',
+  });
+
+  let cleanupCalled = false;
+  await analyzeDocumentFile({
+    id: docId,
+    title: 'Cached Reanalysis Cleanup Fixture',
+    supervisors: [],
+  }, {
+    downloadFiles: false,
+    forceDownload: false,
+    recomputeFromCache: true,
+    artifactClient: {
+      downloadPdfToTemp: async () => ({
+        path: path.join(testDataDir, 'missing-artifact.pdf'),
+        cleanup: async () => { cleanupCalled = true; },
+      }),
+    },
+  });
+
+  const stored = await loadStoredFileMetric(docId);
+  assert.equal(cleanupCalled, true);
+  assert.equal(stored.status, 'cache_error');
 });
 
 test('cached document reparse does not clear or extract citations', async () => {

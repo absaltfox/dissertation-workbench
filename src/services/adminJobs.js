@@ -2,12 +2,13 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { BERTOPIC_PYTHON_COMMAND, BERTOPIC_TIMEOUT_MS, SQLITE_PATH } from '../config.js';
-import { getTopicBuildStatus, updateAdminJob } from '../db.js';
-import { runPendingCatalogueLookups } from '../catalogue.js';
+import { appendAdminJobLog, getAdminJob, getTopicBuildStatus, updateAdminJob } from '../db.js';
+import { isCatalogueLookupCancelledError, runPendingCatalogueLookups } from '../catalogue.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const runningAdminJobs = new Set();
+const runningInProcessAdminJobs = new Map();
 
 function tailLog(text, limit = 12000) {
   const value = String(text || '');
@@ -18,9 +19,14 @@ export function isAdminJobRunning(type) {
   return runningAdminJobs.has(type);
 }
 
-export function runCatalogueLookupJob(jobId, limit) {
+export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCatalogueLookups } = {}) {
+  const controller = new AbortController();
   runningAdminJobs.add('catalogue_lookup');
-  runPendingCatalogueLookups({ pageSize: limit })
+  runningInProcessAdminJobs.set(Number(jobId), {
+    type: 'catalogue_lookup',
+    controller,
+  });
+  runLookup({ pageSize: limit, signal: controller.signal })
     .then(async (stats) => {
       await updateAdminJob(jobId, {
         status: 'completed',
@@ -29,15 +35,48 @@ export function runCatalogueLookupJob(jobId, limit) {
       });
     })
     .catch(async (error) => {
+      if (isCatalogueLookupCancelledError(error)) {
+        const now = new Date().toISOString();
+        await updateAdminJob(jobId, {
+          status: 'cancelled',
+          error: null,
+          cancelledAt: now,
+          finishedAt: now,
+        });
+        return;
+      }
       await updateAdminJob(jobId, {
         status: 'failed',
         error: error?.message || String(error),
+        result: error?.stats || null,
         finishedAt: new Date().toISOString(),
       });
     })
     .finally(() => {
       runningAdminJobs.delete('catalogue_lookup');
+      runningInProcessAdminJobs.delete(Number(jobId));
     });
+}
+
+export async function cancelInProcessAdminJob(jobId) {
+  const id = Number(jobId || 0);
+  const running = runningInProcessAdminJobs.get(id);
+  if (!running) return { ok: false, error: 'Job is not running in this process' };
+
+  const job = await getAdminJob(id);
+  if (!job) return { ok: false, error: 'Job not found' };
+  if (job.status !== 'running') return { ok: false, error: 'Job is not running' };
+
+  running.controller.abort();
+  const now = new Date().toISOString();
+  await updateAdminJob(id, {
+    status: 'cancelled',
+    error: null,
+    cancelledAt: now,
+    finishedAt: now,
+  });
+  await appendAdminJobLog(id, 'Job cancelled by administrator.\n');
+  return { ok: true, jobId: id, cancelled: true };
 }
 
 export function runBertopicJob(jobId, { clearMetricsCache } = {}) {

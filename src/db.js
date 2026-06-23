@@ -862,12 +862,36 @@ export async function validateAdminJobArtifactToken(id, token, { docId = null } 
   return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
 }
 
+export async function reapStaleAdminJobs(type = null) {
+  const now = new Date().toISOString();
+  const args = [now, now];
+  let sql = `
+    UPDATE admin_jobs
+    SET status = 'timed_out',
+        runner_state = 'timed_out',
+        error = COALESCE(error, 'Admin worker timed out or stopped heartbeating.'),
+        finished_at = ?,
+        artifact_token_hash = NULL
+    WHERE status = 'running'
+      AND timeout_at IS NOT NULL
+      AND timeout_at <= ?
+  `;
+  if (type) {
+    sql += ' AND type = ?';
+    args.push(type);
+  }
+  const result = await run(sql, args);
+  return result.changes || 0;
+}
+
 export async function hasRunningAdminJob(type) {
+  await reapStaleAdminJobs(type);
   const row = await get('SELECT id FROM admin_jobs WHERE type = ? AND status = ? ORDER BY started_at DESC LIMIT 1', [type, 'running']);
   return row ? Number(row.id) : null;
 }
 
 export async function listAdminJobs(limit = 25) {
+  await reapStaleAdminJobs();
   const rows = await all(`
     SELECT * FROM admin_jobs
     ORDER BY started_at DESC

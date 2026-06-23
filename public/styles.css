@@ -1433,10 +1433,79 @@ tbody tr:nth-child(even) {
 }
 
 .import-actions {
+  display: grid;
+  gap: 0.7rem;
+  margin-top: 0.8rem;
+}
+
+.import-action-toolbar,
+.import-maintenance-actions {
   display: flex;
   flex-wrap: wrap;
   gap: 0.55rem;
-  margin-top: 0.8rem;
+}
+
+.import-run-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+
+.import-action-card {
+  appearance: none;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
+  min-height: 4.1rem;
+  padding: 0.78rem 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--ink);
+  cursor: pointer;
+  text-align: left;
+  box-shadow: 0 1px 0 rgba(18, 52, 59, 0.04);
+  transition: border-color 0.12s, box-shadow 0.12s, transform 0.12s;
+}
+
+.import-action-card:hover {
+  border-color: var(--accent);
+  box-shadow: 0 8px 18px rgba(18, 52, 59, 0.08);
+  transform: translateY(-1px);
+}
+
+.import-action-card.primary {
+  border-color: rgba(18, 128, 140, 0.55);
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.96), rgba(230, 249, 247, 0.9));
+}
+
+.import-action-card:disabled {
+  cursor: wait;
+  opacity: 0.62;
+  transform: none;
+}
+
+.import-action-title {
+  min-width: 0;
+  font-family: var(--sans);
+  font-size: 0.92rem;
+  font-weight: 800;
+  line-height: 1.2;
+}
+
+.import-action-meta {
+  justify-self: end;
+  max-width: 9rem;
+  border-radius: 999px;
+  background: rgba(18, 128, 140, 0.08);
+  color: var(--accent);
+  padding: 0.26rem 0.48rem;
+  font-family: var(--sans);
+  font-size: 0.72rem;
+  font-weight: 800;
+  line-height: 1.15;
+  text-align: center;
 }
 
 .import-preview {
@@ -2165,7 +2234,11 @@ svg[viewBox] {
   .settings-grid.four-col,
   .settings-status-grid,
   .job-controls-grid,
-  .import-rules-layout { grid-template-columns: 1fr; }
+  .import-rules-layout,
+  .import-run-actions { grid-template-columns: 1fr; }
+  .import-action-card {
+    min-height: 3.7rem;
+  }
   .kpis { flex-direction: column; }
   .bar-row { grid-template-columns: 1fr; }
   .admin-tabs { gap: 0.3rem; }

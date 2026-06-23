@@ -528,14 +528,26 @@
                       </div>
                     </details>
                   </fieldset>
-                  <div class="settings-actions import-actions">
-                    <button type="button" id="previewImportRuleBtn" class="btn ghost">Preview Rule</button>
-                    <button type="submit" id="saveImportRuleBtn" class="btn">Save Rule</button>
-                    <button type="button" id="importAllRuleBtn" class="btn ghost">Import All</button>
-                    <button type="button" id="syncDifferencesRuleBtn" class="btn ghost">Sync Differences</button>
-                    <button type="button" id="refreshMetadataRuleBtn" class="btn ghost">Refresh Metadata</button>
-                    <button type="button" id="syncMissingPdfsRuleBtn" class="btn ghost">Sync Missing PDFs</button>
-                    <button type="button" id="deleteImportRuleBtn" class="btn danger" hidden>Delete Rule</button>
+                  <div class="import-actions">
+                    <div class="import-action-toolbar">
+                      <button type="button" id="previewImportRuleBtn" class="btn ghost">Preview Matches</button>
+                      <button type="submit" id="saveImportRuleBtn" class="btn ghost">Save Rule</button>
+                      <button type="button" id="deleteImportRuleBtn" class="btn danger" hidden>Delete Rule</button>
+                    </div>
+                    <div class="import-run-actions" aria-label="Import actions">
+                      <button type="button" id="importAllRuleBtn" class="import-action-card">
+                        <span class="import-action-title">Import Metadata</span>
+                        <span class="import-action-meta">Fast</span>
+                      </button>
+                      <button type="button" id="syncMissingPdfsRuleBtn" class="import-action-card primary">
+                        <span class="import-action-title">Import + Analyze PDFs</span>
+                        <span class="import-action-meta">Full text, people, citations</span>
+                      </button>
+                    </div>
+                    <div class="import-maintenance-actions" aria-label="Maintenance actions">
+                      <button type="button" id="syncDifferencesRuleBtn" class="btn ghost btn-sm">Import New Metadata</button>
+                      <button type="button" id="refreshMetadataRuleBtn" class="btn ghost btn-sm">Refresh Existing Metadata</button>
+                    </div>
                   </div>
                   <div id="importRulePreview" class="import-preview" aria-live="polite"></div>
                 </form>

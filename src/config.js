@@ -92,6 +92,10 @@ export const CATALOGUE_LOOKUP_ENABLED = process.env.CATALOGUE_LOOKUP_ENABLED
   ? /^(1|true|yes)$/i.test(process.env.CATALOGUE_LOOKUP_ENABLED)
   : true;
 export const CATALOGUE_LOOKUP_PAGE_SIZE = Number(process.env.CATALOGUE_LOOKUP_PAGE_SIZE || 200);
+export const CATALOGUE_LOOKUP_BATCH_SIZE = Number(process.env.CATALOGUE_LOOKUP_BATCH_SIZE || 1);
+export const YAZ_CLIENT_TIMEOUT_MS = Number(process.env.YAZ_CLIENT_TIMEOUT_MS || 15_000);
+export const YAZ_CLIENT_BATCH_BASE_TIMEOUT_MS = Number(process.env.YAZ_CLIENT_BATCH_BASE_TIMEOUT_MS || 30_000);
+export const YAZ_CLIENT_BATCH_ITEM_TIMEOUT_MS = Number(process.env.YAZ_CLIENT_BATCH_ITEM_TIMEOUT_MS || 2_000);
 export const ALLOW_PUBLIC_DOWNLOADS = process.env.ALLOW_PUBLIC_DOWNLOADS
   ? /^(1|true|yes)$/i.test(process.env.ALLOW_PUBLIC_DOWNLOADS)
   : !IS_PRODUCTION;
