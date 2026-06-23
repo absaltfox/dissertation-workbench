@@ -679,9 +679,13 @@ async function handleRunImportRules(mode, button) {
       alert(data.error || 'Sync failed.');
       return;
     }
-    renderDocumentSyncStatus(data.status);
-    const skipped = data.totalSkipped ? `, ${formatNum(data.totalSkipped)} skipped` : '';
-    setStatus(`${labels[mode]} complete: ${formatNum(data.totalSaved || 0)} saved/updated${skipped}.`);
+    if (data.status) renderDocumentSyncStatus(data.status);
+    await loadJobs();
+    if (data.alreadyRunning) {
+      setStatus(`${labels[mode]} is already running.`);
+    } else {
+      setStatus(`${labels[mode]} worker started. Track progress in Admin > Jobs.`);
+    }
   } catch {
     alert('Connection error');
   } finally {
@@ -974,8 +978,8 @@ function renderJobs(data = {}) {
     jobsStatusCardsEl.innerHTML = `
       <div class="settings-status-card">
         <p class="settings-status-title">Catalogue Lookups</p>
-        <p class="settings-status-main">${formatNum(catalogue.total || 0)} checked</p>
-        <p class="settings-status-detail">${formatNum(catalogue.found || 0)} found · ${formatNum(catalogue.not_found || 0)} not found · ${formatNum(catalogue.skipped || 0)} skipped</p>
+        <p class="settings-status-main">${formatNum(catalogue.pending || 0)} pending</p>
+        <p class="settings-status-detail">${formatNum(catalogue.total || 0)} checked · ${formatNum(catalogue.found || 0)} found · ${formatNum(catalogue.not_found || 0)} not found · ${formatNum(catalogue.skipped || 0)} skipped</p>
       </div>
       <div class="settings-status-card">
         <p class="settings-status-title">BERTopic</p>
@@ -1090,8 +1094,12 @@ async function handlePreviewCatalogueLookups() {
       return;
     }
     const previews = data.previews || [];
+    const previewLabel = data.previewTotal && data.previewTotal < data.total
+      ? `Showing ${formatNum(data.previewTotal)} preview${data.previewTotal === 1 ? '' : 's'}.`
+      : '';
     catalogueLookupPreviewEl.innerHTML = `
       <p class="settings-status-main">${formatNum(data.total || 0)} pending citation${data.total === 1 ? '' : 's'}</p>
+      ${previewLabel ? `<p class="meta">${escapeHtml(previewLabel)}</p>` : ''}
       ${previews.slice(0, 5).map((item) => `<p class="meta">${escapeHtml(item.queryAuthor || 'Unknown author')} · ${escapeHtml(item.queryTitle || item.citationText || '')}</p>`).join('')}
     `;
   } catch {

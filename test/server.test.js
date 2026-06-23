@@ -309,6 +309,7 @@ test('admin jobs endpoint exposes operational status and catalogue preview', asy
     assert.ok(Array.isArray(jobs.body.jobs));
     assert.ok(Array.isArray(jobs.body.syncRuns));
     assert.ok(jobs.body.catalogueStats);
+    assert.equal(typeof jobs.body.catalogueStats.pending, 'number');
     assert.ok(jobs.body.topicStatus);
 
     const preview = await request(app)
@@ -321,6 +322,8 @@ test('admin jobs endpoint exposes operational status and catalogue preview', asy
 
     assert.equal(preview.body.ok, true);
     assert.equal(preview.body.dryRun, true);
+    assert.equal(typeof preview.body.total, 'number');
+    assert.equal(typeof preview.body.previewTotal, 'number');
     assert.ok(Array.isArray(preview.body.previews));
   } finally {
     destroySession(token);

@@ -943,6 +943,7 @@ const ACK_HEADING_RE = /(?:^|\n|\f)(ACKNOWLEDGEMENTS?|Acknowledgements?|ACKNOWLE
 const DR_CAP = '((?:[A-Z\\u00C0-\\u024F]\\S*\\s*){1,4})';
 // Title prefix: Dr. or Prof/Professor (period optional for Prof/Professor)
 const TITLE_RE = '(?:Dr\\.|Prof(?:essor)?\\.?)';
+const BARE_NAME = '[A-Z\\u00C0-\\u024F][a-zA-Z\\u00C0-\\u024F]+(?:\\s+[A-Z\\u00C0-\\u024F][a-zA-Z\\u00C0-\\u024F]+){1,2}';
 
 // --- Acknowledgement extraction patterns (constructed once at module scope) ---
 const PAT_PLURAL_SUPERVISORS = new RegExp(
@@ -962,6 +963,12 @@ const PAT_CO_ADVISOR_PREFIX = new RegExp(
 const PAT_AS_SUPERVISOR = new RegExp(
   `${TITLE_RE}\\s+${DR_CAP}[^.]{0,150}as\\s+(?:my\\s+)?(?:(co-?))?supervisor`, 'gi');
 const PAT_TITLED_NAME = new RegExp(`${TITLE_RE}\\s+${DR_CAP}`, 'g');
+const PAT_BARE_SUPERVISORS_SUFFIX = new RegExp(
+  `(${BARE_NAME})\\s+and\\s+(${BARE_NAME}),\\s+(?:[Mm]y\\s+)?(?:[Rr]esearch\\s+)?co-?[Ss]upervisors?\\b`, 'g');
+const PAT_BARE_COMMITTEE_MEMBER_SUFFIX = new RegExp(
+  `(${BARE_NAME})\\s+was\\s+the\\s+(?:third|final|other|remaining)\\s+member\\s+of\\s+my\\s+thesis\\s+committee\\b`, 'g');
+const PAT_DRS_ADVISORY_COMMITTEE = new RegExp(
+  `(?:Advisory|Supervisory|Thesis)\\s+Committee\\s*[-:–—]\\s*Drs?\\.\\s+(${BARE_NAME}(?:,\\s*${BARE_NAME})*(?:,?\\s+and\\s+${BARE_NAME})?)`, 'g');
 
 export function parseAcknowledgements(fullText) {
   if (!fullText) return [];
@@ -1002,6 +1009,12 @@ export function parseAcknowledgements(fullText) {
     if (seen.has(key)) return;
     seen.add(key);
     members.push({ name, role, affiliation: null });
+  }
+
+  function addBareNamesFromList(listText, role) {
+    for (const nm of String(listText || '').matchAll(new RegExp(BARE_NAME, 'g'))) {
+      addMember(nm[0], role);
+    }
   }
 
   // --- Supervisor patterns ---
@@ -1050,6 +1063,12 @@ export function parseAcknowledgements(fullText) {
     addMember(pm[1], pm[2] ? 'Co-Supervisor' : 'Supervisor');
   }
 
+  // "Don Fisher and Kjell Rubenson, my research cosupervisors"
+  for (const pm of section.matchAll(PAT_BARE_SUPERVISORS_SUFFIX)) {
+    addMember(pm[1], 'Co-Supervisor');
+    addMember(pm[2], 'Co-Supervisor');
+  }
+
   // --- Committee member patterns ---
   // Text around each "committee members" / "my committee" occurrence — scan 400 chars forward for titled names.
   // (A character-class exclusion on '.' would incorrectly stop at the '.' in "Dr.".)
@@ -1063,22 +1082,24 @@ export function parseAcknowledgements(fullText) {
     }
   }
 
+  // "Peter Jones was the third member of my thesis committee."
+  for (const cm of section.matchAll(PAT_BARE_COMMITTEE_MEMBER_SUFFIX)) {
+    addMember(cm[1], 'Supervisory Committee Member');
+  }
+
+  // "Advisory Committee - Drs. Tom Sork, Shauna Butterwick, and Jim Frankish - ..."
+  for (const cm of section.matchAll(PAT_DRS_ADVISORY_COMMITTEE)) {
+    addBareNamesFromList(cm[1], 'Supervisory Committee Member');
+  }
+
   // Bare committee list: "committee consisting of Name1, Name2 and Name3"
   // Used when no title prefix (Dr./Prof.) is present, e.g. "my research committee
   // consisting of Tom Sork, Pierre Walter and Robert VanWynsberghe".
   // Extracts sequences of 2–3 consecutive capitalised words as names.
-  const BARE_NAME = '[A-Z\\u00C0-\\u024F][a-zA-Z\\u00C0-\\u024F]+(?:\\s+[A-Z\\u00C0-\\u024F][a-zA-Z\\u00C0-\\u024F]+){1,2}';
   for (const cm of section.matchAll(
     new RegExp(`[Cc]ommittee\\s+(?:[Cc]onsisting|[Cc]omprised)\\s+of\\s+(${BARE_NAME}(?:,\\s*${BARE_NAME})*(?:\\s+and\\s+${BARE_NAME})?)`, 'g')
   )) {
-    const listText = cm[1];
-    for (const nm of listText.matchAll(new RegExp(BARE_NAME, 'g'))) {
-      const name = nm[0].trim();
-      if (!seen.has(`${name}|Supervisor`) && !seen.has(`${name}|Co-Supervisor`) &&
-          !seen.has(`${name}|Supervisory Committee Member`)) {
-        addMember(name, 'Supervisory Committee Member');
-      }
-    }
+    addBareNamesFromList(cm[1], 'Supervisory Committee Member');
   }
 
   return members;

@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import {
-  createAdminJob, getCatalogueLookupStats, getTopicBuildStatus,
+  countPendingLookups, createAdminJob, getCatalogueLookupStats, getTopicBuildStatus,
   hasRunningAdminJob, listAdminJobs, listPendingLookups, listRecentSyncRuns
 } from '../db.js';
 import { extractSearchTerms } from '../catalogue.js';
@@ -45,11 +45,15 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
     const dryRun = parseBooleanParam(req.body?.dryRun ?? getQueryValue(req, 'dryRun'), false);
 
     if (dryRun) {
-      const pending = await listPendingLookups(limit);
+      const [pending, totalPending] = await Promise.all([
+        listPendingLookups(limit),
+        countPendingLookups(),
+      ]);
       res.status(200).json({
         ok: true,
         dryRun: true,
-        total: pending.length,
+        total: totalPending,
+        previewTotal: pending.length,
         previews: pending.map((row) => ({
           citationId: row.id,
           citationText: row.citation_text,

@@ -235,6 +235,29 @@ Without their constant feedback and encouragement, this thesis would not have be
   assert.ok(res4.some((m) => m.name === 'Tom Sork' && m.role === 'Supervisory Committee Member'));
   assert.ok(res4.some((m) => m.name === 'Pierre Walter' && m.role === 'Supervisory Committee Member'));
   assert.ok(res4.some((m) => m.name === 'Robert VanWynsberghe' && m.role === 'Supervisory Committee Member'));
+
+  // Test case 5: Older UBC acknowledgement prose with bare names before roles
+  const ackText5 = `ACKNOWLEDGEMENTS
+First, I want to recognize Don Fisher and Kjell Rubenson, my research cosupervisors,
+for their many efforts. Peter Jones was the third member of my thesis committee.
+They provided invaluable support throughout my entire doctoral journey.
+Without their constant feedback and encouragement, this thesis would not have been possible.`;
+
+  const res5 = parseAcknowledgements(ackText5);
+  assert.ok(res5.some((m) => m.name === 'Don Fisher' && m.role === 'Co-Supervisor'));
+  assert.ok(res5.some((m) => m.name === 'Kjell Rubenson' && m.role === 'Co-Supervisor'));
+  assert.ok(res5.some((m) => m.name === 'Peter Jones' && m.role === 'Supervisory Committee Member'));
+
+  // Test case 6: Advisory Committee heading with plural "Drs."
+  const ackText6 = `ACKNOWLEDGEMENTS
+I am indebted to my Advisory Committee - Drs. Tom Sork, Shauna Butterwick, and Jim Frankish -
+for their unfaltering support and care, their respect for my practice-based knowledge and experience,
+and their ongoing efforts to challenge my thinking and strengthen this work.`;
+
+  const res6 = parseAcknowledgements(ackText6);
+  assert.ok(res6.some((m) => m.name === 'Tom Sork' && m.role === 'Supervisory Committee Member'));
+  assert.ok(res6.some((m) => m.name === 'Shauna Butterwick' && m.role === 'Supervisory Committee Member'));
+  assert.ok(res6.some((m) => m.name === 'Jim Frankish' && m.role === 'Supervisory Committee Member'));
 });
 
 test('parseCommittee parses different layout structures from exam cert pages', () => {

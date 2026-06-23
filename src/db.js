@@ -1556,7 +1556,7 @@ export async function getCitationForSummon(citationId) {
 }
 
 export async function getCatalogueLookupStats() {
-  return get(`
+  const row = await get(`
     SELECT
       COUNT(*) AS total,
       SUM(CASE WHEN hits > 0 THEN 1 ELSE 0 END) AS found,
@@ -1564,6 +1564,13 @@ export async function getCatalogueLookupStats() {
       SUM(CASE WHEN hits IS NULL THEN 1 ELSE 0 END) AS skipped
     FROM catalogue_lookups
   `);
+  return {
+    total: Number(row?.total || 0),
+    found: Number(row?.found || 0),
+    not_found: Number(row?.not_found || 0),
+    skipped: Number(row?.skipped || 0),
+    pending: await countPendingLookups(),
+  };
 }
 
 export async function getTopicBuildStatus() {
@@ -1589,6 +1596,17 @@ export async function listPendingLookups(limit = 100) {
        OR (cl.hits IS NULL AND cl.query_title IS NOT NULL)
     LIMIT ?
   `, [limit]);
+}
+
+export async function countPendingLookups() {
+  const row = await get(`
+    SELECT COUNT(*) AS total
+    FROM citations c
+    LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
+    WHERE cl.citation_id IS NULL
+       OR (cl.hits IS NULL AND cl.query_title IS NOT NULL)
+  `);
+  return Number(row?.total || 0);
 }
 
 export async function getCitationCooccurrence(limit = 100) {
