@@ -46,6 +46,7 @@ export const BERTOPIC_PYTHON_COMMAND = process.env.BERTOPIC_PYTHON_COMMAND || 'p
 export const BERTOPIC_TIMEOUT_MS = Number(process.env.BERTOPIC_TIMEOUT_MS || 60 * 60 * 1000);
 export const ADMIN_WORKER_TIMEOUT_MS = Number(process.env.ADMIN_WORKER_TIMEOUT_MS || 6 * 60 * 60 * 1000);
 export const ADMIN_WORKER_GRACE_MS = Number(process.env.ADMIN_WORKER_GRACE_MS || 30_000);
+export const IMPORT_PDF_BATCH_SIZE = Number(process.env.IMPORT_PDF_BATCH_SIZE || 50);
 export const ADMIN_WORKER_MODE = process.env.ADMIN_WORKER_MODE || 'auto';
 export const WORKER_IMAGE = process.env.WORKER_IMAGE || process.env.FLY_IMAGE_REF || '';
 export const WORKER_ARTIFACT_BASE_URL = process.env.WORKER_ARTIFACT_BASE_URL || '';

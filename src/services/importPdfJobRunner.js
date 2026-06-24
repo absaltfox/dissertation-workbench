@@ -7,6 +7,7 @@ import {
 } from '../pdf.js';
 import { getConfiguredApiKey } from '../secrets.js';
 import { importRuleToSyncOptions } from '../importRules.js';
+import { IMPORT_PDF_BATCH_SIZE } from '../config.js';
 
 async function log(jobId, message) {
   await appendAdminJobLog(jobId, `[${new Date().toISOString()}] ${message}\n`);
@@ -41,6 +42,64 @@ function createProgressReporter(jobId) {
       counts: event.counts || null,
     });
   };
+}
+
+function readPdfBatchSize(params = {}) {
+  const value = Number(params.pdfBatchSize || IMPORT_PDF_BATCH_SIZE || 0);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+
+function readDocIdList(value) {
+  return Array.isArray(value)
+    ? value.map((id) => String(id || '').trim()).filter(Boolean)
+    : [];
+}
+
+async function startContinuationJob(job, result, progress) {
+  const params = job.params || {};
+  if (params.mode !== 'sync_missing_pdfs') return null;
+  if (!params.autoContinuePdfBatches) return null;
+  if (!result.ok || !result.pdfBatchLimitReached || Number(result.totalSaved || 0) <= 0) return null;
+
+  const nextParams = {
+    ...params,
+    continuationOf: params.continuationOf || job.id,
+    previousJobId: job.id,
+    skipPdfDocIds: result.pdfAttemptedIds || [],
+  };
+  await progress?.({
+    phase: 'continuation',
+    label: 'Scheduling next PDF batch',
+    status: 'running',
+    counts: { saved: result.totalSaved || 0 },
+  });
+
+  try {
+    const { createAndStartAdminWorkerJob } = await import('./adminWorker.js');
+    const next = await createAndStartAdminWorkerJob({
+      type: 'import_rules_sync',
+      label: 'Import Rules Sync (PDF batch)',
+      params: nextParams,
+    });
+    await log(job.id, `Scheduled next PDF batch as job ${next.jobId}.`);
+    await progress?.({
+      phase: 'continuation',
+      label: 'Scheduled next PDF batch',
+      status: 'completed',
+      detail: `Job ${next.jobId}`,
+    });
+    return next;
+  } catch (error) {
+    const message = error?.message || String(error);
+    await log(job.id, `Could not schedule next PDF batch: ${message}`);
+    await progress?.({
+      phase: 'continuation',
+      label: 'Next PDF batch was not scheduled',
+      status: 'failed',
+      detail: message,
+    });
+    return { error: message };
+  }
 }
 
 async function analyzePdfEntry(entry, artifactClient, {
@@ -182,8 +241,18 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     await progress({ phase: 'import_rules', label: 'Running import rules', status: 'running' });
     const apiKey = await getConfiguredApiKey();
     const perRule = [];
+    const pdfBatchSize = readPdfBatchSize(params);
+    const attemptedPdfIds = new Set(readDocIdList(params.skipPdfDocIds));
     const totals = { rulesStarted: 0, totalSeen: 0, totalSaved: 0, totalSkipped: 0 };
+    let pdfBatchLimitReached = false;
     for (const rule of rules) {
+      const remainingPdfBatchSize = params.mode === 'sync_missing_pdfs' && pdfBatchSize
+        ? Math.max(0, pdfBatchSize - totals.totalSaved)
+        : 0;
+      if (params.mode === 'sync_missing_pdfs' && pdfBatchSize && remainingPdfBatchSize <= 0) {
+        pdfBatchLimitReached = true;
+        break;
+      }
       await log(job.id, `Syncing rule "${rule.name}" (${rule.id}).`);
       await progress({
         phase: 'import_rules',
@@ -199,11 +268,19 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
           apiKey,
         }),
         artifactClient,
+        onProgress: async (event = {}) => progress({
+          ...event,
+          detail: event.detail || `Syncing ${rule.name}`,
+        }),
+        pdfBatchSize: params.mode === 'sync_missing_pdfs' ? remainingPdfBatchSize : 0,
+        skipPdfDocIds: Array.from(attemptedPdfIds),
       });
       totals.rulesStarted += 1;
       totals.totalSeen += Number(result.totalSeen || 0);
       totals.totalSaved += Number(result.totalSaved || 0);
       totals.totalSkipped += Number(result.totalSkipped || 0);
+      for (const docId of readDocIdList(result.pdfAttemptedIds)) attemptedPdfIds.add(docId);
+      if (result.pdfBatchLimitReached) pdfBatchLimitReached = true;
       perRule.push({
         ruleId: rule.id,
         ruleName: rule.name,
@@ -213,11 +290,29 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         totalSaved: result.totalSaved || 0,
         totalSkipped: result.totalSkipped || 0,
         apiTotal: result.apiTotal ?? null,
+        pdfBatchLimitReached: Boolean(result.pdfBatchLimitReached),
+        pdfAttempted: Array.isArray(result.pdfAttemptedIds) ? result.pdfAttemptedIds.length : 0,
         error: result.error || null,
       });
       await log(job.id, `Rule result: ${result.ok ? 'success' : 'failed'}; ${result.totalSaved || 0} saved.`);
+      if (params.mode === 'sync_missing_pdfs' && pdfBatchSize && totals.totalSaved >= pdfBatchSize) {
+        pdfBatchLimitReached = true;
+        break;
+      }
     }
-    const result = { ok: perRule.every((item) => item.ok), mode: params.mode, scope: params.scope, ...totals, rules: perRule };
+    const result = {
+      ok: perRule.every((item) => item.ok),
+      mode: params.mode,
+      scope: params.scope,
+      pdfBatchSize: params.mode === 'sync_missing_pdfs' ? pdfBatchSize : null,
+      pdfBatchLimitReached,
+      pdfAttemptedIds: Array.from(attemptedPdfIds),
+      ...totals,
+      rules: perRule,
+    };
+    const continuation = await startContinuationJob(job, result, progress);
+    if (continuation?.jobId) result.nextJobId = continuation.jobId;
+    if (continuation?.error) result.continuationError = continuation.error;
     clearMetricsCache?.();
     await finishAdminJob(job.id, {
       status: result.ok ? 'completed' : 'failed',

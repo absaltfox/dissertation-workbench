@@ -327,6 +327,7 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_citations_citation_id ON document_citations(citation_id)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_citations_citation_doc ON document_citations(citation_id, doc_id)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_catalogue_lookups_hits_query_title ON catalogue_lookups(hits, query_title)');
 
   const cleaned = await cleanupCommitteeArtifacts(client);
   if (cleaned > 0) logger.info(`Cleaned up ${cleaned} committee artefact rows`);
@@ -1558,18 +1559,27 @@ export async function getCitationForSummon(citationId) {
 export async function getCatalogueLookupStats() {
   const row = await get(`
     SELECT
-      COUNT(*) AS total,
-      SUM(CASE WHEN hits > 0 THEN 1 ELSE 0 END) AS found,
-      SUM(CASE WHEN hits = 0 THEN 1 ELSE 0 END) AS not_found,
-      SUM(CASE WHEN hits IS NULL THEN 1 ELSE 0 END) AS skipped
-    FROM catalogue_lookups
+      (SELECT COUNT(*) FROM catalogue_lookups) AS total,
+      (SELECT COUNT(*) FROM catalogue_lookups WHERE hits > 0) AS found,
+      (SELECT COUNT(*) FROM catalogue_lookups WHERE hits = 0) AS not_found,
+      (SELECT COUNT(*) FROM catalogue_lookups WHERE hits IS NULL) AS skipped,
+      (
+        (SELECT COUNT(*) FROM citations)
+        - (SELECT COUNT(*) FROM catalogue_lookups)
+        + (
+          SELECT COUNT(*)
+          FROM catalogue_lookups
+          WHERE hits IS NULL
+            AND query_title IS NOT NULL
+        )
+      ) AS pending
   `);
   return {
     total: Number(row?.total || 0),
     found: Number(row?.found || 0),
     not_found: Number(row?.not_found || 0),
     skipped: Number(row?.skipped || 0),
-    pending: await countPendingLookups(),
+    pending: Number(row?.pending || 0),
   };
 }
 
@@ -1590,21 +1600,36 @@ export async function getTopicBuildStatus() {
 export async function listPendingLookups(limit = 100) {
   return all(`
     SELECT c.id, c.citation_text, c.author, c.title, c.year, c.source
-    FROM citations c
-    LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
-    WHERE cl.citation_id IS NULL
-       OR (cl.hits IS NULL AND cl.query_title IS NOT NULL)
+    FROM (
+      SELECT c.id, c.citation_text, c.author, c.title, c.year, c.source
+      FROM catalogue_lookups cl
+      JOIN citations c ON c.id = cl.citation_id
+      WHERE cl.hits IS NULL
+        AND cl.query_title IS NOT NULL
+      UNION ALL
+      SELECT c.id, c.citation_text, c.author, c.title, c.year, c.source
+      FROM citations c
+      WHERE NOT EXISTS (
+        SELECT 1 FROM catalogue_lookups cl WHERE cl.citation_id = c.id
+      )
+    ) c
     LIMIT ?
   `, [limit]);
 }
 
 export async function countPendingLookups() {
   const row = await get(`
-    SELECT COUNT(*) AS total
-    FROM citations c
-    LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
-    WHERE cl.citation_id IS NULL
-       OR (cl.hits IS NULL AND cl.query_title IS NOT NULL)
+    SELECT
+      (
+        (SELECT COUNT(*) FROM citations)
+        - (SELECT COUNT(*) FROM catalogue_lookups)
+        + (
+          SELECT COUNT(*)
+          FROM catalogue_lookups
+          WHERE hits IS NULL
+            AND query_title IS NOT NULL
+        )
+      ) AS total
   `);
   return Number(row?.total || 0);
 }

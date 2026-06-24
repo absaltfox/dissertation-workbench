@@ -4,7 +4,7 @@ import {
   saveImportRule, hasRunningAdminJob
 } from '../db.js';
 import { createAndStartAdminWorkerJob } from '../services/adminWorker.js';
-import { DEFAULT_BASE_URL, DEFAULT_SOURCE, DEFAULT_TERM } from '../config.js';
+import { DEFAULT_BASE_URL, DEFAULT_SOURCE, DEFAULT_TERM, IMPORT_PDF_BATCH_SIZE } from '../config.js';
 import { fetchPage, extractHits, fetchSearchAggregations, resolveIndexName } from '../api.js';
 import { normalizeRecord } from '../metrics.js';
 import { getConfiguredApiKey } from '../secrets.js';
@@ -260,7 +260,14 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
     const result = await createAndStartAdminWorkerJob({
       type: 'import_rules_sync',
       label: 'Import Rules Sync',
-      params: { mode, scope, ruleIds: selectedIds, downloadFiles: parseBooleanParam(body.downloadFiles, true) },
+      params: {
+        mode,
+        scope,
+        ruleIds: selectedIds,
+        downloadFiles: parseBooleanParam(body.downloadFiles, true),
+        pdfBatchSize: mode === 'sync_missing_pdfs' ? IMPORT_PDF_BATCH_SIZE : null,
+        autoContinuePdfBatches: mode === 'sync_missing_pdfs',
+      },
     });
 
     clearMetricsCache();

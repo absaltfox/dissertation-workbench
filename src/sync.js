@@ -68,18 +68,45 @@ function hasCachedEnrichmentMetric(stored) {
     );
 }
 
-async function runSync(syncKey, source, apiKey, runId, { mode = 'import_all', artifactClient = null } = {}) {
+function progressDocDetail(doc = {}) {
+  return [doc.title, doc.id].filter(Boolean).join(' · ') || 'Untitled document';
+}
+
+async function runSync(syncKey, source, apiKey, runId, {
+  mode = 'import_all',
+  artifactClient = null,
+  onProgress = null,
+  pdfBatchSize = 0,
+  skipPdfDocIds = [],
+} = {}) {
   const startedAt = Date.now();
   let totalSeen = 0;
   let totalSaved = 0;
   let totalSkipped = 0;
   let apiTotal = null;
+  let pdfBatchLimitReached = false;
+  const pdfAttemptedIds = [];
+  const skippedPdfIds = new Set(
+    (Array.isArray(skipPdfDocIds) ? skipPdfDocIds : [])
+      .map((id) => String(id || '').trim())
+      .filter(Boolean)
+  );
+  const pdfBatchLimit = mode === 'sync_missing_pdfs'
+    ? Math.max(0, Number(pdfBatchSize || 0))
+    : 0;
   try {
     const index = source.requestedIndex
       ? await resolveIndexName(source.baseUrl, source.requestedIndex, apiKey)
       : null;
 
     for (let from = 0; from < source.scanLimit; from += source.pageSize) {
+      await onProgress?.({
+        phase: 'oc_scan',
+        label: 'Scanning Open Collections records',
+        detail: `Records ${from + 1}-${from + source.pageSize}`,
+        status: 'running',
+        counts: { processed: totalSeen, total: apiTotal ?? source.maxRecords },
+      });
       const payload = await fetchPage({
         baseUrl: source.baseUrl,
         index,
@@ -111,22 +138,83 @@ async function runSync(syncKey, source, apiKey, runId, { mode = 'import_all', ar
       if (mode === 'sync_missing_pdfs') {
         const missing = [];
         for (const item of filtered.items) {
+          if (skippedPdfIds.has(String(item.doc.id))) {
+            totalSkipped += 1;
+            continue;
+          }
           const stored = await loadStoredFileMetric(item.doc.id);
           if (hasCachedEnrichmentMetric(stored)) {
             totalSkipped += 1;
             continue;
           }
+          if (pdfBatchLimit && totalSaved + missing.length >= pdfBatchLimit) {
+            pdfBatchLimitReached = true;
+            break;
+          }
           missing.push(item);
         }
+        if (pdfBatchLimit && totalSaved + missing.length >= pdfBatchLimit) {
+          pdfBatchLimitReached = true;
+        }
+        if (missing.length) {
+          await onProgress?.({
+            phase: 'pdf_batch',
+            label: 'Analyzing missing PDFs',
+            status: 'running',
+            counts: { processed: totalSaved, total: pdfBatchLimit || totalSaved + missing.length },
+          });
+        }
+        let pdfIndex = 0;
+        const savedBeforePage = totalSaved;
         for (const item of missing) {
+          pdfIndex += 1;
+          const docCounts = {
+            processed: savedBeforePage + pdfIndex,
+            total: pdfBatchLimit || savedBeforePage + missing.length,
+          };
+          await onProgress?.({
+            phase: 'pdf_document',
+            label: 'Parsing PDF document data',
+            detail: progressDocDetail(item.doc),
+            status: 'running',
+            counts: docCounts,
+          });
           await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
+          pdfAttemptedIds.push(item.doc.id);
           await analyzeDocumentFile(item.doc, {
             downloadFiles: source.downloadFiles,
             forceDownload: false,
             recomputeFromCache: false,
             artifactClient,
+            onProgress: async (event = {}) => onProgress?.({
+              ...event,
+              detail: event.detail || progressDocDetail(item.doc),
+              counts: { ...docCounts, ...(event.counts || {}) },
+            }),
           });
           await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
+          await onProgress?.({
+            phase: 'pdf_document',
+            label: 'Parsed PDF document data',
+            detail: progressDocDetail(item.doc),
+            status: 'completed',
+            counts: {
+              ...docCounts,
+              pages: item.doc.pages || 0,
+              words: item.doc.wordCount || 0,
+            },
+          });
+        }
+        if (missing.length) {
+          await onProgress?.({
+            phase: 'pdf_batch',
+            label: 'Missing PDF batch',
+            status: 'completed',
+            counts: {
+              processed: savedBeforePage + missing.length,
+              total: pdfBatchLimit || savedBeforePage + missing.length,
+            },
+          });
         }
         totalSaved += missing.length;
       } else {
@@ -136,6 +224,7 @@ async function runSync(syncKey, source, apiKey, runId, { mode = 'import_all', ar
 
       if (totalSeen >= source.maxRecords) break;
       if (apiTotal !== null && totalSeen >= Math.min(apiTotal, source.maxRecords)) break;
+      if (pdfBatchLimitReached) break;
     }
 
     await updateSyncRun(runId, {
@@ -151,9 +240,12 @@ async function runSync(syncKey, source, apiKey, runId, { mode = 'import_all', ar
       totalSeen,
       totalSaved,
       totalSkipped,
+      pdfBatchSize: pdfBatchLimit || null,
+      pdfBatchLimitReached,
+      pdfAttempted: pdfAttemptedIds.length,
       seconds: Math.round((Date.now() - startedAt) / 1000),
     });
-    return { ok: true, totalSeen, totalSaved, totalSkipped, apiTotal };
+    return { ok: true, totalSeen, totalSaved, totalSkipped, apiTotal, pdfBatchLimitReached, pdfAttemptedIds };
   } catch (error) {
     await updateSyncRun(runId, {
       status: 'failed',
@@ -164,7 +256,16 @@ async function runSync(syncKey, source, apiKey, runId, { mode = 'import_all', ar
       finishedAt: new Date().toISOString(),
     });
     logger.error('Open Collections sync failed', { syncKey, error: error?.message || String(error) });
-    return { ok: false, totalSeen, totalSaved, totalSkipped, apiTotal, error: error?.message || String(error) };
+    return {
+      ok: false,
+      totalSeen,
+      totalSaved,
+      totalSkipped,
+      apiTotal,
+      pdfBatchLimitReached,
+      pdfAttemptedIds,
+      error: error?.message || String(error),
+    };
   } finally {
     runningSyncs.delete(syncKey);
   }
@@ -182,7 +283,13 @@ export async function startDocumentSync(options = {}) {
     return { started: false, alreadyRunning: true, syncKey, status: await getDocumentSyncStatus(syncKey) };
   }
   const runId = await createSyncRun(syncKey, source);
-  const task = runSync(syncKey, source, built.apiKey, runId, { mode, artifactClient: options.artifactClient || null });
+  const task = runSync(syncKey, source, built.apiKey, runId, {
+    mode,
+    artifactClient: options.artifactClient || null,
+    onProgress: options.onProgress || null,
+    pdfBatchSize: options.pdfBatchSize || 0,
+    skipPdfDocIds: options.skipPdfDocIds || [],
+  });
   runningSyncs.set(syncKey, task);
   return { started: true, syncKey, runId, status: await getDocumentSyncStatus(syncKey) };
 }
@@ -196,7 +303,13 @@ export async function runDocumentSync(options = {}) {
   });
   const syncKey = buildDocumentSyncKey(source);
   const runId = await createSyncRun(syncKey, source);
-  const summary = await runSync(syncKey, source, built.apiKey, runId, { mode, artifactClient: options.artifactClient || null });
+  const summary = await runSync(syncKey, source, built.apiKey, runId, {
+    mode,
+    artifactClient: options.artifactClient || null,
+    onProgress: options.onProgress || null,
+    pdfBatchSize: options.pdfBatchSize || 0,
+    skipPdfDocIds: options.skipPdfDocIds || [],
+  });
   return { syncKey, runId, mode, ...summary, status: await getDocumentSyncStatus(syncKey) };
 }
 
