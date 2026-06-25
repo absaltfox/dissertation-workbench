@@ -1324,12 +1324,89 @@ export async function loadCommitteeMembers(docId) {
 
 // --- Citation functions ---
 
+function citationMatchYear(value) {
+  const text = String(value || '').trim();
+  const match = text.match(/\b(1[89]\d{2}|20[0-2]\d)\b/);
+  return match ? Number(match[0]) : null;
+}
+
+function citationTextPrefix(value) {
+  const prefix = String(value || '').trim().toLowerCase().slice(0, 3);
+  return prefix.length === 3 ? prefix : null;
+}
+
+function prepareCitationForMatching(row) {
+  return {
+    ...row,
+    matchText: String(row.citation_text || '').toLowerCase(),
+    matchYear: citationMatchYear(row.year),
+    matchPrefix: citationTextPrefix(row.citation_text),
+  };
+}
+
+function pushBucket(map, key, row) {
+  if (key == null) return;
+  const existing = map.get(key);
+  if (existing) {
+    existing.push(row);
+  } else {
+    map.set(key, [row]);
+  }
+}
+
+function buildCitationMatchIndex(rows) {
+  const index = {
+    all: rows,
+    byHash: new Map(rows.map((row) => [row.citation_hash, row])),
+    byYear: new Map(),
+    withoutYear: [],
+    byPrefix: new Map(),
+  };
+  for (const row of rows) {
+    if (row.matchYear == null) {
+      index.withoutYear.push(row);
+    } else {
+      pushBucket(index.byYear, row.matchYear, row);
+    }
+    pushBucket(index.byPrefix, row.matchPrefix, row);
+  }
+  return index;
+}
+
+function addCitationToMatchIndex(index, row) {
+  index.all.push(row);
+  index.byHash.set(row.citation_hash, row);
+  if (row.matchYear == null) {
+    index.withoutYear.push(row);
+  } else {
+    pushBucket(index.byYear, row.matchYear, row);
+  }
+  pushBucket(index.byPrefix, row.matchPrefix, row);
+}
+
+function fuzzyMatchCandidates(index, text, itemYear) {
+  const year = citationMatchYear(itemYear) ?? citationMatchYear(text);
+  if (year != null) {
+    const candidates = [...index.withoutYear];
+    for (let candidateYear = year - 1; candidateYear <= year + 1; candidateYear += 1) {
+      candidates.push(...(index.byYear.get(candidateYear) || []));
+    }
+    return candidates.length ? candidates : index.all;
+  }
+
+  const prefix = citationTextPrefix(text);
+  if (!prefix) return index.all;
+  const candidates = index.byPrefix.get(prefix) || [];
+  return candidates.length ? candidates : index.all;
+}
+
 export async function saveCitations(docId, citations, hashFn, { onProgress = null } = {}) {
   const now = new Date().toISOString();
   
-  // Fetch existing citations to do quick exact matching and fuzzy matching in memory
-  const existingCitations = await all('SELECT id, citation_hash, citation_text, author, title, year FROM citations');
-  const hashMap = new Map(existingCitations.map(row => [row.citation_hash, row]));
+  // Fetch once, then bucket in memory so fuzzy matching avoids scanning every citation.
+  const existingCitations = (await all('SELECT id, citation_hash, citation_text, author, title, year FROM citations'))
+    .map(prepareCitationForMatching);
+  const matchIndex = buildCitationMatchIndex(existingCitations);
   const counts = {
     processed: 0,
     total: citations.length,
@@ -1353,42 +1430,24 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
     let matchedBy = null;
 
     // 1. Exact match check
-    if (hashMap.has(hash)) {
-      matchedId = hashMap.get(hash).id;
+    if (matchIndex.byHash.has(hash)) {
+      matchedId = matchIndex.byHash.get(hash).id;
       matchedHash = hash;
       matchedBy = 'exact';
     } else {
       // 2. Fuzzy match check
-      const itemYear = (typeof item === 'string' ? null : item.year) || (() => {
-        const m = text.match(/\b(1[89]\d{2}|20[0-2]\d)\b/);
-        return m ? m[0] : null;
-      })();
-
-      let candidates = existingCitations;
-      if (itemYear) {
-        // Filter candidates within +/- 1 year
-        candidates = existingCitations.filter(c => {
-          if (!c.year) return true;
-          const cy = Number(c.year);
-          const iy = Number(itemYear);
-          return Math.abs(cy - iy) <= 1;
-        });
-      } else {
-        // Filter candidates sharing the first 3 letters
-        const prefix = text.trim().toLowerCase().slice(0, 3);
-        if (prefix.length === 3) {
-          candidates = existingCitations.filter(c => 
-            c.citation_text.trim().toLowerCase().startsWith(prefix)
-          );
-        }
-      }
+      const candidates = fuzzyMatchCandidates(
+        matchIndex,
+        text,
+        typeof item === 'string' ? null : item.year
+      );
 
       let bestMatch = null;
       let maxSim = 0;
-      const searchPool = candidates.length > 0 ? candidates : existingCitations;
 
-      for (const candidate of searchPool) {
-        const sim = jaroWinkler(text.toLowerCase(), candidate.citation_text.toLowerCase());
+      const incomingMatchText = text.toLowerCase();
+      for (const candidate of candidates) {
+        const sim = jaroWinkler(incomingMatchText, candidate.matchText);
         if (sim > maxSim) {
           maxSim = sim;
           bestMatch = candidate;
@@ -1435,8 +1494,7 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
       ]);
       const row = await get('SELECT id, citation_hash, citation_text, author, title, year FROM citations WHERE citation_hash = ?', [hash]);
       if (row) {
-        existingCitations.push(row);
-        hashMap.set(hash, row);
+        addCitationToMatchIndex(matchIndex, prepareCitationForMatching(row));
         await run(`
           INSERT INTO document_citations (doc_id, citation_id, updated_at)
           VALUES (?, ?, ?)
