@@ -1386,15 +1386,18 @@ function addCitationToMatchIndex(index, row) {
 
 function fuzzyMatchCandidates(index, text, itemYear) {
   const year = citationMatchYear(itemYear) ?? citationMatchYear(text);
+  const prefix = citationTextPrefix(text);
   if (year != null) {
-    const candidates = [...index.withoutYear];
+    const candidates = [];
     for (let candidateYear = year - 1; candidateYear <= year + 1; candidateYear += 1) {
       candidates.push(...(index.byYear.get(candidateYear) || []));
+    }
+    if (prefix) {
+      candidates.push(...(index.byPrefix.get(prefix) || []).filter((row) => row.matchYear == null));
     }
     return candidates.length ? candidates : index.all;
   }
 
-  const prefix = citationTextPrefix(text);
   if (!prefix) return index.all;
   const candidates = index.byPrefix.get(prefix) || [];
   return candidates.length ? candidates : index.all;
