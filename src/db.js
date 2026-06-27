@@ -283,6 +283,12 @@ async function ensureSchema(client) {
       linkage_json    TEXT NOT NULL,
       created_at      TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS document_embeddings (
+      doc_id      TEXT PRIMARY KEY,
+      embedding   TEXT NOT NULL,
+      created_at  TEXT NOT NULL
+    );
   `);
 
   await tryExec(client, 'ALTER TABLE catalogue_lookups ADD COLUMN bib_id TEXT');
@@ -1837,4 +1843,39 @@ export async function logCacheStats() {
     oldest: stats.oldest,
     newest: stats.newest,
   });
+}
+
+export async function loadStoredEmbeddings(docIds) {
+  let rows;
+  if (Array.isArray(docIds) && docIds.length > 0) {
+    const chunkSize = 999;
+    rows = [];
+    for (let i = 0; i < docIds.length; i += chunkSize) {
+      const chunk = docIds.slice(i, i + chunkSize);
+      const placeholders = chunk.map(() => '?').join(', ');
+      const chunkRows = await all(`
+        SELECT doc_id, embedding
+        FROM document_embeddings
+        WHERE doc_id IN (${placeholders})
+      `, chunk);
+      rows.push(...chunkRows);
+    }
+  } else {
+    rows = await all('SELECT doc_id, embedding FROM document_embeddings');
+  }
+  const map = new Map();
+  for (const row of rows) {
+    map.set(row.doc_id, JSON.parse(row.embedding));
+  }
+  return map;
+}
+
+export async function saveStoredEmbeddings(embeddingsList) {
+  const now = new Date().toISOString();
+  for (const item of embeddingsList) {
+    await run(`
+      INSERT OR REPLACE INTO document_embeddings (doc_id, embedding, created_at)
+      VALUES (?, ?, ?)
+    `, [item.docId, JSON.stringify(item.embedding), now]);
+  }
 }

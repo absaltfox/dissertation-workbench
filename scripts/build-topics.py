@@ -9,8 +9,21 @@ Usage:
     python scripts/build-topics.py
 """
 
-import json
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["TORCH_NUM_THREADS"] = "1"
+
+try:
+    import torch
+    torch.set_num_threads(1)
+except ImportError:
+    pass
+
+import json
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -100,13 +113,18 @@ def get_db_client(db_path):
         return SqliteClientWrapper(db_path)
 
 
-def generate_claude_labels(topic_model, abstracts, topic_assignments):
-    """Use Claude to generate human-readable topic labels."""
+def generate_labels(topic_model, abstracts, topic_assignments):
+    """Generate human-readable topic labels using Claude (if API key set) or a local Qwen model."""
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
-        print("\nNo ANTHROPIC_API_KEY set — skipping Claude label generation, using default BERTopic labels")
-        return {}
+    if api_key:
+        labels = generate_claude_labels(topic_model, abstracts, topic_assignments, api_key)
+        if labels and len(labels) > 1:
+            return labels
+    return generate_local_labels(topic_model, abstracts, topic_assignments)
 
+
+def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key):
+    """Use Claude to generate human-readable topic labels."""
     try:
         import anthropic
     except ImportError:
@@ -175,8 +193,91 @@ def generate_claude_labels(topic_model, abstracts, topic_assignments):
         print(f"  Generated {len(parsed)} labels successfully")
     except Exception as e:
         print(f"\nWarning: Claude label generation failed: {e}", file=sys.stderr)
-        print("  Falling back to default BERTopic labels")
+        return {}
 
+    return labels
+
+
+def generate_local_labels(topic_model, abstracts, topic_assignments):
+    """Use a local tiny LLM (Qwen/Qwen2.5-0.5B-Instruct) to generate topic labels."""
+    print("\nLoading local label generation model: Qwen/Qwen2.5-0.5B-Instruct...")
+    try:
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        import torch
+        
+        model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+        
+        # Enforce single-threaded CPU execution for inference
+        torch.set_num_threads(1)
+    except Exception as e:
+        print(f"Failed to load local transformers model: {e}")
+        return {}
+
+    topic_info = topic_model.get_topic_info()
+    labels = {}
+    labels[-1] = "Uncategorized"
+
+    print(f"Generating labels for {len(topic_info) - 1} topics locally...")
+    
+    for _, row in topic_info.iterrows():
+        topic_id = int(row["Topic"])
+        if topic_id == -1:
+            continue
+
+        # Get top terms
+        terms = topic_model.get_topic(topic_id)
+        if not terms:
+            continue
+        top_words = [t[0] for t in terms[:10]]
+
+        # Get representative abstracts (up to 3, truncated)
+        doc_indices = [i for i, t in enumerate(topic_assignments) if t == topic_id][:3]
+        sample_abstracts = [abstracts[i][:250] for i in doc_indices]
+
+        # Formulate prompt for Qwen
+        prompt = (
+            f"Keywords: {', '.join(top_words)}\n"
+            f"Sample Abstracts:\n"
+            + "\n".join(f"- {a}..." for a in sample_abstracts)
+            + "\n\nBased on the keywords and abstracts, generate a short, clean, descriptive academic topic title (3-6 words) as a noun phrase (e.g. 'Indigenous Education Policy' or 'Reading Comprehension & Assessment').\n"
+              "Respond with ONLY the title. No other text."
+        )
+
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant that labels academic research topics. Respond with ONLY the short title."},
+            {"role": "user", "content": prompt}
+        ]
+
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        model_inputs = tokenizer([text], return_tensors="pt")
+
+        generated_ids = model.generate(
+            model_inputs.input_ids,
+            max_new_tokens=15,
+            pad_token_id=tokenizer.eos_token_id,
+            do_sample=False
+        )
+        generated_ids = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
+
+        response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+        response = response.replace('"', '').replace("'", "").strip(" .")
+        
+        print(f"  Topic {topic_id} -> {response}")
+        labels[topic_id] = response
+
+    del model
+    del tokenizer
+    import gc
+    gc.collect()
+    
     return labels
 
 
@@ -232,17 +333,70 @@ def main():
         if len(abstracts) < MIN_TOPIC_SIZE:
             raise ValueError("Not enough abstracts to cluster")
 
+        # 1. Load stored embeddings
+        print("Checking for stored embeddings in database...")
+        stored_embeddings = {}
+        try:
+            embeddings_res = client.execute("SELECT doc_id, embedding FROM document_embeddings")
+            for row in embeddings_res.rows:
+                stored_embeddings[row["doc_id"]] = json.loads(row["embedding"])
+            print(f"Found {len(stored_embeddings)} cached embeddings in database.")
+        except Exception as e:
+            print(f"Could not load stored embeddings (table might not exist yet): {e}")
+
+        # 2. Compute embeddings incrementally
+        import numpy as np
+        final_embeddings = []
+        docs_to_encode = []
+        docs_to_encode_indices = []
+
+        for idx, (doc_id, abstract) in enumerate(zip(doc_ids, abstracts)):
+            if doc_id in stored_embeddings:
+                final_embeddings.append(np.array(stored_embeddings[doc_id], dtype=np.float32))
+            else:
+                docs_to_encode.append(abstract)
+                docs_to_encode_indices.append(idx)
+                final_embeddings.append(None) # placeholder
+
+        if docs_to_encode:
+            print(f"Loading embedding model to encode {len(docs_to_encode)} new documents: {MODEL_NAME}")
+            from sentence_transformers import SentenceTransformer
+            embedding_model = SentenceTransformer(MODEL_NAME)
+            new_embeddings = embedding_model.encode(docs_to_encode, show_progress_bar=True)
+            
+            # Save new embeddings back to database and update placeholders
+            for i, new_emb in enumerate(new_embeddings):
+                orig_idx = docs_to_encode_indices[i]
+                doc_id = doc_ids[orig_idx]
+                emb_list = new_emb.tolist()
+                final_embeddings[orig_idx] = new_emb
+                
+                try:
+                    client.execute(
+                        "INSERT OR REPLACE INTO document_embeddings (doc_id, embedding, created_at) VALUES (?, ?, ?)",
+                        [doc_id, json.dumps(emb_list), datetime.now(timezone.utc).isoformat()]
+                    )
+                except Exception as ex:
+                    print(f"Failed to cache embedding for {doc_id}: {ex}")
+            print(f"Successfully cached {len(docs_to_encode)} new embeddings.")
+            
+            # Explicitly free up SentenceTransformer to save memory
+            del embedding_model
+            import gc
+            import torch
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        else:
+            print("All documents are cached. Bypassing embedding model loading entirely!")
+
+        # Convert final_embeddings list to a single numpy array
+        embeddings_matrix = np.vstack(final_embeddings)
+
         # Run BERTopic
-        print(f"Loading embedding model: {MODEL_NAME}")
-        from sentence_transformers import SentenceTransformer
         from bertopic import BERTopic
-
-        embedding_model = SentenceTransformer(MODEL_NAME)
-
         from hdbscan import HDBSCAN
 
-        # min_samples=1 makes HDBSCAN more aggressive at assigning points to clusters
-        # instead of dumping them into a single catch-all topic.
         hdbscan_model = HDBSCAN(
             min_cluster_size=MIN_TOPIC_SIZE,
             min_samples=1,
@@ -252,12 +406,12 @@ def main():
 
         print(f"Fitting BERTopic (min_topic_size={MIN_TOPIC_SIZE}, min_samples=1)...")
         topic_model = BERTopic(
-            embedding_model=embedding_model,
+            embedding_model=MODEL_NAME,
             min_topic_size=MIN_TOPIC_SIZE,
             hdbscan_model=hdbscan_model,
             verbose=True,
         )
-        topics, probs = topic_model.fit_transform(abstracts)
+        topics, probs = topic_model.fit_transform(abstracts, embeddings=embeddings_matrix)
 
         # Reduce outliers — reassign topic -1 docs using c-TF-IDF similarity.
         # The "c-tf-idf" strategy only reassigns a doc if its text has strong
@@ -311,8 +465,8 @@ def main():
 
         print(f"\nDiscovered {len(topic_info) - 1} topics (plus outlier cluster)")
 
-        # Generate human-readable labels via Claude API
-        claude_labels = generate_claude_labels(topic_model, abstracts, topics)
+        # Generate human-readable labels (Claude API or local Qwen model fallback)
+        claude_labels = generate_labels(topic_model, abstracts, topics)
 
         # Create tables
         client.execute("""
