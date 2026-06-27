@@ -87,9 +87,11 @@ class DatabaseLogger:
 
 
 def get_db_client(db_path):
-    url = os.environ.get("TURSO_DATABASE_URL")
-    auth_token = os.environ.get("TURSO_AUTH_TOKEN")
+    url = os.environ.get("TURSO_DATABASE_URL", "").strip()
+    auth_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
     if url:
+        if url.startswith("libsql://"):
+            url = "https://" + url[len("libsql://"):]
         import libsql_client
         print(f"Connecting to remote Turso database: {url}")
         return libsql_client.create_client_sync(url, auth_token=auth_token)

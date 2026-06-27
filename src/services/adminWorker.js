@@ -101,6 +101,8 @@ export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = 
     TURSO_AUTH_TOKEN: process.env.TURSO_AUTH_TOKEN || '',
     SQLITE_PATH: process.env.SQLITE_PATH || '',
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+    HF_HUB_OFFLINE: '1',
+    TRANSFORMERS_OFFLINE: '1',
   };
   const config = {
     image: workerImage,
