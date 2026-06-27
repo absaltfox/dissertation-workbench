@@ -493,7 +493,7 @@ export async function applyStoredFileMetricsToDocuments(documents = []) {
   if (!ids.length) return list;
 
   const metricsByDocId = new Map();
-  const chunkSize = 200;
+  const chunkSize = 999;
   for (let i = 0; i < ids.length; i += chunkSize) {
     const chunk = ids.slice(i, i + chunkSize);
     const placeholders = chunk.map(() => '?').join(', ');
@@ -519,7 +519,7 @@ export async function applyCitationCountsToDocuments(documents = []) {
   if (!ids.length) return list;
 
   const countsByDocId = new Map();
-  const chunkSize = 200;
+  const chunkSize = 999;
   for (let i = 0; i < ids.length; i += chunkSize) {
     const chunk = ids.slice(i, i + chunkSize);
     const placeholders = chunk.map(() => '?').join(', ');
@@ -546,7 +546,7 @@ export async function applyCommitteeMembersToDocuments(documents = []) {
   if (!ids.length) return list;
 
   const membersByDocId = new Map(ids.map((id) => [id, []]));
-  const chunkSize = 200;
+  const chunkSize = 999;
   for (let i = 0; i < ids.length; i += chunkSize) {
     const chunk = ids.slice(i, i + chunkSize);
     const placeholders = chunk.map(() => '?').join(', ');
@@ -1762,8 +1762,24 @@ export async function loadTopics() {
   }));
 }
 
-export async function loadDocumentTopics() {
-  const rows = await all('SELECT doc_id, topic_id, probability FROM document_topics');
+export async function loadDocumentTopics(docIds) {
+  let rows;
+  if (Array.isArray(docIds) && docIds.length > 0) {
+    const chunkSize = 999;
+    rows = [];
+    for (let i = 0; i < docIds.length; i += chunkSize) {
+      const chunk = docIds.slice(i, i + chunkSize);
+      const placeholders = chunk.map(() => '?').join(', ');
+      const chunkRows = await all(`
+        SELECT doc_id, topic_id, probability
+        FROM document_topics
+        WHERE doc_id IN (${placeholders})
+      `, chunk);
+      rows.push(...chunkRows);
+    }
+  } else {
+    rows = await all('SELECT doc_id, topic_id, probability FROM document_topics');
+  }
   const map = new Map();
   for (const row of rows) {
     map.set(row.doc_id, { topicId: Number(row.topic_id), probability: row.probability != null ? Number(row.probability) : null });
@@ -1771,9 +1787,25 @@ export async function loadDocumentTopics() {
   return map;
 }
 
-export async function loadDocumentTopicCoords() {
+export async function loadDocumentTopicCoords(docIds) {
   try {
-    const rows = await all('SELECT doc_id, umap_x, umap_y FROM document_topic_coords');
+    let rows;
+    if (Array.isArray(docIds) && docIds.length > 0) {
+      const chunkSize = 999;
+      rows = [];
+      for (let i = 0; i < docIds.length; i += chunkSize) {
+        const chunk = docIds.slice(i, i + chunkSize);
+        const placeholders = chunk.map(() => '?').join(', ');
+        const chunkRows = await all(`
+          SELECT doc_id, umap_x, umap_y
+          FROM document_topic_coords
+          WHERE doc_id IN (${placeholders})
+        `, chunk);
+        rows.push(...chunkRows);
+      }
+    } else {
+      rows = await all('SELECT doc_id, umap_x, umap_y FROM document_topic_coords');
+    }
     const map = new Map();
     for (const row of rows) {
       map.set(row.doc_id, { x: Number(row.umap_x), y: Number(row.umap_y) });

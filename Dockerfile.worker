@@ -1,0 +1,35 @@
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# Install compilation tools needed for HDBSCAN and UMAP
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# Pre-download the SentenceTransformer model to bake it into the image cache.
+# This prevents downloading a 400MB model on every ephemeral container startup.
+RUN python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('allenai/specter2_base')"
+
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy installed pip packages and Hugging Face cache
+COPY --from=builder /root/.local /root/.local
+COPY --from=builder /root/.cache /root/.cache
+
+COPY scripts/build-topics.py ./scripts/build-topics.py
+
+ENV PATH=/root/.local/bin:$PATH
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python3", "scripts/build-topics.py"]

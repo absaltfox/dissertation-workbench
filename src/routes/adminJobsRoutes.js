@@ -7,8 +7,8 @@ import { extractSearchTerms } from '../catalogue.js';
 import { getConceptPipelineStatus } from '../conceptsPipeline.js';
 import { parseBooleanParam, parseNumberParam } from '../validate.js';
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
-import { cancelInProcessAdminJob, isAdminJobRunning, runBertopicJob, runCatalogueLookupJob } from '../services/adminJobs.js';
-import { cancelAdminWorkerJob } from '../services/adminWorker.js';
+import { cancelInProcessAdminJob, isAdminJobRunning, runCatalogueLookupJob } from '../services/adminJobs.js';
+import { cancelAdminWorkerJob, createAndStartAdminWorkerJob } from '../services/adminWorker.js';
 
 /**
  * Creates admin job orchestration endpoints.
@@ -81,21 +81,18 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
   }));
 
   router.post('/jobs/bertopic', asyncHandler(async (_req, res) => {
-    const runningId = isAdminJobRunning('bertopic')
-      ? (await hasRunningAdminJob('bertopic'))
-      : await hasRunningAdminJob('bertopic');
+    const runningId = await hasRunningAdminJob('bertopic');
     if (runningId) {
       res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
       return;
     }
-    const jobId = await createAdminJob({
+    const result = await createAndStartAdminWorkerJob({
       type: 'bertopic',
       label: 'BERTopic Rebuild',
       params: { script: 'scripts/build-topics.py' },
     });
-    // BERTopic rebuilds shell out to the Python pipeline and can take minutes.
-    runBertopicJob(jobId, { clearMetricsCache });
-    res.status(202).json({ ok: true, started: true, jobId });
+    clearMetricsCache();
+    res.status(202).json({ ok: true, started: true, jobId: result.jobId });
   }));
 
   router.post('/jobs/:id/cancel', asyncHandler(async (req, res) => {

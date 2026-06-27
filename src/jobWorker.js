@@ -44,9 +44,37 @@ async function main() {
     timer.unref();
   });
 
-  const run = runImportPdfAdminJob(claimed, {
-    artifactClient: createWorkerArtifactClientFromEnv(),
-  });
+  let run;
+  if (claimed.type === 'bertopic') {
+    const { spawn } = await import('node:child_process');
+    const path = await import('node:path');
+    const { fileURLToPath } = await import('node:url');
+    const { BERTOPIC_PYTHON_COMMAND } = await import('./config.js');
+
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = path.dirname(__filename);
+    const scriptPath = path.join(__dirname, '..', 'scripts', 'build-topics.py');
+
+    run = new Promise((resolve, reject) => {
+      const child = spawn(BERTOPIC_PYTHON_COMMAND, [scriptPath], {
+        cwd: path.join(__dirname, '..'),
+        env: {
+          ...process.env,
+        },
+      });
+      child.stdout.on('data', (chunk) => appendAdminJobLog(jobId, chunk.toString()).catch(() => {}));
+      child.stderr.on('data', (chunk) => appendAdminJobLog(jobId, chunk.toString()).catch(() => {}));
+      child.on('error', (err) => reject(err));
+      child.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`Local Python process exited with code ${code}`));
+      });
+    });
+  } else {
+    run = runImportPdfAdminJob(claimed, {
+      artifactClient: createWorkerArtifactClientFromEnv(),
+    });
+  }
 
   try {
     await Promise.race([run, timeout]);

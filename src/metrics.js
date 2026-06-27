@@ -370,6 +370,9 @@ export function buildDocumentSyncKey({ baseUrl, requestedIndex, query, term, sou
 }
 
 function docConceptTerms(rec, limit = 12, dict = null) {
+  if (Array.isArray(rec?.conceptTerms)) {
+    return rec.conceptTerms.slice(0, limit);
+  }
   const { canonicalSet, variantMap, idfMap, conceptMeta, sourceDocuments } = dict || loadConceptDictionary();
   const tf = new Map();
 
@@ -974,7 +977,7 @@ export async function collectMetrics(options = {}) {
       forceDownload,
       recomputeFromCache
     });
-  } else if (options.applyStoredFileMetrics) {
+  } else if (options.applyStoredFileMetrics && !usesCachedDocuments) {
     await applyStoredFileMetricsToDocuments(normalizedRecords);
   }
   if (options.applyCitationCounts) {
@@ -1013,9 +1016,10 @@ export async function collectMetrics(options = {}) {
   let topicData = null;
   if (await hasTopics()) {
     const topics = await loadTopics();
-    const docTopics = await loadDocumentTopics();
+    const docIds = normalizedRecords.map((doc) => doc.id).filter(Boolean);
+    const docTopics = await loadDocumentTopics(docIds);
     // Attach topic_id and UMAP coords to each document
-    const topicCoords = await loadDocumentTopicCoords();
+    const topicCoords = await loadDocumentTopicCoords(docIds);
     for (const doc of normalizedRecords) {
       const dt = docTopics.get(doc.id);
       if (dt) {

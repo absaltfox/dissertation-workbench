@@ -79,24 +79,39 @@ async function resolveWorkerImage() {
   return image;
 }
 
-export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = ADMIN_WORKER_TIMEOUT_MS }) {
+export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = ADMIN_WORKER_TIMEOUT_MS, jobType = null }) {
+  const isBertopic = jobType === 'bertopic';
+  const workerImage = isBertopic
+    ? (process.env.BERTOPIC_WORKER_IMAGE || image)
+    : image;
+  const execCmd = isBertopic
+    ? ['python3', 'scripts/build-topics.py']
+    : ['node', 'src/jobWorker.js'];
+  const memoryMb = isBertopic
+    ? 2048 // BERTopic needs at least 2GB RAM
+    : FLY_WORKER_MEMORY_MB;
+
   const env = {
     ADMIN_JOB_ID: String(jobId),
     ADMIN_JOB_ARTIFACT_TOKEN: token,
     ADMIN_WORKER_TIMEOUT_MS: String(timeoutMs),
     DOCUMENT_SYNC_ENABLED: '0',
     DOCUMENT_SYNC_ON_START: '0',
+    TURSO_DATABASE_URL: process.env.TURSO_DATABASE_URL || '',
+    TURSO_AUTH_TOKEN: process.env.TURSO_AUTH_TOKEN || '',
+    SQLITE_PATH: process.env.SQLITE_PATH || '',
+    ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
   };
   const config = {
-    image,
+    image: workerImage,
     auto_destroy: true,
     restart: { policy: 'no' },
     env,
-    init: { exec: ['node', 'src/jobWorker.js'] },
+    init: { exec: execCmd },
     guest: {
       cpu_kind: FLY_WORKER_CPU_KIND,
       cpus: FLY_WORKER_CPUS,
-      memory_mb: FLY_WORKER_MEMORY_MB,
+      memory_mb: memoryMb,
     },
     metadata: {
       role: 'admin-worker',
@@ -112,8 +127,9 @@ export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = 
 }
 
 async function startFlyWorker(jobId, token) {
+  const job = await getAdminJob(jobId);
   const image = await resolveWorkerImage();
-  const payload = buildFlyWorkerMachinePayload({ image, jobId, token });
+  const payload = buildFlyWorkerMachinePayload({ image, jobId, token, jobType: job?.type });
   const machine = await flyRequest(`/v1/apps/${encodeURIComponent(FLY_APP_NAME)}/machines`, {
     method: 'POST',
     body: JSON.stringify(payload),

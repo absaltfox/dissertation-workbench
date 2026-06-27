@@ -1,3 +1,4 @@
 bertopic>=0.16
 sentence-transformers
 anthropic
+libsql-client>=0.1.0
