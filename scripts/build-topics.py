@@ -99,6 +99,49 @@ class DatabaseLogger:
             self._flush_to_db()
 
 
+class ProgressReporter:
+    def __init__(self, client, job_id):
+        self.client = client
+        self.job_id = int(job_id) if job_id else None
+        self.tasks = []
+        self.task_index = {}
+
+    def report(self, key, label=None, status="running", detail=None, counts=None, next_task=None):
+        if not self.job_id:
+            return
+        label = label or key
+        task = {
+            "key": key,
+            "label": label,
+            "status": status,
+            "detail": detail,
+            "counts": counts,
+            "updatedAt": datetime.now(timezone.utc).isoformat()
+        }
+        if key in self.task_index:
+            self.tasks[self.task_index[key]] = task
+        else:
+            self.task_index[key] = len(self.tasks)
+            self.tasks.append(task)
+        
+        current_task = next_task if (status == "completed" and next_task) else label
+        progress_data = {
+            "phase": key,
+            "currentTask": current_task,
+            "tasks": self.tasks,
+            "counts": counts
+        }
+        
+        try:
+            now_str = datetime.now(timezone.utc).isoformat()
+            self.client.execute(
+                "UPDATE admin_jobs SET progress_json = ?, runner_state = ?, heartbeat_at = ? WHERE id = ?",
+                [json.dumps(progress_data), current_task, now_str, self.job_id]
+            )
+        except Exception as e:
+            sys.stderr.write(f"\n[Progress Error] Failed to update progress in DB: {e}\n")
+
+
 def get_db_client(db_path):
     url = os.environ.get("TURSO_DATABASE_URL", "").strip()
     auth_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
@@ -113,17 +156,17 @@ def get_db_client(db_path):
         return SqliteClientWrapper(db_path)
 
 
-def generate_labels(topic_model, abstracts, topic_assignments):
+def generate_labels(topic_model, abstracts, topic_assignments, reporter=None):
     """Generate human-readable topic labels using Claude (if API key set) or a local Qwen model."""
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if api_key:
-        labels = generate_claude_labels(topic_model, abstracts, topic_assignments, api_key)
+        labels = generate_claude_labels(topic_model, abstracts, topic_assignments, api_key, reporter)
         if labels and len(labels) > 1:
             return labels
-    return generate_local_labels(topic_model, abstracts, topic_assignments)
+    return generate_local_labels(topic_model, abstracts, topic_assignments, reporter)
 
 
-def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key):
+def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key, reporter=None):
     """Use Claude to generate human-readable topic labels."""
     try:
         import anthropic
@@ -166,6 +209,16 @@ def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key):
     if not topic_descriptions:
         return labels
 
+    total_topics = len(topic_ids_in_batch)
+    if reporter:
+        reporter.report(
+            "generate_labels",
+            "Generating Labels",
+            status="running",
+            detail=f"Requesting labels for {total_topics} topics from Claude...",
+            counts={"processed": 0, "total": total_topics}
+        )
+
     prompt = (
         "You are labeling topics discovered by clustering ~418 Education doctoral dissertation abstracts "
         "from UBC (University of British Columbia). For each topic below, generate a short, descriptive "
@@ -191,21 +244,39 @@ def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key):
         for tid_str, label in parsed.items():
             labels[int(tid_str)] = str(label)
         print(f"  Generated {len(parsed)} labels successfully")
+        
+        if reporter:
+            reporter.report(
+                "generate_labels",
+                "Generating Labels",
+                status="completed",
+                detail=f"Successfully generated {len(parsed)} labels via Claude.",
+                counts={"processed": total_topics, "total": total_topics},
+                next_task="Saving Results"
+            )
     except Exception as e:
         print(f"\nWarning: Claude label generation failed: {e}", file=sys.stderr)
+        if reporter:
+            reporter.report(
+                "generate_labels",
+                "Generating Labels",
+                status="failed",
+                detail=f"Claude label generation failed: {e}",
+                counts={"processed": 0, "total": total_topics}
+            )
         return {}
 
     return labels
 
 
-def generate_local_labels(topic_model, abstracts, topic_assignments):
-    """Use a local LLM (Qwen/Qwen2.5-1.5B-Instruct) to generate topic labels."""
-    print("\nLoading local label generation model: Qwen/Qwen2.5-1.5B-Instruct...")
+def generate_local_labels(topic_model, abstracts, topic_assignments, reporter=None):
+    """Use a local LLM (Qwen/Qwen2.5-0.5B-Instruct by default) to generate topic labels."""
+    model_name = os.environ.get("LOCAL_LLM_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
+    print(f"\nLoading local label generation model: {model_name}...")
     try:
         from transformers import AutoTokenizer, AutoModelForCausalLM
         import torch
         
-        model_name = "Qwen/Qwen2.5-1.5B-Instruct"
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModelForCausalLM.from_pretrained(model_name)
         
@@ -219,12 +290,23 @@ def generate_local_labels(topic_model, abstracts, topic_assignments):
     labels = {}
     labels[-1] = "Uncategorized"
 
-    print(f"Generating labels for {len(topic_info) - 1} topics locally...")
+    total_topics = len(topic_info) - 1
+    print(f"Generating labels for {total_topics} topics locally...")
     
+    processed_count = 0
     for _, row in topic_info.iterrows():
         topic_id = int(row["Topic"])
         if topic_id == -1:
             continue
+
+        if reporter:
+            reporter.report(
+                "generate_labels",
+                "Generating Labels",
+                status="running",
+                detail=f"Generating local label for topic {topic_id} ({processed_count + 1}/{total_topics})...",
+                counts={"processed": processed_count, "total": total_topics}
+            )
 
         # Get top terms
         terms = topic_model.get_topic(topic_id)
@@ -275,6 +357,17 @@ def generate_local_labels(topic_model, abstracts, topic_assignments):
         
         print(f"  Topic {topic_id} -> {response}")
         labels[topic_id] = response
+        processed_count += 1
+
+    if reporter:
+        reporter.report(
+            "generate_labels",
+            "Generating Labels",
+            status="completed",
+            detail=f"Successfully generated {total_topics} local labels.",
+            counts={"processed": total_topics, "total": total_topics},
+            next_task="Saving Results"
+        )
 
     del model
     del tokenizer
@@ -301,6 +394,7 @@ def main():
     # Claim job if running in worker mode
     job_id = os.environ.get("ADMIN_JOB_ID")
     db_logger = None
+    reporter = None
     if job_id:
         print(f"Claiming and starting job ID {job_id}")
         now_str = datetime.now(timezone.utc).isoformat()
@@ -311,9 +405,17 @@ def main():
         db_logger = DatabaseLogger(client, job_id, sys.stdout)
         sys.stdout = db_logger
         sys.stderr = db_logger
+        reporter = ProgressReporter(client, job_id)
 
     try:
         # Load abstracts
+        if reporter:
+            reporter.report(
+                "load_abstracts",
+                "Loading Abstracts",
+                status="running",
+                detail="Loading document abstracts from database..."
+            )
         rows_res = client.execute("SELECT doc_id, metadata_json FROM documents")
         print(f"Found {len(rows_res.rows)} documents in database")
 
@@ -332,11 +434,26 @@ def main():
             abstracts.append(abstract)
 
         print(f"Extracted {len(abstracts)} non-empty abstracts (skipped {len(rows_res.rows) - len(abstracts)})")
+        if reporter:
+            reporter.report(
+                "load_abstracts",
+                "Loading Abstracts",
+                status="completed",
+                detail=f"Extracted {len(abstracts)} abstracts.",
+                next_task="Checking Cache"
+            )
 
         if len(abstracts) < MIN_TOPIC_SIZE:
             raise ValueError("Not enough abstracts to cluster")
 
         # 1. Load stored embeddings
+        if reporter:
+            reporter.report(
+                "check_cache",
+                "Checking Cache",
+                status="running",
+                detail="Retrieving cached embeddings from database..."
+            )
         print("Checking for stored embeddings in database...")
         stored_embeddings = {}
         try:
@@ -346,6 +463,15 @@ def main():
             print(f"Found {len(stored_embeddings)} cached embeddings in database.")
         except Exception as e:
             print(f"Could not load stored embeddings (table might not exist yet): {e}")
+
+        if reporter:
+            reporter.report(
+                "check_cache",
+                "Checking Cache",
+                status="completed",
+                detail=f"Retrieved {len(stored_embeddings)} cached embeddings.",
+                next_task="Computing Embeddings"
+            )
 
         # 2. Compute embeddings incrementally
         import numpy as np
@@ -363,9 +489,33 @@ def main():
 
         if docs_to_encode:
             print(f"Loading embedding model to encode {len(docs_to_encode)} new documents: {MODEL_NAME}")
+            if reporter:
+                reporter.report(
+                    "compute_embeddings",
+                    "Computing Embeddings",
+                    status="running",
+                    detail=f"Loading model to encode {len(docs_to_encode)} new documents...",
+                    counts={"processed": 0, "total": len(docs_to_encode)}
+                )
             from sentence_transformers import SentenceTransformer
             embedding_model = SentenceTransformer(MODEL_NAME)
-            new_embeddings = embedding_model.encode(docs_to_encode, show_progress_bar=True)
+            
+            # Encode incrementally in batches of 32 to report real-time progress
+            batch_size = 32
+            new_embeddings_list = []
+            for i in range(0, len(docs_to_encode), batch_size):
+                batch = docs_to_encode[i:i+batch_size]
+                if reporter:
+                    reporter.report(
+                        "compute_embeddings",
+                        "Computing Embeddings",
+                        status="running",
+                        detail=f"Encoding new documents (batch {i//batch_size + 1}/{(len(docs_to_encode) + batch_size - 1) // batch_size})...",
+                        counts={"processed": i, "total": len(docs_to_encode)}
+                    )
+                batch_embeddings = embedding_model.encode(batch, show_progress_bar=False)
+                new_embeddings_list.extend(batch_embeddings)
+            new_embeddings = new_embeddings_list
             
             # Save new embeddings back to database and update placeholders
             for i, new_emb in enumerate(new_embeddings):
@@ -390,8 +540,27 @@ def main():
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                
+            if reporter:
+                reporter.report(
+                    "compute_embeddings",
+                    "Computing Embeddings",
+                    status="completed",
+                    detail=f"Successfully encoded and cached {len(docs_to_encode)} documents.",
+                    counts={"processed": len(docs_to_encode), "total": len(docs_to_encode)},
+                    next_task="Clustering Topics"
+                )
         else:
             print("All documents are cached. Bypassing embedding model loading entirely!")
+            if reporter:
+                reporter.report(
+                    "compute_embeddings",
+                    "Computing Embeddings",
+                    status="completed",
+                    detail="All documents already cached; bypassed encoding phase.",
+                    counts={"processed": 0, "total": 0},
+                    next_task="Clustering Topics"
+                )
 
         # Convert final_embeddings list to a single numpy array
         embeddings_matrix = np.vstack(final_embeddings)
@@ -420,6 +589,13 @@ def main():
             prediction_data=True,
         )
 
+        if reporter:
+            reporter.report(
+                "cluster_topics",
+                "Clustering Topics",
+                status="running",
+                detail="Fitting BERTopic model (UMAP & HDBSCAN)..."
+            )
         print(f"Fitting BERTopic (min_topic_size={MIN_TOPIC_SIZE}, min_samples=1)...")
         topic_model = BERTopic(
             embedding_model=MODEL_NAME,
@@ -481,9 +657,25 @@ def main():
         now = datetime.now(timezone.utc).isoformat()
 
         print(f"\nDiscovered {len(topic_info) - 1} topics (plus outlier cluster)")
+        if reporter:
+            reporter.report(
+                "cluster_topics",
+                "Clustering Topics",
+                status="completed",
+                detail=f"Discovered {len(topic_info) - 1} topics.",
+                next_task="Generating Labels"
+            )
 
         # Generate human-readable labels (Claude API or local Qwen model fallback)
-        claude_labels = generate_labels(topic_model, abstracts, topics)
+        claude_labels = generate_labels(topic_model, abstracts, topics, reporter)
+
+        if reporter:
+            reporter.report(
+                "save_results",
+                "Saving Results",
+                status="running",
+                detail="Writing topics and assignments to database..."
+            )
 
         # Create tables
         client.execute("""
@@ -580,6 +772,13 @@ def main():
                 [doc_id, float(coords_2d[i, 0]), float(coords_2d[i, 1])],
             )
         print(f"  Saved 2D coordinates for {len(doc_ids)} documents")
+        if reporter:
+            reporter.report(
+                "save_results",
+                "Saving Results",
+                status="completed",
+                detail=f"Saved assignments and 2D coordinates for {len(doc_ids)} documents."
+            )
 
         # Print summary
         assigned = sum(1 for t in topics if t != -1)
@@ -618,6 +817,13 @@ def main():
             
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
+        if reporter:
+            reporter.report(
+                reporter.tasks[-1]["key"] if reporter.tasks else "run",
+                reporter.tasks[-1]["label"] if reporter.tasks else "Run",
+                status="failed",
+                detail=str(e)
+            )
         if job_id:
             now_str = datetime.now(timezone.utc).isoformat()
             client.execute(

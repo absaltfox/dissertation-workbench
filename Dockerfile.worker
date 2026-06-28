@@ -9,12 +9,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir --user -r requirements.txt
+RUN pip install --no-cache-dir --user --index-url https://download.pytorch.org/whl/cpu torch && \
+    pip install --no-cache-dir --user -r requirements.txt
 
 # Pre-download the models to bake them into the image cache.
 # This prevents downloading them on every ephemeral container startup.
 RUN python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('allenai/specter2_base')"
-RUN python3 -c "from transformers import AutoTokenizer, AutoModelForCausalLM; AutoTokenizer.from_pretrained('Qwen/Qwen2.5-1.5B-Instruct'); AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-1.5B-Instruct')"
+RUN python3 -c "from transformers import AutoTokenizer, AutoModelForCausalLM; AutoTokenizer.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct'); AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct')"
 
 FROM python:3.11-slim AS runtime
 
@@ -26,7 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy installed pip packages and Hugging Face cache
 COPY --from=builder /root/.local /root/.local
-COPY --from=builder /root/.cache /root/.cache
+COPY --from=builder /root/.cache/huggingface /root/.cache/huggingface
 
 COPY scripts/build-topics.py ./scripts/build-topics.py
 
