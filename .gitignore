@@ -3,6 +3,7 @@ node_modules/
 # Local runtime/cache artifacts
 data/
 output/
+docs/dissertation-workbench-architecture.md
 
 # Secrets
 .env
@@ -24,4 +25,3 @@ fly.grobid.toml
 __pycache__/
 *.pyc
 .venv/
-
