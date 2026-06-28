@@ -94,7 +94,12 @@ app.use((_req, res) => {
 });
 
 app.use((error, req, res, _next) => {
-  logger.error('Request error', { path: req.path, error: error.message });
+  logger.error('Request error', {
+    path: req.path,
+    error: error.message,
+    cause: error.cause ? (error.cause.message || String(error.cause)) : undefined,
+    stack: error.stack
+  });
   if (res.headersSent) return;
   const statusCode = Number(error?.statusCode || error?.status || 500);
   const safeStatus = statusCode >= 400 && statusCode < 600 ? statusCode : 500;

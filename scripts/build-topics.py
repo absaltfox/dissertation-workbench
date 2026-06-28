@@ -544,7 +544,7 @@ def main():
         import umap
 
         print("\nComputing 2D UMAP projection for visualization...")
-        embeddings = embedding_model.encode(abstracts, show_progress_bar=True)
+        embeddings = embeddings_matrix
         reducer = umap.UMAP(n_components=2, random_state=42, metric="cosine")
         coords_2d = reducer.fit_transform(embeddings)
 

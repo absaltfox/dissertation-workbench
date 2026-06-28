@@ -88,7 +88,7 @@ export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = 
     ? ['python3', 'scripts/build-topics.py']
     : ['node', 'src/jobWorker.js'];
   const memoryMb = isBertopic
-    ? 2048 // BERTopic needs at least 2GB RAM
+    ? Math.max(2048, FLY_WORKER_MEMORY_MB)
     : FLY_WORKER_MEMORY_MB;
 
   const env = {
