@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 
 MODEL_NAME = "allenai/specter2_base"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
-MIN_TOPIC_SIZE = 3  # small for ~400-doc corpus to find niche topics
+MIN_TOPIC_SIZE = 5  # increased from 3 for cleaner, more cohesive clusters
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "metrics.sqlite")
 
 
@@ -199,13 +199,13 @@ def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key):
 
 
 def generate_local_labels(topic_model, abstracts, topic_assignments):
-    """Use a local tiny LLM (Qwen/Qwen2.5-0.5B-Instruct) to generate topic labels."""
-    print("\nLoading local label generation model: Qwen/Qwen2.5-0.5B-Instruct...")
+    """Use a local LLM (Qwen/Qwen2.5-1.5B-Instruct) to generate topic labels."""
+    print("\nLoading local label generation model: Qwen/Qwen2.5-1.5B-Instruct...")
     try:
         from transformers import AutoTokenizer, AutoModelForCausalLM
         import torch
         
-        model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+        model_name = "Qwen/Qwen2.5-1.5B-Instruct"
         tokenizer = AutoTokenizer.from_pretrained(model_name)
         model = AutoModelForCausalLM.from_pretrained(model_name)
         
@@ -238,15 +238,18 @@ def generate_local_labels(topic_model, abstracts, topic_assignments):
 
         # Formulate prompt for Qwen
         prompt = (
-            f"Keywords: {', '.join(top_words)}\n"
-            f"Sample Abstracts:\n"
+            f"Highly Relevant Keywords: {', '.join(top_words)}\n"
+            f"Sample Abstracts of papers in this topic:\n"
             + "\n".join(f"- {a}..." for a in sample_abstracts)
-            + "\n\nBased on the keywords and abstracts, generate a short, clean, descriptive academic topic title (3-6 words) as a noun phrase (e.g. 'Indigenous Education Policy' or 'Reading Comprehension & Assessment').\n"
-              "Respond with ONLY the title. No other text."
+            + "\n\nInstructions:\n"
+              "1. Find the core common theme across these sample abstracts.\n"
+              "2. Generate a short, clean, descriptive academic topic title (3-6 words) as a noun phrase (e.g. 'Indigenous Education Policy' or 'Reading Comprehension & Assessment').\n"
+              "3. Focus on what these abstracts share in common. If the keywords or abstracts cover diverse or unrelated topics, do not create a literal mashup of terms (like 'Pasifika, Swiss schools and Pride'). Instead, write a broader, cohesive category name (e.g. 'Global & Intercultural Educational Studies' or 'Diverse Identity & Equity in Higher Education').\n"
+              "4. Respond with ONLY the short title. Do not include quotes, periods, or other text."
         )
 
         messages = [
-            {"role": "system", "content": "You are a helpful assistant that labels academic research topics. Respond with ONLY the short title."},
+            {"role": "system", "content": "You are a professional academic librarian who creates high-quality, natural category labels for research topics. You respond with ONLY the short category title, no metadata, no quotes, and no commentary."},
             {"role": "user", "content": prompt}
         ]
 
@@ -396,6 +399,19 @@ def main():
         # Run BERTopic
         from bertopic import BERTopic
         from hdbscan import HDBSCAN
+        from sklearn.feature_extraction.text import CountVectorizer
+        from sklearn.feature_extraction import text
+
+        # Custom stop words list to filter out academic noise
+        stop_words = list(text.ENGLISH_STOP_WORDS.union([
+            "chapter", "study", "research", "thesis", "dissertation", "university",
+            "ubc", "british", "columbia", "participants", "findings", "methodology",
+            "results", "methods", "data", "analysis", "chapters", "approach",
+            "participant", "abstract", "introduction", "conclusion",
+            "my", "our", "we", "i"
+        ]))
+
+        vectorizer_model = CountVectorizer(stop_words=stop_words)
 
         hdbscan_model = HDBSCAN(
             min_cluster_size=MIN_TOPIC_SIZE,
@@ -409,6 +425,7 @@ def main():
             embedding_model=MODEL_NAME,
             min_topic_size=MIN_TOPIC_SIZE,
             hdbscan_model=hdbscan_model,
+            vectorizer_model=vectorizer_model,
             verbose=True,
         )
         topics, probs = topic_model.fit_transform(abstracts, embeddings=embeddings_matrix)
@@ -420,7 +437,7 @@ def main():
         outlier_count = sum(1 for t in topics if t == -1)
         if outlier_count > 0:
             print(f"\nReducing outliers ({outlier_count} docs) using c-TF-IDF strategy...")
-            topics = topic_model.reduce_outliers(abstracts, topics, strategy="c-tf-idf", threshold=0.1)
+            topics = topic_model.reduce_outliers(abstracts, topics, strategy="c-tf-idf", threshold=0.15)
             topic_model.update_topics(abstracts, topics=topics)
             new_outliers = sum(1 for t in topics if t == -1)
             print(f"  Outliers reduced: {outlier_count} -> {new_outliers}")

@@ -1536,6 +1536,19 @@ export async function extractAndSaveParsedData(doc, fullText, pdfPath, {
       let citations = null;
       if (pdfPath) {
         citations = await parseBibliographyWithGrobid(pdfPath);
+        // Fall back to text-based extraction if GROBID returned suspiciously few citations
+        // for a very long document.
+        if (citations && citations.length < 80 && fullText && fullText.length > 50_000) {
+          const textCitations = await parseBibliographyWithAnyStyle(fullText);
+          if (textCitations.length > citations.length * 2.5) {
+            logger.info('GROBID found few citations, falling back to text-based extraction', {
+              docId: doc.id,
+              grobidCount: citations.length,
+              fallbackCount: textCitations.length,
+            });
+            citations = textCitations.map(text => ({ text }));
+          }
+        }
       }
       if (!citations) {
         const textCitations = await parseBibliographyWithAnyStyle(fullText);
