@@ -264,6 +264,44 @@ async function ensureSchema(client) {
       created_at  TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS topic_label_runs (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      backend      TEXT NOT NULL,
+      model_name   TEXT NOT NULL,
+      status       TEXT NOT NULL,
+      config_json  TEXT,
+      error        TEXT,
+      started_at   TEXT NOT NULL,
+      finished_at  TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS topic_label_candidates (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id        INTEGER,
+      topic_id      INTEGER NOT NULL,
+      label         TEXT NOT NULL,
+      source        TEXT NOT NULL,
+      score         REAL NOT NULL DEFAULT 0,
+      status        TEXT NOT NULL,
+      warnings_json TEXT NOT NULL DEFAULT '[]',
+      evidence_json TEXT NOT NULL DEFAULT '{}',
+      created_at    TEXT NOT NULL,
+      FOREIGN KEY (run_id) REFERENCES topic_label_runs(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS topic_label_overrides (
+      topic_id     INTEGER PRIMARY KEY,
+      label        TEXT NOT NULL,
+      source       TEXT NOT NULL,
+      candidate_id INTEGER,
+      created_at   TEXT NOT NULL,
+      updated_at   TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_topic_label_candidates_topic ON topic_label_candidates(topic_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_topic_label_candidates_run ON topic_label_candidates(run_id);
+    CREATE INDEX IF NOT EXISTS idx_topic_label_candidates_status ON topic_label_candidates(status);
+
     CREATE TABLE IF NOT EXISTS document_topics (
       doc_id      TEXT NOT NULL,
       topic_id    INTEGER NOT NULL,
@@ -1791,6 +1829,216 @@ export async function loadDocumentTopics(docIds) {
     map.set(row.doc_id, { topicId: Number(row.topic_id), probability: row.probability != null ? Number(row.probability) : null });
   }
   return map;
+}
+
+function parseJsonValue(value, fallback) {
+  try {
+    return value ? JSON.parse(value) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function mapTopicLabelCandidate(row) {
+  return {
+    id: Number(row.id),
+    runId: row.run_id != null ? Number(row.run_id) : null,
+    topicId: Number(row.topic_id),
+    label: row.label,
+    source: row.source,
+    score: Number(row.score || 0),
+    status: row.status,
+    warnings: parseJsonValue(row.warnings_json, []),
+    evidence: parseJsonValue(row.evidence_json, {}),
+    createdAt: row.created_at,
+  };
+}
+
+export async function createTopicLabelRun({ backend, modelName, status = 'running', config = null }) {
+  const now = new Date().toISOString();
+  const result = await execute(`
+    INSERT INTO topic_label_runs (backend, model_name, status, config_json, started_at)
+    VALUES (?, ?, ?, ?, ?)
+  `, [backend || 'unknown', modelName || 'unknown', status, config ? JSON.stringify(config) : null, now]);
+  return Number(result.lastInsertRowid || result.lastInsertId || 0);
+}
+
+export async function finishTopicLabelRun(runId, { status = 'completed', error = null } = {}) {
+  await run(`
+    UPDATE topic_label_runs
+    SET status = ?, error = ?, finished_at = ?
+    WHERE id = ?
+  `, [status, error, new Date().toISOString(), Number(runId)]);
+}
+
+export async function listTopicLabelReviews() {
+  const [topics, candidates, overrides, docRows, runs] = await Promise.all([
+    all('SELECT topic_id, label, top_terms, doc_count, model_name, created_at FROM topics ORDER BY doc_count DESC'),
+    all(`
+      SELECT id, run_id, topic_id, label, source, score, status, warnings_json, evidence_json, created_at
+      FROM topic_label_candidates
+      ORDER BY topic_id, score DESC, created_at DESC
+    `),
+    all('SELECT topic_id, label, source, candidate_id, created_at, updated_at FROM topic_label_overrides'),
+    all(`
+      SELECT dt.topic_id, d.metadata_json
+      FROM document_topics dt
+      JOIN documents d ON d.doc_id = dt.doc_id
+      ORDER BY dt.topic_id, dt.probability DESC
+    `),
+    all('SELECT id, backend, model_name, status, config_json, error, started_at, finished_at FROM topic_label_runs ORDER BY id DESC LIMIT 5'),
+  ]);
+
+  const candidatesByTopic = new Map();
+  for (const row of candidates) {
+    const candidate = mapTopicLabelCandidate(row);
+    if (!candidatesByTopic.has(candidate.topicId)) candidatesByTopic.set(candidate.topicId, []);
+    candidatesByTopic.get(candidate.topicId).push(candidate);
+  }
+
+  const overrideByTopic = new Map(overrides.map((row) => [Number(row.topic_id), {
+    topicId: Number(row.topic_id),
+    label: row.label,
+    source: row.source,
+    candidateId: row.candidate_id != null ? Number(row.candidate_id) : null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }]));
+
+  const titlesByTopic = new Map();
+  for (const row of docRows) {
+    const topicId = Number(row.topic_id);
+    const list = titlesByTopic.get(topicId) || [];
+    if (list.length >= 5) continue;
+    const metadata = parseJsonValue(row.metadata_json, {});
+    const title = String(metadata?.title || '').trim();
+    if (!title || list.includes(title)) continue;
+    list.push(title);
+    titlesByTopic.set(topicId, list);
+  }
+
+  const reviewTopics = topics.map((row) => {
+    const topicId = Number(row.topic_id);
+    const topicCandidates = candidatesByTopic.get(topicId) || [];
+    const override = overrideByTopic.get(topicId) || null;
+    const selected = topicCandidates.find((candidate) => ['selected', 'auto_selected'].includes(candidate.status)) || null;
+    const warnings = Array.from(new Set(topicCandidates.flatMap((candidate) => candidate.warnings || [])));
+    const pendingReview = topicId !== -1 && !override && (
+      !selected || topicCandidates.some((candidate) => candidate.status === 'pending' && (candidate.warnings || []).length)
+    );
+    return {
+      topicId,
+      label: row.label,
+      topTerms: parseJsonValue(row.top_terms, []),
+      docCount: Number(row.doc_count),
+      modelName: row.model_name,
+      createdAt: row.created_at,
+      candidates: topicCandidates,
+      override,
+      selectedCandidateId: selected?.id || null,
+      representativeTitles: titlesByTopic.get(topicId) || [],
+      warnings,
+      pendingReview,
+    };
+  });
+
+  return {
+    topics: reviewTopics,
+    runs: runs.map((row) => ({
+      id: Number(row.id),
+      backend: row.backend,
+      modelName: row.model_name,
+      status: row.status,
+      config: parseJsonValue(row.config_json, null),
+      error: row.error,
+      startedAt: row.started_at,
+      finishedAt: row.finished_at,
+    })),
+    summary: {
+      total: reviewTopics.length,
+      pendingReview: reviewTopics.filter((topic) => topic.pendingReview).length,
+      overrides: reviewTopics.filter((topic) => topic.override).length,
+      duplicateLabels: (() => {
+        const counts = new Map();
+        for (const topic of reviewTopics) counts.set(topic.label, (counts.get(topic.label) || 0) + 1);
+        return Array.from(counts.entries()).filter(([, count]) => count > 1).map(([label, count]) => ({ label, count }));
+      })(),
+    },
+  };
+}
+
+export async function selectTopicLabelCandidate(topicId, candidateId) {
+  const candidate = await get(`
+    SELECT id, topic_id, label
+    FROM topic_label_candidates
+    WHERE id = ? AND topic_id = ?
+  `, [Number(candidateId), Number(topicId)]);
+  if (!candidate) return null;
+  const now = new Date().toISOString();
+  await run('UPDATE topic_label_candidates SET status = ? WHERE topic_id = ? AND status != ?', ['rejected', Number(topicId), 'rejected']);
+  await run('UPDATE topic_label_candidates SET status = ? WHERE id = ?', ['selected', Number(candidateId)]);
+  await run('UPDATE topics SET label = ? WHERE topic_id = ?', [candidate.label, Number(topicId)]);
+  await run(`
+    INSERT INTO topic_label_overrides (topic_id, label, source, candidate_id, created_at, updated_at)
+    VALUES (?, ?, 'selected', ?, ?, ?)
+    ON CONFLICT(topic_id) DO UPDATE SET
+      label = excluded.label,
+      source = excluded.source,
+      candidate_id = excluded.candidate_id,
+      updated_at = excluded.updated_at
+  `, [Number(topicId), candidate.label, Number(candidateId), now, now]);
+  return { topicId: Number(topicId), label: candidate.label, candidateId: Number(candidateId) };
+}
+
+export async function updateTopicManualLabel(topicId, label) {
+  const normalized = String(label || '').trim();
+  if (!normalized) return null;
+  const existing = await get('SELECT topic_id FROM topics WHERE topic_id = ?', [Number(topicId)]);
+  if (!existing) return null;
+  const now = new Date().toISOString();
+  await run('UPDATE topics SET label = ? WHERE topic_id = ?', [normalized, Number(topicId)]);
+  await run(`
+    INSERT INTO topic_label_overrides (topic_id, label, source, candidate_id, created_at, updated_at)
+    VALUES (?, ?, 'manual', NULL, ?, ?)
+    ON CONFLICT(topic_id) DO UPDATE SET
+      label = excluded.label,
+      source = excluded.source,
+      candidate_id = NULL,
+      updated_at = excluded.updated_at
+  `, [Number(topicId), normalized, now, now]);
+  return { topicId: Number(topicId), label: normalized };
+}
+
+export async function deleteTopicLabelOverride(topicId) {
+  const result = await run('DELETE FROM topic_label_overrides WHERE topic_id = ?', [Number(topicId)]);
+  return result.changes > 0;
+}
+
+export async function publishPassingTopicLabels() {
+  const rows = await all(`
+    SELECT c.id, c.topic_id, c.label, c.score, c.warnings_json
+    FROM topic_label_candidates c
+    LEFT JOIN topic_label_overrides o ON o.topic_id = c.topic_id
+    WHERE o.topic_id IS NULL
+      AND c.status IN ('pending', 'selected', 'auto_selected')
+    ORDER BY c.topic_id, c.score DESC, c.created_at DESC
+  `);
+  const bestByTopic = new Map();
+  for (const row of rows) {
+    const topicId = Number(row.topic_id);
+    if (bestByTopic.has(topicId)) continue;
+    const warnings = parseJsonValue(row.warnings_json, []);
+    if (Number(row.score || 0) < 80 || warnings.length) continue;
+    bestByTopic.set(topicId, row);
+  }
+
+  for (const [topicId, row] of bestByTopic.entries()) {
+    await run('UPDATE topic_label_candidates SET status = ? WHERE topic_id = ? AND status != ?', ['rejected', topicId, 'rejected']);
+    await run('UPDATE topic_label_candidates SET status = ? WHERE id = ?', ['auto_selected', Number(row.id)]);
+    await run('UPDATE topics SET label = ? WHERE topic_id = ?', [row.label, topicId]);
+  }
+
+  return { published: bestByTopic.size };
 }
 
 export async function loadDocumentTopicCoords(docIds) {

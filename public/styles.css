@@ -2295,6 +2295,36 @@ svg[viewBox] {
   }
 }
 
+.topic-label-card {
+  margin-bottom: 0.75rem;
+}
+
+.topic-label-candidates {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0.65rem 0;
+}
+
+.topic-label-candidate {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 0.45rem 0.6rem;
+  align-items: center;
+  padding: 0.45rem 0.5rem;
+  border: 1px solid rgba(45, 74, 82, 0.14);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.45);
+}
+
+.topic-label-candidate small {
+  grid-column: 2 / 4;
+  color: var(--muted);
+}
+
+.topic-label-card input[type="text"] {
+  min-width: min(100%, 24rem);
+}
+
 @media (max-width: 480px) {
   .hero h1 { font-size: 1.3rem; }
   .subtitle { font-size: 0.85rem; }

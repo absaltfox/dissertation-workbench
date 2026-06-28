@@ -115,6 +115,10 @@ refreshJobsBtn?.addEventListener('click', loadJobs);
 previewCatalogueLookupsBtn?.addEventListener('click', handlePreviewCatalogueLookups);
 runCatalogueLookupsBtn?.addEventListener('click', handleRunCatalogueLookups);
 runBertopicBtn?.addEventListener('click', handleRunBertopic);
+refreshTopicLabelsBtn?.addEventListener('click', loadTopicLabels);
+regenerateTopicLabelsBtn?.addEventListener('click', () => handleRegenerateTopicLabels());
+publishPassingTopicLabelsBtn?.addEventListener('click', handlePublishPassingTopicLabels);
+topicLabelFilterEl?.addEventListener('change', renderTopicLabels);
 
 // Keyboard navigation for document table
 documentsTableEl.addEventListener('keydown', (e) => {

@@ -49,6 +49,7 @@ export const ADMIN_WORKER_GRACE_MS = Number(process.env.ADMIN_WORKER_GRACE_MS ||
 export const IMPORT_PDF_BATCH_SIZE = Number(process.env.IMPORT_PDF_BATCH_SIZE || 50);
 export const ADMIN_WORKER_MODE = process.env.ADMIN_WORKER_MODE || 'auto';
 export const WORKER_IMAGE = process.env.WORKER_IMAGE || process.env.FLY_IMAGE_REF || '';
+export const LABELER_WORKER_IMAGE = process.env.LABELER_WORKER_IMAGE || process.env.BERTOPIC_LABELER_IMAGE || '';
 export const WORKER_ARTIFACT_BASE_URL = process.env.WORKER_ARTIFACT_BASE_URL || '';
 export const WORKER_FORCE_ARTIFACT_API = /^(1|true|yes)$/i.test(process.env.WORKER_FORCE_ARTIFACT_API || '');
 export const FLY_API_HOSTNAME = process.env.FLY_API_HOSTNAME || 'https://api.machines.dev';
@@ -61,6 +62,10 @@ export const FLY_WORKER_MEMORY_MB = Number(process.env.FLY_WORKER_MEMORY_MB || 2
 export const FLY_WORKER_CPUS = Number(process.env.FLY_WORKER_CPUS || 1);
 export const FLY_WORKER_CPU_KIND = process.env.FLY_WORKER_CPU_KIND || 'shared';
 export const FLY_WORKER_REGION = process.env.FLY_WORKER_REGION || FLY_REGION || '';
+export const LOCAL_LABEL_BACKEND = process.env.LOCAL_LABEL_BACKEND || 'llama_cpp';
+export const LOCAL_LABEL_MODEL_PATH = process.env.LOCAL_LABEL_MODEL_PATH || '/app/models/qwen2.5-1.5b-instruct-q4.gguf';
+export const TOPIC_LABEL_AUTO_PUBLISH = process.env.TOPIC_LABEL_AUTO_PUBLISH || 'passing_only';
+export const TOPIC_LABEL_REVIEW_REQUIRED = process.env.TOPIC_LABEL_REVIEW_REQUIRED || 'weak';
 export const SESSION_COOKIE_SECURE = process.env.SESSION_COOKIE_SECURE
   ? /^(1|true|yes)$/i.test(process.env.SESSION_COOKIE_SECURE)
   : IS_PRODUCTION;

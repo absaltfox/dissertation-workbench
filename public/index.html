@@ -673,7 +673,27 @@
                     <button type="button" id="runBertopicBtn" class="btn">Run BERTopic</button>
                   </div>
                 </fieldset>
+                <fieldset class="settings-section">
+                  <legend>Topic Labels</legend>
+                  <p class="meta">Review generated topic label candidates, publish passing labels, or lock manual labels across rebuilds.</p>
+                  <div class="settings-actions row-actions">
+                    <button type="button" id="refreshTopicLabelsBtn" class="btn ghost">Refresh Labels</button>
+                    <button type="button" id="regenerateTopicLabelsBtn" class="btn ghost">Regenerate Weak Labels</button>
+                    <button type="button" id="publishPassingTopicLabelsBtn" class="btn">Accept Passing</button>
+                  </div>
+                  <label>
+                    <span>Filter</span>
+                    <select id="topicLabelFilter">
+                      <option value="all">All topics</option>
+                      <option value="pending">Pending review</option>
+                      <option value="warnings">Warnings</option>
+                      <option value="overrides">Manual/selected overrides</option>
+                    </select>
+                  </label>
+                  <div id="topicLabelSummary" class="import-preview" aria-live="polite"></div>
+                </fieldset>
               </div>
+              <div id="topicLabelsPanel" class="settings-section" aria-live="polite"></div>
               <div id="jobsStatusCards" class="settings-status-grid" aria-live="polite"></div>
               <h3>Recent Jobs</h3>
               <div class="table-wrap">

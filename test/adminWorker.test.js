@@ -28,13 +28,19 @@ let hashAdminJobToken;
 let heartbeatAdminJob;
 let hasRunningAdminJob;
 let finishAdminJob;
+let getDb;
 let loadDocumentCitations;
+let listTopicLabelReviews;
 let loadCatalogueLookup;
 let loadStoredFileMetric;
 let listPendingLookups;
+let publishPassingTopicLabels;
 let saveDocumentMetadata;
 let saveCitations;
 let saveFileMetric;
+let selectTopicLabelCandidate;
+let updateTopicManualLabel;
+let deleteTopicLabelOverride;
 let validateAdminJobArtifactToken;
 
 async function writeTextPdf(filePath, lines) {
@@ -93,13 +99,19 @@ test.before(async () => {
     heartbeatAdminJob,
     hasRunningAdminJob,
     finishAdminJob,
+    getDb,
     loadDocumentCitations,
+    listTopicLabelReviews,
     loadCatalogueLookup,
     loadStoredFileMetric,
     listPendingLookups,
+    publishPassingTopicLabels,
     saveDocumentMetadata,
     saveCitations,
     saveFileMetric,
+    selectTopicLabelCandidate,
+    updateTopicManualLabel,
+    deleteTopicLabelOverride,
     validateAdminJobArtifactToken,
   } = await import('../src/db.js'));
 });
@@ -129,6 +141,105 @@ test('Fly worker machine payload is private, one-shot, and job-scoped', () => {
   assert.equal(payload.config.metadata.role, 'admin-worker');
   assert.equal(payload.config.metadata.admin_job_id, '42');
   assert.equal(payload.config.services, undefined);
+});
+
+test('BERTopic Fly worker payload uses the Python worker image and labeling env', () => {
+  const previousBertopicImage = process.env.BERTOPIC_WORKER_IMAGE;
+  const previousAnthropicKey = process.env.ANTHROPIC_API_KEY;
+  process.env.BERTOPIC_WORKER_IMAGE = 'registry.fly.io/dissertation-workbench:worker-latest';
+  process.env.ANTHROPIC_API_KEY = 'test-anthropic-key';
+
+  try {
+    const payload = buildFlyWorkerMachinePayload({
+      image: 'registry.fly.io/dissertation-workbench:deployment-123',
+      jobId: 43,
+      token: 'secret-token',
+      timeoutMs: 12345,
+      jobType: 'bertopic',
+    });
+
+    assert.equal(payload.config.image, 'registry.fly.io/dissertation-workbench:worker-latest');
+    assert.deepEqual(payload.config.init.exec, ['python3', 'scripts/build-topics.py']);
+    assert.equal(payload.config.env.ANTHROPIC_API_KEY, 'test-anthropic-key');
+    assert.equal(payload.config.env.HF_HUB_OFFLINE, '1');
+    assert.equal(payload.config.env.TRANSFORMERS_OFFLINE, '1');
+    assert.equal(payload.config.guest.memory_mb >= 2048, true);
+  } finally {
+    if (previousBertopicImage === undefined) delete process.env.BERTOPIC_WORKER_IMAGE;
+    else process.env.BERTOPIC_WORKER_IMAGE = previousBertopicImage;
+    if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
+  }
+});
+
+test('topic label Fly worker payload uses labeler image and labels-only command', () => {
+  const previousLabelerImage = process.env.LABELER_WORKER_IMAGE;
+  process.env.LABELER_WORKER_IMAGE = 'registry.fly.io/dissertation-workbench:labeler-latest';
+
+  try {
+    const payload = buildFlyWorkerMachinePayload({
+      image: 'registry.fly.io/dissertation-workbench:deployment-123',
+      jobId: 44,
+      token: 'secret-token',
+      timeoutMs: 12345,
+      jobType: 'topic_labels',
+    });
+
+    assert.equal(payload.config.image, 'registry.fly.io/dissertation-workbench:labeler-latest');
+    assert.deepEqual(payload.config.init.exec, ['python3', 'scripts/build-topics.py', '--labels-only']);
+    assert.equal(payload.config.env.LOCAL_LABEL_BACKEND, 'llama_cpp');
+    assert.equal(payload.config.env.LOCAL_LABEL_MODEL_PATH, '/app/models/qwen2.5-1.5b-instruct-q4.gguf');
+    assert.equal(payload.config.guest.memory_mb >= 2048, true);
+  } finally {
+    if (previousLabelerImage === undefined) delete process.env.LABELER_WORKER_IMAGE;
+    else process.env.LABELER_WORKER_IMAGE = previousLabelerImage;
+  }
+});
+
+test('topic label candidates can be reviewed, selected, edited, unlocked, and bulk-published', async () => {
+  await ensureStorage();
+  const db = await getDb();
+  const suffix = Date.now();
+  await db.execute({
+    sql: 'INSERT OR REPLACE INTO topics (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    args: [7001, 'Old Label', JSON.stringify([['teacher', 0.9], ['identity', 0.8]]), 12, 'test-model', new Date().toISOString()],
+  });
+  await db.execute({
+    sql: 'INSERT INTO topic_label_runs (backend, model_name, status, config_json, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?)',
+    args: ['test', 'test-model', 'completed', '{}', new Date().toISOString(), new Date().toISOString()],
+  });
+  const runId = Number((await db.execute('SELECT MAX(id) AS id FROM topic_label_runs')).rows[0].id);
+  await db.execute({
+    sql: `INSERT INTO topic_label_candidates
+      (run_id, topic_id, label, source, score, status, warnings_json, evidence_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    args: [runId, 7001, `Teacher Identity Practice ${suffix}`, 'qwen', 95, 'pending', '[]', '{}', new Date().toISOString()],
+  });
+  const candidateId = Number((await db.execute('SELECT MAX(id) AS id FROM topic_label_candidates')).rows[0].id);
+
+  let review = await listTopicLabelReviews();
+  let topic = review.topics.find((item) => item.topicId === 7001);
+  assert.equal(topic.label, 'Old Label');
+  assert.equal(topic.candidates.length, 1);
+
+  await selectTopicLabelCandidate(7001, candidateId);
+  topic = (await listTopicLabelReviews()).topics.find((item) => item.topicId === 7001);
+  assert.equal(topic.label, `Teacher Identity Practice ${suffix}`);
+  assert.equal(topic.override.source, 'selected');
+
+  await updateTopicManualLabel(7001, `Manual Topic Label ${suffix}`);
+  topic = (await listTopicLabelReviews()).topics.find((item) => item.topicId === 7001);
+  assert.equal(topic.label, `Manual Topic Label ${suffix}`);
+  assert.equal(topic.override.source, 'manual');
+
+  assert.equal(await deleteTopicLabelOverride(7001), true);
+  review = await listTopicLabelReviews();
+  topic = review.topics.find((item) => item.topicId === 7001);
+  assert.equal(topic.override, null);
+
+  await publishPassingTopicLabels();
+  topic = (await listTopicLabelReviews()).topics.find((item) => item.topicId === 7001);
+  assert.equal(topic.label, `Teacher Identity Practice ${suffix}`);
 });
 
 test('admin worker job lifecycle helpers claim once, heartbeat, log, and validate artifact token', async () => {

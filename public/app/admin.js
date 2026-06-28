@@ -244,7 +244,7 @@ async function handlePasswordReset(e) {
 // --- Admin data loading ---
 
 async function loadAdminData() {
-  await Promise.all([loadUsers(), loadCache(), loadRuns(), loadSettings(), loadImportRules(), loadImportFacets(), loadConceptPipelineStatus(), loadJobs()]);
+  await Promise.all([loadUsers(), loadCache(), loadRuns(), loadSettings(), loadImportRules(), loadImportFacets(), loadConceptPipelineStatus(), loadJobs(), loadTopicLabels()]);
 }
 
 async function loadUsers() {
@@ -1064,6 +1064,212 @@ function renderJobs(data = {}) {
         </tr>
       `).join('')
       : '<tr><td colspan="6">No import or PDF sync runs have run yet.</td></tr>';
+  }
+}
+
+async function loadTopicLabels() {
+  if (!topicLabelsPanelEl) return;
+  try {
+    const res = await fetch('/api/admin/topics/labels');
+    if (!res.ok) return;
+    const data = await res.json();
+    state.topicLabels = data;
+    renderTopicLabels();
+  } catch { /* ignore */ }
+}
+
+function topicLabelVisible(topic, filter) {
+  if (filter === 'pending') return !!topic.pendingReview;
+  if (filter === 'warnings') return !!topic.warnings?.length || topic.candidates?.some((candidate) => candidate.warnings?.length);
+  if (filter === 'overrides') return !!topic.override;
+  return true;
+}
+
+function renderTopicLabels() {
+  if (!topicLabelsPanelEl) return;
+  const data = state.topicLabels || {};
+  const topics = data.topics || [];
+  const summary = data.summary || {};
+  if (topicLabelSummaryEl) {
+    const duplicates = summary.duplicateLabels?.length
+      ? ` · ${formatNum(summary.duplicateLabels.length)} duplicate label group${summary.duplicateLabels.length === 1 ? '' : 's'}`
+      : '';
+    topicLabelSummaryEl.innerHTML = `
+      <p class="settings-status-main">${formatNum(summary.pendingReview || 0)} pending review</p>
+      <p class="meta">${formatNum(summary.total || 0)} topics · ${formatNum(summary.overrides || 0)} locked overrides${duplicates}</p>
+    `;
+  }
+
+  const filter = topicLabelFilterEl?.value || 'all';
+  const visibleTopics = topics.filter((topic) => topic.topicId !== -1 && topicLabelVisible(topic, filter));
+  topicLabelsPanelEl.innerHTML = visibleTopics.length
+    ? visibleTopics.map((topic) => {
+      const warnings = Array.from(new Set([
+        ...(topic.warnings || []),
+        ...(topic.candidates || []).flatMap((candidate) => candidate.warnings || [])
+      ]));
+      const terms = (topic.topTerms || []).slice(0, 8).map((item) => Array.isArray(item) ? item[0] : item).filter(Boolean);
+      return `
+        <article class="settings-status-card topic-label-card">
+          <div class="section-heading-row">
+            <div>
+              <p class="settings-status-title">Topic ${formatNum(topic.topicId)} · ${formatNum(topic.docCount || 0)} docs</p>
+              <p class="settings-status-main">${escapeHtml(topic.label || '')}</p>
+              <p class="meta">${topic.override ? `Locked ${escapeHtml(topic.override.source || 'override')}` : topic.pendingReview ? 'Pending review' : 'Auto-selected'}</p>
+            </div>
+            <div class="row-actions">
+              <button type="button" class="btn ghost btn-sm" data-regenerate-topic-label="${topic.topicId}">Regenerate</button>
+              ${topic.override ? `<button type="button" class="btn ghost btn-sm" data-unlock-topic-label="${topic.topicId}">Unlock</button>` : ''}
+            </div>
+          </div>
+          ${warnings.length ? `<p class="form-error">${escapeHtml(warnings.join(', '))}</p>` : ''}
+          ${terms.length ? `<p class="meta">Terms: ${escapeHtml(terms.join(', '))}</p>` : ''}
+          ${topic.representativeTitles?.length ? `<p class="meta">Titles: ${topic.representativeTitles.slice(0, 3).map(escapeHtml).join(' · ')}</p>` : ''}
+          <div class="topic-label-candidates">
+            ${(topic.candidates || []).slice(0, 4).map((candidate) => `
+              <label class="topic-label-candidate">
+                <input type="radio" name="topic-label-${topic.topicId}" value="${candidate.id}" ${candidate.id === topic.selectedCandidateId ? 'checked' : ''} />
+                <span>${escapeHtml(candidate.label)}</span>
+                <small>${escapeHtml(candidate.source)} · score ${formatNum(Math.round(candidate.score || 0))}${candidate.warnings?.length ? ` · ${escapeHtml(candidate.warnings.join(', '))}` : ''}</small>
+                <button type="button" class="btn ghost btn-sm" data-select-topic-label="${topic.topicId}" data-candidate-id="${candidate.id}">Select</button>
+              </label>
+            `).join('')}
+          </div>
+          <div class="settings-actions row-actions">
+            <input type="text" value="${escapeHtml(topic.label || '')}" data-topic-label-input="${topic.topicId}" />
+            <button type="button" class="btn btn-sm" data-save-topic-label="${topic.topicId}">Save Label</button>
+          </div>
+        </article>
+      `;
+    }).join('')
+    : '<p class="meta">No topic labels match this filter.</p>';
+
+  for (const btn of topicLabelsPanelEl.querySelectorAll('[data-select-topic-label]')) {
+    btn.addEventListener('click', async () => {
+      await selectTopicLabel(btn.dataset.selectTopicLabel, btn.dataset.candidateId);
+    });
+  }
+  for (const btn of topicLabelsPanelEl.querySelectorAll('[data-save-topic-label]')) {
+    btn.addEventListener('click', async () => {
+      const topicId = btn.dataset.saveTopicLabel;
+      const input = topicLabelsPanelEl.querySelector(`[data-topic-label-input="${CSS.escape(topicId)}"]`);
+      await saveTopicLabel(topicId, input?.value || '');
+    });
+  }
+  for (const btn of topicLabelsPanelEl.querySelectorAll('[data-unlock-topic-label]')) {
+    btn.addEventListener('click', async () => {
+      await unlockTopicLabel(btn.dataset.unlockTopicLabel);
+    });
+  }
+  for (const btn of topicLabelsPanelEl.querySelectorAll('[data-regenerate-topic-label]')) {
+    btn.addEventListener('click', async () => {
+      await handleRegenerateTopicLabels(btn.dataset.regenerateTopicLabel);
+    });
+  }
+}
+
+async function selectTopicLabel(topicId, candidateId) {
+  try {
+    const res = await fetch(`/api/admin/topics/${encodeURIComponent(topicId)}/labels/select`, {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ candidateId: Number(candidateId) }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert(data.error || 'Label could not be selected.');
+      return;
+    }
+    setStatus('Topic label selected.');
+    await loadTopicLabels();
+  } catch {
+    alert('Connection error');
+  }
+}
+
+async function saveTopicLabel(topicId, label) {
+  const trimmed = String(label || '').trim();
+  if (!trimmed) {
+    alert('Label is required.');
+    return;
+  }
+  try {
+    const res = await fetch(`/api/admin/topics/${encodeURIComponent(topicId)}/label`, {
+      method: 'PATCH',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ label: trimmed }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert(data.error || 'Label could not be saved.');
+      return;
+    }
+    setStatus('Topic label saved.');
+    await loadTopicLabels();
+  } catch {
+    alert('Connection error');
+  }
+}
+
+async function unlockTopicLabel(topicId) {
+  try {
+    const res = await fetch(`/api/admin/topics/${encodeURIComponent(topicId)}/label/override`, {
+      method: 'DELETE',
+      headers: csrfHeaders(),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || 'Override could not be unlocked.');
+      return;
+    }
+    setStatus('Topic label override unlocked.');
+    await loadTopicLabels();
+  } catch {
+    alert('Connection error');
+  }
+}
+
+async function handleRegenerateTopicLabels(topicId = null) {
+  const button = topicId == null ? regenerateTopicLabelsBtn : null;
+  if (button) button.disabled = true;
+  try {
+    const res = await fetch('/api/admin/topics/labels/regenerate', {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify(topicId == null ? {} : { topicId: Number(topicId) }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert(data.error || 'Label regeneration failed to start.');
+      return;
+    }
+    setStatus(data.alreadyRunning ? 'Topic label regeneration is already running.' : 'Topic label regeneration started.');
+    await loadJobs();
+  } catch {
+    alert('Connection error');
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+async function handlePublishPassingTopicLabels() {
+  publishPassingTopicLabelsBtn.disabled = true;
+  try {
+    const res = await fetch('/api/admin/topics/labels/publish-passing', {
+      method: 'POST',
+      headers: csrfHeaders(),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert(data.error || 'Passing labels could not be published.');
+      return;
+    }
+    setStatus(`Published ${formatNum(data.published || 0)} passing topic label${data.published === 1 ? '' : 's'}.`);
+    await loadTopicLabels();
+  } catch {
+    alert('Connection error');
+  } finally {
+    publishPassingTopicLabelsBtn.disabled = false;
   }
 }
 

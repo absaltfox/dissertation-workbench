@@ -1,0 +1,43 @@
+FROM python:3.11-slim AS llama-builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    cmake \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/ggerganov/llama.cpp.git ./llama.cpp \
+    && cmake -S ./llama.cpp -B ./llama.cpp/build -DLLAMA_NATIVE=OFF \
+    && cmake --build ./llama.cpp/build -j --target llama-cli
+
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=llama-builder /build/llama.cpp/build/bin/llama-cli /usr/local/bin/llama-cli
+
+RUN pip install --no-cache-dir "libsql-client>=0.1.0"
+
+RUN mkdir -p /app/models \
+    && curl -L --fail \
+      -o /app/models/qwen2.5-1.5b-instruct-q4.gguf \
+      https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf
+
+COPY scripts/build-topics.py ./scripts/build-topics.py
+
+ENV PYTHONUNBUFFERED=1
+ENV LOCAL_LABEL_BACKEND=llama_cpp
+ENV LOCAL_LABEL_MODEL_PATH=/app/models/qwen2.5-1.5b-instruct-q4.gguf
+ENV LLAMA_CPP_COMMAND=llama-cli
+
+CMD ["python3", "scripts/build-topics.py", "--labels-only"]

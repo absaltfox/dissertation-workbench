@@ -45,7 +45,7 @@ async function main() {
   });
 
   let run;
-  if (claimed.type === 'bertopic') {
+  if (claimed.type === 'bertopic' || claimed.type === 'topic_labels') {
     const { spawn } = await import('node:child_process');
     const path = await import('node:path');
     const { fileURLToPath } = await import('node:url');
@@ -54,9 +54,12 @@ async function main() {
     const __filename = fileURLToPath(import.meta.url);
     const __dirname = path.dirname(__filename);
     const scriptPath = path.join(__dirname, '..', 'scripts', 'build-topics.py');
+    const args = claimed.type === 'topic_labels'
+      ? [scriptPath, '--labels-only', ...(claimed.params?.topicId != null ? ['--topic-id', String(claimed.params.topicId)] : [])]
+      : [scriptPath];
 
     run = new Promise((resolve, reject) => {
-      const child = spawn(BERTOPIC_PYTHON_COMMAND, [scriptPath], {
+      const child = spawn(BERTOPIC_PYTHON_COMMAND, args, {
         cwd: path.join(__dirname, '..'),
         env: {
           ...process.env,

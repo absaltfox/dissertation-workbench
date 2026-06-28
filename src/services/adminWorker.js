@@ -3,7 +3,8 @@ import { spawn } from 'node:child_process';
 import {
   ADMIN_WORKER_GRACE_MS, ADMIN_WORKER_MODE, ADMIN_WORKER_TIMEOUT_MS,
   FLY_API_HOSTNAME, FLY_API_TOKEN, FLY_APP_NAME, FLY_MACHINE_ID,
-  FLY_WORKER_CPUS, FLY_WORKER_CPU_KIND, FLY_WORKER_MEMORY_MB,
+  FLY_WORKER_CPUS, FLY_WORKER_CPU_KIND, FLY_WORKER_MEMORY_MB, LABELER_WORKER_IMAGE,
+  LOCAL_LABEL_BACKEND, LOCAL_LABEL_MODEL_PATH,
   FLY_WORKER_REGION, IS_PRODUCTION, WORKER_IMAGE
 } from '../config.js';
 import {
@@ -81,13 +82,18 @@ async function resolveWorkerImage() {
 
 export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = ADMIN_WORKER_TIMEOUT_MS, jobType = null }) {
   const isBertopic = jobType === 'bertopic';
-  const workerImage = isBertopic
+  const isTopicLabels = jobType === 'topic_labels';
+  const workerImage = isTopicLabels
+    ? (process.env.LABELER_WORKER_IMAGE || LABELER_WORKER_IMAGE || process.env.BERTOPIC_WORKER_IMAGE || image)
+    : isBertopic
     ? (process.env.BERTOPIC_WORKER_IMAGE || image)
     : image;
-  const execCmd = isBertopic
+  const execCmd = isTopicLabels
+    ? ['python3', 'scripts/build-topics.py', '--labels-only']
+    : isBertopic
     ? ['python3', 'scripts/build-topics.py']
     : ['node', 'src/jobWorker.js'];
-  const memoryMb = isBertopic
+  const memoryMb = isBertopic || isTopicLabels
     ? Math.max(2048, FLY_WORKER_MEMORY_MB)
     : FLY_WORKER_MEMORY_MB;
 
@@ -101,6 +107,8 @@ export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = 
     TURSO_AUTH_TOKEN: process.env.TURSO_AUTH_TOKEN || '',
     SQLITE_PATH: process.env.SQLITE_PATH || '',
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+    LOCAL_LABEL_BACKEND,
+    LOCAL_LABEL_MODEL_PATH,
     HF_HUB_OFFLINE: '1',
     TRANSFORMERS_OFFLINE: '1',
     OMP_NUM_THREADS: '1',

@@ -24,7 +24,10 @@ except ImportError:
     pass
 
 import json
+import re
 import sqlite3
+import argparse
+import subprocess
 import sys
 from datetime import datetime, timezone
 
@@ -156,6 +159,150 @@ def get_db_client(db_path):
         return SqliteClientWrapper(db_path)
 
 
+GENERIC_LABEL_KEYS = {
+    "academic category title",
+    "category title",
+    "education research",
+    "educational research",
+    "educational research themes",
+    "global & intercultural educational studies",
+    "global intercultural educational studies",
+    "global and intercultural educational studies",
+    "research topic",
+    "research topics",
+    "short category title",
+    "topic label",
+    "topic title",
+}
+
+
+def normalize_label_key(label):
+    return re.sub(r"\s+", " ", str(label or "").strip().lower())
+
+
+def clean_generated_label(label):
+    if label is None:
+        return None
+
+    cleaned = str(label).strip()
+    if not cleaned:
+        return None
+
+    # Some small local models echo a whole instruction or multiple lines.
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    cleaned = lines[0] if lines else cleaned
+    cleaned = re.sub(r"^(topic\s*-?\d+\s*[:\-]\s*|label\s*[:\-]\s*)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip(" \t\r\n\"'`.,;:")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+
+    key = normalize_label_key(cleaned)
+    if len(cleaned) < 3 or key in GENERIC_LABEL_KEYS:
+        return None
+    return cleaned
+
+
+def titleize_terms(terms):
+    words = []
+    for term in terms:
+        cleaned = re.sub(r"[_\-]+", " ", str(term)).strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        if cleaned:
+            words.append(cleaned)
+    if not words:
+        return None
+    return " ".join(words[:4]).title()
+
+
+def bertopic_default_label(topic_model, topic_id, row=None):
+    if topic_id == -1:
+        return "Uncategorized"
+
+    terms = topic_model.get_topic(topic_id) or []
+    if isinstance(terms, list):
+        label = titleize_terms([term for term, _weight in terms[:4]])
+        if label:
+            return label
+
+    if row is not None:
+        name = str(row.get("Name", "")).strip()
+        if "_" in name:
+            return titleize_terms(name.split("_")[1:]) or f"Topic {topic_id}"
+        cleaned = clean_generated_label(name)
+        if cleaned:
+            return cleaned
+
+    return f"Topic {topic_id}"
+
+
+def unique_label(label, topic_id, used_keys):
+    key = normalize_label_key(label)
+    if key not in used_keys:
+        used_keys.add(key)
+        return label
+
+    candidate = f"{label} Topic {topic_id}"
+    key = normalize_label_key(candidate)
+    suffix = 2
+    while key in used_keys:
+        candidate = f"{label} Topic {topic_id}-{suffix}"
+        key = normalize_label_key(candidate)
+        suffix += 1
+    used_keys.add(key)
+    return candidate
+
+
+def label_is_usable(label, used_keys=None):
+    cleaned = clean_generated_label(label)
+    if not cleaned:
+        return False
+    if used_keys and normalize_label_key(cleaned) in used_keys:
+        return False
+    return True
+
+
+def build_topic_label_map(topic_model, topic_info, generated_labels):
+    """Return safe per-topic labels, replacing duplicate model outputs only as a last resort."""
+    label_map = {}
+    generated_by_key = {}
+
+    for _, row in topic_info.iterrows():
+        topic_id = int(row["Topic"])
+        if topic_id == -1:
+            label_map[topic_id] = "Uncategorized"
+            continue
+
+        label = clean_generated_label(generated_labels.get(topic_id))
+        if label:
+            generated_by_key.setdefault(normalize_label_key(label), []).append(topic_id)
+        label_map[topic_id] = label
+
+    duplicate_generated_ids = {
+        topic_id
+        for topic_ids in generated_by_key.values()
+        if len(topic_ids) > 1
+        for topic_id in topic_ids
+    }
+
+    if duplicate_generated_ids:
+        print(
+            f"  Replacing {len(duplicate_generated_ids)} duplicate generated labels "
+            "with per-topic fallback labels"
+        )
+
+    used_keys = {normalize_label_key("Uncategorized")}
+    for _, row in topic_info.iterrows():
+        topic_id = int(row["Topic"])
+        if topic_id == -1:
+            continue
+
+        label = label_map.get(topic_id)
+        if not label or topic_id in duplicate_generated_ids:
+            label = bertopic_default_label(topic_model, topic_id, row)
+        label_map[topic_id] = unique_label(label, topic_id, used_keys)
+
+    return label_map
+
+
 def generate_labels(topic_model, abstracts, topic_assignments, reporter=None):
     """Generate human-readable topic labels using Claude (if API key set) or a local Qwen model."""
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
@@ -269,8 +416,83 @@ def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key, r
     return labels
 
 
+def generate_llama_cpp_labels(topic_model, abstracts, topic_assignments, reporter=None):
+    model_path = os.environ.get("LOCAL_LABEL_MODEL_PATH", "/app/models/qwen2.5-1.5b-instruct-q4.gguf")
+    command = os.environ.get("LLAMA_CPP_COMMAND", "llama-cli")
+    if not os.path.exists(model_path):
+        print(f"llama.cpp model not found at {model_path}; falling back to transformers")
+        return {}
+
+    topic_info = topic_model.get_topic_info()
+    labels = {-1: "Uncategorized"}
+    used_label_keys = {normalize_label_key("Uncategorized")}
+    total_topics = len(topic_info) - 1
+    processed_count = 0
+    print(f"Generating labels for {total_topics} topics with llama.cpp ({model_path})...")
+
+    for _, row in topic_info.iterrows():
+        topic_id = int(row["Topic"])
+        if topic_id == -1:
+            continue
+        if reporter:
+            reporter.report(
+                "generate_labels",
+                "Generating Labels",
+                status="running",
+                detail=f"Generating llama.cpp label for topic {topic_id} ({processed_count + 1}/{total_topics})...",
+                counts={"processed": processed_count, "total": total_topics}
+            )
+        terms = clean_topic_terms(topic_model.get_topic(topic_id))[:10]
+        fallback = bertopic_default_label(topic_model, topic_id, row)
+        doc_indices = [i for i, t in enumerate(topic_assignments) if int(t) == topic_id][:3]
+        samples = [re.sub(r"\s+", " ", abstracts[i]).strip()[:260] for i in doc_indices]
+        prompt = (
+            "You are an academic librarian. Write one concise, human-readable research topic label.\n"
+            f"Top terms: {', '.join(terms)}\n"
+            f"Rough machine phrase, not final: {fallback}\n"
+            "Representative documents:\n"
+            + "\n".join(f"- {sample}" for sample in samples)
+            + "\nRules: return only one natural 3 to 6 word noun phrase. Do not list keywords. Label:"
+        )
+        try:
+            result = subprocess.run(
+                [
+                    command,
+                    "-m", model_path,
+                    "-p", prompt,
+                    "-n", "24",
+                    "--temp", "0.35",
+                    "--top-p", "0.9",
+                    "--no-display-prompt",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            response = clean_generated_label(result.stdout.strip())
+        except Exception as exc:
+            print(f"  Topic {topic_id} llama.cpp generation failed: {exc}")
+            response = None
+
+        label, _score, _warnings = score_label_candidate(response, topic_id, fallback, used_label_keys)
+        if not label:
+            label = fallback
+        used_label_keys.add(normalize_label_key(label))
+        labels[topic_id] = label
+        print(f"  Topic {topic_id} -> {label} (llama.cpp)", flush=True)
+        processed_count += 1
+
+    return labels
+
+
 def generate_local_labels(topic_model, abstracts, topic_assignments, reporter=None):
     """Use a local LLM (Qwen/Qwen2.5-0.5B-Instruct by default) to generate topic labels."""
+    if os.environ.get("LOCAL_LABEL_BACKEND", "").strip().lower() == "llama_cpp":
+        labels = generate_llama_cpp_labels(topic_model, abstracts, topic_assignments, reporter)
+        if labels and len(labels) > 1:
+            return labels
+
     model_name = os.environ.get("LOCAL_LLM_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
     print(f"\nLoading local label generation model: {model_name}...")
     try:
@@ -289,6 +511,7 @@ def generate_local_labels(topic_model, abstracts, topic_assignments, reporter=No
     topic_info = topic_model.get_topic_info()
     labels = {}
     labels[-1] = "Uncategorized"
+    used_label_keys = {normalize_label_key("Uncategorized")}
 
     total_topics = len(topic_info) - 1
     print(f"Generating labels for {total_topics} topics locally...")
@@ -313,50 +536,100 @@ def generate_local_labels(topic_model, abstracts, topic_assignments, reporter=No
         if not terms:
             continue
         top_words = [t[0] for t in terms[:10]]
+        keyword_fallback_label = bertopic_default_label(topic_model, topic_id, row)
+        prior_labels = [
+            label
+            for tid, label in sorted(labels.items())
+            if tid != -1 and normalize_label_key(label) in used_label_keys
+        ][-8:]
 
         # Get representative abstracts (up to 3, truncated)
-        doc_indices = [i for i, t in enumerate(topic_assignments) if t == topic_id][:3]
-        sample_abstracts = [abstracts[i][:250] for i in doc_indices]
-
-        # Formulate prompt for Qwen
-        prompt = (
-            f"Highly Relevant Keywords: {', '.join(top_words)}\n"
-            f"Sample Abstracts of papers in this topic:\n"
+        doc_indices = [i for i, t in enumerate(topic_assignments) if t == topic_id][:2]
+        sample_abstracts = [abstracts[i][:180] for i in doc_indices]
+        topic_context = (
+            f"Topic ID: {topic_id}\n"
+            f"Top weighted terms: {', '.join(top_words)}\n"
+            f"Rough machine phrase, not final: {keyword_fallback_label}\n"
+            f"Already used labels: {', '.join(prior_labels) if prior_labels else 'None'}\n"
+            f"Representative abstracts:\n"
             + "\n".join(f"- {a}..." for a in sample_abstracts)
-            + "\n\nInstructions:\n"
-              "1. Find the core common theme across these sample abstracts.\n"
-              "2. Generate a short, clean, descriptive academic topic title (3-6 words) as a noun phrase (e.g. 'Indigenous Education Policy' or 'Reading Comprehension & Assessment').\n"
-              "3. Focus on what these abstracts share in common. If the keywords or abstracts cover diverse or unrelated topics, do not create a literal mashup of terms (like 'Pasifika, Swiss schools and Pride'). Instead, write a broader, cohesive category name (e.g. 'Global & Intercultural Educational Studies' or 'Diverse Identity & Equity in Higher Education').\n"
-              "4. Respond with ONLY the short title. Do not include quotes, periods, or other text."
         )
 
-        messages = [
-            {"role": "system", "content": "You are a professional academic librarian who creates high-quality, natural category labels for research topics. You respond with ONLY the short category title, no metadata, no quotes, and no commentary."},
-            {"role": "user", "content": prompt}
+        prompts = [
+            (
+                topic_context
+                + "\n\nInstructions:\n"
+                  "1. Find the core common research theme across these representative abstracts.\n"
+                  "2. Write a short, clean, descriptive academic topic title as a natural noun phrase.\n"
+                  "3. Use 3 to 6 words, with normal English connectors where needed.\n"
+                  "4. Do not output a literal keyword list or a choppy sequence of search terms.\n"
+                  "5. Do not reuse any already used label, and avoid broad catch-all labels.\n"
+                  "6. Respond with ONLY the title. Do not include quotes, periods, or other text."
+            ),
+            (
+                topic_context
+                + "\n\nRewrite this as a polished topic legend label. "
+                  "The label should sound like a library subject category, not raw BERTopic keywords. "
+                  "Prefer phrasing like 'Teacher Identity and Practice', 'Policy Implementation in Schools', "
+                  "or 'Indigenous Language Revitalization' when supported by the evidence. "
+                  "Do not copy those examples unless they exactly fit this topic. "
+                  "Do not reuse the rough machine phrase verbatim. "
+                  "Return only one 3 to 6 word title."
+            ),
         ]
 
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
-        model_inputs = tokenizer([text], return_tensors="pt")
+        label = None
+        source = None
+        for attempt, prompt in enumerate(prompts):
+            messages = [
+                {"role": "system", "content": "You are an academic librarian creating concise, human-readable research topic labels. Return only one natural noun phrase, with no quotes and no commentary."},
+                {"role": "user", "content": prompt}
+            ]
 
-        generated_ids = model.generate(
-            model_inputs.input_ids,
-            max_new_tokens=15,
-            pad_token_id=tokenizer.eos_token_id,
-            do_sample=False
-        )
-        generated_ids = [
-            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-        ]
+            text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            model_inputs = tokenizer([text], return_tensors="pt")
 
-        response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
-        response = response.replace('"', '').replace("'", "").strip(" .")
-        
-        print(f"  Topic {topic_id} -> {response}")
-        labels[topic_id] = response
+            generate_kwargs = {
+                "max_new_tokens": 18,
+                "pad_token_id": tokenizer.eos_token_id,
+                "no_repeat_ngram_size": 2,
+            }
+            if attempt == 0:
+                generate_kwargs["do_sample"] = False
+            else:
+                generate_kwargs.update({"do_sample": True, "temperature": 0.7, "top_p": 0.9})
+
+            generated_ids = model.generate(
+                model_inputs.input_ids,
+                attention_mask=model_inputs.get("attention_mask"),
+                **generate_kwargs
+            )
+            generated_ids = [
+                output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+            ]
+
+            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+            response = clean_generated_label(response)
+            if normalize_label_key(response) == normalize_label_key(keyword_fallback_label):
+                response = None
+            if label_is_usable(response, used_label_keys):
+                label = response
+                source = "Qwen" if attempt == 0 else "Qwen retry"
+                break
+
+        if not label:
+            label = unique_label(keyword_fallback_label, topic_id, used_label_keys)
+            source = "keyword fallback"
+
+        if source in ("Qwen", "Qwen retry"):
+            used_label_keys.add(normalize_label_key(label))
+
+        print(f"  Topic {topic_id} -> {label} ({source})", flush=True)
+        labels[topic_id] = label
         processed_count += 1
 
     if reporter:
@@ -377,10 +650,369 @@ def generate_local_labels(topic_model, abstracts, topic_assignments, reporter=No
     return labels
 
 
+LABEL_STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "into",
+    "is", "it", "my", "of", "on", "or", "our", "the", "their", "this", "to",
+    "was", "we", "with", "study", "research", "thesis", "dissertation",
+    "education", "university", "ubc", "british", "columbia", "data", "analysis",
+}
+
+
+def clean_topic_terms(topic_terms):
+    cleaned = []
+    for item in topic_terms or []:
+        term = item[0] if isinstance(item, (list, tuple)) and item else item
+        term = re.sub(r"\s+", " ", str(term or "").replace("_", " ")).strip()
+        if len(term) < 3 or term.lower() in LABEL_STOP_WORDS:
+            continue
+        cleaned.append(term)
+    return cleaned
+
+
+def label_word_count(label):
+    return len(re.findall(r"[A-Za-z][A-Za-z'’-]*", label or ""))
+
+
+def looks_like_keyword_bag(label):
+    if not label:
+        return True
+    if "," in label or " / " in label:
+        return True
+    words = re.findall(r"[A-Za-z][A-Za-z'’-]*", label)
+    if len(words) >= 4 and not re.search(r"\b(and|of|in|for|with|through|across|among|on)\b", label, re.I):
+        return True
+    return False
+
+
+def score_label_candidate(label, topic_id, fallback_label=None, used_keys=None):
+    warnings = []
+    cleaned = clean_generated_label(label)
+    if not cleaned:
+        return None, 0, ["empty_or_generic"]
+    key = normalize_label_key(cleaned)
+    score = 100
+    if used_keys and key in used_keys:
+        warnings.append("duplicate")
+        score -= 60
+    if fallback_label and key == normalize_label_key(fallback_label):
+        warnings.append("matches_keyword_fallback")
+        score -= 35
+    wc = label_word_count(cleaned)
+    if wc < 3:
+        warnings.append("too_short")
+        score -= 20
+    if wc > 8 or len(cleaned) > 80:
+        warnings.append("too_long")
+        score -= 15
+    if looks_like_keyword_bag(cleaned):
+        warnings.append("keyword_like")
+        score -= 30
+    if key in GENERIC_LABEL_KEYS:
+        warnings.append("generic")
+        score -= 50
+    return cleaned, max(score, 0), warnings
+
+
+def ensure_topic_label_tables(client):
+    client.execute("""
+        CREATE TABLE IF NOT EXISTS topic_label_runs (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          backend      TEXT NOT NULL,
+          model_name   TEXT NOT NULL,
+          status       TEXT NOT NULL,
+          config_json  TEXT,
+          error        TEXT,
+          started_at   TEXT NOT NULL,
+          finished_at  TEXT
+        )
+    """)
+    client.execute("""
+        CREATE TABLE IF NOT EXISTS topic_label_candidates (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id        INTEGER,
+          topic_id      INTEGER NOT NULL,
+          label         TEXT NOT NULL,
+          source        TEXT NOT NULL,
+          score         REAL NOT NULL DEFAULT 0,
+          status        TEXT NOT NULL,
+          warnings_json TEXT NOT NULL DEFAULT '[]',
+          evidence_json TEXT NOT NULL DEFAULT '{}',
+          created_at    TEXT NOT NULL
+        )
+    """)
+    client.execute("""
+        CREATE TABLE IF NOT EXISTS topic_label_overrides (
+          topic_id     INTEGER PRIMARY KEY,
+          label        TEXT NOT NULL,
+          source       TEXT NOT NULL,
+          candidate_id INTEGER,
+          created_at   TEXT NOT NULL,
+          updated_at   TEXT NOT NULL
+        )
+    """)
+
+
+def load_existing_topic_labels(client):
+    labels = {}
+    try:
+        for row in client.execute("SELECT topic_id, label FROM topics").rows:
+            labels[int(row["topic_id"])] = row["label"]
+    except Exception:
+        pass
+    return labels
+
+
+def load_topic_label_overrides(client):
+    overrides = {}
+    try:
+        for row in client.execute("SELECT topic_id, label FROM topic_label_overrides").rows:
+            overrides[int(row["topic_id"])] = row["label"]
+    except Exception:
+        pass
+    return overrides
+
+
+def build_topic_evidence(topic_model, topic_id, abstracts, topic_assignments, titles_by_topic=None, existing_label=None):
+    terms = clean_topic_terms(topic_model.get_topic(topic_id))[:10]
+    doc_indices = [i for i, t in enumerate(topic_assignments) if int(t) == int(topic_id)][:3]
+    samples = []
+    for i in doc_indices:
+        text = abstracts[i]
+        samples.append(re.sub(r"\s+", " ", text).strip()[:320])
+    return {
+        "terms": terms,
+        "titles": (titles_by_topic or {}).get(topic_id, [])[:5],
+        "abstracts": samples,
+        "existingLabel": existing_label,
+    }
+
+
+def build_candidate_rows(topic_model, topic_info, generated_labels, abstracts, topic_assignments, existing_labels=None, titles_by_topic=None):
+    candidates_by_topic = {}
+    used_keys = {normalize_label_key("Uncategorized")}
+    for _, row in topic_info.iterrows():
+        topic_id = int(row["Topic"])
+        if topic_id == -1:
+            continue
+        fallback = bertopic_default_label(topic_model, topic_id, row)
+        evidence = build_topic_evidence(
+            topic_model, topic_id, abstracts, topic_assignments,
+            titles_by_topic=titles_by_topic,
+            existing_label=(existing_labels or {}).get(topic_id),
+        )
+        raw_candidates = [
+            (generated_labels.get(topic_id), "qwen"),
+            ((existing_labels or {}).get(topic_id), "previous"),
+            (fallback, "keyword_fallback"),
+        ]
+        rows = []
+        seen = set()
+        for raw_label, source in raw_candidates:
+            label, score, warnings = score_label_candidate(raw_label, topic_id, fallback, used_keys)
+            if not label:
+                continue
+            key = normalize_label_key(label)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append({
+                "topic_id": topic_id,
+                "label": label,
+                "source": source,
+                "score": score,
+                "warnings": warnings,
+                "evidence": evidence,
+            })
+        rows.sort(key=lambda item: item["score"], reverse=True)
+        if rows:
+            used_keys.add(normalize_label_key(rows[0]["label"]))
+        candidates_by_topic[topic_id] = rows
+    return candidates_by_topic
+
+
+def save_topic_label_candidates(client, candidates_by_topic, backend, model_name, config=None):
+    ensure_topic_label_tables(client)
+    now = datetime.now(timezone.utc).isoformat()
+    result = client.execute(
+        "INSERT INTO topic_label_runs (backend, model_name, status, config_json, started_at) VALUES (?, ?, 'completed', ?, ?)",
+        [backend, model_name, json.dumps(config or {}), now]
+    )
+    run_id = getattr(result, "last_insert_rowid", None) or getattr(result, "lastInsertRowid", None)
+    if not run_id:
+        row = client.execute("SELECT MAX(id) AS id FROM topic_label_runs").rows[0]
+        run_id = int(row["id"])
+
+    for topic_id, rows in candidates_by_topic.items():
+        client.execute("UPDATE topic_label_candidates SET status = 'rejected' WHERE topic_id = ? AND status = 'pending'", [topic_id])
+        for row in rows:
+            status = "pending"
+            client.execute(
+                """
+                INSERT INTO topic_label_candidates
+                  (run_id, topic_id, label, source, score, status, warnings_json, evidence_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    int(run_id), topic_id, row["label"], row["source"], float(row["score"]), status,
+                    json.dumps(row["warnings"]), json.dumps(row["evidence"]), now
+                ]
+            )
+    return int(run_id)
+
+
+def choose_topic_labels(topic_model, topic_info, candidates_by_topic, overrides=None, existing_labels=None):
+    labels = {-1: "Uncategorized"}
+    for _, row in topic_info.iterrows():
+        topic_id = int(row["Topic"])
+        if topic_id == -1:
+            continue
+        if overrides and overrides.get(topic_id):
+            labels[topic_id] = overrides[topic_id]
+            continue
+        passing = [
+            candidate for candidate in candidates_by_topic.get(topic_id, [])
+            if candidate["score"] >= 80 and not candidate["warnings"]
+        ]
+        if passing:
+            labels[topic_id] = passing[0]["label"]
+            continue
+        previous = clean_generated_label((existing_labels or {}).get(topic_id))
+        if previous:
+            labels[topic_id] = previous
+        else:
+            labels[topic_id] = bertopic_default_label(topic_model, topic_id, row)
+    return labels
+
+
+def mark_auto_selected_candidates(client, candidates_by_topic, labels, overrides=None):
+    for topic_id, label in labels.items():
+        if topic_id == -1 or (overrides and overrides.get(topic_id)):
+            continue
+        for candidate in candidates_by_topic.get(topic_id, []):
+            if normalize_label_key(candidate["label"]) == normalize_label_key(label) and candidate["score"] >= 80 and not candidate["warnings"]:
+                client.execute(
+                    "UPDATE topic_label_candidates SET status = 'auto_selected' WHERE topic_id = ? AND label = ? AND status = 'pending'",
+                    [topic_id, candidate["label"]]
+                )
+                break
+
+
+class ExistingTopicInfo:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def iterrows(self):
+        for idx, row in enumerate(self.rows):
+            yield idx, row
+
+    def __len__(self):
+        return len(self.rows)
+
+
+class ExistingTopicModel:
+    def __init__(self, topic_terms, topic_info):
+        self.topic_terms = topic_terms
+        self.topic_info = topic_info
+
+    def get_topic(self, topic_id):
+        return self.topic_terms.get(int(topic_id), [])
+
+    def get_topic_info(self):
+        return self.topic_info
+
+
+def parse_top_terms(value):
+    try:
+        parsed = json.loads(value or "[]")
+    except Exception:
+        return []
+    terms = []
+    for item in parsed:
+        if isinstance(item, (list, tuple)) and item:
+            weight = item[1] if len(item) > 1 else 0
+            terms.append((str(item[0]), float(weight or 0)))
+    return terms
+
+
+def run_label_only(client, topic_id=None, reporter=None):
+    ensure_topic_label_tables(client)
+    topic_rows = client.execute("SELECT topic_id, label, top_terms, doc_count FROM topics ORDER BY topic_id").rows
+    existing_labels = {int(row["topic_id"]): row["label"] for row in topic_rows}
+    overrides = load_topic_label_overrides(client)
+    selected_topic_ids = {
+        int(row["topic_id"]) for row in topic_rows
+        if int(row["topic_id"]) != -1 and (topic_id is None or int(row["topic_id"]) == int(topic_id))
+    }
+    info_rows = []
+    topic_terms = {}
+    for row in topic_rows:
+        tid = int(row["topic_id"])
+        if tid == -1 or tid in selected_topic_ids:
+            terms = parse_top_terms(row["top_terms"])
+            topic_terms[tid] = terms
+            info_rows.append({
+                "Topic": tid,
+                "Name": f"{tid}_{'_'.join([term for term, _ in terms[:4]])}" if tid != -1 else "Uncategorized",
+                "Count": int(row["doc_count"] or 0),
+            })
+    topic_info = ExistingTopicInfo(info_rows)
+    topic_model = ExistingTopicModel(topic_terms, topic_info)
+
+    rows = client.execute("""
+        SELECT dt.topic_id, d.metadata_json
+        FROM document_topics dt
+        JOIN documents d ON d.doc_id = dt.doc_id
+        WHERE dt.topic_id != -1
+        ORDER BY dt.topic_id, dt.probability DESC
+    """).rows
+    abstracts = []
+    assignments = []
+    titles_by_topic = {}
+    counts = {}
+    for row in rows:
+        tid = int(row["topic_id"])
+        if tid not in selected_topic_ids or counts.get(tid, 0) >= 3:
+            continue
+        try:
+            metadata = json.loads(row["metadata_json"] or "{}")
+        except Exception:
+            continue
+        title = str(metadata.get("title") or "").strip()
+        abstract = str(metadata.get("abstract") or metadata.get("description") or "").strip()
+        if title:
+            titles_by_topic.setdefault(tid, [])
+            if title not in titles_by_topic[tid]:
+                titles_by_topic[tid].append(title)
+        if len(abstract) < 50:
+            continue
+        sample = f"Title: {title}\nAbstract: {abstract}" if title else abstract
+        abstracts.append(sample)
+        assignments.append(tid)
+        counts[tid] = counts.get(tid, 0) + 1
+
+    generated = generate_labels(topic_model, abstracts, assignments, reporter)
+    backend = os.environ.get("LOCAL_LABEL_BACKEND", "transformers")
+    model_name = os.environ.get("LOCAL_LABEL_MODEL", os.environ.get("LOCAL_LABEL_MODEL_PATH", "Qwen/Qwen2.5-0.5B-Instruct"))
+    candidates = build_candidate_rows(topic_model, topic_info, generated, abstracts, assignments, existing_labels, titles_by_topic)
+    save_topic_label_candidates(client, candidates, backend, model_name, {"labelsOnly": True, "topicId": topic_id})
+    labels = choose_topic_labels(topic_model, topic_info, candidates, overrides, existing_labels)
+    for tid, label in labels.items():
+        if tid == -1:
+            continue
+        client.execute("UPDATE topics SET label = ? WHERE topic_id = ?", [label, tid])
+    mark_auto_selected_candidates(client, candidates, labels, overrides)
+    print(f"Regenerated labels for {len(selected_topic_ids)} topics.")
+
+
 import threading
 import time
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--labels-only", action="store_true")
+    parser.add_argument("--topic-id", type=int)
+    args = parser.parse_args()
+
     db_path = os.environ.get("SQLITE_PATH", DB_PATH)
     db_path = os.path.abspath(db_path)
 
@@ -408,6 +1040,31 @@ def main():
         reporter = ProgressReporter(client, job_id)
 
     try:
+        if args.labels_only:
+            if reporter:
+                reporter.report(
+                    "generate_labels",
+                    "Generating Labels",
+                    status="running",
+                    detail="Regenerating labels for existing topics..."
+                )
+            run_label_only(client, topic_id=args.topic_id, reporter=reporter)
+            if reporter:
+                reporter.report(
+                    "generate_labels",
+                    "Generating Labels",
+                    status="completed",
+                    detail="Regenerated labels for existing topics.",
+                    next_task="Completed"
+                )
+            if job_id:
+                now_str = datetime.now(timezone.utc).isoformat()
+                client.execute(
+                    "UPDATE admin_jobs SET status = 'completed', runner_state = 'completed', finished_at = ? WHERE id = ?",
+                    [now_str, int(job_id)]
+                )
+            return
+
         # Load abstracts
         if reporter:
             reporter.report(
@@ -655,6 +1312,9 @@ def main():
         # Extract topic info
         topic_info = topic_model.get_topic_info()
         now = datetime.now(timezone.utc).isoformat()
+        ensure_topic_label_tables(client)
+        existing_labels = load_existing_topic_labels(client)
+        label_overrides = load_topic_label_overrides(client)
 
         print(f"\nDiscovered {len(topic_info) - 1} topics (plus outlier cluster)")
         if reporter:
@@ -668,6 +1328,17 @@ def main():
 
         # Generate human-readable labels (Claude API or local Qwen model fallback)
         claude_labels = generate_labels(topic_model, abstracts, topics, reporter)
+        label_candidates = build_candidate_rows(topic_model, topic_info, claude_labels, abstracts, topics, existing_labels)
+        backend = "claude" if os.environ.get("ANTHROPIC_API_KEY", "").strip() else os.environ.get("LOCAL_LABEL_BACKEND", "transformers")
+        label_model_name = CLAUDE_MODEL if backend == "claude" else os.environ.get("LOCAL_LABEL_MODEL", os.environ.get("LOCAL_LABEL_MODEL_PATH", "Qwen/Qwen2.5-0.5B-Instruct"))
+        save_topic_label_candidates(
+            client,
+            label_candidates,
+            backend,
+            label_model_name,
+            {"autoPublish": os.environ.get("TOPIC_LABEL_AUTO_PUBLISH", "passing_only")}
+        )
+        topic_labels = choose_topic_labels(topic_model, topic_info, label_candidates, label_overrides, existing_labels)
 
         if reporter:
             reporter.report(
@@ -713,8 +1384,7 @@ def main():
         # Write topic rows
         for _, row in topic_info.iterrows():
             topic_id = int(row["Topic"])
-            # Use Claude-generated label if available, otherwise fall back to BERTopic default
-            label = claude_labels.get(topic_id, str(row.get("Name", f"Topic_{topic_id}")))
+            label = topic_labels.get(topic_id, bertopic_default_label(topic_model, topic_id, row))
             count = int(row.get("Count", 0))
 
             # Get top terms with weights
@@ -728,6 +1398,7 @@ def main():
                 "INSERT INTO topics (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                 [topic_id, label, top_terms_json, count, MODEL_NAME, now],
             )
+        mark_auto_selected_candidates(client, label_candidates, topic_labels, label_overrides)
 
         # Write document-topic assignments
         for i, (doc_id, topic_id) in enumerate(zip(doc_ids, topics)):
@@ -794,7 +1465,7 @@ def main():
             tid = int(row["Topic"])
             if tid == -1:
                 continue
-            display = claude_labels.get(tid, row.get("Name", "?"))
+            display = topic_labels.get(tid, row.get("Name", "?"))
             print(f"  Topic {tid}: {display} ({row.get('Count', 0)} docs)")
 
         # Optionally save model
