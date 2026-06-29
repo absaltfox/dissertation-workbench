@@ -451,6 +451,7 @@
             <button class="admin-tab-btn active" data-admin-tab="settings">Settings</button>
             <button class="admin-tab-btn" data-admin-tab="import">Import</button>
             <button class="admin-tab-btn" data-admin-tab="jobs">Jobs</button>
+            <button class="admin-tab-btn" data-admin-tab="labels">Topic Labels</button>
             <button class="admin-tab-btn" data-admin-tab="users">Users</button>
             <button class="admin-tab-btn" data-admin-tab="cache">Cache</button>
             <button class="admin-tab-btn" data-admin-tab="runs">Run History</button>
@@ -673,27 +674,7 @@
                     <button type="button" id="runBertopicBtn" class="btn">Run BERTopic</button>
                   </div>
                 </fieldset>
-                <fieldset class="settings-section">
-                  <legend>Topic Labels</legend>
-                  <p class="meta">Review generated topic label candidates, publish passing labels, or lock manual labels across rebuilds.</p>
-                  <div class="settings-actions row-actions">
-                    <button type="button" id="refreshTopicLabelsBtn" class="btn ghost">Refresh Labels</button>
-                    <button type="button" id="regenerateTopicLabelsBtn" class="btn ghost">Regenerate Weak Labels</button>
-                    <button type="button" id="publishPassingTopicLabelsBtn" class="btn">Accept Passing</button>
-                  </div>
-                  <label>
-                    <span>Filter</span>
-                    <select id="topicLabelFilter">
-                      <option value="all">All topics</option>
-                      <option value="pending">Pending review</option>
-                      <option value="warnings">Warnings</option>
-                      <option value="overrides">Manual/selected overrides</option>
-                    </select>
-                  </label>
-                  <div id="topicLabelSummary" class="import-preview" aria-live="polite"></div>
-                </fieldset>
               </div>
-              <div id="topicLabelsPanel" class="settings-section" aria-live="polite"></div>
               <div id="jobsStatusCards" class="settings-status-grid" aria-live="polite"></div>
               <h3>Recent Jobs</h3>
               <div class="table-wrap">
@@ -726,6 +707,49 @@
                   </thead>
                   <tbody id="syncRunsTable"></tbody>
                 </table>
+              </div>
+            </article>
+          </div>
+
+          <!-- Topic Labels -->
+          <div id="admin-labels" class="admin-panel-section">
+            <article class="panel">
+              <div class="section-heading-row">
+                <div>
+                  <h2>Topic Labels</h2>
+                  <p class="meta">Review generated candidates, publish passing labels, and lock manual labels across BERTopic rebuilds.</p>
+                </div>
+                <div class="row-actions">
+                  <button type="button" id="refreshTopicLabelsBtn" class="btn ghost btn-sm">Refresh</button>
+                  <button type="button" id="regenerateTopicLabelsBtn" class="btn ghost btn-sm">Regenerate Weak</button>
+                  <button type="button" id="publishPassingTopicLabelsBtn" class="btn btn-sm">Accept Passing</button>
+                </div>
+              </div>
+              <div class="topic-label-toolbar">
+                <div id="topicLabelSummary" class="topic-label-summary" aria-live="polite"></div>
+                <label>
+                  <span>Filter</span>
+                  <select id="topicLabelFilter">
+                    <option value="all">All topics</option>
+                    <option value="pending">Pending review</option>
+                    <option value="warnings">Warnings</option>
+                    <option value="overrides">Manual/selected overrides</option>
+                  </select>
+                </label>
+                <label class="topic-label-search">
+                  <span>Search</span>
+                  <input id="topicLabelSearch" type="search" placeholder="Search labels, terms, or titles..." />
+                </label>
+              </div>
+              <div class="topic-label-workspace">
+                <section class="topic-label-list-panel" aria-label="Topic labels">
+                  <div class="section-heading-row compact">
+                    <h3>Topics</h3>
+                    <span id="topicLabelCount" class="meta"></span>
+                  </div>
+                  <div id="topicLabelsPanel" class="topic-label-list" aria-live="polite"></div>
+                </section>
+                <section id="topicLabelDetailPanel" class="topic-label-detail-panel" aria-live="polite"></section>
               </div>
             </article>
           </div>

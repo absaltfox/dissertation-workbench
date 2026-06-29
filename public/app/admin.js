@@ -61,6 +61,7 @@ function showAdminContent() {
   state.pendingLogin = null;
   adminUserLabel.textContent = `Signed in as ${state.user.username}`;
   loadAdminData();
+  if (getActiveAdminTab() === 'labels') loadTopicLabels();
 }
 
 function showMfaChallenge() {
@@ -244,7 +245,7 @@ async function handlePasswordReset(e) {
 // --- Admin data loading ---
 
 async function loadAdminData() {
-  await Promise.all([loadUsers(), loadCache(), loadRuns(), loadSettings(), loadImportRules(), loadImportFacets(), loadConceptPipelineStatus(), loadJobs(), loadTopicLabels()]);
+  await Promise.all([loadUsers(), loadCache(), loadRuns(), loadSettings(), loadImportRules(), loadImportFacets(), loadConceptPipelineStatus(), loadJobs()]);
 }
 
 async function loadUsers() {
@@ -1069,6 +1070,10 @@ function renderJobs(data = {}) {
 
 async function loadTopicLabels() {
   if (!topicLabelsPanelEl) return;
+  if (document.querySelector('#admin-labels.active')) {
+    topicLabelsPanelEl.innerHTML = '<p class="meta">Loading topic labels...</p>';
+    topicLabelDetailPanelEl.innerHTML = '<p class="meta">Loading review detail...</p>';
+  }
   try {
     const res = await fetch('/api/admin/topics/labels');
     if (!res.ok) return;
@@ -1085,87 +1090,193 @@ function topicLabelVisible(topic, filter) {
   return true;
 }
 
-function renderTopicLabels() {
-  if (!topicLabelsPanelEl) return;
-  const data = state.topicLabels || {};
-  const topics = data.topics || [];
-  const summary = data.summary || {};
-  if (topicLabelSummaryEl) {
-    const duplicates = summary.duplicateLabels?.length
-      ? ` · ${formatNum(summary.duplicateLabels.length)} duplicate label group${summary.duplicateLabels.length === 1 ? '' : 's'}`
-      : '';
-    topicLabelSummaryEl.innerHTML = `
-      <p class="settings-status-main">${formatNum(summary.pendingReview || 0)} pending review</p>
-      <p class="meta">${formatNum(summary.total || 0)} topics · ${formatNum(summary.overrides || 0)} locked overrides${duplicates}</p>
-    `;
-  }
+function getTopicLabelTerms(topic) {
+  return (topic.topTerms || []).slice(0, 10).map((item) => Array.isArray(item) ? item[0] : item).filter(Boolean);
+}
 
-  const filter = topicLabelFilterEl?.value || 'all';
-  const visibleTopics = topics.filter((topic) => topic.topicId !== -1 && topicLabelVisible(topic, filter));
-  topicLabelsPanelEl.innerHTML = visibleTopics.length
-    ? visibleTopics.map((topic) => {
-      const warnings = Array.from(new Set([
-        ...(topic.warnings || []),
-        ...(topic.candidates || []).flatMap((candidate) => candidate.warnings || [])
-      ]));
-      const terms = (topic.topTerms || []).slice(0, 8).map((item) => Array.isArray(item) ? item[0] : item).filter(Boolean);
+function getTopicLabelWarnings(topic) {
+  return Array.from(new Set([
+    ...(topic.warnings || []),
+    ...(topic.candidates || []).flatMap((candidate) => candidate.warnings || [])
+  ])).filter(Boolean);
+}
+
+function topicLabelStatus(topic) {
+  const warnings = getTopicLabelWarnings(topic);
+  if (topic.override) return { key: 'locked', label: 'Locked' };
+  if (topic.pendingReview) return { key: 'pending', label: 'Review' };
+  if (warnings.length) return { key: 'warning', label: 'Warning' };
+  return { key: 'ready', label: 'Ready' };
+}
+
+function topicLabelMatchesSearch(topic, query) {
+  if (!query) return true;
+  const haystack = [
+    topic.label,
+    topic.topicId,
+    ...getTopicLabelTerms(topic),
+    ...(topic.representativeTitles || []),
+    ...(topic.candidates || []).map((candidate) => candidate.label)
+  ].join(' ').toLowerCase();
+  return haystack.includes(query);
+}
+
+function renderTopicLabelSummary(summary = {}) {
+  if (!topicLabelSummaryEl) return;
+  const duplicateCount = summary.duplicateLabels?.length || 0;
+  topicLabelSummaryEl.innerHTML = `
+    <div class="topic-label-summary-card">
+      <span>Topics</span>
+      <strong>${formatNum(summary.total || 0)}</strong>
+    </div>
+    <div class="topic-label-summary-card attention">
+      <span>Review</span>
+      <strong>${formatNum(summary.pendingReview || 0)}</strong>
+    </div>
+    <div class="topic-label-summary-card">
+      <span>Locked</span>
+      <strong>${formatNum(summary.overrides || 0)}</strong>
+    </div>
+    <div class="topic-label-summary-card ${duplicateCount ? 'attention' : ''}">
+      <span>Duplicates</span>
+      <strong>${formatNum(duplicateCount)}</strong>
+    </div>
+  `;
+}
+
+function renderTopicLabelList(topics) {
+  if (!topicLabelsPanelEl) return;
+  if (topicLabelCountEl) {
+    topicLabelCountEl.textContent = `${formatNum(topics.length)} shown`;
+  }
+  topicLabelsPanelEl.innerHTML = topics.length
+    ? topics.map((topic) => {
+      const status = topicLabelStatus(topic);
+      const terms = getTopicLabelTerms(topic).slice(0, 4);
+      const active = String(state.selectedTopicLabelId) === String(topic.topicId);
       return `
-        <article class="settings-status-card topic-label-card">
-          <div class="section-heading-row">
-            <div>
-              <p class="settings-status-title">Topic ${formatNum(topic.topicId)} · ${formatNum(topic.docCount || 0)} docs</p>
-              <p class="settings-status-main">${escapeHtml(topic.label || '')}</p>
-              <p class="meta">${topic.override ? `Locked ${escapeHtml(topic.override.source || 'override')}` : topic.pendingReview ? 'Pending review' : 'Auto-selected'}</p>
-            </div>
-            <div class="row-actions">
-              <button type="button" class="btn ghost btn-sm" data-regenerate-topic-label="${topic.topicId}">Regenerate</button>
-              ${topic.override ? `<button type="button" class="btn ghost btn-sm" data-unlock-topic-label="${topic.topicId}">Unlock</button>` : ''}
-            </div>
-          </div>
-          ${warnings.length ? `<p class="form-error">${escapeHtml(warnings.join(', '))}</p>` : ''}
-          ${terms.length ? `<p class="meta">Terms: ${escapeHtml(terms.join(', '))}</p>` : ''}
-          ${topic.representativeTitles?.length ? `<p class="meta">Titles: ${topic.representativeTitles.slice(0, 3).map(escapeHtml).join(' · ')}</p>` : ''}
-          <div class="topic-label-candidates">
-            ${(topic.candidates || []).slice(0, 4).map((candidate) => `
-              <label class="topic-label-candidate">
-                <input type="radio" name="topic-label-${topic.topicId}" value="${candidate.id}" ${candidate.id === topic.selectedCandidateId ? 'checked' : ''} />
-                <span>${escapeHtml(candidate.label)}</span>
-                <small>${escapeHtml(candidate.source)} · score ${formatNum(Math.round(candidate.score || 0))}${candidate.warnings?.length ? ` · ${escapeHtml(candidate.warnings.join(', '))}` : ''}</small>
-                <button type="button" class="btn ghost btn-sm" data-select-topic-label="${topic.topicId}" data-candidate-id="${candidate.id}">Select</button>
-              </label>
-            `).join('')}
-          </div>
-          <div class="settings-actions row-actions">
-            <input type="text" value="${escapeHtml(topic.label || '')}" data-topic-label-input="${topic.topicId}" />
-            <button type="button" class="btn btn-sm" data-save-topic-label="${topic.topicId}">Save Label</button>
-          </div>
-        </article>
+        <button type="button" class="topic-label-row ${active ? 'active' : ''}" data-topic-label-row="${topic.topicId}">
+          <span class="topic-label-row-main">
+            <strong>${escapeHtml(topic.label || 'Untitled topic')}</strong>
+            <small>Topic ${formatNum(topic.topicId)} · ${formatNum(topic.docCount || 0)} docs${terms.length ? ` · ${escapeHtml(terms.join(', '))}` : ''}</small>
+          </span>
+          <span class="topic-label-status ${escapeHtml(status.key)}">${escapeHtml(status.label)}</span>
+        </button>
       `;
     }).join('')
     : '<p class="meta">No topic labels match this filter.</p>';
 
-  for (const btn of topicLabelsPanelEl.querySelectorAll('[data-select-topic-label]')) {
+  for (const btn of topicLabelsPanelEl.querySelectorAll('[data-topic-label-row]')) {
+    btn.addEventListener('click', () => {
+      state.selectedTopicLabelId = Number(btn.dataset.topicLabelRow);
+      renderTopicLabels();
+    });
+  }
+}
+
+function renderTopicLabelDetail(topic) {
+  if (!topicLabelDetailPanelEl) return;
+  if (!topic) {
+    topicLabelDetailPanelEl.innerHTML = '<p class="meta">Select a topic to review labels, evidence, and candidates.</p>';
+    return;
+  }
+  const warnings = getTopicLabelWarnings(topic);
+  const terms = getTopicLabelTerms(topic);
+  const status = topicLabelStatus(topic);
+  const candidates = topic.candidates || [];
+  topicLabelDetailPanelEl.innerHTML = `
+    <div class="topic-label-detail-header">
+      <div>
+        <p class="settings-status-title">Topic ${formatNum(topic.topicId)} · ${formatNum(topic.docCount || 0)} docs</p>
+        <h3>${escapeHtml(topic.label || 'Untitled topic')}</h3>
+        <p class="meta">${topic.override ? `Locked ${escapeHtml(topic.override.source || 'override')}` : topic.pendingReview ? 'Pending review' : 'Current public label'}</p>
+      </div>
+      <div class="row-actions">
+        <span class="topic-label-status ${escapeHtml(status.key)}">${escapeHtml(status.label)}</span>
+        <button type="button" class="btn ghost btn-sm" data-regenerate-topic-label="${topic.topicId}">Regenerate</button>
+        ${topic.override ? `<button type="button" class="btn ghost btn-sm" data-unlock-topic-label="${topic.topicId}">Unlock</button>` : ''}
+      </div>
+    </div>
+    ${warnings.length ? `<div class="topic-label-warning-list">${warnings.map((warning) => `<span>${escapeHtml(warning)}</span>`).join('')}</div>` : ''}
+    <div class="topic-label-manual-edit">
+      <label>
+        <span>Published label</span>
+        <input type="text" value="${escapeHtml(topic.label || '')}" data-topic-label-input="${topic.topicId}" />
+      </label>
+      <button type="button" class="btn btn-sm" data-save-topic-label="${topic.topicId}">Save Manual Label</button>
+    </div>
+    <section class="topic-label-detail-section">
+      <div class="section-heading-row compact">
+        <h4>Candidates</h4>
+        <span class="meta">${formatNum(candidates.length)} generated</span>
+      </div>
+      <div class="topic-label-candidates">
+        ${candidates.length ? candidates.slice(0, 5).map((candidate) => `
+          <article class="topic-label-candidate ${candidate.id === topic.selectedCandidateId ? 'selected' : ''}">
+            <div>
+              <strong>${escapeHtml(candidate.label)}</strong>
+              <small>${escapeHtml(candidate.source || 'generated')} · score ${formatNum(Math.round(candidate.score || 0))}${candidate.status ? ` · ${escapeHtml(candidate.status)}` : ''}</small>
+              ${candidate.warnings?.length ? `<small class="topic-label-candidate-warning">${escapeHtml(candidate.warnings.join(', '))}</small>` : ''}
+            </div>
+            <button type="button" class="btn ghost btn-sm" data-select-topic-label="${topic.topicId}" data-candidate-id="${candidate.id}">Use</button>
+          </article>
+        `).join('') : '<p class="meta">No generated candidates are stored for this topic.</p>'}
+      </div>
+    </section>
+    <section class="topic-label-detail-section">
+      <h4>Evidence</h4>
+      ${terms.length ? `<div class="topic-label-chip-list">${terms.map((term) => `<span>${escapeHtml(term)}</span>`).join('')}</div>` : '<p class="meta">No top terms stored.</p>'}
+      ${topic.representativeTitles?.length ? `
+        <ul class="topic-label-title-list">
+          ${topic.representativeTitles.slice(0, 5).map((title) => `<li>${escapeHtml(title)}</li>`).join('')}
+        </ul>
+      ` : '<p class="meta">No representative titles stored.</p>'}
+    </section>
+  `;
+
+  for (const btn of topicLabelDetailPanelEl.querySelectorAll('[data-select-topic-label]')) {
     btn.addEventListener('click', async () => {
       await selectTopicLabel(btn.dataset.selectTopicLabel, btn.dataset.candidateId);
     });
   }
-  for (const btn of topicLabelsPanelEl.querySelectorAll('[data-save-topic-label]')) {
+  for (const btn of topicLabelDetailPanelEl.querySelectorAll('[data-save-topic-label]')) {
     btn.addEventListener('click', async () => {
       const topicId = btn.dataset.saveTopicLabel;
-      const input = topicLabelsPanelEl.querySelector(`[data-topic-label-input="${CSS.escape(topicId)}"]`);
+      const input = topicLabelDetailPanelEl.querySelector(`[data-topic-label-input="${CSS.escape(topicId)}"]`);
       await saveTopicLabel(topicId, input?.value || '');
     });
   }
-  for (const btn of topicLabelsPanelEl.querySelectorAll('[data-unlock-topic-label]')) {
+  for (const btn of topicLabelDetailPanelEl.querySelectorAll('[data-unlock-topic-label]')) {
     btn.addEventListener('click', async () => {
       await unlockTopicLabel(btn.dataset.unlockTopicLabel);
     });
   }
-  for (const btn of topicLabelsPanelEl.querySelectorAll('[data-regenerate-topic-label]')) {
+  for (const btn of topicLabelDetailPanelEl.querySelectorAll('[data-regenerate-topic-label]')) {
     btn.addEventListener('click', async () => {
       await handleRegenerateTopicLabels(btn.dataset.regenerateTopicLabel);
     });
   }
+}
+
+function renderTopicLabels() {
+  if (!topicLabelsPanelEl) return;
+  const data = state.topicLabels || {};
+  const topics = data.topics || [];
+  renderTopicLabelSummary(data.summary || {});
+
+  const filter = topicLabelFilterEl?.value || 'all';
+  const query = String(state.topicLabelSearchText || '').trim().toLowerCase();
+  const visibleTopics = topics
+    .filter((topic) => topic.topicId !== -1)
+    .filter((topic) => topicLabelVisible(topic, filter))
+    .filter((topic) => topicLabelMatchesSearch(topic, query));
+
+  if (!visibleTopics.some((topic) => String(topic.topicId) === String(state.selectedTopicLabelId))) {
+    state.selectedTopicLabelId = visibleTopics[0]?.topicId ?? null;
+  }
+  const selectedTopic = visibleTopics.find((topic) => String(topic.topicId) === String(state.selectedTopicLabelId));
+  renderTopicLabelList(visibleTopics);
+  renderTopicLabelDetail(selectedTopic);
 }
 
 async function selectTopicLabel(topicId, candidateId) {

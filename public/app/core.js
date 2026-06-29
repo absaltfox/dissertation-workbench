@@ -163,8 +163,11 @@ const refreshTopicLabelsBtn = document.getElementById('refreshTopicLabelsBtn');
 const regenerateTopicLabelsBtn = document.getElementById('regenerateTopicLabelsBtn');
 const publishPassingTopicLabelsBtn = document.getElementById('publishPassingTopicLabelsBtn');
 const topicLabelFilterEl = document.getElementById('topicLabelFilter');
+const topicLabelSearchEl = document.getElementById('topicLabelSearch');
 const topicLabelSummaryEl = document.getElementById('topicLabelSummary');
+const topicLabelCountEl = document.getElementById('topicLabelCount');
 const topicLabelsPanelEl = document.getElementById('topicLabelsPanel');
+const topicLabelDetailPanelEl = document.getElementById('topicLabelDetailPanel');
 const catalogueLookupPreviewEl = document.getElementById('catalogueLookupPreview');
 const jobsStatusCardsEl = document.getElementById('jobsStatusCards');
 const jobsTableEl = document.getElementById('jobsTable');
@@ -224,6 +227,9 @@ const state = {
   checkedImportRuleIds: new Set(),
   cacheEntries: [],
   cacheFilterText: '',
+  topicLabels: null,
+  selectedTopicLabelId: null,
+  topicLabelSearchText: '',
 };
 
 let _analyticsCache = null;
@@ -546,6 +552,7 @@ function setActiveAdminTab(tabName, { updateUrl = true } = {}) {
     section.classList.toggle('active', section.id === `admin-${tabName}`);
   }
   if (tabName === 'jobs') loadJobs();
+  if (tabName === 'labels') loadTopicLabels();
   if (updateUrl && document.body.classList.contains('admin-mode')) {
     window.history.pushState(null, '', `#/admin/${tabName}`);
   }

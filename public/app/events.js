@@ -119,6 +119,10 @@ refreshTopicLabelsBtn?.addEventListener('click', loadTopicLabels);
 regenerateTopicLabelsBtn?.addEventListener('click', () => handleRegenerateTopicLabels());
 publishPassingTopicLabelsBtn?.addEventListener('click', handlePublishPassingTopicLabels);
 topicLabelFilterEl?.addEventListener('change', renderTopicLabels);
+topicLabelSearchEl?.addEventListener('input', () => {
+  state.topicLabelSearchText = topicLabelSearchEl.value.trim();
+  renderTopicLabels();
+});
 
 // Keyboard navigation for document table
 documentsTableEl.addEventListener('keydown', (e) => {
