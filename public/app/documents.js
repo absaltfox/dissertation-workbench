@@ -185,6 +185,27 @@ function syncSelectAllDocs() {
   selectAllDocsEl.indeterminate = !allChecked && state.selectedDocIds.size > 0;
 }
 
+function openCollectionsDocumentHref(doc) {
+  const candidates = [doc?.uri, ...(doc?.downloadCandidates || [])];
+  for (const candidate of candidates) {
+    const href = safeExternalHref(candidate);
+    if (!href) continue;
+    try {
+      const url = new URL(href);
+      const isOpenCollections = url.hostname.toLowerCase() === 'open.library.ubc.ca';
+      const isItemPage = /\/collections\/[^/]+\/items\/[^/]+\/?$/.test(url.pathname);
+      if (isOpenCollections && isItemPage) return href;
+    } catch {
+      // Ignore malformed candidates and try the next available identifier.
+    }
+  }
+
+  const id = String(doc?.id || '').match(/\b1\.\d+\b/)?.[0];
+  return id
+    ? safeExternalHref(`https://open.library.ubc.ca/collections/ubctheses/items/${encodeURIComponent(id)}`)
+    : '';
+}
+
 function renderDetails() {
   const docs = state.payload?.documents || [];
   if (!docs.length) {
@@ -255,15 +276,12 @@ function renderDetails() {
 
   // Action buttons
   const actions = [];
-  const downloadHref = safeExternalHref(doc.downloadUrl);
-  if (downloadHref) {
-    actions.push(`<a class="btn ghost btn-sm" href="${escapeHtml(downloadHref)}" target="_blank" rel="noreferrer">Open PDF</a>`);
-  }
-  const recordHref = safeExternalHref(doc.uri);
+  const recordHref = openCollectionsDocumentHref(doc);
   if (recordHref) {
-    actions.push(`<a class="btn ghost btn-sm" href="${escapeHtml(recordHref)}" target="_blank" rel="noreferrer">Open Record</a>`);
+    actions.push(`<a class="btn ghost btn-sm" href="${escapeHtml(recordHref)}" target="_blank" rel="noreferrer">View Document</a>`);
   }
   actions.push(`<button class="btn ghost btn-sm" data-doc-bibtex>BibTeX</button>`);
+  actions.push(`<button class="btn ghost btn-sm" data-doc-ris>RIS</button>`);
   const actionsHtml = `<div class="doc-actions">${actions.join('')}</div>`;
   const downloadNoteHtml = doc.downloadError
     ? `<p class="detail-download-note">${escapeHtml(doc.downloadError)}</p>`
@@ -335,6 +353,12 @@ function renderDetails() {
   if (bibBtn) {
     bibBtn.addEventListener('click', () => {
       downloadFile(generateBibTeX([doc]), `${sanitizeBibKey(doc.author)}${doc.year || ''}.bib`, 'application/x-bibtex');
+    });
+  }
+  const risBtn = docDetailsEl.querySelector('[data-doc-ris]');
+  if (risBtn) {
+    risBtn.addEventListener('click', () => {
+      downloadFile(generateRIS([doc]), `${sanitizeBibKey(doc.author)}${doc.year || ''}.ris`, 'application/x-research-info-systems');
     });
   }
 
