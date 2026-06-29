@@ -24,6 +24,7 @@ except ImportError:
     pass
 
 import json
+import math
 import re
 import sqlite3
 import argparse
@@ -676,8 +677,13 @@ def label_word_count(label):
 def looks_like_keyword_bag(label):
     if not label:
         return True
-    if "," in label or " / " in label:
+    if " / " in label:
         return True
+    if "," in label:
+        parts = [part.strip() for part in label.split(",") if part.strip()]
+        has_final_conjunction = bool(re.search(r",\s*(and|or)\s+", label, re.I))
+        if len(parts) > 3 or not has_final_conjunction:
+            return True
     words = re.findall(r"[A-Za-z][A-Za-z'’-]*", label)
     if len(words) >= 4 and not re.search(r"\b(and|of|in|for|with|through|across|among|on)\b", label, re.I):
         return True
@@ -711,6 +717,64 @@ def score_label_candidate(label, topic_id, fallback_label=None, used_keys=None):
         warnings.append("generic")
         score -= 50
     return cleaned, max(score, 0), warnings
+
+
+def label_content_terms(label):
+    terms = []
+    for term in re.findall(r"[A-Za-z][A-Za-z'’-]*", label or ""):
+        normalized = term.lower().replace("’", "'")
+        if len(normalized) < 3 or normalized in LABEL_STOP_WORDS:
+            continue
+        terms.append(normalized)
+    return terms
+
+
+def topic_text_support_count(label, evidence):
+    label_terms = label_content_terms(label)
+    if not label_terms:
+        return 0
+    support_count = 0
+    documents = list((evidence or {}).get("documents") or [])
+    if not documents:
+        documents = [{"title": title, "abstract": ""} for title in (evidence or {}).get("titles", [])]
+    if not documents:
+        documents = [{"title": "", "abstract": abstract} for abstract in (evidence or {}).get("abstracts", [])]
+    for doc in documents:
+        text = f"{doc.get('title', '')} {doc.get('abstract', '')}".lower()
+        matched = sum(1 for term in label_terms if term in text)
+        if matched >= max(2, min(len(label_terms), 3)):
+            support_count += 1
+    return support_count
+
+
+def evidence_quality_warnings(label, evidence):
+    warnings = []
+    doc_count = int((evidence or {}).get("docCount") or 0)
+    if 0 < doc_count <= 10:
+        warnings.append("small_topic_review")
+
+    label_terms = label_content_terms(label)
+    evidence_documents = list((evidence or {}).get("documents") or [])
+    if not evidence_documents:
+        evidence_documents = [{"title": title, "abstract": ""} for title in (evidence or {}).get("titles", [])]
+    if not evidence_documents:
+        evidence_documents = [{"title": "", "abstract": abstract} for abstract in (evidence or {}).get("abstracts", [])]
+    evidence_count = len(evidence_documents)
+    if evidence_count >= 3 and len(label_terms) >= 3:
+        support_count = topic_text_support_count(label, evidence)
+        minimum_support = max(2, math.ceil(evidence_count * 0.3))
+        if support_count < minimum_support:
+            warnings.append("low_label_coverage")
+
+        title_support = []
+        for title in (evidence or {}).get("titles", []):
+            text = str(title or "").lower()
+            matches = sum(1 for term in label_terms if term in text)
+            if matches >= max(2, math.ceil(len(label_terms) * 0.6)):
+                title_support.append(title)
+        if len(title_support) == 1 and support_count <= 2:
+            warnings.append("overfits_single_document")
+    return warnings
 
 
 def ensure_topic_label_tables(client):
@@ -772,22 +836,25 @@ def load_topic_label_overrides(client):
     return overrides
 
 
-def build_topic_evidence(topic_model, topic_id, abstracts, topic_assignments, titles_by_topic=None, existing_label=None):
+def build_topic_evidence(topic_model, topic_id, abstracts, topic_assignments, titles_by_topic=None, existing_label=None, doc_count=None, documents_by_topic=None):
     terms = clean_topic_terms(topic_model.get_topic(topic_id))[:10]
     doc_indices = [i for i, t in enumerate(topic_assignments) if int(t) == int(topic_id)][:3]
     samples = []
     for i in doc_indices:
         text = abstracts[i]
         samples.append(re.sub(r"\s+", " ", text).strip()[:320])
+    documents = (documents_by_topic or {}).get(topic_id, [])
     return {
         "terms": terms,
-        "titles": (titles_by_topic or {}).get(topic_id, [])[:5],
+        "titles": (titles_by_topic or {}).get(topic_id, [])[:8],
         "abstracts": samples,
         "existingLabel": existing_label,
+        "docCount": doc_count,
+        "documents": documents[:8],
     }
 
 
-def build_candidate_rows(topic_model, topic_info, generated_labels, abstracts, topic_assignments, existing_labels=None, titles_by_topic=None):
+def build_candidate_rows(topic_model, topic_info, generated_labels, abstracts, topic_assignments, existing_labels=None, titles_by_topic=None, documents_by_topic=None):
     candidates_by_topic = {}
     used_keys = {normalize_label_key("Uncategorized")}
     for _, row in topic_info.iterrows():
@@ -799,6 +866,8 @@ def build_candidate_rows(topic_model, topic_info, generated_labels, abstracts, t
             topic_model, topic_id, abstracts, topic_assignments,
             titles_by_topic=titles_by_topic,
             existing_label=(existing_labels or {}).get(topic_id),
+            doc_count=int(row.get("Count") or 0),
+            documents_by_topic=documents_by_topic,
         )
         raw_candidates = [
             (generated_labels.get(topic_id), "qwen"),
@@ -811,6 +880,12 @@ def build_candidate_rows(topic_model, topic_info, generated_labels, abstracts, t
             label, score, warnings = score_label_candidate(raw_label, topic_id, fallback, used_keys)
             if not label:
                 continue
+            coverage_warnings = evidence_quality_warnings(label, evidence)
+            for warning in coverage_warnings:
+                if warning not in warnings:
+                    warnings.append(warning)
+            if coverage_warnings:
+                score = max(score - 25, 0)
             key = normalize_label_key(label)
             if key in seen:
                 continue
@@ -968,10 +1043,11 @@ def run_label_only(client, topic_id=None, reporter=None):
     abstracts = []
     assignments = []
     titles_by_topic = {}
+    documents_by_topic = {}
     counts = {}
     for row in rows:
         tid = int(row["topic_id"])
-        if tid not in selected_topic_ids or counts.get(tid, 0) >= 3:
+        if tid not in selected_topic_ids:
             continue
         try:
             metadata = json.loads(row["metadata_json"] or "{}")
@@ -983,6 +1059,13 @@ def run_label_only(client, topic_id=None, reporter=None):
             titles_by_topic.setdefault(tid, [])
             if title not in titles_by_topic[tid]:
                 titles_by_topic[tid].append(title)
+        if title or abstract:
+            documents_by_topic.setdefault(tid, []).append({
+                "title": title,
+                "abstract": re.sub(r"\s+", " ", abstract).strip()[:420],
+            })
+        if counts.get(tid, 0) >= 3:
+            continue
         if len(abstract) < 50:
             continue
         sample = f"Title: {title}\nAbstract: {abstract}" if title else abstract
@@ -993,7 +1076,7 @@ def run_label_only(client, topic_id=None, reporter=None):
     generated = generate_labels(topic_model, abstracts, assignments, reporter)
     backend = os.environ.get("LOCAL_LABEL_BACKEND", "transformers")
     model_name = os.environ.get("LOCAL_LABEL_MODEL", os.environ.get("LOCAL_LABEL_MODEL_PATH", "Qwen/Qwen2.5-0.5B-Instruct"))
-    candidates = build_candidate_rows(topic_model, topic_info, generated, abstracts, assignments, existing_labels, titles_by_topic)
+    candidates = build_candidate_rows(topic_model, topic_info, generated, abstracts, assignments, existing_labels, titles_by_topic, documents_by_topic)
     save_topic_label_candidates(client, candidates, backend, model_name, {"labelsOnly": True, "topicId": topic_id})
     labels = choose_topic_labels(topic_model, topic_info, candidates, overrides, existing_labels)
     for tid, label in labels.items():
