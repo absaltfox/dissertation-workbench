@@ -252,7 +252,7 @@ function renderTopicTimeline() {
 
 // --- Analytics sub-tabs ---
 
-function setActiveAnalyticsTab(tabName) {
+async function setActiveAnalyticsTab(tabName) {
   for (const btn of analyticsTabButtons) {
     btn.classList.toggle('active', btn.dataset.analyticsTab === tabName);
   }
@@ -260,6 +260,13 @@ function setActiveAnalyticsTab(tabName) {
     section.classList.toggle('active', section.id === `analytics-${tabName}`);
   }
   if (tabName === 'visualizations' && state.payload) {
+    try {
+      await ensureD3Library();
+      await loadVisualizationData();
+    } catch (error) {
+      setStatus(`Failed to load visualizations: ${error.message}`, true);
+      return;
+    }
     renderTopicCluster();
     renderTopicDendrogram();
     renderTopicSankey();

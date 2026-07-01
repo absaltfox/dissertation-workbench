@@ -192,10 +192,15 @@ selectAllDocsEl.addEventListener('change', () => {
 });
 
 // Facet filter handlers
-function onFacetChange() {
+async function onFacetChange() {
   state.activeFilters.degree      = filterDegreeEl.value;
   state.activeFilters.program     = filterProgramEl.value;
   state.activeFilters.affiliation = filterAffiliationEl.value;
+  state.analyticsLoaded = false;
+  _analyticsCache = null;
+  _analyticsCacheKey = '';
+  _personListCache = null;
+  _personListCacheKey = '';
   updateFacetCount();
   // Deselect docs that are no longer in the filtered set
   if (!getFilteredDocs().some(d => d.id === state.selectedDocId)) state.selectedDocId = null;
@@ -205,7 +210,17 @@ function onFacetChange() {
     citationListTitleEl.textContent = 'Works Cited';
   }
   renderAll();
-  if (document.querySelector('#tab-citations.active')) renderCitationDocs();
+  if (document.querySelector('#tab-citations.active')) {
+    await loadCitationDocuments();
+    renderCitationDocs();
+  }
+  if (document.querySelector('#tab-people.active')) {
+    await loadPeopleData();
+    renderPersonTable();
+  }
+  if (document.querySelector('#tab-analytics.active')) {
+    await loadAnalytics();
+  }
 }
 filterDegreeEl.addEventListener('change', onFacetChange);
 filterProgramEl.addEventListener('change', onFacetChange);

@@ -200,6 +200,15 @@ const facetChipsEl        = document.getElementById('facetChips');
 // --- State ---
 const state = {
   payload: null,
+  documentsById: new Map(),
+  detailByDocId: new Map(),
+  tabData: {
+    analyticsByFilterKey: new Map(),
+    visualizationsByFilterKey: new Map(),
+    peopleByFilterKey: new Map(),
+    citationsByFilterKey: new Map(),
+  },
+  activeDataKey: '',
   selectedDocId: null,
   selectedTheme: null,
   loading: false,
@@ -311,6 +320,47 @@ function safeExternalHref(value) {
   } catch {
     return '';
   }
+}
+
+const _scriptLoadPromises = new Map();
+
+function loadClassicScript(src) {
+  if (_scriptLoadPromises.has(src)) return _scriptLoadPromises.get(src);
+  const existing = document.querySelector(`script[src="${src}"]`);
+  if (existing?.dataset.loaded === 'true') {
+    const resolved = Promise.resolve();
+    _scriptLoadPromises.set(src, resolved);
+    return resolved;
+  }
+
+  const promise = new Promise((resolve, reject) => {
+    const script = existing || document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.onload = () => {
+      script.dataset.loaded = 'true';
+      resolve();
+    };
+    script.onerror = () => {
+      _scriptLoadPromises.delete(src);
+      reject(new Error(`Could not load ${src}`));
+    };
+    if (!existing) document.head.appendChild(script);
+  });
+  _scriptLoadPromises.set(src, promise);
+  return promise;
+}
+
+async function ensureChartLibrary() {
+  await loadClassicScript('/vendor/chart.js');
+}
+
+async function ensureD3Library() {
+  await loadClassicScript('/vendor/d3.js');
+}
+
+async function ensureVisualizationLibraries() {
+  await Promise.all([ensureChartLibrary(), ensureD3Library()]);
 }
 
 function normalizeAffiliation(raw) {
@@ -506,7 +556,7 @@ function updateRoute(tabName) {
   }
 }
 
-function setActiveTab(tabName, { updateUrl = true } = {}) {
+async function setActiveTab(tabName, { updateUrl = true } = {}) {
   const isAdminTab = tabName === 'admin';
   document.body.classList.toggle('admin-mode', isAdminTab);
 
@@ -519,15 +569,17 @@ function setActiveTab(tabName, { updateUrl = true } = {}) {
     panel.classList.toggle('active', panel.id === `tab-${tabName}`);
   }
   if (tabName === 'citations' && state.payload) {
+    await loadCitationDocuments();
     renderCitationDocs();
     setActiveCitationTab('browse');
   }
   if (tabName === 'people' && state.payload) {
+    await loadPeopleData();
     renderPersonTable();
     if (state.selectedPersonKey) renderPersonDetail(state.selectedPersonKey);
   }
   if (tabName === 'analytics' && state.payload && !state.analyticsLoaded) {
-    loadAnalytics();
+    await loadAnalytics();
   }
   if (updateUrl) updateRoute(tabName);
 }

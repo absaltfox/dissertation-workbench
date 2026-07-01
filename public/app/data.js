@@ -352,13 +352,7 @@ function buildAnalytics(docs) {
 
 function getAnalytics() {
   if (!state.payload) return null;
-  const { degree, program, affiliation } = state.activeFilters;
-  if (!degree && !program && !affiliation) return state.payload;
-  const key = `${degree}\0${program}\0${affiliation}`;
-  if (_analyticsCache && _analyticsCacheKey === key) return _analyticsCache;
-  _analyticsCache = buildAnalytics(getFilteredDocs());
-  _analyticsCacheKey = key;
-  return _analyticsCache;
+  return state.payload;
 }
 
 function renderAnalytics() {
@@ -394,6 +388,102 @@ function renderAll() {
 
 // --- Data loading ---
 
+function currentFilterParams() {
+  const params = {};
+  for (const key of ['degree', 'program', 'affiliation']) {
+    const value = state.activeFilters?.[key];
+    if (value) params[key] = value;
+  }
+  return params;
+}
+
+function dataKey(params = getCurrentParams(), filters = currentFilterParams()) {
+  return JSON.stringify({ params, filters });
+}
+
+function mergeDocuments(rows = []) {
+  if (!state.payload) return;
+  const docs = state.payload.documents || [];
+  const index = new Map(docs.map((doc, idx) => [doc.id, idx]));
+  for (const row of rows) {
+    if (!row?.id) continue;
+    const existing = state.documentsById.get(row.id) || {};
+    const merged = { ...existing, ...row };
+    state.documentsById.set(row.id, merged);
+    if (index.has(row.id)) docs[index.get(row.id)] = merged;
+    else {
+      docs.push(merged);
+      index.set(row.id, docs.length - 1);
+    }
+  }
+  state.payload.documents = docs;
+}
+
+async function fetchWorkbenchJson(path, { filters = false, refresh = false } = {}) {
+  const params = new URLSearchParams(getCurrentParams());
+  if (filters) {
+    for (const [key, value] of Object.entries(currentFilterParams())) params.set(key, value);
+  }
+  if (refresh) params.set('refresh', '1');
+  const res = await fetch(`${path}?${params.toString()}`, refresh ? { headers: csrfHeaders() } : {});
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.message || err.error || `Request failed with ${res.status}`);
+  }
+  return res.json();
+}
+
+async function loadDocumentDetail(docId) {
+  if (!docId) return null;
+  if (state.detailByDocId.has(docId)) return state.detailByDocId.get(docId);
+  const data = await fetchWorkbenchJson(`/api/workbench/documents/${encodeURIComponent(docId)}`);
+  const detail = data.document;
+  if (detail) {
+    state.detailByDocId.set(docId, detail);
+    mergeDocuments([detail]);
+  }
+  return detail || null;
+}
+
+async function loadCitationDocuments() {
+  if (!state.payload) return;
+  const key = dataKey();
+  if (state.tabData.citationsByFilterKey.has(key)) {
+    mergeDocuments(state.tabData.citationsByFilterKey.get(key).documents || []);
+    return;
+  }
+  const data = await fetchWorkbenchJson('/api/workbench/citations/documents', { filters: true });
+  state.tabData.citationsByFilterKey.set(key, data);
+  mergeDocuments(data.documents || []);
+}
+
+async function loadPeopleData() {
+  if (!state.payload) return;
+  const key = dataKey();
+  if (state.tabData.peopleByFilterKey.has(key)) {
+    mergeDocuments(state.tabData.peopleByFilterKey.get(key).documents || []);
+    return;
+  }
+  const data = await fetchWorkbenchJson('/api/workbench/people', { filters: true });
+  state.tabData.peopleByFilterKey.set(key, data);
+  mergeDocuments(data.documents || []);
+}
+
+async function loadVisualizationData() {
+  if (!state.payload) return;
+  const key = dataKey();
+  if (state.tabData.visualizationsByFilterKey.has(key)) {
+    const cached = state.tabData.visualizationsByFilterKey.get(key);
+    Object.assign(state.payload, cached);
+    mergeDocuments(cached.documents || []);
+    return;
+  }
+  const data = await fetchWorkbenchJson('/api/workbench/visualizations', { filters: true });
+  state.tabData.visualizationsByFilterKey.set(key, data);
+  Object.assign(state.payload, data);
+  mergeDocuments(data.documents || []);
+}
+
 async function loadData({ refresh = false } = {}) {
   if (state.loading) return;
   state.loading = true;
@@ -407,13 +497,20 @@ async function loadData({ refresh = false } = {}) {
 
   try {
     const query = new URLSearchParams(params);
-    const res = await fetch(`/api/metrics?${query.toString()}`, refresh ? { headers: csrfHeaders() } : {});
+    const res = await fetch(`/api/workbench/bootstrap?${query.toString()}`, refresh ? { headers: csrfHeaders() } : {});
     if (!res.ok) {
       const err = await res.json();
       throw new Error(err.message || err.error || `Request failed with ${res.status}`);
     }
 
     state.payload = await res.json();
+    state.documentsById = new Map((state.payload.documents || []).map((doc) => [doc.id, doc]));
+    state.detailByDocId = new Map();
+    state.tabData.analyticsByFilterKey = new Map();
+    state.tabData.visualizationsByFilterKey = new Map();
+    state.tabData.peopleByFilterKey = new Map();
+    state.tabData.citationsByFilterKey = new Map();
+    state.activeDataKey = dataKey(params, {});
     state.analyticsLoaded = false;
     _analyticsCache = null;
     _analyticsCacheKey = '';
@@ -444,12 +541,24 @@ async function loadData({ refresh = false } = {}) {
   }
 }
 
-function loadAnalytics() {
-  if (state.analyticsLoaded || state.analyticsLoading || !state.payload?.metrics) return;
+async function loadAnalytics() {
+  if (state.analyticsLoading || !state.payload) return;
   state.analyticsLoading = true;
   try {
+    const key = dataKey();
+    const data = state.tabData.analyticsByFilterKey.get(key)
+      || await fetchWorkbenchJson('/api/workbench/analytics', { filters: true });
+    state.tabData.analyticsByFilterKey.set(key, data);
+    Object.assign(state.payload, data);
+    await ensureChartLibrary();
+    if (document.querySelector('.analytics-tab-section#analytics-visualizations.active')) {
+      await ensureD3Library();
+      await loadVisualizationData();
+    }
     renderAnalytics();
     state.analyticsLoaded = true;
+  } catch (error) {
+    setStatus(`Failed to load analytics: ${error.message}`, true);
   } finally {
     state.analyticsLoading = false;
   }

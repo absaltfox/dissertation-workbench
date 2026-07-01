@@ -1,10 +1,17 @@
 
-function openRecord(docId, focusTab = 'records') {
+async function openRecord(docId, focusTab = 'records') {
   state.selectedDocId = docId;
   renderDocuments();
-  renderDetails();
+  docModalTitleEl.textContent = 'Document Details';
+  docDetailsEl.innerHTML = '<p class="meta">Loading document details...</p>';
   docModalOverlay.hidden = false;
   setActiveTab(focusTab);
+  try {
+    await loadDocumentDetail(docId);
+    renderDetails();
+  } catch (error) {
+    docDetailsEl.innerHTML = `<p class="meta">Failed to load document details: ${escapeHtml(error.message)}</p>`;
+  }
 }
 
 function closeDocModal() {
@@ -223,7 +230,7 @@ function renderDetails() {
   // Set modal heading to document title
   docModalTitleEl.textContent = doc.title || '(Untitled)';
 
-  const related = relatedDocuments(doc, docs);
+  const related = Array.isArray(doc.related) ? doc.related : relatedDocuments(doc, docs);
   const abstract = doc.abstract
     ? doc.abstract.split(/\n{2,}|\r?\n/).map((p) => `<p>${escapeHtml(p.trim())}</p>`).join('')
     : '<p>No abstract provided.</p>';
@@ -321,7 +328,7 @@ function renderDetails() {
       <div class="token-list">${concepts}</div>
     </div>
     ${doc.topicId != null ? (() => {
-      const topic = state.payload?.topicData?.topics?.find((t) => t.topicId === doc.topicId);
+      const topic = doc.topic || state.payload?.topicData?.topics?.find((t) => t.topicId === doc.topicId);
       const label = doc.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || `Topic ${doc.topicId}`);
       const confidence = typeof doc.topicProbability === 'number' ? ` (${Math.round(doc.topicProbability * 100)}% confidence)` : '';
       return `<div><p class="detail-section-title">Topic</p><div class="token-list"><span class="token topic">${escapeHtml(label)}${escapeHtml(confidence)}</span></div></div>`;
