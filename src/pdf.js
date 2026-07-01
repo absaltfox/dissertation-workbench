@@ -371,6 +371,14 @@ export async function parseBibliographyWithAnyStyle(fullText) {
     // Fall back to regex if AnyStyle found suspiciously few references for
     // a document that likely has a real bibliography (long text, few hits).
     if (citations.length === 0) return parseBibliography(fullText);
+    if (citations.length < 5) {
+      const regexCitations = parseBibliography(fullText);
+      const regexChars = regexCitations.reduce((sum, text) => sum + text.length, 0);
+      const anystyleChars = citations.reduce((sum, text) => sum + text.length, 0);
+      if (regexCitations.length >= citations.length && regexChars > anystyleChars * 1.1) {
+        return regexCitations;
+      }
+    }
     if (citations.length < 5 && fullText.length > 50_000) {
       const regexCitations = parseBibliography(fullText);
       if (regexCitations.length > citations.length * 3) {
@@ -480,6 +488,41 @@ async function ensurePdftotextAvailability() {
   return hasPdftotext;
 }
 
+function decodePdfLiteralString(value) {
+  return String(value || '').replace(/\\([nrtbf()\\])/g, (_match, char) => {
+    switch (char) {
+      case 'n': return '\n';
+      case 'r': return '\r';
+      case 't': return '\t';
+      case 'b': return '\b';
+      case 'f': return '\f';
+      default: return char;
+    }
+  });
+}
+
+function extractPdfTextFallback(buffer) {
+  const raw = buffer.toString('latin1');
+  const parts = [];
+  const literalPattern = /\((?:\\.|[^\\)])*\)\s*Tj/g;
+  const arrayPattern = /\[([\s\S]*?)\]\s*TJ/g;
+
+  for (const match of raw.matchAll(literalPattern)) {
+    parts.push(decodePdfLiteralString(match[0].slice(1, match[0].lastIndexOf(')'))));
+  }
+
+  for (const arrayMatch of raw.matchAll(arrayPattern)) {
+    const block = arrayMatch[1];
+    const strings = [];
+    for (const stringMatch of block.matchAll(/\((?:\\.|[^\\)])*\)/g)) {
+      strings.push(decodePdfLiteralString(stringMatch[0].slice(1, -1)));
+    }
+    if (strings.length) parts.push(strings.join(''));
+  }
+
+  return parts.join('\n').trim();
+}
+
 export function extractBodyWordCount(text) {
   if (!text) return null;
   const lines = text.split('\n');
@@ -502,20 +545,30 @@ export function extractBodyWordCount(text) {
   return count || null;
 }
 
-async function extractPdfText(filePath) {
-  if (!(await ensurePdftotextAvailability())) return { text: null, wordCount: null, bodyWordCount: null };
+async function extractPdfText(filePath, bytes = null) {
+  if (!(await ensurePdftotextAvailability())) {
+    const text = bytes ? extractPdfTextFallback(bytes) : '';
+    const wordCount = wordCountFromText(text);
+    return {
+      text: text || null,
+      wordCount,
+      bodyWordCount: extractBodyWordCount(text)
+    };
+  }
   try {
     const { stdout } = await execFileAsync('pdftotext', ['-enc', 'UTF-8', filePath, '-']);
-    const text = String(stdout || '');
-    const wordCount = text
-      .replace(/\s+/g, ' ')
-      .trim()
-      .split(' ')
-      .filter(Boolean).length;
+    let text = String(stdout || '');
+    if (!text.trim() && bytes) text = extractPdfTextFallback(bytes);
+    const wordCount = wordCountFromText(text);
     const bodyWordCount = extractBodyWordCount(text);
     return { text, wordCount: wordCount || null, bodyWordCount };
   } catch {
-    return { text: null, wordCount: null, bodyWordCount: null };
+    const text = bytes ? extractPdfTextFallback(bytes) : '';
+    return {
+      text: text || null,
+      wordCount: wordCountFromText(text),
+      bodyWordCount: extractBodyWordCount(text)
+    };
   }
 }
 
@@ -539,7 +592,7 @@ export async function analyzePdfAtPath(pdfPath, bytes) {
   const fileBytes = bytes || (await fs.readFile(pdfPath));
   let pageCount = await countPdfPagesWithPdfinfo(pdfPath);
   if (!pageCount) pageCount = countPdfPagesFromBuffer(fileBytes);
-  const { text, wordCount, bodyWordCount } = await extractPdfText(pdfPath);
+  const { text, wordCount, bodyWordCount } = await extractPdfText(pdfPath, fileBytes);
   return {
     pageCount: pageCount || null,
     wordCount: wordCount || null,

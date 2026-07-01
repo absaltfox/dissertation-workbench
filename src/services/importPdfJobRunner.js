@@ -433,7 +433,31 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       label: 'Parsing cached PDF text for citations',
     });
     try {
-      if (!analysis?.fullText) throw new Error('Cached PDF text extraction returned no text.');
+      if (!analysis?.fullText) {
+        const error = 'Cached PDF text extraction returned no text.';
+        const result = {
+          ok: false,
+          docId,
+          citations: 0,
+          error,
+        };
+        clearMetricsCache?.();
+        await finishAdminJob(job.id, {
+          status: 'failed',
+          result,
+          error,
+          finishedAt: new Date().toISOString(),
+        });
+        await log(job.id, `Citation re-extraction skipped for ${docId}: ${error}`);
+        await progress({
+          phase: 'complete',
+          label: 'Citation re-extraction skipped',
+          status: 'failed',
+          detail: error,
+          counts: { citations: 0 },
+        });
+        return result;
+      }
       await extractAndSaveParsedData(doc, analysis.fullText, analysis.pdfPath, {
         onProgress: progress,
         extractCommittee: false,
