@@ -1,3 +1,97 @@
+import {
+  dom,
+  ensureD3Library,
+  escapeHtml,
+  formatNum,
+  setStatus,
+  state,
+} from './core.js';
+import {
+  getAnalytics,
+  loadVisualizationData,
+} from './data.js';
+import {
+  getFilteredDocs,
+  docsForTopic,
+  openMatchesModal,
+  openRecord,
+} from './documents.js';
+
+const {
+  analyticsTabButtons,
+  citationNetworkChartEl,
+  citationNetworkContainerEl,
+  citationNetworkPanelEl,
+  citationNetworkTooltipEl,
+  conceptNetworkChartEl,
+  conceptNetworkContainerEl,
+  conceptNetworkPanelEl,
+  conceptNetworkTooltipEl,
+  conceptTimelineChartEl,
+  conceptTimelineLegendEl,
+  methTopicBubbleChartEl,
+  methTopicBubbleContainerEl,
+  methTopicBubblePanelEl,
+  methTopicBubbleTooltipEl,
+  supervisorNetworkChartEl,
+  supervisorNetworkContainerEl,
+  supervisorNetworkPanelEl,
+  supervisorNetworkTooltipEl,
+  topicBarsEl,
+  topicClusterChartEl,
+  topicClusterContainerEl,
+  topicClusterLegendEl,
+  topicClusterPanelEl,
+  topicClusterTooltipEl,
+  topicDendrogramChartEl,
+  topicDendrogramContainerEl,
+  topicDendrogramPanelEl,
+  topicDendrogramTooltipEl,
+  topicDistPanelEl,
+  topicModelMetaEl,
+  topicSankeyChartEl,
+  topicSankeyLegendEl,
+  topicSankeyPanelEl,
+  topicTimelineChartEl,
+  topicTimelineLegendEl,
+  topicTimelinePanelEl,
+} = dom;
+
+let topicVisualsInitialized = false;
+const topicVisualIntegrations = {
+  openSupervisorProfile: async () => {},
+};
+
+function configureTopicVisuals(integrations = {}) {
+  Object.assign(topicVisualIntegrations, integrations);
+}
+
+function initTopicVisuals() {
+  if (topicVisualsInitialized) return;
+  topicVisualsInitialized = true;
+}
+
+async function loadAndRenderVisualizations() {
+  try {
+    await ensureD3Library();
+    await loadVisualizationData();
+  } catch (error) {
+    setStatus(`Failed to load visualizations: ${error.message}`, true);
+    return;
+  }
+  renderVisualizations();
+}
+
+function renderVisualizations() {
+  renderTopicCluster();
+  renderTopicDendrogram();
+  renderTopicSankey();
+  renderMethTopicBubble();
+  renderSupervisorNetwork();
+  renderCitationNetwork();
+  renderConceptNetwork();
+}
+
 
 let conceptTimelineChartInstance = null;
 
@@ -252,7 +346,7 @@ function renderTopicTimeline() {
 
 // --- Analytics sub-tabs ---
 
-function setActiveAnalyticsTab(tabName) {
+async function setActiveAnalyticsTab(tabName) {
   for (const btn of analyticsTabButtons) {
     btn.classList.toggle('active', btn.dataset.analyticsTab === tabName);
   }
@@ -260,6 +354,13 @@ function setActiveAnalyticsTab(tabName) {
     section.classList.toggle('active', section.id === `analytics-${tabName}`);
   }
   if (tabName === 'visualizations' && state.payload) {
+    try {
+      await ensureD3Library();
+      await loadVisualizationData();
+    } catch (error) {
+      setStatus(`Failed to load visualizations: ${error.message}`, true);
+      return;
+    }
     renderTopicCluster();
     renderTopicDendrogram();
     renderTopicSankey();
@@ -382,9 +483,7 @@ function renderTopicCluster() {
     tooltip.style('display', 'none');
   })
   .on('click', function(event, d) {
-    state.selectedDocId = d.id;
-    renderDetails();
-    docModalOverlay.hidden = false;
+    openRecord(d.id, 'analytics');
   });
 
   const activeTids = new Set(topicIds);
@@ -729,7 +828,7 @@ function renderSupervisorNetwork() {
       .attr('r', d => 5 + (d.docCount / maxDoc) * 14);
   })
   .on('click', function(event, d) {
-    openSupervisorProfile(d.id);
+    topicVisualIntegrations.openSupervisorProfile(d.id);
   });
 }
 
@@ -1269,3 +1368,17 @@ function renderMethTopicBubble() {
     openMatchesModal(`${d.meth} + ${topicDisplayLabel(d.topic?.label || '')}`, matches);
   });
 }
+
+export {
+  configureTopicVisuals,
+  initTopicVisuals,
+  loadAndRenderVisualizations,
+  renderCitationNetwork,
+  renderConceptNetwork,
+  renderMethTopicBubble,
+  renderSupervisorNetwork,
+  renderTopicCluster,
+  renderTopicDendrogram,
+  renderTopicSankey,
+  renderVisualizations,
+};

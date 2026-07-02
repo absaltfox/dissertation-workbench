@@ -1,3 +1,84 @@
+import {
+  dom,
+  escapeHtml,
+  formatNum,
+  heatmapHeaderCell,
+  mergeAffiliations,
+  normalizeAffiliation,
+  state,
+} from './core.js';
+import {
+  getFilteredDocs,
+  openMatchesModal,
+  openRecord,
+} from './documents.js';
+import {
+  getAnalytics,
+} from './data.js';
+const {
+  docDetailsEl,
+  docModalOverlay,
+  docModalTitleEl,
+  methodologyConceptHeatmapEl,
+  personCountEl,
+  personDetailEl,
+  personFilterEl,
+  personRoleFilterEl,
+  personSortHeaders,
+  personTableEl,
+} = dom;
+
+let peopleInitialized = false;
+const peopleIntegrations = {
+  activateTab: async () => {},
+};
+
+function configurePeople(integrations = {}) {
+  Object.assign(peopleIntegrations, integrations);
+}
+
+function initPeople() {
+  if (peopleInitialized) return;
+  peopleInitialized = true;
+
+  personTableEl?.addEventListener('click', (e) => {
+    const row = e.target.closest('.doc-row[data-person-key]');
+    if (row) {
+      state.selectedPersonKey = row.dataset.personKey;
+      renderPersonTable();
+      renderPersonDetail(state.selectedPersonKey);
+    }
+  });
+
+  for (const th of personSortHeaders) {
+    th.addEventListener('click', () => {
+      const key = th.dataset.personSort;
+      if (state.personSortKey === key) {
+        state.personSortDir = state.personSortDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        state.personSortKey = key;
+        state.personSortDir = key === 'name' ? 'asc' : 'desc';
+      }
+      renderPersonTable();
+    });
+  }
+
+  personFilterEl?.addEventListener('input', () => {
+    state.personFilterText = personFilterEl.value.trim();
+    renderPersonTable();
+  });
+
+  personRoleFilterEl?.addEventListener('change', () => {
+    state.personRoleFilter = personRoleFilterEl.value;
+    renderPersonTable();
+  });
+}
+
+function topicDisplayLabel(label) {
+  const cleaned = String(label || '').replace(/^-?\d+_/, '').replace(/_/g, ' ');
+  return cleaned || label;
+}
+
 
 // --- Supervisor Profiles ---
 
@@ -222,12 +303,7 @@ function buildPersonList(docs) {
 
 function getPersonList() {
   if (!state.payload) return [];
-  const { degree, program, affiliation } = state.activeFilters;
-  const key = `${degree}\0${program}\0${affiliation}`;
-  if (_personListCache && _personListCacheKey === key) return _personListCache;
-  _personListCache = buildPersonList(getFilteredDocs());
-  _personListCacheKey = key;
-  return _personListCache;
+  return buildPersonList(getFilteredDocs());
 }
 
 function renderPersonTable() {
@@ -417,7 +493,7 @@ function renderPersonDetail(personKey) {
 
 function openPersonProfile(nameOrKey) {
   state.selectedPersonKey = nameOrKey.toLowerCase().trim();
-  setActiveTab('people');
+  peopleIntegrations.activateTab('people');
   renderPersonTable();
   renderPersonDetail(state.selectedPersonKey);
   // Scroll selected row into view
@@ -485,3 +561,20 @@ function renderMethodologyConceptMatrix() {
   }
 
 }
+
+export {
+  buildPersonList,
+  buildSupervisorProfile,
+  buildTopicSummary,
+  configurePeople,
+  docsForMethodologyConcept,
+  getPersonList,
+  initPeople,
+  openPersonProfile,
+  openSupervisorProfile,
+  renderMethodologyConceptMatrix,
+  renderPersonDetail,
+  renderPersonTable,
+  renderSupervisorProfile,
+  renderTopicTokens,
+};

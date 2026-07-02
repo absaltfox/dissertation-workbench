@@ -16,7 +16,7 @@ import { getConceptPipelineStatus, rebuildConceptDictionary, scheduleDailyConcep
 import { logger } from './logger.js';
 import { getConfiguredApiKey } from './secrets.js';
 import { getTrustedClientIp } from './requestSecurity.js';
-import { applySecurityHeaders } from './middleware/http.js';
+import { applyCompression, applySecurityHeaders } from './middleware/http.js';
 import { requireAdmin, requireCsrf } from './middleware/adminAuth.js';
 import { createAuthRouter } from './routes/authRoutes.js';
 import { createAdminJobsRouter } from './routes/adminJobsRoutes.js';
@@ -55,6 +55,7 @@ export const app = express();
 
 app.set('trust proxy', TRUST_PROXY);
 app.use(applySecurityHeaders);
+app.use(applyCompression);
 app.use((req, _res, next) => {
   logger.info(`${req.method} ${req.path}`, { ip: getClientIp(req) });
   next();

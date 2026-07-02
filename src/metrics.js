@@ -930,7 +930,7 @@ function normalizeStoredRecordShape(rec) {
   return rec;
 }
 
-export async function collectMetrics(options = {}) {
+export async function collectMetricRecords(options = {}) {
   await ensureStorage();
   await getDb();
 
@@ -1007,6 +1007,12 @@ export async function collectMetrics(options = {}) {
     sqlitePath: SQLITE_PATH
   };
 
+  return { records: normalizedRecords, sourceMeta, subjectLimit };
+}
+
+export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjectLimit = 25) {
+  const normalizedRecords = records.map(normalizeStoredRecordShape);
+
   assignTfidfThemes(normalizedRecords);
 
   const metrics = buildMetrics(normalizedRecords, subjectLimit);
@@ -1070,4 +1076,9 @@ export async function collectMetrics(options = {}) {
     methodologyTopicMatrix: topicData ? buildMethodologyTopicMatrix(normalizedRecords, topicData.topics) : null,
     topicData
   };
+}
+
+export async function collectMetrics(options = {}) {
+  const { records, sourceMeta, subjectLimit } = await collectMetricRecords(options);
+  return buildMetricsPayloadFromRecords(records, sourceMeta, subjectLimit);
 }

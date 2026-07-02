@@ -1,3 +1,172 @@
+import {
+  csrfHeaders,
+  dom,
+  escapeHtml,
+  formatBytes,
+  formatNum,
+  jsonHeaders,
+  setActiveAdminTab as setActiveAdminTabShell,
+  setStatus,
+  state,
+} from './core.js';
+
+const {
+  adminContent,
+  adminTabButtons,
+  adminUserLabel,
+  cacheFilterEl,
+  catalogueLookupLimitEl,
+  catalogueLookupPreviewEl,
+  conceptPipelineStatusEl,
+  confirmOwnMfaBtn,
+  createUserError,
+  createUserForm,
+  createUserResetLinkEl,
+  deleteImportRuleBtn,
+  documentSyncStatusEl,
+  importAffiliationEl,
+  importAllRuleBtn,
+  importDegreeEl,
+  importGeneratedTermEl,
+  importIndexEl,
+  importProgramEl,
+  importQueryEl,
+  importRuleForm,
+  importRuleIdEl,
+  importRuleNameEl,
+  importRulePreviewEl,
+  importRulesListEl,
+  importRunScopeEl,
+  importSourceEl,
+  jobsStatusCardsEl,
+  jobsTableEl,
+  loginError,
+  loginForm,
+  loginGate,
+  loginMfaCode,
+  logoutBtn,
+  mfaBackBtn,
+  mfaChallengeError,
+  mfaChallengeForm,
+  mfaSetupCode,
+  mfaSetupError,
+  mfaSetupForm,
+  mfaSetupSecret,
+  mfaSetupToken,
+  newImportRuleBtn,
+  ownMfaCodeEl,
+  ownMfaErrorEl,
+  ownMfaSecretEl,
+  ownMfaSetupEl,
+  ownMfaTokenEl,
+  passwordResetConfirmEl,
+  passwordResetErrorEl,
+  passwordResetForm,
+  passwordResetPasswordEl,
+  passwordResetTokenEl,
+  previewCatalogueLookupsBtn,
+  previewImportRuleBtn,
+  publishPassingTopicLabelsBtn,
+  rebuildConceptsBtn,
+  refreshCacheBtn,
+  refreshJobsBtn,
+  refreshMetadataRuleBtn,
+  refreshTopicLabelsBtn,
+  regenerateTopicLabelsBtn,
+  reparseAllBtn,
+  reparseCitationsBtn,
+  runBertopicBtn,
+  runCatalogueLookupsBtn,
+  saveSettingsBtn,
+  settingsForm,
+  setupOwnMfaBtn,
+  syncDifferencesRuleBtn,
+  syncDocumentsBtn,
+  syncMissingPdfsRuleBtn,
+  syncRunsTableEl,
+  topicLabelCountEl,
+  topicLabelDetailPanelEl,
+  topicLabelFilterEl,
+  topicLabelSearchEl,
+  topicLabelSummaryEl,
+  topicLabelsPanelEl,
+} = dom;
+
+let adminInitialized = false;
+
+function initAdmin() {
+  if (adminInitialized) return;
+  adminInitialized = true;
+
+  settingsForm?.addEventListener('submit', (event) => {
+    event.preventDefault();
+    handleSaveSettings();
+  });
+  saveSettingsBtn?.addEventListener('click', handleSaveSettings);
+  syncDocumentsBtn?.addEventListener('click', handleSyncDocuments);
+  rebuildConceptsBtn?.addEventListener('click', handleRebuildConcepts);
+  importRuleForm?.addEventListener('submit', handleSaveImportRule);
+  newImportRuleBtn?.addEventListener('click', () => setImportRuleForm({}));
+  previewImportRuleBtn?.addEventListener('click', handlePreviewImportRule);
+  importAllRuleBtn?.addEventListener('click', () => handleRunImportRules('import_all', importAllRuleBtn));
+  syncDifferencesRuleBtn?.addEventListener('click', () => handleRunImportRules('sync_differences', syncDifferencesRuleBtn));
+  refreshMetadataRuleBtn?.addEventListener('click', () => handleRunImportRules('refresh_metadata', refreshMetadataRuleBtn));
+  syncMissingPdfsRuleBtn?.addEventListener('click', () => handleRunImportRules('sync_missing_pdfs', syncMissingPdfsRuleBtn));
+  deleteImportRuleBtn?.addEventListener('click', handleDeleteImportRule);
+
+  for (const input of [importRuleNameEl, importDegreeEl, importProgramEl, importAffiliationEl, importIndexEl, importQueryEl, importSourceEl]) {
+    input?.addEventListener('input', () => {
+      updateImportGeneratedTerm();
+      if (input !== importRuleNameEl) loadImportFacets();
+    });
+  }
+
+  for (const btn of adminTabButtons) {
+    btn.addEventListener('click', () => activateAdminTab(btn.dataset.adminTab));
+  }
+
+  loginForm?.addEventListener('submit', handleLogin);
+  mfaChallengeForm?.addEventListener('submit', handleMfaChallenge);
+  mfaBackBtn?.addEventListener('click', handleMfaBack);
+  mfaSetupForm?.addEventListener('submit', handleMfaSetup);
+  passwordResetForm?.addEventListener('submit', handlePasswordReset);
+  logoutBtn?.addEventListener('click', handleLogout);
+  createUserForm?.addEventListener('submit', handleCreateUser);
+  setupOwnMfaBtn?.addEventListener('click', handleSetupOwnMfa);
+  confirmOwnMfaBtn?.addEventListener('click', handleConfirmOwnMfa);
+  dom.cancelOwnMfaBtn?.addEventListener('click', () => {
+    ownMfaSetupEl.hidden = true;
+    ownMfaTokenEl.value = '';
+    ownMfaCodeEl.value = '';
+    ownMfaErrorEl.hidden = true;
+  });
+  refreshCacheBtn?.addEventListener('click', handleRefreshCache);
+  cacheFilterEl?.addEventListener('input', () => {
+    state.cacheFilterText = cacheFilterEl.value.trim();
+    renderCache(state.cacheEntries);
+  });
+  reparseAllBtn?.addEventListener('click', handleReparseAll);
+  reparseCitationsBtn?.addEventListener('click', handleReparseCitations);
+  refreshJobsBtn?.addEventListener('click', loadJobs);
+  previewCatalogueLookupsBtn?.addEventListener('click', handlePreviewCatalogueLookups);
+  runCatalogueLookupsBtn?.addEventListener('click', handleRunCatalogueLookups);
+  runBertopicBtn?.addEventListener('click', handleRunBertopic);
+  refreshTopicLabelsBtn?.addEventListener('click', loadTopicLabels);
+  regenerateTopicLabelsBtn?.addEventListener('click', () => handleRegenerateTopicLabels());
+  publishPassingTopicLabelsBtn?.addEventListener('click', handlePublishPassingTopicLabels);
+  topicLabelFilterEl?.addEventListener('change', renderTopicLabels);
+  topicLabelSearchEl?.addEventListener('input', () => {
+    state.topicLabelSearchText = topicLabelSearchEl.value.trim();
+    renderTopicLabels();
+  });
+}
+
+function activateAdminTab(tabName, options = {}) {
+  setActiveAdminTabShell(tabName, options);
+  if (tabName === 'jobs') loadJobs();
+  if (tabName === 'labels') loadTopicLabels();
+}
+
 
 // --- Auth ---
 
@@ -1701,3 +1870,13 @@ function renderRuns(runs) {
     `;
   }).join('');
 }
+
+export {
+  activateAdminTab,
+  checkSession,
+  handleSaveSettings,
+  initAdmin,
+  loadJobs,
+  loadTopicLabels,
+  showPasswordResetGate,
+};

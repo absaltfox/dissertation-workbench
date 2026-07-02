@@ -200,6 +200,15 @@ const facetChipsEl        = document.getElementById('facetChips');
 // --- State ---
 const state = {
   payload: null,
+  documentsById: new Map(),
+  detailByDocId: new Map(),
+  tabData: {
+    analyticsByFilterKey: new Map(),
+    visualizationsByFilterKey: new Map(),
+    peopleByFilterKey: new Map(),
+    citationsByFilterKey: new Map(),
+  },
+  activeDataKey: '',
   selectedDocId: null,
   selectedTheme: null,
   loading: false,
@@ -231,11 +240,6 @@ const state = {
   selectedTopicLabelId: null,
   topicLabelSearchText: '',
 };
-
-let _analyticsCache = null;
-let _analyticsCacheKey = '';
-let _personListCache = null;
-let _personListCacheKey = '';
 
 // Mirrors COOCCURRENCE_BLOCKLIST in src/metrics.js — keep in sync.
 const COOCCURRENCE_BLOCKLIST = new Set([
@@ -311,6 +315,47 @@ function safeExternalHref(value) {
   } catch {
     return '';
   }
+}
+
+const _scriptLoadPromises = new Map();
+
+function loadClassicScript(src) {
+  if (_scriptLoadPromises.has(src)) return _scriptLoadPromises.get(src);
+  const existing = document.querySelector(`script[src="${src}"]`);
+  if (existing?.dataset.loaded === 'true') {
+    const resolved = Promise.resolve();
+    _scriptLoadPromises.set(src, resolved);
+    return resolved;
+  }
+
+  const promise = new Promise((resolve, reject) => {
+    const script = existing || document.createElement('script');
+    script.src = src;
+    script.async = true;
+    script.onload = () => {
+      script.dataset.loaded = 'true';
+      resolve();
+    };
+    script.onerror = () => {
+      _scriptLoadPromises.delete(src);
+      reject(new Error(`Could not load ${src}`));
+    };
+    if (!existing) document.head.appendChild(script);
+  });
+  _scriptLoadPromises.set(src, promise);
+  return promise;
+}
+
+async function ensureChartLibrary() {
+  await loadClassicScript('/vendor/chart.js');
+}
+
+async function ensureD3Library() {
+  await loadClassicScript('/vendor/d3.js');
+}
+
+async function ensureVisualizationLibraries() {
+  await Promise.all([ensureChartLibrary(), ensureD3Library()]);
 }
 
 function normalizeAffiliation(raw) {
@@ -518,17 +563,6 @@ function setActiveTab(tabName, { updateUrl = true } = {}) {
   for (const panel of tabPanels) {
     panel.classList.toggle('active', panel.id === `tab-${tabName}`);
   }
-  if (tabName === 'citations' && state.payload) {
-    renderCitationDocs();
-    setActiveCitationTab('browse');
-  }
-  if (tabName === 'people' && state.payload) {
-    renderPersonTable();
-    if (state.selectedPersonKey) renderPersonDetail(state.selectedPersonKey);
-  }
-  if (tabName === 'analytics' && state.payload && !state.analyticsLoaded) {
-    loadAnalytics();
-  }
   if (updateUrl) updateRoute(tabName);
 }
 
@@ -539,9 +573,6 @@ function setActiveCitationTab(tabName) {
   for (const section of document.querySelectorAll('.citation-tab-section')) {
     section.classList.toggle('active', section.id === `citation-${tabName}`);
   }
-  if (tabName === 'foundational' && state.payload) {
-    loadFoundationalWorks();
-  }
 }
 
 function setActiveAdminTab(tabName, { updateUrl = true } = {}) {
@@ -551,8 +582,6 @@ function setActiveAdminTab(tabName, { updateUrl = true } = {}) {
   for (const section of document.querySelectorAll('.admin-panel-section')) {
     section.classList.toggle('active', section.id === `admin-${tabName}`);
   }
-  if (tabName === 'jobs') loadJobs();
-  if (tabName === 'labels') loadTopicLabels();
   if (updateUrl && document.body.classList.contains('admin-mode')) {
     window.history.pushState(null, '', `#/admin/${tabName}`);
   }
@@ -579,8 +608,7 @@ function applyRouteFromHash() {
     setActiveAdminTab(hasAdminTab ? adminTab : 'settings', { updateUrl: false });
   }
   setActiveTab(tab, { updateUrl: false });
-  if (tab === 'admin' && resetToken) showPasswordResetGate(resetToken);
-  else if (tab === 'admin') checkSession();
+  return { tab, adminTab, resetToken };
 }
 
 // --- Query params ---
@@ -662,3 +690,220 @@ function relatedDocuments(doc, allDocs, limit = 6) {
     .sort((a, b) => b.relatedness.score - a.relatedness.score || (b.year || 0) - (a.year || 0))
     .slice(0, limit);
 }
+
+const dom = {
+  refreshRuleEl,
+  statusWrapEl,
+  statusTextEl,
+  spinnerEl,
+  statusEl,
+  documentsTableEl,
+  docFilterEl,
+  docTheadRow,
+  selectAllDocsEl,
+  docDetailsEl,
+  kpisEl,
+  pagesByYearChartEl,
+  wordCloudEl,
+  themeResultsEl,
+  subjectBarsEl,
+  dissertationsByYearChartEl,
+  wordsByYearChartEl,
+  pageTrendChartEl,
+  ngramCloudEl,
+  methodologyBarsEl,
+  cooccurrenceBarsEl,
+  supervisorHeatmapEl,
+  conceptTimelineChartEl,
+  conceptTimelineLegendEl,
+  methodologyConceptHeatmapEl,
+  supervisorTopicPanelEl,
+  supervisorTopicHeatmapEl,
+  topicDistPanelEl,
+  topicModelMetaEl,
+  topicBarsEl,
+  topicTimelinePanelEl,
+  topicTimelineChartEl,
+  topicTimelineLegendEl,
+  foundationalWorksListEl,
+  analyticsTabButtons,
+  topicClusterPanelEl,
+  topicClusterChartEl,
+  topicClusterTooltipEl,
+  topicClusterLegendEl,
+  topicClusterContainerEl,
+  topicDendrogramPanelEl,
+  topicDendrogramChartEl,
+  topicDendrogramTooltipEl,
+  topicDendrogramContainerEl,
+  topicSankeyPanelEl,
+  topicSankeyChartEl,
+  topicSankeyLegendEl,
+  methTopicBubblePanelEl,
+  methTopicBubbleChartEl,
+  methTopicBubbleTooltipEl,
+  methTopicBubbleContainerEl,
+  supervisorNetworkPanelEl,
+  supervisorNetworkChartEl,
+  supervisorNetworkTooltipEl,
+  supervisorNetworkContainerEl,
+  citationNetworkPanelEl,
+  citationNetworkChartEl,
+  citationNetworkTooltipEl,
+  citationNetworkContainerEl,
+  conceptNetworkPanelEl,
+  conceptNetworkChartEl,
+  conceptNetworkTooltipEl,
+  conceptNetworkContainerEl,
+  exportBibTeXBtn,
+  exportRISBtn,
+  exportCitationBibTeXBtn,
+  exportCitationRISBtn,
+  settingsForm,
+  loadBtn,
+  refreshBtn,
+  saveSettingsBtn,
+  syncDocumentsBtn,
+  rebuildConceptsBtn,
+  documentSyncStatusEl,
+  conceptPipelineStatusEl,
+  importRuleForm,
+  importRuleIdEl,
+  importRuleNameEl,
+  importDegreeEl,
+  importProgramEl,
+  importAffiliationEl,
+  importIndexEl,
+  importQueryEl,
+  importSourceEl,
+  importGeneratedTermEl,
+  importRulesListEl,
+  importRulePreviewEl,
+  newImportRuleBtn,
+  previewImportRuleBtn,
+  importRunScopeEl,
+  importAllRuleBtn,
+  syncDifferencesRuleBtn,
+  refreshMetadataRuleBtn,
+  syncMissingPdfsRuleBtn,
+  deleteImportRuleBtn,
+  tabButtons,
+  tabPanels,
+  docModalOverlay,
+  docModalCloseBtn,
+  docModalTitleEl,
+  summonModalOverlayEl,
+  summonModalTitleEl,
+  summonResultsEl,
+  summonModalCloseBtn,
+  loginGate,
+  adminContent,
+  loginForm,
+  loginError,
+  mfaChallengeForm,
+  loginMfaCode,
+  mfaChallengeError,
+  mfaBackBtn,
+  mfaSetupForm,
+  mfaSetupSecret,
+  mfaSetupToken,
+  mfaSetupCode,
+  mfaSetupError,
+  passwordResetForm,
+  passwordResetTokenEl,
+  passwordResetPasswordEl,
+  passwordResetConfirmEl,
+  passwordResetErrorEl,
+  adminUserLabel,
+  logoutBtn,
+  adminTabButtons,
+  createUserForm,
+  createUserError,
+  createUserResetLinkEl,
+  setupOwnMfaBtn,
+  ownMfaSetupEl,
+  ownMfaSecretEl,
+  ownMfaTokenEl,
+  ownMfaCodeEl,
+  ownMfaErrorEl,
+  confirmOwnMfaBtn,
+  cancelOwnMfaBtn,
+  refreshCacheBtn,
+  cacheFilterEl,
+  reparseAllBtn,
+  reparseCitationsBtn,
+  refreshJobsBtn,
+  catalogueLookupLimitEl,
+  previewCatalogueLookupsBtn,
+  runCatalogueLookupsBtn,
+  runBertopicBtn,
+  refreshTopicLabelsBtn,
+  regenerateTopicLabelsBtn,
+  publishPassingTopicLabelsBtn,
+  topicLabelFilterEl,
+  topicLabelSearchEl,
+  topicLabelSummaryEl,
+  topicLabelCountEl,
+  topicLabelsPanelEl,
+  topicLabelDetailPanelEl,
+  catalogueLookupPreviewEl,
+  jobsStatusCardsEl,
+  jobsTableEl,
+  syncRunsTableEl,
+  citationDocsTableEl,
+  citationDocFilterEl,
+  citationListTitleEl,
+  citationEntriesEl,
+  citationTabButtons,
+  personTableEl,
+  personDetailEl,
+  personFilterEl,
+  personRoleFilterEl,
+  personCountEl,
+  personSortHeaders,
+  facetFilterBarEl,
+  filterDegreeEl,
+  filterProgramEl,
+  filterAffiliationEl,
+  clearFacetsBtn,
+  facetCountEl,
+  facetChipsEl,
+};
+
+function resetDerivedCaches() {
+  // Route modules keep their own staged API caches keyed by source/filter.
+}
+
+export {
+  COOCCURRENCE_BLOCKLIST,
+  applyRouteFromHash,
+  csrfHeaders,
+  dom,
+  escapeHtml,
+  formatBytes,
+  formatNum,
+  formatRefreshDate,
+  getCurrentParams,
+  heatmapHeaderCell,
+  hideStatus,
+  jsonHeaders,
+  mergeAffiliations,
+  normalizeAffiliation,
+  parseRouteFromHash,
+  relatedDocuments,
+  resetDerivedCaches,
+  routeForTab,
+  safeExternalHref,
+  setActiveAdminTab,
+  setActiveCitationTab,
+  setActiveTab,
+  setRefreshRuleError,
+  setRefreshRuleFromPayload,
+  setStatus,
+  showSpinner,
+  state,
+  updateRoute,
+  ensureChartLibrary,
+  ensureD3Library,
+  ensureVisualizationLibraries,
+};
