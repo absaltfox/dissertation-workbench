@@ -35,13 +35,13 @@ test('GET / serves the static dashboard shell', async () => {
   assert.match(res.text, /<html/i);
 });
 
-test('GET /app.js serves the frontend bundle', async () => {
+test('GET /app/main.js serves the frontend entry module', async () => {
   const res = await request(app)
-    .get('/app.js')
+    .get('/app/main.js')
     .expect(200);
 
   assert.match(res.headers['content-type'], /(application|text)\/javascript/);
-  assert.match(res.text, /fetch/);
+  assert.match(res.text, /loadData/);
 });
 
 test('unknown paths return the JSON 404 contract', async () => {

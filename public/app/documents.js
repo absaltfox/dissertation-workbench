@@ -1,3 +1,40 @@
+import {
+  dom,
+  escapeHtml,
+  formatNum,
+  normalizeAffiliation,
+  relatedDocuments,
+  safeExternalHref,
+  state,
+} from './core.js';
+
+const {
+  docDetailsEl,
+  docModalOverlay,
+  docModalTitleEl,
+  docTheadRow,
+  documentsTableEl,
+  selectAllDocsEl,
+} = dom;
+
+const documentIntegrations = {
+  activateTab: async () => {},
+  attachSummonHandlers: () => {},
+  catalogueBadge: () => '',
+  downloadFile: () => {},
+  generateBibTeX: () => '',
+  generateRIS: () => '',
+  getCitationHelpers: async () => documentIntegrations,
+  loadDocumentDetail: async () => null,
+  openSupervisorProfile: () => {},
+  sanitizeBibKey: (value) => String(value || '').replace(/\W+/g, '_'),
+  topicDisplayLabel: (label) => String(label || '').replace(/^-?\d+_/, '').replace(/_/g, ' '),
+};
+
+function configureDocuments(integrations = {}) {
+  Object.assign(documentIntegrations, integrations);
+}
+
 
 async function openRecord(docId, focusTab = 'records') {
   state.selectedDocId = docId;
@@ -5,9 +42,9 @@ async function openRecord(docId, focusTab = 'records') {
   docModalTitleEl.textContent = 'Document Details';
   docDetailsEl.innerHTML = '<p class="meta">Loading document details...</p>';
   docModalOverlay.hidden = false;
-  setActiveTab(focusTab);
+  await documentIntegrations.activateTab(focusTab);
   try {
-    await loadDocumentDetail(docId);
+    await documentIntegrations.loadDocumentDetail(docId);
     renderDetails();
   } catch (error) {
     docDetailsEl.innerHTML = `<p class="meta">Failed to load document details: ${escapeHtml(error.message)}</p>`;
@@ -329,7 +366,7 @@ function renderDetails() {
     </div>
     ${doc.topicId != null ? (() => {
       const topic = doc.topic || state.payload?.topicData?.topics?.find((t) => t.topicId === doc.topicId);
-      const label = doc.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || `Topic ${doc.topicId}`);
+      const label = doc.topicId === -1 ? 'Uncategorized' : documentIntegrations.topicDisplayLabel(topic?.label || `Topic ${doc.topicId}`);
       const confidence = typeof doc.topicProbability === 'number' ? ` (${Math.round(doc.topicProbability * 100)}% confidence)` : '';
       return `<div><p class="detail-section-title">Topic</p><div class="token-list"><span class="token topic">${escapeHtml(label)}${escapeHtml(confidence)}</span></div></div>`;
     })() : ''}
@@ -351,21 +388,31 @@ function renderDetails() {
   for (const btn of docDetailsEl.querySelectorAll('.supervisor-link[data-supervisor-name]')) {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      openSupervisorProfile(btn.dataset.supervisorName);
+      documentIntegrations.openSupervisorProfile(btn.dataset.supervisorName);
     });
   }
 
   // BibTeX export for single document
   const bibBtn = docDetailsEl.querySelector('[data-doc-bibtex]');
   if (bibBtn) {
-    bibBtn.addEventListener('click', () => {
-      downloadFile(generateBibTeX([doc]), `${sanitizeBibKey(doc.author)}${doc.year || ''}.bib`, 'application/x-bibtex');
+    bibBtn.addEventListener('click', async () => {
+      const helpers = await documentIntegrations.getCitationHelpers();
+      helpers.downloadFile(
+        helpers.generateBibTeX([doc]),
+        `${helpers.sanitizeBibKey(doc.author)}${doc.year || ''}.bib`,
+        'application/x-bibtex'
+      );
     });
   }
   const risBtn = docDetailsEl.querySelector('[data-doc-ris]');
   if (risBtn) {
-    risBtn.addEventListener('click', () => {
-      downloadFile(generateRIS([doc]), `${sanitizeBibKey(doc.author)}${doc.year || ''}.ris`, 'application/x-research-info-systems');
+    risBtn.addEventListener('click', async () => {
+      const helpers = await documentIntegrations.getCitationHelpers();
+      helpers.downloadFile(
+        helpers.generateRIS([doc]),
+        `${helpers.sanitizeBibKey(doc.author)}${doc.year || ''}.ris`,
+        'application/x-research-info-systems'
+      );
     });
   }
 
@@ -389,10 +436,11 @@ function renderDetails() {
           contentEl.innerHTML = '<p class="meta">No citations found.</p>';
           return;
         }
+        const helpers = await documentIntegrations.getCitationHelpers();
         contentEl.innerHTML = data.citations.map((c) =>
-          `<p class="citation-entry" data-citation-text="${escapeHtml(c.citation_text)}">${escapeHtml(c.citation_text)}${catalogueBadge(c)}</p>`
+          `<p class="citation-entry" data-citation-text="${escapeHtml(c.citation_text)}">${escapeHtml(c.citation_text)}${helpers.catalogueBadge(c)}</p>`
         ).join('');
-        attachSummonHandlers(contentEl);
+        helpers.attachSummonHandlers(contentEl);
       } catch {
         contentEl.innerHTML = '<p class="meta">Connection error.</p>';
       }
@@ -400,3 +448,24 @@ function renderDetails() {
   }
 
 }
+
+export {
+  closeDocModal,
+  configureDocuments,
+  docSortValue,
+  docsForCooccurrence,
+  docsForConceptTerm,
+  docsForMethodology,
+  docsForSupervisorConcept,
+  docsForTheme,
+  docsForTopic,
+  getFilteredDocs,
+  getFilteredSortedDocs,
+  openCollectionsDocumentHref,
+  openMatchesModal,
+  openRecord,
+  renderDetails,
+  renderDocuments,
+  syncSelectAllDocs,
+  updateSortHeaders,
+};

@@ -1,3 +1,76 @@
+import {
+  dom,
+  escapeHtml,
+  formatNum,
+  safeExternalHref,
+  setActiveCitationTab as setActiveCitationTabShell,
+  state,
+} from './core.js';
+import {
+  getFilteredDocs,
+  openRecord,
+} from './documents.js';
+
+const {
+  citationDocFilterEl,
+  citationDocsTableEl,
+  citationEntriesEl,
+  citationListTitleEl,
+  citationTabButtons,
+  docDetailsEl,
+  docModalOverlay,
+  exportCitationBibTeXBtn,
+  exportCitationRISBtn,
+  foundationalWorksListEl,
+  summonModalOverlayEl,
+  summonModalTitleEl,
+  summonResultsEl,
+} = dom;
+
+let citationsInitialized = false;
+
+function initCitations() {
+  if (citationsInitialized) return;
+  citationsInitialized = true;
+
+  citationDocFilterEl?.addEventListener('input', () => {
+    state.citationFilterText = citationDocFilterEl.value.trim();
+    renderCitationDocs();
+  });
+
+  for (const btn of citationTabButtons) {
+    btn.addEventListener('click', () => activateCitationTab(btn.dataset.citationTab));
+  }
+
+  exportCitationBibTeXBtn?.addEventListener('click', () => {
+    const texts = getSelectedCitationTexts();
+    if (!texts.length) return;
+    downloadFile(generateCitationBibTeX(texts), 'works-cited.bib', 'application/x-bibtex');
+  });
+
+  exportCitationRISBtn?.addEventListener('click', () => {
+    const texts = getSelectedCitationTexts();
+    if (!texts.length) return;
+    downloadFile(generateCitationRIS(texts), 'works-cited.ris', 'application/x-research-info-systems');
+  });
+}
+
+function activateCitationTab(tabName) {
+  setActiveCitationTabShell(tabName);
+  if (tabName === 'foundational' && state.payload) loadFoundationalWorks();
+}
+
+function getSelectedCitationTexts() {
+  const entries = Array.from(citationEntriesEl.querySelectorAll('.citation-entry[data-citation-text]'));
+  return entries
+    .filter((entry) => {
+      const id = entry.dataset.citationId;
+      return !id || state.selectedCitationIds.size === 0 || state.selectedCitationIds.has(id);
+    })
+    .map((entry) => entry.dataset.citationText)
+    .filter(Boolean);
+}
+
 
 // --- Citation Explorer ---
 
@@ -353,3 +426,21 @@ function renderFoundationalWorks(works) {
   }
 
 }
+
+export {
+  activateCitationTab,
+  attachSummonHandlers,
+  catalogueBadge,
+  downloadFile,
+  generateBibTeX,
+  generateCitationBibTeX,
+  generateCitationRIS,
+  generateRIS,
+  getSelectedCitationTexts,
+  initCitations,
+  loadFoundationalWorks,
+  renderCitationDocs,
+  renderCitationList,
+  sanitizeBibKey,
+  selectCitationDoc,
+};

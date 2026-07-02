@@ -1,4 +1,45 @@
 
+import {
+  COOCCURRENCE_BLOCKLIST,
+  csrfHeaders,
+  dom,
+  escapeHtml,
+  formatNum,
+  getCurrentParams,
+  hideStatus,
+  normalizeAffiliation,
+  resetDerivedCaches,
+  setRefreshRuleError,
+  setRefreshRuleFromPayload,
+  setStatus,
+  showSpinner,
+  state,
+} from './core.js';
+import { getFilteredDocs, renderDocuments } from './documents.js';
+
+const {
+  clearFacetsBtn,
+  docFilterEl,
+  facetChipsEl,
+  facetCountEl,
+  facetFilterBarEl,
+  filterAffiliationEl,
+  filterDegreeEl,
+  filterProgramEl,
+  loadBtn,
+  refreshBtn,
+} = dom;
+
+const dataHooks = {
+  afterDataLoad: async () => {},
+  renderAnalytics: async () => {},
+  renderPeople: () => {},
+};
+
+function configureData(hooks = {}) {
+  Object.assign(dataHooks, hooks);
+}
+
 // --- Facet filter helpers ---
 
 function updateFacetCount() {
@@ -356,34 +397,13 @@ function getAnalytics() {
 }
 
 function renderAnalytics() {
-  renderKpis();
-  renderPagesByYear();
-  renderDissertationsByYear();
-  renderWordsByYear();
-  renderWordCloud();
-  renderSubjectBars();
-  renderPageTrend();
-  renderNgramCloud();
-  renderMethodologies();
-  renderCooccurrence();
-  renderSupervisorHeatmap();
-  renderConceptTimeline();
-  renderTopicDistribution();
-  renderTopicTimeline();
-  renderSupervisorTopicHeatmap();
-  renderMethodologyConceptMatrix();
-  if (document.querySelector('.analytics-tab-section#analytics-visualizations.active')) {
-    renderTopicCluster();
-    renderTopicDendrogram();
-    renderTopicSankey();
-    renderMethTopicBubble();
-  }
+  return dataHooks.renderAnalytics();
 }
 
 function renderAll() {
   renderDocuments();
   if (state.analyticsLoaded) renderAnalytics();
-  if (document.querySelector('#tab-people.active')) renderPersonTable();
+  if (document.querySelector('#tab-people.active')) dataHooks.renderPeople();
 }
 
 // --- Data loading ---
@@ -512,10 +532,7 @@ async function loadData({ refresh = false } = {}) {
     state.tabData.citationsByFilterKey = new Map();
     state.activeDataKey = dataKey(params, {});
     state.analyticsLoaded = false;
-    _analyticsCache = null;
-    _analyticsCacheKey = '';
-    _personListCache = null;
-    _personListCacheKey = '';
+    resetDerivedCaches();
     state.selectedDocId = state.payload.documents?.[0]?.id || null;
     state.selectedTheme = null;
     state.sortKey = null;
@@ -526,10 +543,9 @@ async function loadData({ refresh = false } = {}) {
     docFilterEl.value = '';
     renderAll();
     populateFacetFilters();
-    if (document.querySelector('#tab-analytics.active')) loadAnalytics();
-
     setRefreshRuleFromPayload();
     hideStatus();
+    await dataHooks.afterDataLoad();
   } catch (error) {
     setRefreshRuleError(error.message);
     setStatus(`Failed to load data: ${error.message}`, true);
@@ -550,12 +566,6 @@ async function loadAnalytics() {
       || await fetchWorkbenchJson('/api/workbench/analytics', { filters: true });
     state.tabData.analyticsByFilterKey.set(key, data);
     Object.assign(state.payload, data);
-    await ensureChartLibrary();
-    if (document.querySelector('.analytics-tab-section#analytics-visualizations.active')) {
-      await ensureD3Library();
-      await loadVisualizationData();
-    }
-    renderAnalytics();
     state.analyticsLoaded = true;
   } catch (error) {
     setStatus(`Failed to load analytics: ${error.message}`, true);
@@ -563,3 +573,23 @@ async function loadAnalytics() {
     state.analyticsLoading = false;
   }
 }
+
+export {
+  buildAnalytics,
+  configureData,
+  currentFilterParams,
+  dataKey,
+  fetchWorkbenchJson,
+  getAnalytics,
+  loadAnalytics,
+  loadCitationDocuments,
+  loadData,
+  loadDocumentDetail,
+  loadPeopleData,
+  loadVisualizationData,
+  mergeDocuments,
+  populateFacetFilters,
+  renderAll,
+  renderAnalytics,
+  updateFacetCount,
+};

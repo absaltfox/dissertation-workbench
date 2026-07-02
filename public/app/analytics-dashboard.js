@@ -1,3 +1,113 @@
+import {
+  dom,
+  ensureChartLibrary,
+  escapeHtml,
+  formatNum,
+  heatmapHeaderCell,
+  state,
+} from './core.js';
+import {
+  getAnalytics,
+  loadAnalytics,
+} from './data.js';
+import {
+  docsForCooccurrence,
+  docsForConceptTerm,
+  docsForMethodology,
+  docsForSupervisorConcept,
+  docsForTheme,
+  docsForTopic,
+  getFilteredDocs,
+  openMatchesModal,
+  openRecord,
+} from './documents.js';
+
+const {
+  analyticsTabButtons,
+  cooccurrenceBarsEl,
+  conceptTimelineChartEl,
+  conceptTimelineLegendEl,
+  dissertationsByYearChartEl,
+  kpisEl,
+  methodologyBarsEl,
+  methodologyConceptHeatmapEl,
+  ngramCloudEl,
+  pageTrendChartEl,
+  pagesByYearChartEl,
+  subjectBarsEl,
+  supervisorHeatmapEl,
+  supervisorTopicHeatmapEl,
+  supervisorTopicPanelEl,
+  themeResultsEl,
+  topicBarsEl,
+  topicDistPanelEl,
+  topicModelMetaEl,
+  topicTimelineChartEl,
+  topicTimelineLegendEl,
+  topicTimelinePanelEl,
+  wordCloudEl,
+  wordsByYearChartEl,
+} = dom;
+
+let analyticsInitialized = false;
+const analyticsIntegrations = {
+  ensureTopicVisuals: async () => null,
+  openSupervisorProfile: async () => {},
+};
+
+function configureAnalyticsDashboard(integrations = {}) {
+  Object.assign(analyticsIntegrations, integrations);
+}
+
+function initAnalyticsDashboard() {
+  if (analyticsInitialized) return;
+  analyticsInitialized = true;
+
+  for (const btn of analyticsTabButtons) {
+    btn.addEventListener('click', () => setActiveAnalyticsTab(btn.dataset.analyticsTab));
+  }
+}
+
+async function setActiveAnalyticsTab(tabName) {
+  for (const btn of analyticsTabButtons) {
+    btn.classList.toggle('active', btn.dataset.analyticsTab === tabName);
+  }
+  for (const section of document.querySelectorAll('.analytics-tab-section')) {
+    section.classList.toggle('active', section.id === `analytics-${tabName}`);
+  }
+  if (tabName === 'visualizations' && state.payload) {
+    const visuals = await analyticsIntegrations.ensureTopicVisuals();
+    visuals?.renderVisualizations?.();
+    return;
+  }
+  renderAnalytics();
+}
+
+async function loadAndRenderAnalytics() {
+  await loadAnalytics();
+  await ensureChartLibrary();
+  renderAnalytics();
+}
+
+function renderAnalytics() {
+  renderKpis();
+  renderPagesByYear();
+  renderDissertationsByYear();
+  renderWordsByYear();
+  renderWordCloud();
+  renderSubjectBars();
+  renderPageTrend();
+  renderNgramCloud();
+  renderMethodologies();
+  renderCooccurrence();
+  renderSupervisorHeatmap();
+  renderConceptTimeline();
+  renderTopicDistribution();
+  renderTopicTimeline();
+  renderSupervisorTopicHeatmap();
+  renderMethodologyConceptMatrix();
+}
+
 
 // --- Analytics rendering ---
 
@@ -480,9 +590,209 @@ function renderSupervisorHeatmap() {
   for (const btn of supervisorHeatmapEl.querySelectorAll('.supervisor-link[data-supervisor-name]')) {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      openSupervisorProfile(btn.dataset.supervisorName);
+      analyticsIntegrations.openSupervisorProfile(btn.dataset.supervisorName);
     });
   }
+}
+
+let conceptTimelineChartInstance = null;
+
+function renderConceptTimeline() {
+  const data = getAnalytics()?.conceptTimeline || [];
+  if (!data.length || !conceptTimelineChartEl) {
+    if (conceptTimelineChartEl) conceptTimelineChartEl.innerHTML = '<p class="meta">No concept timeline data available.</p>';
+    if (conceptTimelineLegendEl) conceptTimelineLegendEl.innerHTML = '';
+    return;
+  }
+
+  const canvas = conceptTimelineChartEl.querySelector('canvas');
+  if (!canvas) return;
+  if (conceptTimelineChartInstance) conceptTimelineChartInstance.destroy();
+
+  const allYears = new Set();
+  for (const series of data) {
+    for (const pt of series.data) allYears.add(pt.year);
+  }
+  const years = Array.from(allYears).sort((a, b) => a - b);
+  if (!years.length) {
+    conceptTimelineChartEl.innerHTML = '<p class="meta">No year data.</p>';
+    if (conceptTimelineLegendEl) conceptTimelineLegendEl.innerHTML = '';
+    return;
+  }
+
+  const hueStep = 360 / data.length;
+  const datasets = data.map((series, idx) => {
+    const hue = Math.round(idx * hueStep);
+    const yearMap = new Map(series.data.map(pt => [pt.year, pt.count]));
+    return {
+      label: `${series.concept} (${series.totalDocs})`,
+      data: years.map(yr => yearMap.get(yr) || 0),
+      borderColor: `hsl(${hue}, 65%, 45%)`,
+      backgroundColor: `hsla(${hue}, 65%, 45%, 0.05)`,
+      borderWidth: 2,
+      tension: 0.15,
+      pointRadius: 3,
+      pointHoverRadius: 5
+    };
+  });
+
+  conceptTimelineChartInstance = new Chart(canvas, {
+    type: 'line',
+    data: { labels: years, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          display: true,
+          position: 'bottom',
+          labels: { color: 'var(--fg)', boxWidth: 12, font: { size: 11 } }
+        }
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { color: 'var(--fg)' } },
+        y: { beginAtZero: true, ticks: { color: 'var(--fg)' } }
+      }
+    }
+  });
+
+  if (conceptTimelineLegendEl) conceptTimelineLegendEl.innerHTML = '';
+}
+
+function topicDisplayLabel(label) {
+  const cleaned = String(label || '').replace(/^-?\d+_/, '').replace(/_/g, ' ');
+  return cleaned || label;
+}
+
+function wrapLabel(text, maxChars) {
+  const words = String(text || '').split(/\s+/);
+  const lines = [];
+  let cur = '';
+  for (const w of words) {
+    if (cur && (cur.length + 1 + w.length) > maxChars) {
+      lines.push(cur);
+      cur = w;
+    } else {
+      cur = cur ? cur + ' ' + w : w;
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines.length ? lines : [String(text || '')];
+}
+
+function renderTopicDistribution() {
+  const td = getAnalytics()?.topicData;
+  if (!td || !td.topics || !td.topics.length) {
+    if (topicDistPanelEl) topicDistPanelEl.hidden = true;
+    return;
+  }
+  topicDistPanelEl.hidden = false;
+  if (topicModelMetaEl) {
+    const modelName = td.topics.find((topic) => topic.modelName)?.modelName;
+    const createdAt = td.topics.find((topic) => topic.createdAt)?.createdAt;
+    const detail = [modelName, createdAt ? `run ${new Date(createdAt).toLocaleDateString()}` : '']
+      .filter(Boolean)
+      .join('; ');
+    topicModelMetaEl.textContent = `Topics discovered by BERTopic clustering of dissertation abstracts${detail ? ` (${detail})` : ''}.`;
+  }
+
+  const regular = td.topics.filter((t) => t.topicId !== -1);
+  const outlier = td.topics.find((t) => t.topicId === -1);
+  const ordered = [...regular];
+  if (outlier) ordered.push(outlier);
+  const maxCount = Math.max(...ordered.map((t) => t.docCount), 1);
+
+  topicBarsEl.innerHTML = ordered
+    .map((topic) => {
+      const widthPct = (topic.docCount / maxCount) * 100;
+      const displayLabel = topic.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic.label);
+      const topTerms = topic.topicId === -1 ? '' : (topic.topTerms || []).slice(0, 3).map((pair) => Array.isArray(pair) ? pair[0] : pair).join(', ');
+      return `
+        <div class="bar-row">
+          <span class="bar-label" title="${escapeHtml(topic.label)}">
+            ${escapeHtml(displayLabel)}
+            ${topTerms ? `<span class="topic-terms">${escapeHtml(topTerms)}</span>` : ''}
+          </span>
+          <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
+          <button class="bar-value" data-topic-id="${topic.topicId}">${formatNum(topic.docCount)}</button>
+        </div>
+      `;
+    })
+    .join('');
+
+  for (const node of topicBarsEl.querySelectorAll('[data-topic-id]')) {
+    node.addEventListener('click', () => {
+      const topicId = Number(node.getAttribute('data-topic-id'));
+      const topic = td.topics.find((t) => t.topicId === topicId);
+      const label = topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || '');
+      openMatchesModal(`Topic: ${label}`, docsForTopic(topicId));
+    });
+  }
+}
+
+let topicTimelineChartInstance = null;
+
+function renderTopicTimeline() {
+  const td = getAnalytics()?.topicData;
+  if (!td || !td.byYear || !td.byYear.length) {
+    if (topicTimelinePanelEl) topicTimelinePanelEl.hidden = true;
+    return;
+  }
+  topicTimelinePanelEl.hidden = false;
+
+  const data = td.byYear;
+  const canvas = topicTimelineChartEl.querySelector('canvas');
+  if (!canvas) return;
+  if (topicTimelineChartInstance) topicTimelineChartInstance.destroy();
+
+  const allYears = new Set();
+  for (const series of data) {
+    for (const pt of series.data) allYears.add(pt.year);
+  }
+  const years = Array.from(allYears).sort((a, b) => a - b);
+  if (!years.length) {
+    topicTimelineChartEl.innerHTML = '<p class="meta">No year data.</p>';
+    if (topicTimelineLegendEl) topicTimelineLegendEl.innerHTML = '';
+    return;
+  }
+
+  const hueStep = 360 / data.length;
+  const datasets = data.map((series, idx) => {
+    const hue = Math.round(idx * hueStep);
+    const yearMap = new Map(series.data.map(pt => [pt.year, pt.count]));
+    return {
+      label: topicDisplayLabel(series.label),
+      data: years.map(yr => yearMap.get(yr) || 0),
+      borderColor: `hsl(${hue}, 65%, 45%)`,
+      backgroundColor: `hsla(${hue}, 65%, 45%, 0.05)`,
+      borderWidth: 2,
+      tension: 0.15,
+      pointRadius: 3,
+      pointHoverRadius: 5
+    };
+  });
+
+  topicTimelineChartInstance = new Chart(canvas, {
+    type: 'line',
+    data: { labels: years, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          display: true,
+          position: 'bottom',
+          labels: { color: 'var(--fg)', boxWidth: 12, font: { size: 11 } }
+        }
+      },
+      scales: {
+        x: { grid: { display: false }, ticks: { color: 'var(--fg)' } },
+        y: { beginAtZero: true, ticks: { color: 'var(--fg)' } }
+      }
+    }
+  });
+
+  if (topicTimelineLegendEl) topicTimelineLegendEl.innerHTML = '';
 }
 
 function renderSupervisorTopicHeatmap() {
@@ -503,8 +813,8 @@ function renderSupervisorTopicHeatmap() {
       if (!supTopicCounts.has(sup)) supTopicCounts.set(sup, new Map());
       const tm = supTopicCounts.get(sup);
       tm.set(doc.topicId, (tm.get(doc.topicId) || 0) + 1);
-    }
   }
+}
 
   const topSups = Array.from(supCounts.entries())
     .sort((a, b) => b[1] - a[1])
@@ -583,9 +893,90 @@ function renderSupervisorTopicHeatmap() {
   for (const btn of supervisorTopicHeatmapEl.querySelectorAll('.supervisor-link[data-supervisor-name]')) {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      openSupervisorProfile(btn.dataset.supervisorName);
+      analyticsIntegrations.openSupervisorProfile(btn.dataset.supervisorName);
     });
   }
 
 
 }
+
+function docsForMethodologyConcept(methodology, concept) {
+  const methNorm = String(methodology || '').toLowerCase();
+  const conceptNorm = String(concept || '').toLowerCase();
+  const docs = state.payload?.documents || [];
+  return docs.filter((doc) => {
+    const hasMeth = (doc.methodologies || []).some((m) => String(m || '').toLowerCase() === methNorm);
+    if (!hasMeth) return false;
+    const terms = new Set((doc.conceptTerms || []).map((t) => String(t || '').toLowerCase()));
+    return terms.has(conceptNorm);
+  });
+}
+
+function renderMethodologyConceptMatrix() {
+  const data = getAnalytics()?.methodologyConceptMatrix;
+  if (!data || !data.methodologies.length || !data.concepts.length) {
+    if (methodologyConceptHeatmapEl) methodologyConceptHeatmapEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No methodology-concept data available.</p>';
+    return;
+  }
+
+  const maxVal = Math.max(...data.matrix.flat(), 1);
+  const headerCells = data.concepts.map((c) => heatmapHeaderCell(c)).join('');
+  const bodyRows = data.methodologies
+    .map((meth, mi) => {
+      const cells = data.concepts
+        .map((concept, ci) => {
+          const val = data.matrix[mi][ci];
+          const lightness = val > 0 ? 95 - Math.round((val / maxVal) * 65) : 97;
+          const textColor = lightness < 55 ? '#fff' : 'var(--ink)';
+          const content = val > 0
+            ? `<button class="heatmap-cell-btn" data-mc-meth="${escapeHtml(meth)}" data-mc-concept="${escapeHtml(concept)}" style="color:${textColor}">${val}</button>`
+            : '';
+          return `<td class="heatmap-cell" style="background:hsl(30 58% ${lightness}%);color:${textColor}">${content}</td>`;
+        })
+        .join('');
+      return `<tr><td class="heatmap-label" title="${escapeHtml(meth)}">${escapeHtml(meth)}</td>${cells}</tr>`;
+    })
+    .join('');
+
+  methodologyConceptHeatmapEl.innerHTML = `
+    <table class="heatmap-table">
+      <thead><tr><th></th>${headerCells}</tr></thead>
+      <tbody>${bodyRows}</tbody>
+    </table>
+  `;
+
+  for (const node of methodologyConceptHeatmapEl.querySelectorAll('[data-mc-meth][data-mc-concept]')) {
+    node.addEventListener('click', () => {
+      const meth = node.getAttribute('data-mc-meth');
+      const concept = node.getAttribute('data-mc-concept');
+      openMatchesModal(`${meth} + ${concept}`, docsForMethodologyConcept(meth, concept));
+    });
+  }
+}
+
+export {
+  configureAnalyticsDashboard,
+  initAnalyticsDashboard,
+  loadAndRenderAnalytics,
+  renderAnalytics,
+  renderCooccurrence,
+  renderConceptTimeline,
+  renderDissertationsByYear,
+  renderKpis,
+  renderMethodologies,
+  renderMethodologyConceptMatrix,
+  renderNgramCloud,
+  renderPageTrend,
+  renderPagesByYear,
+  renderSubjectBars,
+  renderSupervisorHeatmap,
+  renderSupervisorTopicHeatmap,
+  renderThemeResults,
+  renderTopicDistribution,
+  renderTopicTimeline,
+  renderWordCloud,
+  renderWordsByYear,
+  setActiveAnalyticsTab,
+  topicDisplayLabel,
+  wrapLabel,
+};
