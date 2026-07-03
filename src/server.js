@@ -129,7 +129,7 @@ export async function start() {
   }
 
   const server = app.listen(PORT, () => {
-    logger.info(`UBC Dissertation Intelligence Workbench running at http://localhost:${PORT}`);
+    logger.info(`Dissertation Workbench running at http://localhost:${PORT}`);
   });
 
 

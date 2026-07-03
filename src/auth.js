@@ -99,8 +99,8 @@ export function verifyTotp(secret, code, now = Date.now()) {
 }
 
 function mfaOtpauthUrl(username, secret) {
-  const label = encodeURIComponent(`UBC Dissertation Workbench:${username}`);
-  const issuer = encodeURIComponent('UBC Dissertation Workbench');
+  const label = encodeURIComponent(`Dissertation Workbench:${username}`);
+  const issuer = encodeURIComponent('Dissertation Workbench');
   return `otpauth://totp/${label}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=${TOTP_DIGITS}&period=${TOTP_PERIOD_SECONDS}`;
 }
 

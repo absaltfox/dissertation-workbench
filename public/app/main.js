@@ -2,7 +2,6 @@ import {
   dom,
   parseRouteFromHash,
   resetDerivedCaches,
-  setActiveAdminTab,
   setActiveTab,
   state,
 } from './core.js';
@@ -147,18 +146,13 @@ async function activateTab(tabName, { updateUrl = true, resetToken = '' } = {}) 
     const admin = await ensureAdminModule();
     const { adminTab } = parseRouteFromHash();
     const hasAdminTab = dom.adminTabButtons.some((btn) => btn.dataset.adminTab === adminTab);
-    admin.activateAdminTab(hasAdminTab ? adminTab : 'settings', { updateUrl: false });
     if (resetToken) admin.showPasswordResetGate(resetToken);
-    else await admin.checkSession();
+    else await admin.checkSession({ requestedTab: hasAdminTab ? adminTab : 'settings' });
   }
 }
 
 async function applyRouteFromHash() {
-  const { tab, adminTab, resetToken } = parseRouteFromHash();
-  if (tab === 'admin') {
-    const hasAdminTab = dom.adminTabButtons.some((btn) => btn.dataset.adminTab === adminTab);
-    setActiveAdminTab(hasAdminTab ? adminTab : 'settings', { updateUrl: false });
-  }
+  const { tab, resetToken } = parseRouteFromHash();
   await activateTab(tab, { updateUrl: false, resetToken });
 }
 

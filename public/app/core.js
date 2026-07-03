@@ -603,10 +603,6 @@ function parseRouteFromHash() {
 
 function applyRouteFromHash() {
   const { tab, adminTab, resetToken } = parseRouteFromHash();
-  if (tab === 'admin') {
-    const hasAdminTab = adminTabButtons.some((btn) => btn.dataset.adminTab === adminTab);
-    setActiveAdminTab(hasAdminTab ? adminTab : 'settings', { updateUrl: false });
-  }
   setActiveTab(tab, { updateUrl: false });
   return { tab, adminTab, resetToken };
 }
@@ -883,6 +879,7 @@ export {
   formatBytes,
   formatNum,
   formatRefreshDate,
+  getActiveAdminTab,
   getCurrentParams,
   heatmapHeaderCell,
   hideStatus,

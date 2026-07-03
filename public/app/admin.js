@@ -4,6 +4,7 @@ import {
   escapeHtml,
   formatBytes,
   formatNum,
+  getActiveAdminTab,
   jsonHeaders,
   setActiveAdminTab as setActiveAdminTabShell,
   setStatus,
@@ -93,6 +94,15 @@ const {
 } = dom;
 
 let adminInitialized = false;
+let requestedAdminTab = 'settings';
+
+function isKnownAdminTab(tabName) {
+  return adminTabButtons.some((btn) => btn.dataset.adminTab === tabName);
+}
+
+function normalizeAdminTab(tabName) {
+  return isKnownAdminTab(tabName) ? tabName : 'settings';
+}
 
 function initAdmin() {
   if (adminInitialized) return;
@@ -122,7 +132,13 @@ function initAdmin() {
   }
 
   for (const btn of adminTabButtons) {
-    btn.addEventListener('click', () => activateAdminTab(btn.dataset.adminTab));
+    btn.addEventListener('click', () => {
+      if (!state.user) {
+        showLoginGate();
+        return;
+      }
+      activateAdminTab(btn.dataset.adminTab);
+    });
   }
 
   loginForm?.addEventListener('submit', handleLogin);
@@ -162,9 +178,15 @@ function initAdmin() {
 }
 
 function activateAdminTab(tabName, options = {}) {
-  setActiveAdminTabShell(tabName, options);
-  if (tabName === 'jobs') loadJobs();
-  if (tabName === 'labels') loadTopicLabels();
+  if (!state.user) {
+    showLoginGate();
+    return false;
+  }
+  const targetTab = normalizeAdminTab(tabName);
+  setActiveAdminTabShell(targetTab, options);
+  if (targetTab === 'jobs') loadJobs();
+  if (targetTab === 'labels') loadTopicLabels();
+  return true;
 }
 
 
@@ -172,23 +194,27 @@ function activateAdminTab(tabName, options = {}) {
 
 let jobsPollTimer = null;
 
-async function checkSession() {
+async function checkSession({ requestedTab = 'settings' } = {}) {
+  requestedAdminTab = normalizeAdminTab(requestedTab);
   try {
     const res = await fetch('/api/auth/session');
     if (res.ok) {
       const data = await res.json();
       state.user = { username: data.username };
       state.csrfToken = data.csrfToken || '';
-      showAdminContent();
+      showAdminContent({ activeTab: requestedAdminTab });
+      return true;
     } else {
       state.user = null;
       state.csrfToken = '';
       showLoginGate();
+      return false;
     }
   } catch {
     state.user = null;
     state.csrfToken = '';
     showLoginGate();
+    return false;
   }
 }
 
@@ -224,13 +250,15 @@ function showPasswordResetGate(token) {
   passwordResetPasswordEl.focus();
 }
 
-function showAdminContent() {
+function showAdminContent({ activeTab = getActiveAdminTab() } = {}) {
   loginGate.hidden = true;
   adminContent.hidden = false;
   state.pendingLogin = null;
   adminUserLabel.textContent = `Signed in as ${state.user.username}`;
+  const targetTab = normalizeAdminTab(activeTab);
+  setActiveAdminTabShell(targetTab, { updateUrl: false });
   loadAdminData();
-  if (getActiveAdminTab() === 'labels') loadTopicLabels();
+  if (targetTab === 'labels') loadTopicLabels();
 }
 
 function showMfaChallenge() {
@@ -250,7 +278,7 @@ function completeLogin(data, username) {
   mfaChallengeForm.reset();
   mfaSetupForm.reset();
   loginMfaCode.required = false;
-  showAdminContent();
+  showAdminContent({ activeTab: requestedAdminTab });
 }
 
 async function handleLogin(e) {
@@ -362,7 +390,7 @@ async function handleMfaSetup(e) {
     mfaChallengeForm.reset();
     mfaSetupForm.reset();
     state.pendingLogin = null;
-    showAdminContent();
+    showAdminContent({ activeTab: requestedAdminTab });
   } catch {
     mfaSetupError.textContent = 'Connection error';
     mfaSetupError.hidden = false;
