@@ -81,7 +81,7 @@ async function parseMetricsRequest(req, res) {
   };
 }
 
-function sourceCacheKey(params) {
+export function sourceCacheKey(params) {
   return JSON.stringify({
     maxRecords: params.maxRecords,
     pageSize: params.pageSize,
@@ -269,6 +269,78 @@ function visualizationSlice(payload) {
   };
 }
 
+async function cachedDocumentsForParams(params, loadSyncModule) {
+  const { getSyncKeyForOptions } = await loadSyncModule();
+  const syncKey = getSyncKeyForOptions(params);
+  const syncCacheStats = await getDocumentCacheStats(syncKey);
+  const hasExactSyncCache = syncCacheStats.total > 0;
+  const cacheStats = hasExactSyncCache ? syncCacheStats : await getDocumentCacheStats();
+  const documents = await listCachedDocuments({
+    syncKey: hasExactSyncCache ? syncKey : null,
+    limit: params.maxRecords,
+  });
+  return {
+    documents,
+    documentCache: {
+      syncKey: hasExactSyncCache ? syncKey : null,
+      requestedSyncKey: syncKey,
+      exactSyncKeyMatch: hasExactSyncCache,
+      recordsAvailable: cacheStats.total,
+      lastSyncedAt: cacheStats.lastSyncedAt,
+    },
+  };
+}
+
+async function metricRecordsForParams(params, loadSyncModule) {
+  const { documents, documentCache } = await cachedDocumentsForParams(params, loadSyncModule);
+  const result = await collectMetricRecords({
+    ...params,
+    cachedDocuments: documents,
+    skipFileEnrichment: true,
+    applyStoredFileMetrics: true,
+    applyCitationCounts: true,
+    applyCommitteeMembers: true,
+  });
+  result.sourceMeta.documentCache = documentCache;
+  result.sourceMeta.readOnlyFileEnrichment = true;
+  result.sourceMeta.ignoredFileEnrichmentParams = {
+    downloadFiles: params.requestedDownloadFiles,
+    recomputeFromCache: params.requestedRecomputeFromCache,
+  };
+  return result;
+}
+
+export async function buildWorkbenchBootstrapPayload(params, loadSyncModule) {
+  const { documents, documentCache } = await cachedDocumentsForParams(params, loadSyncModule);
+  await applyCitationCountsToDocuments(documents);
+  await applyCommitteeMembersToDocuments(documents);
+  const rows = documents.map(bootstrapDoc);
+  return {
+    generatedAt: new Date().toISOString(),
+    source: {
+      maxRecords: params.maxRecords,
+      pageSize: params.pageSize,
+      scanLimit: params.scanLimit,
+      requestedIndex: params.index || '',
+      query: params.query || '',
+      term: params.term || '',
+      source: params.source || '',
+      documentCache,
+      readOnlyFileEnrichment: true,
+      ignoredFileEnrichmentParams: {
+        downloadFiles: params.requestedDownloadFiles,
+        recomputeFromCache: params.requestedRecomputeFromCache,
+      },
+    },
+    summary: {
+      documents: rows.length,
+      supervisors: new Set(rows.flatMap((doc) => doc.supervisors || []).map((name) => String(name || '').toLowerCase()).filter(Boolean)).size,
+    },
+    facets: facetValues(rows),
+    documents: rows,
+  };
+}
+
 async function cachedSlice(cache, inflight, key, refresh, compute) {
   if (!refresh) {
     const cached = cache.get(key);
@@ -295,80 +367,12 @@ async function cachedSlice(cache, inflight, key, refresh, compute) {
 export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncModule }) {
   const router = Router();
 
-  async function cachedDocumentsForParams(params) {
-    const { getSyncKeyForOptions } = await loadSyncModule();
-    const syncKey = getSyncKeyForOptions(params);
-    const syncCacheStats = await getDocumentCacheStats(syncKey);
-    const hasExactSyncCache = syncCacheStats.total > 0;
-    const cacheStats = hasExactSyncCache ? syncCacheStats : await getDocumentCacheStats();
-    const documents = await listCachedDocuments({
-      syncKey: hasExactSyncCache ? syncKey : null,
-      limit: params.maxRecords,
-    });
-    return {
-      documents,
-      documentCache: {
-        syncKey: hasExactSyncCache ? syncKey : null,
-        requestedSyncKey: syncKey,
-        exactSyncKeyMatch: hasExactSyncCache,
-        recordsAvailable: cacheStats.total,
-        lastSyncedAt: cacheStats.lastSyncedAt,
-      },
-    };
-  }
-
-  async function metricRecordsForParams(params) {
-    const { documents, documentCache } = await cachedDocumentsForParams(params);
-    const result = await collectMetricRecords({
-      ...params,
-      cachedDocuments: documents,
-      skipFileEnrichment: true,
-      applyStoredFileMetrics: true,
-      applyCitationCounts: true,
-      applyCommitteeMembers: true,
-    });
-    result.sourceMeta.documentCache = documentCache;
-    result.sourceMeta.readOnlyFileEnrichment = true;
-    result.sourceMeta.ignoredFileEnrichmentParams = {
-      downloadFiles: params.requestedDownloadFiles,
-      recomputeFromCache: params.requestedRecomputeFromCache,
-    };
-    return result;
-  }
-
   router.get('/workbench/bootstrap', asyncHandler(async (req, res) => {
     const params = await parseMetricsRequest(req, res);
     if (!params) return;
     const key = `workbench:bootstrap:${sourceCacheKey(params)}`;
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
-      const { documents, documentCache } = await cachedDocumentsForParams(params);
-      await applyCitationCountsToDocuments(documents);
-      await applyCommitteeMembersToDocuments(documents);
-      const rows = documents.map(bootstrapDoc);
-      return {
-        generatedAt: new Date().toISOString(),
-        source: {
-          maxRecords: params.maxRecords,
-          pageSize: params.pageSize,
-          scanLimit: params.scanLimit,
-          requestedIndex: params.index || '',
-          query: params.query || '',
-          term: params.term || '',
-          source: params.source || '',
-          documentCache,
-          readOnlyFileEnrichment: true,
-          ignoredFileEnrichmentParams: {
-            downloadFiles: params.requestedDownloadFiles,
-            recomputeFromCache: params.requestedRecomputeFromCache,
-          },
-        },
-        summary: {
-          documents: rows.length,
-          supervisors: new Set(rows.flatMap((doc) => doc.supervisors || []).map((name) => String(name || '').toLowerCase()).filter(Boolean)).size,
-        },
-        facets: facetValues(rows),
-        documents: rows,
-      };
+      return buildWorkbenchBootstrapPayload(params, loadSyncModule);
     });
     res.status(200).json(payload);
   }));
@@ -394,7 +398,7 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       const topicInfo = doc.topicId == null
         ? null
         : topics.find((item) => item.topicId === doc.topicId) || null;
-      const { documents } = await cachedDocumentsForParams(params);
+      const { documents } = await cachedDocumentsForParams(params, loadSyncModule);
       await applyCitationCountsToDocuments(documents);
       await applyCommitteeMembersToDocuments(documents);
       const related = relatedDocumentsFor(doc, documents);
@@ -413,7 +417,7 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const filters = activeFilters(req);
     const key = `workbench:analytics:${sourceCacheKey(params)}:${JSON.stringify(filters)}`;
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
-      const { records, sourceMeta, subjectLimit } = await metricRecordsForParams(params);
+      const { records, sourceMeta, subjectLimit } = await metricRecordsForParams(params, loadSyncModule);
       const filtered = filterDocuments(records, filters);
       const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit);
       return analyticsSlice(full);
@@ -427,7 +431,7 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const filters = activeFilters(req);
     const key = `workbench:visualizations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`;
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
-      const { records, sourceMeta, subjectLimit } = await metricRecordsForParams(params);
+      const { records, sourceMeta, subjectLimit } = await metricRecordsForParams(params, loadSyncModule);
       const filtered = filterDocuments(records, filters);
       const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit);
       return visualizationSlice(full);
@@ -441,7 +445,7 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const filters = activeFilters(req);
     const key = `workbench:people:${sourceCacheKey(params)}:${JSON.stringify(filters)}`;
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
-      const { records } = await metricRecordsForParams(params);
+      const { records } = await metricRecordsForParams(params, loadSyncModule);
       const filtered = filterDocuments(records, filters);
       return {
         generatedAt: new Date().toISOString(),
@@ -463,7 +467,7 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const filters = activeFilters(req);
     const key = `workbench:citations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`;
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
-      const { documents } = await cachedDocumentsForParams(params);
+      const { documents } = await cachedDocumentsForParams(params, loadSyncModule);
       await applyCitationCountsToDocuments(documents);
       await applyCommitteeMembersToDocuments(documents);
       return {

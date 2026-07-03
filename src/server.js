@@ -1,15 +1,12 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { buildDocumentSyncKey, collectMetrics } from './metrics.js';
 import {
   PORT, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT, EXPOSE_ERROR_DETAILS,
-  DEFAULT_BASE_URL, DEFAULT_INDEX, DEFAULT_QUERY, DEFAULT_TERM, DEFAULT_SOURCE,
-  TRUST_PROXY, validateRuntimeSecrets
+  DEFAULT_TERM, DEFAULT_SOURCE, TRUST_PROXY, validateRuntimeSecrets
 } from './config.js';
 import {
-  checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb,
-  getDocumentCacheStats, listCachedDocuments
+  checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb
 } from './db.js';
 import { ensureDefaultAdmin } from './auth.js';
 import { getConceptPipelineStatus, rebuildConceptDictionary, scheduleDailyConceptRebuild } from './conceptsPipeline.js';
@@ -25,7 +22,11 @@ import { createAdminOperationsRouter } from './routes/adminOperationsRoutes.js';
 import { createAdminTopicLabelsRouter } from './routes/adminTopicLabelsRoutes.js';
 import { createAdminUsersRouter } from './routes/adminUsersRoutes.js';
 import { createInternalWorkerRouter } from './routes/internalWorkerRoutes.js';
-import { createMetricsRouter } from './routes/metricsRoutes.js';
+import {
+  buildWorkbenchBootstrapPayload,
+  createMetricsRouter,
+  sourceCacheKey,
+} from './routes/metricsRoutes.js';
 import { createPublicRouter } from './routes/publicRoutes.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -132,83 +133,46 @@ export async function start() {
     logger.info(`Dissertation Workbench running at http://localhost:${PORT}`);
   });
 
-
-
-  // Warm the in-memory metrics cache so the first browser load is served instantly.
-  // Key is constructed to match exactly what the request handler produces for a default
-  // non-admin request (no query params): index/query/term/source all undefined -> omitted by JSON.stringify.
+  // Warm the workbench bootstrap cache so the first browser load is served quickly.
   const _warmupApiKey = await getConfiguredApiKey();
   // The browser always sends maxRecords=9999 (UI default), which the server caps to
   // PUBLIC_MAX_RECORDS. The scan limit is derived from the uncapped value, then capped
   // to PUBLIC_SCAN_LIMIT. We replicate that math here so the warmup key matches the
-  // first browser request exactly and the cache is used without a cold re-fetch.
+  // first browser request exactly.
   // Other values must mirror the HTML input defaults in public/index.html:
   //   subjectLimit=20, downloadFiles=0, index='', term=DEFAULT_TERM, source=DEFAULT_SOURCE.
-  const _warmupMaxRecords = PUBLIC_MAX_RECORDS;
-  const _warmupScanLimit = PUBLIC_SCAN_LIMIT;
-  const _warmupSubjectLimit = 20; // mirrors s-subjectLimit input default
-  const _warmupSyncKey = buildDocumentSyncKey({
-    baseUrl: DEFAULT_BASE_URL,
-    requestedIndex: DEFAULT_INDEX,
-    query: DEFAULT_QUERY,
+  const _warmupParams = {
+    maxRecords: PUBLIC_MAX_RECORDS,
+    pageSize: 20,
+    scanLimit: PUBLIC_SCAN_LIMIT,
+    subjectLimit: 20,
+    index: '',
+    query: undefined,
     term: DEFAULT_TERM,
     source: DEFAULT_SOURCE,
-  });
-  Promise.resolve().then(async () => {
-    const syncCacheStats = await getDocumentCacheStats(_warmupSyncKey);
-    const hasExactSyncCache = syncCacheStats.total > 0;
-    const cacheStats = hasExactSyncCache ? syncCacheStats : await getDocumentCacheStats();
-    const cachedDocuments = await listCachedDocuments({
-      syncKey: hasExactSyncCache ? _warmupSyncKey : null,
-      limit: _warmupMaxRecords,
+    apiKey: _warmupApiKey || undefined,
+    downloadFiles: false,
+    forceDownload: false,
+    recomputeFromCache: false,
+    refresh: false,
+    isAdminRequest: false,
+    requestedDownloadFiles: false,
+    requestedRecomputeFromCache: false,
+  };
+  const _warmupBootstrapKey = `workbench:bootstrap:${sourceCacheKey(_warmupParams)}`;
+  const _warmupPromise = Promise.resolve().then(() => (
+    buildWorkbenchBootstrapPayload(_warmupParams, loadSyncModule)
+  ));
+  metricsInflight.set(_warmupBootstrapKey, _warmupPromise);
+  _warmupPromise.then((payload) => {
+    metricsCache.set(_warmupBootstrapKey, { timestamp: Date.now(), payload });
+    logger.info('Workbench bootstrap cache warmed on startup', {
+      documents: payload?.summary?.documents || 0,
     });
-    const payload = await collectMetrics({
-      maxRecords: _warmupMaxRecords,
-      pageSize: 20,
-      scanLimit: _warmupScanLimit,
-      subjectLimit: _warmupSubjectLimit,
-      apiKey: _warmupApiKey || undefined,
-      term: DEFAULT_TERM,
-      source: DEFAULT_SOURCE,
-      downloadFiles: false,
-      forceDownload: false,
-      recomputeFromCache: false,
-      cachedDocuments,
-      skipFileEnrichment: true,
-      applyStoredFileMetrics: true,
-      applyCitationCounts: true,
-      applyCommitteeMembers: true,
-    });
-
-    payload.source.documentCache = {
-      syncKey: hasExactSyncCache ? _warmupSyncKey : null,
-      requestedSyncKey: _warmupSyncKey,
-      exactSyncKeyMatch: hasExactSyncCache,
-      recordsAvailable: cacheStats.total,
-      lastSyncedAt: cacheStats.lastSyncedAt,
-    };
-    payload.source.readOnlyFileEnrichment = true;
-    payload.source.ignoredFileEnrichmentParams = {
-      downloadFiles: false,
-      recomputeFromCache: false,
-    };
-    return payload;
-  }).then((payload) => {
-    // Key must match what a default anonymous browser request produces so the
-    // first page load is served from cache without a round-trip to the UBC API.
-    const warmupKey = JSON.stringify({
-      maxRecords: _warmupMaxRecords, pageSize: 20, scanLimit: _warmupScanLimit,
-      subjectLimit: _warmupSubjectLimit,
-      index: '',              // browser sends index='' (empty input) which is not || undefined'd
-      term: DEFAULT_TERM,     // browser sends this from s-term input
-      source: DEFAULT_SOURCE, // browser sends this from s-source input
-      hasApiKey: Boolean(_warmupApiKey),
-      downloadFiles: false, recomputeFromCache: false, refresh: false, isAdminRequest: false,
-    });
-    metricsCache.set(warmupKey, { timestamp: Date.now(), payload });
-    logger.info('Metrics cache warmed on startup');
   }).catch((e) => {
-    logger.warn('Startup metrics cache warmup failed', { error: e.message });
+    logger.warn('Startup workbench bootstrap cache warmup failed', { error: e.message });
+  }).finally(() => {
+    metricsInflight.delete(_warmupBootstrapKey);
   });
 
   stopDailyConceptScheduler = scheduleDailyConceptRebuild();
