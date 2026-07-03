@@ -171,6 +171,17 @@ function citationDoc(doc) {
   };
 }
 
+function analyticsDoc(doc) {
+  return {
+    ...bootstrapDoc(doc),
+    themes: Array.isArray(doc.themes) ? doc.themes : [],
+    conceptTerms: Array.isArray(doc.conceptTerms) ? doc.conceptTerms : [],
+    methodologies: Array.isArray(doc.methodologies) ? doc.methodologies : [],
+    topicId: doc.topicId ?? null,
+    topicProbability: doc.topicProbability ?? null,
+  };
+}
+
 function detailDoc(doc, related = [], topic = null) {
   return {
     id: doc.id,
@@ -244,6 +255,7 @@ function analyticsSlice(payload) {
       byYear: payload.topicData.byYear,
     } : null,
     methodologyTopicMatrix: payload.methodologyTopicMatrix,
+    documents: (payload.documents || []).map(analyticsDoc),
   };
 }
 
@@ -452,9 +464,12 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
         documents: filtered.map((doc) => ({
           ...bootstrapDoc(doc),
           role: 'Supervisor',
+          committee: Array.isArray(doc.committee) ? doc.committee : [],
+          themes: doc.themes || [],
           conceptTerms: doc.conceptTerms || [],
           methodologies: doc.methodologies || [],
           topicId: doc.topicId ?? null,
+          topicProbability: doc.topicProbability ?? null,
         })),
       };
     });

@@ -565,7 +565,9 @@ async function loadAnalytics() {
     const data = state.tabData.analyticsByFilterKey.get(key)
       || await fetchWorkbenchJson('/api/workbench/analytics', { filters: true });
     state.tabData.analyticsByFilterKey.set(key, data);
-    Object.assign(state.payload, data);
+    const { documents = [], ...analyticsPayload } = data;
+    mergeDocuments(documents);
+    Object.assign(state.payload, analyticsPayload);
     state.analyticsLoaded = true;
   } catch (error) {
     setStatus(`Failed to load analytics: ${error.message}`, true);

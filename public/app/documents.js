@@ -56,24 +56,24 @@ function closeDocModal() {
 }
 
 function docsForTheme(theme) {
-  const docs = state.payload?.documents || [];
+  const docs = getFilteredDocs();
   const normalized = String(theme || '').toLowerCase();
   return docs.filter((doc) => (doc.themes || []).some((t) => t.toLowerCase() === normalized));
 }
 
 function docsForConceptTerm(term) {
-  const docs = state.payload?.documents || [];
+  const docs = getFilteredDocs();
   const normalized = String(term || '').toLowerCase();
   return docs.filter((doc) => (doc.conceptTerms || []).some((t) => String(t || '').toLowerCase() === normalized));
 }
 
 function docsForTopic(topicId) {
-  const docs = state.payload?.documents || [];
+  const docs = getFilteredDocs();
   return docs.filter((doc) => doc.topicId === topicId);
 }
 
 function docsForMethodology(methodology) {
-  const docs = state.payload?.documents || [];
+  const docs = getFilteredDocs();
   const normalized = String(methodology || '').toLowerCase();
   return docs.filter((doc) => (doc.methodologies || []).some((m) => String(m || '').toLowerCase() === normalized));
 }
@@ -82,7 +82,7 @@ function docsForCooccurrence(termA, termB) {
   const a = String(termA || '').toLowerCase();
   const b = String(termB || '').toLowerCase();
   if (!a || !b) return [];
-  const docs = state.payload?.documents || [];
+  const docs = getFilteredDocs();
   return docs.filter((doc) => {
     const terms = new Set((doc.conceptTerms || []).map((t) => String(t || '').toLowerCase()));
     return terms.has(a) && terms.has(b);
@@ -92,7 +92,7 @@ function docsForCooccurrence(termA, termB) {
 function docsForSupervisorConcept(supervisor, concept) {
   const sup = String(supervisor || '').toLowerCase();
   const conceptNorm = String(concept || '').toLowerCase();
-  const docs = state.payload?.documents || [];
+  const docs = getFilteredDocs();
   return docs.filter((doc) => {
     const hasSup = (doc.supervisors || []).some((s) => String(s || '').toLowerCase() === sup);
     if (!hasSup) return false;

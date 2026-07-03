@@ -131,7 +131,9 @@ test('workbench analytics and citation document slices are filter-aware', async 
     .expect('content-type', /application\/json/)
     .expect(200);
   assert.equal(analytics.body.metrics.recordCount, 1);
-  assert.equal(Object.prototype.hasOwnProperty.call(analytics.body, 'documents'), false);
+  assert.deepEqual(analytics.body.documents.map((doc) => doc.id), ['wb-doc-1']);
+  assert.ok(analytics.body.documents[0].themes.includes('performance'));
+  assert.deepEqual(analytics.body.documents[0].conceptTerms, ['page load performance', 'staged loading']);
 
   const citations = await request(app)
     .get('/api/workbench/citations/documents?maxRecords=10&degree=Doctor%20of%20Education%20-%20EdD')
