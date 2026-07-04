@@ -249,7 +249,23 @@ function syncSelectAllDocs() {
   selectAllDocsEl.indeterminate = !allChecked && state.selectedDocIds.size > 0;
 }
 
+function doiDocumentHref(doc) {
+  const raw = String(doc?.doi || '').trim();
+  if (!raw) return '';
+  if (/^https?:\/\//i.test(raw)) return safeExternalHref(raw);
+  const doi = raw
+    .replace(/^doi:\s*/i, '')
+    .replace(/^https?:\/\/(?:dx\.)?doi\.org\//i, '')
+    .trim();
+  if (!/^10\.\S+\/\S+/.test(doi)) return '';
+  const encoded = encodeURIComponent(doi).replaceAll('%2F', '/');
+  return safeExternalHref(`https://doi.org/${encoded}`);
+}
+
 function openCollectionsDocumentHref(doc) {
+  const doiHref = doiDocumentHref(doc);
+  if (doiHref) return doiHref;
+
   const candidates = [doc?.uri, ...(doc?.downloadCandidates || [])];
   for (const candidate of candidates) {
     const href = safeExternalHref(candidate);

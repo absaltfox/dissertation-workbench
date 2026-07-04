@@ -164,6 +164,8 @@ async function onFacetChange() {
   state.activeFilters.program = filterProgramEl.value;
   state.activeFilters.affiliation = filterAffiliationEl.value;
   state.analyticsLoaded = false;
+  state.analyticsRequestToken += 1;
+  state.analyticsLoadingKey = '';
   resetDerivedCaches();
   await loadDocumentPage({ reset: true });
   updateFacetCount();

@@ -65,6 +65,7 @@ async function seedWorkbenchDocs() {
       conceptTerms: ['page load performance', 'staged loading'],
       methodologies: ['Case Study'],
       themes: ['performance'],
+      doi: '10.14288/1.0000001',
     },
     {
       id: 'wb-doc-2',
@@ -82,6 +83,36 @@ async function seedWorkbenchDocs() {
       methodologies: ['Interview'],
       themes: ['performance'],
     },
+    {
+      id: 'wb-doc-3',
+      title: 'Performance Loading Three',
+      author: 'C. Author',
+      year: 2019,
+      date: '2019',
+      degree: 'Doctor of Philosophy - PhD',
+      program: 'Curriculum Studies',
+      affiliation: ['UBC'],
+      supervisors: ['Alex Supervisor'],
+      abstract: 'Performance loading work with staged loading and responsive document exploration.',
+      subjects: ['Performance'],
+      methodologies: [],
+    },
+    {
+      id: 'wb-doc-4',
+      title: 'MEd Loading Four',
+      author: 'D. Author',
+      year: 2018,
+      date: '2018',
+      degree: 'Master of Education - MEd',
+      program: 'Educational Studies',
+      affiliation: ['UBC'],
+      supervisors: ['Morgan Supervisor'],
+      abstract: 'A masters thesis about word-count-sensitive analytics filtering.',
+      subjects: ['Analytics'],
+      conceptTerms: ['analytics filtering'],
+      methodologies: ['Survey'],
+      themes: ['analytics'],
+    },
   ];
 
   for (const doc of docs) {
@@ -91,8 +122,8 @@ async function seedWorkbenchDocs() {
       pdfPath: null,
       downloadUrl: '',
       fileBytes: 1000,
-      wordCount: doc.id === 'wb-doc-1' ? 1200 : 1400,
-      pageCount: doc.id === 'wb-doc-1' ? 40 : 45,
+      wordCount: doc.id === 'wb-doc-1' ? 1200 : (doc.id === 'wb-doc-2' ? 1400 : (doc.id === 'wb-doc-3' ? 900 : 2400)),
+      pageCount: doc.id === 'wb-doc-1' ? 40 : (doc.id === 'wb-doc-2' ? 45 : (doc.id === 'wb-doc-3' ? 35 : 60)),
       wordSource: 'test',
       pageSource: 'test',
     });
@@ -110,8 +141,11 @@ test('workbench bootstrap returns source metadata and facets without preloading 
     .expect(200);
 
   assert.equal(res.body.documents.length, 0);
-  assert.equal(res.body.summary.documents, 2);
-  assert.deepEqual(res.body.facets.degree.sort(), ['Doctor of Education - EdD', 'Doctor of Philosophy - PhD'].sort());
+  assert.equal(res.body.summary.documents, 4);
+  assert.deepEqual(
+    res.body.facets.degree.sort(),
+    ['Doctor of Education - EdD', 'Doctor of Philosophy - PhD', 'Master of Education - MEd'].sort()
+  );
 });
 
 test('workbench document page returns projected rows on demand', async () => {
@@ -121,7 +155,7 @@ test('workbench document page returns projected rows on demand', async () => {
     .expect(200);
 
   assert.equal(res.body.documents.length, 1);
-  assert.equal(res.body.source.total, 2);
+  assert.equal(res.body.source.total, 4);
   assert.equal(res.body.source.hasMore, true);
   const doc = res.body.documents[0];
   assert.equal(doc.title, 'Fast Loading Two');
@@ -142,7 +176,10 @@ test('workbench document detail returns heavy modal fields on demand', async () 
   assert.match(res.body.document.abstract, /detailed abstract/);
   assert.deepEqual(res.body.document.conceptTerms, ['page load performance', 'staged loading']);
   assert.equal(res.body.document.citationCount, 1);
+  assert.equal(res.body.document.doi, '10.14288/1.0000001');
   assert.ok(Array.isArray(res.body.document.related));
+  assert.ok(res.body.document.themes.length > 0);
+  assert.ok(res.body.document.related.some((doc) => doc.id === 'wb-doc-3'));
 });
 
 test('workbench analytics and citation document slices are filter-aware', async () => {
@@ -151,9 +188,18 @@ test('workbench analytics and citation document slices are filter-aware', async 
     .expect('content-type', /application\/json/)
     .expect(200);
   assert.equal(analytics.body.metrics.recordCount, 1);
+  assert.equal(analytics.body.metrics.overallWordCount.mean, 1200);
   assert.deepEqual(analytics.body.documents.map((doc) => doc.id), ['wb-doc-1']);
   assert.ok(analytics.body.documents[0].themes.includes('performance'));
   assert.deepEqual(analytics.body.documents[0].conceptTerms, ['page load performance', 'staged loading']);
+
+  const medAnalytics = await request(app)
+    .get('/api/workbench/analytics?maxRecords=10&degree=Master%20of%20Education%20-%20MEd')
+    .expect('content-type', /application\/json/)
+    .expect(200);
+  assert.equal(medAnalytics.body.metrics.recordCount, 1);
+  assert.equal(medAnalytics.body.metrics.overallWordCount.mean, 2400);
+  assert.deepEqual(medAnalytics.body.documents.map((doc) => doc.id), ['wb-doc-4']);
 
   const citations = await request(app)
     .get('/api/workbench/citations/documents?maxRecords=10&degree=Doctor%20of%20Education%20-%20EdD')

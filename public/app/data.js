@@ -663,21 +663,30 @@ async function loadData({ refresh = false } = {}) {
 }
 
 async function loadAnalytics() {
-  if (state.analyticsLoading || !state.payload) return;
+  if (!state.payload) return;
+  const key = dataKey();
+  if (state.analyticsLoading && state.analyticsLoadingKey === key) return;
+  const requestToken = state.analyticsRequestToken + 1;
+  state.analyticsRequestToken = requestToken;
+  state.analyticsLoadingKey = key;
   state.analyticsLoading = true;
   try {
-    const key = dataKey();
     const data = state.tabData.analyticsByFilterKey.get(key)
       || await fetchWorkbenchJson('/api/workbench/analytics', { filters: true });
+    if (requestToken !== state.analyticsRequestToken || key !== dataKey()) return;
     state.tabData.analyticsByFilterKey.set(key, data);
     const { documents = [], ...analyticsPayload } = data;
     mergeDocuments(documents);
     Object.assign(state.payload, analyticsPayload);
     state.analyticsLoaded = true;
   } catch (error) {
+    if (requestToken !== state.analyticsRequestToken) return;
     setStatus(`Failed to load analytics: ${error.message}`, true);
   } finally {
-    state.analyticsLoading = false;
+    if (requestToken === state.analyticsRequestToken) {
+      state.analyticsLoading = false;
+      state.analyticsLoadingKey = '';
+    }
   }
 }
 

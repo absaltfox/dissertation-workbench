@@ -251,6 +251,7 @@ function detailDoc(doc, related = [], topic = null) {
     pages: doc.pages ?? null,
     wordCount: doc.wordCount ?? null,
     citationCount: doc.citationCount || 0,
+    doi: doc.doi || '',
     uri: doc.uri || '',
     downloadCandidates: doc.downloadCandidates || [],
     downloadError: doc.downloadError || null,
@@ -516,6 +517,13 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
         ? null
         : topics.find((item) => item.topicId === doc.topicId) || null;
       const { documents } = await cachedDocumentsForParams(params, loadSyncModule);
+      enrichDocumentSignals(documents);
+      const corpusDoc = documents.find((item) => item.id === doc.id);
+      for (const field of ['themes', 'conceptTerms', 'methodologies']) {
+        if (Array.isArray(corpusDoc?.[field]) && corpusDoc[field].length) {
+          doc[field] = corpusDoc[field];
+        }
+      }
       const related = relatedDocumentsFor(doc, documents);
       return { document: detailDoc(doc, related, topicInfo) };
     });

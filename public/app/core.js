@@ -214,6 +214,8 @@ const state = {
   loading: false,
   analyticsLoaded: false,
   analyticsLoading: false,
+  analyticsLoadingKey: '',
+  analyticsRequestToken: 0,
   user: null, // { username } or null
   pendingLogin: null,
   csrfToken: '',
