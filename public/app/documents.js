@@ -14,6 +14,10 @@ const {
   docModalTitleEl,
   docTheadRow,
   documentsTableEl,
+  phoneScreenBodyEl,
+  phoneScreenEl,
+  phoneScreenEyebrowEl,
+  phoneScreenTitleEl,
   selectAllDocsEl,
 } = dom;
 
@@ -36,24 +40,67 @@ function configureDocuments(integrations = {}) {
   Object.assign(documentIntegrations, integrations);
 }
 
+function isPhoneView() {
+  return window.matchMedia('(max-width: 680px)').matches;
+}
+
+function openPhoneScreen({ title = 'Details', eyebrow = '', bodyHtml = '', bodyClass = 'detail-body', onMount = null } = {}) {
+  docModalOverlay.hidden = true;
+  phoneScreenTitleEl.textContent = title;
+  phoneScreenEyebrowEl.textContent = eyebrow;
+  phoneScreenEyebrowEl.hidden = !eyebrow;
+  phoneScreenBodyEl.innerHTML = `<div class="${bodyClass}">${bodyHtml}</div>`;
+  phoneScreenEl.hidden = false;
+  document.body.classList.add('phone-screen-open');
+  onMount?.(phoneScreenBodyEl);
+}
+
+function closePhoneScreen() {
+  phoneScreenEl.hidden = true;
+  phoneScreenBodyEl.innerHTML = '';
+  document.body.classList.remove('phone-screen-open');
+}
+
+function openDesktopModal({ title = 'Details', bodyHtml = '', onMount = null } = {}) {
+  closePhoneScreen();
+  docModalTitleEl.textContent = title;
+  docDetailsEl.innerHTML = bodyHtml;
+  docModalOverlay.hidden = false;
+  onMount?.(docDetailsEl);
+}
+
+function openResponsivePanel({ title = 'Details', eyebrow = '', bodyHtml = '', bodyClass = 'detail-body', onMount = null } = {}) {
+  if (isPhoneView()) {
+    openPhoneScreen({ title, eyebrow, bodyHtml, bodyClass, onMount });
+  } else {
+    openDesktopModal({ title, bodyHtml, onMount });
+  }
+}
 
 async function openRecord(docId, focusTab = 'records') {
   state.selectedDocId = docId;
   renderDocuments();
-  docModalTitleEl.textContent = 'Document Details';
-  docDetailsEl.innerHTML = '<p class="meta">Loading document details...</p>';
-  docModalOverlay.hidden = false;
+  openResponsivePanel({
+    title: 'Document Details',
+    eyebrow: 'Loading',
+    bodyHtml: '<p class="meta">Loading document details...</p>',
+  });
   await documentIntegrations.activateTab(focusTab);
   try {
     await documentIntegrations.loadDocumentDetail(docId);
     renderDetails();
   } catch (error) {
-    docDetailsEl.innerHTML = `<p class="meta">Failed to load document details: ${escapeHtml(error.message)}</p>`;
+    openResponsivePanel({
+      title: 'Document Details',
+      eyebrow: 'Error',
+      bodyHtml: `<p class="meta">Failed to load document details: ${escapeHtml(error.message)}</p>`,
+    });
   }
 }
 
 function closeDocModal() {
   docModalOverlay.hidden = true;
+  closePhoneScreen();
 }
 
 function docsForTheme(theme) {
@@ -121,21 +168,28 @@ function openMatchesModal(title, matches) {
     `
     : '<p class="meta">No matching dissertations found in the current result set.</p>';
 
-  docDetailsEl.innerHTML = `
+  const bodyHtml = `
     <div class="meta">
       <p><strong>${escapeHtml(title)}</strong></p>
       <p>${formatNum(list.length)} dissertation(s)</p>
     </div>
     ${body}
   `;
+  openResponsivePanel({
+    title,
+    eyebrow: `${formatNum(list.length)} dissertation(s)`,
+    bodyHtml,
+    onMount: attachRelatedItemHandlers,
+  });
+}
 
-  for (const item of docDetailsEl.querySelectorAll('.related-item[data-related-id]')) {
+function attachRelatedItemHandlers(root, focusTab = 'records') {
+  for (const item of root.querySelectorAll('.related-item[data-related-id]')) {
     item.addEventListener('click', () => {
       const targetId = item.getAttribute('data-related-id');
-      if (targetId) openRecord(targetId, 'records');
+      if (targetId) openRecord(targetId, focusTab);
     });
   }
-  docModalOverlay.hidden = false;
 }
 
 function docSortValue(doc, key) {
@@ -216,7 +270,12 @@ function renderDocuments() {
       return `
         <tr class="doc-row${active}" data-doc-id="${escapeHtml(doc.id)}">
           <td class="doc-check-col"><input type="checkbox" class="doc-row-check" data-check-id="${escapeHtml(doc.id)}"${checked} /></td>
-          <td>${escapeHtml(doc.title || '(Untitled)')}</td>
+          <td class="doc-title-cell">
+            <span class="doc-title-text">${escapeHtml(doc.title || '(Untitled)')}</span>
+            <span class="doc-card-mobile">${escapeHtml(doc.author || 'Unknown')} &middot; ${doc.year || '-'}</span>
+            <span class="doc-card-mobile">${escapeHtml([doc.degree || doc.type || '', doc.program || ''].filter(Boolean).join(' · ') || '-')}</span>
+            <span class="doc-card-mobile">${formatNum(doc.pages)} pages &middot; ${formatNum(doc.wordCount)} words</span>
+          </td>
           <td>${escapeHtml(doc.author || '')}</td>
           <td>${doc.year || '-'}</td>
           <td>${escapeHtml(doc.degree || doc.type || '-')}</td>
@@ -289,8 +348,10 @@ function openCollectionsDocumentHref(doc) {
 function renderDetails() {
   const docs = state.payload?.documents || [];
   if (!docs.length) {
-    docModalTitleEl.textContent = 'Document Details';
-    docDetailsEl.textContent = 'No documents in current result set.';
+    openResponsivePanel({
+      title: 'Document Details',
+      bodyHtml: '<p class="meta">No documents in current result set.</p>',
+    });
     return;
   }
 
@@ -299,9 +360,6 @@ function renderDetails() {
     doc = docs[0];
     state.selectedDocId = doc.id;
   }
-
-  // Set modal heading to document title
-  docModalTitleEl.textContent = doc.title || '(Untitled)';
 
   const related = Array.isArray(doc.related) ? doc.related : relatedDocuments(doc, docs);
   const abstract = doc.abstract
@@ -376,7 +434,7 @@ function renderDetails() {
       </details>`
     : '';
 
-  docDetailsEl.innerHTML = `
+  const bodyHtml = `
     <p class="doc-subtitle">${escapeHtml(subtitleParts.join(' \u00B7 '))}</p>
     ${actionsHtml}
     ${downloadNoteHtml}
@@ -413,15 +471,19 @@ function renderDetails() {
     ${citationsHtml}
   `;
 
-  for (const item of docDetailsEl.querySelectorAll('.related-item[data-related-id]')) {
-    item.addEventListener('click', () => {
-      const targetId = item.getAttribute('data-related-id');
-      if (targetId) openRecord(targetId, 'records');
-    });
-  }
+  openResponsivePanel({
+    title: doc.title || '(Untitled)',
+    eyebrow: subtitleParts.join(' \u00B7 '),
+    bodyHtml,
+    onMount: (root) => attachDocumentDetailHandlers(root, doc),
+  });
+}
+
+function attachDocumentDetailHandlers(root, doc) {
+  attachRelatedItemHandlers(root, 'records');
 
   // Supervisor profile links
-  for (const btn of docDetailsEl.querySelectorAll('.supervisor-link[data-supervisor-name]')) {
+  for (const btn of root.querySelectorAll('.supervisor-link[data-supervisor-name]')) {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       documentIntegrations.openSupervisorProfile(btn.dataset.supervisorName);
@@ -429,7 +491,7 @@ function renderDetails() {
   }
 
   // BibTeX export for single document
-  const bibBtn = docDetailsEl.querySelector('[data-doc-bibtex]');
+  const bibBtn = root.querySelector('[data-doc-bibtex]');
   if (bibBtn) {
     bibBtn.addEventListener('click', async () => {
       const helpers = await documentIntegrations.getCitationHelpers();
@@ -440,7 +502,7 @@ function renderDetails() {
       );
     });
   }
-  const risBtn = docDetailsEl.querySelector('[data-doc-ris]');
+  const risBtn = root.querySelector('[data-doc-ris]');
   if (risBtn) {
     risBtn.addEventListener('click', async () => {
       const helpers = await documentIntegrations.getCitationHelpers();
@@ -453,7 +515,7 @@ function renderDetails() {
   }
 
   // Lazy-load citations on toggle
-  const citationsDetails = docDetailsEl.querySelector('.citations-details[data-doc-id]');
+  const citationsDetails = root.querySelector('.citations-details[data-doc-id]');
   if (citationsDetails) {
     citationsDetails.addEventListener('toggle', async () => {
       if (!citationsDetails.open) return;
@@ -482,11 +544,11 @@ function renderDetails() {
       }
     });
   }
-
 }
 
 export {
   closeDocModal,
+  closePhoneScreen,
   configureDocuments,
   docSortValue,
   docsForCooccurrence,
@@ -497,8 +559,10 @@ export {
   docsForTopic,
   getFilteredDocs,
   getFilteredSortedDocs,
+  isPhoneView,
   openCollectionsDocumentHref,
   openMatchesModal,
+  openResponsivePanel,
   openRecord,
   renderDetails,
   renderDocuments,

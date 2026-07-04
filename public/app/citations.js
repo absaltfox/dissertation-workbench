@@ -8,6 +8,8 @@ import {
 } from './core.js';
 import {
   getFilteredDocs,
+  isPhoneView,
+  openResponsivePanel,
   openRecord,
 } from './documents.js';
 
@@ -159,9 +161,10 @@ function catalogueBadge(citation) {
 }
 
 function openSummonModal(data, citationText) {
-  summonModalTitleEl.textContent = citationText
+  const title = citationText
     ? `Summon: ${citationText.slice(0, 80)}${citationText.length > 80 ? '\u2026' : ''}`
     : 'Summon Search Results';
+  summonModalTitleEl.textContent = title;
 
   const itemsHtml = data.results.length
     ? data.results.map((r) => {
@@ -188,8 +191,18 @@ function openSummonModal(data, citationText) {
     ${searchHref ? `<a href="${escapeHtml(searchHref)}" target="_blank" rel="noreferrer">View all results in UBC Summon &rarr;</a>` : '<span></span>'}
   </div>`;
 
-  summonResultsEl.innerHTML = itemsHtml + footerHtml;
-  summonModalOverlayEl.hidden = false;
+  const bodyHtml = itemsHtml + footerHtml;
+  if (isPhoneView()) {
+    openResponsivePanel({
+      title,
+      eyebrow: 'Summon Results',
+      bodyHtml,
+      bodyClass: 'summon-phone-body',
+    });
+  } else {
+    summonResultsEl.innerHTML = bodyHtml;
+    summonModalOverlayEl.hidden = false;
+  }
 }
 
 function attachSummonHandlers(container) {
@@ -293,7 +306,7 @@ async function showCitingDissertations(citationId, citationText, totalDocs = nul
         </div>`
       : '<p class="meta">No dissertations found for this citation.</p>';
 
-    docDetailsEl.innerHTML = `
+    const bodyHtml = `
       <div class="meta">
         <p><strong>Citation:</strong> ${escapeHtml(shortText)}</p>
         <p><strong>Linked dissertations:</strong> ${formatNum(linkedCount)}</p>
@@ -302,13 +315,19 @@ async function showCitingDissertations(citationId, citationText, totalDocs = nul
       ${list}
     `;
 
-    for (const item of docDetailsEl.querySelectorAll('.related-item[data-cite-nav-id]')) {
-      item.addEventListener('click', () => {
-        const targetId = item.getAttribute('data-cite-nav-id');
-        if (targetId) openRecord(targetId, 'citations');
-      });
-    }
-    docModalOverlay.hidden = false;
+    openResponsivePanel({
+      title: 'Linked Dissertations',
+      eyebrow: `${formatNum(linkedCount)} linked`,
+      bodyHtml,
+      onMount: (root) => {
+        for (const item of root.querySelectorAll('.related-item[data-cite-nav-id]')) {
+          item.addEventListener('click', () => {
+            const targetId = item.getAttribute('data-cite-nav-id');
+            if (targetId) openRecord(targetId, 'citations');
+          });
+        }
+      },
+    });
   } catch {
     // silently fail
   }

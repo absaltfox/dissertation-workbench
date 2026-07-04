@@ -110,6 +110,11 @@ const tabPanels = Array.from(document.querySelectorAll('.tab-panel'));
 const docModalOverlay = document.getElementById('docModalOverlay');
 const docModalCloseBtn = document.getElementById('docModalClose');
 const docModalTitleEl = document.getElementById('docModalTitle');
+const phoneScreenEl = document.getElementById('phoneScreen');
+const phoneScreenBackBtn = document.getElementById('phoneScreenBack');
+const phoneScreenEyebrowEl = document.getElementById('phoneScreenEyebrow');
+const phoneScreenTitleEl = document.getElementById('phoneScreenTitle');
+const phoneScreenBodyEl = document.getElementById('phoneScreenBody');
 
 // Summon modal elements
 const summonModalOverlayEl = document.getElementById('summonModalOverlay');
@@ -799,6 +804,11 @@ const dom = {
   docModalOverlay,
   docModalCloseBtn,
   docModalTitleEl,
+  phoneScreenEl,
+  phoneScreenBackBtn,
+  phoneScreenEyebrowEl,
+  phoneScreenTitleEl,
+  phoneScreenBodyEl,
   summonModalOverlayEl,
   summonModalTitleEl,
   summonResultsEl,

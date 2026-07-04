@@ -592,6 +592,10 @@ tbody tr:nth-child(even) {
   background: rgba(8, 90, 99, 0.10);
 }
 
+.doc-card-mobile {
+  display: none;
+}
+
 .document-page-status td {
   color: var(--ink-soft);
   font-family: var(--sans);
@@ -645,6 +649,20 @@ tbody tr:nth-child(even) {
 
 .doc-modal-close:hover {
   background: rgba(8, 90, 99, 0.08);
+}
+
+/* --- Phone detail/results screen --- */
+
+.phone-screen {
+  display: none;
+}
+
+.phone-screen[hidden] {
+  display: none !important;
+}
+
+body.phone-screen-open {
+  overflow: hidden;
 }
 
 /* --- Detail panel --- */
@@ -2262,17 +2280,65 @@ svg[viewBox] {
   .facet-filter-controls { flex-direction: column; align-items: stretch; }
   .facet-filter-right { margin-left: 0; }
 
-  /* Document table: hide low-priority columns (checkbox, degree, pages, words) */
-  #tab-records th:nth-child(1),
-  #tab-records td:nth-child(1),
-  #tab-records th:nth-child(5),
-  #tab-records td:nth-child(5),
-  #tab-records th:nth-child(6),
-  #tab-records td:nth-child(6),
-  #tab-records th:nth-child(7),
-  #tab-records td:nth-child(7) { display: none; }
+  /* Document Explorer: use touch cards instead of a compressed table. */
+  #tab-records .table-wrap {
+    overflow: visible;
+    max-height: none;
+  }
+  #tab-records table,
+  #tab-records tbody {
+    display: block;
+  }
+  #tab-records thead {
+    display: none;
+  }
+  #tab-records .doc-row {
+    display: block;
+    margin-bottom: 0.55rem;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.78);
+    padding: 0.72rem 0.78rem;
+    box-shadow: 0 2px 8px rgba(35, 64, 70, 0.06);
+  }
+  #tab-records .doc-row.active {
+    border-color: rgba(8, 90, 99, 0.32);
+    background: rgba(8, 90, 99, 0.07);
+  }
+  #tab-records .doc-row td {
+    display: none;
+    border: 0;
+    padding: 0;
+  }
+  #tab-records .doc-row .doc-title-cell {
+    display: grid;
+    gap: 0.18rem;
+  }
+  .doc-title-text {
+    display: block;
+    font-family: var(--serif);
+    font-size: 0.94rem;
+    line-height: 1.35;
+    color: var(--ink);
+  }
+  .doc-card-mobile {
+    display: block;
+    font-family: var(--sans);
+    font-size: 0.76rem;
+    line-height: 1.35;
+    color: var(--ink-soft);
+  }
+  .document-page-status {
+    display: block;
+  }
+  .document-page-status td {
+    display: block;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 0.7rem;
+  }
 
-  /* Tighter table cells */
+  /* Tighter table cells outside the card list. */
   th, td { padding: 0.4rem 0.35rem; font-size: 0.78rem; }
 
   /* Tab buttons */
@@ -2299,6 +2365,121 @@ svg[viewBox] {
     width: 24px;
     background: linear-gradient(90deg, transparent, rgba(246, 243, 234, 0.6));
     pointer-events: none;
+  }
+
+  .doc-modal-overlay {
+    display: none !important;
+  }
+
+  .phone-screen {
+    position: fixed;
+    inset: 0;
+    z-index: 220;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    background: var(--bg-warm);
+    color: var(--ink);
+  }
+
+  .phone-screen-header {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    gap: 0.75rem;
+    align-items: start;
+    padding: max(0.8rem, env(safe-area-inset-top)) 0.85rem 0.75rem;
+    border-bottom: 1px solid var(--line);
+    background: rgba(250, 247, 240, 0.96);
+    backdrop-filter: blur(8px);
+  }
+
+  .phone-screen-back {
+    min-height: 40px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.72);
+    color: var(--accent);
+    font-family: var(--sans);
+    font-size: 0.84rem;
+    font-weight: 700;
+    padding: 0.38rem 0.62rem;
+  }
+
+  .phone-screen-title-block {
+    min-width: 0;
+  }
+
+  .phone-screen-eyebrow {
+    margin: 0 0 0.14rem;
+    overflow: hidden;
+    color: var(--ink-soft);
+    font-family: var(--sans);
+    font-size: 0.68rem;
+    line-height: 1.3;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  .phone-screen-title-block h2 {
+    margin: 0;
+    display: -webkit-box;
+    overflow: hidden;
+    font-size: 1rem;
+    line-height: 1.25;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
+  .phone-screen-body {
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 0.9rem 0.85rem max(1.25rem, env(safe-area-inset-bottom));
+  }
+
+  .phone-screen-body .detail-body,
+  .phone-screen-body .summon-phone-body {
+    display: grid;
+    gap: 1rem;
+  }
+
+  .phone-screen-body .doc-actions {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.45rem;
+    padding: 0.45rem 0;
+    background: linear-gradient(var(--bg-warm) 75%, rgba(250, 247, 240, 0));
+  }
+
+  .phone-screen-body .doc-actions .btn {
+    justify-content: center;
+    min-height: 42px;
+  }
+
+  .phone-screen-body .detail-meta {
+    grid-template-columns: 1fr;
+    gap: 0.12rem 0;
+  }
+
+  .phone-screen-body .detail-meta-label {
+    margin-top: 0.45rem;
+  }
+
+  .phone-screen-body .detail-abstract {
+    max-height: none;
+    overflow: visible;
+    mask-image: none;
+    -webkit-mask-image: none;
+  }
+
+  .phone-screen-body .related-item {
+    padding: 0.7rem;
   }
 }
 

@@ -7,6 +7,7 @@ import {
 } from './core.js';
 import {
   closeDocModal,
+  closePhoneScreen,
   configureDocuments,
   getFilteredDocs,
   getFilteredSortedDocs,
@@ -43,6 +44,8 @@ const {
   filterAffiliationEl,
   filterDegreeEl,
   filterProgramEl,
+  phoneScreenBackBtn,
+  phoneScreenEl,
   refreshBtn,
   selectAllDocsEl,
   summonModalCloseBtn,
@@ -230,6 +233,7 @@ function bindFirstScreenEvents() {
   });
 
   docModalCloseBtn.addEventListener('click', closeDocModal);
+  phoneScreenBackBtn.addEventListener('click', closePhoneScreen);
   docModalOverlay.addEventListener('click', (e) => {
     if (e.target === docModalOverlay) closeDocModal();
   });
@@ -239,6 +243,7 @@ function bindFirstScreenEvents() {
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
+      if (!phoneScreenEl.hidden) { closePhoneScreen(); return; }
       if (!summonModalOverlayEl.hidden) { summonModalOverlayEl.hidden = true; return; }
       if (!docModalOverlay.hidden) closeDocModal();
     }

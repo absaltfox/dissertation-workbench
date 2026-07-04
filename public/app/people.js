@@ -10,6 +10,7 @@ import {
 import {
   getFilteredDocs,
   openMatchesModal,
+  openResponsivePanel,
   openRecord,
 } from './documents.js';
 import {
@@ -169,7 +170,7 @@ function renderSupervisorProfile(profile) {
 
   const topicTokens = renderTopicTokens(profile.dissertations);
 
-  docDetailsEl.innerHTML = `
+  const bodyHtml = `
     <div class="meta">
       <p><strong>${escapeHtml(profile.name)}</strong></p>
       <p>${formatNum(profile.count)} dissertation(s) &middot; ${profile.yearRange}</p>
@@ -189,13 +190,19 @@ function renderSupervisorProfile(profile) {
     </div>
   `;
 
-  for (const item of docDetailsEl.querySelectorAll('.related-item[data-related-id]')) {
-    item.addEventListener('click', () => {
-      const targetId = item.getAttribute('data-related-id');
-      if (targetId) openRecord(targetId, 'records');
-    });
-  }
-  docModalOverlay.hidden = false;
+  openResponsivePanel({
+    title: profile.name,
+    eyebrow: `${formatNum(profile.count)} dissertation(s)`,
+    bodyHtml,
+    onMount: (root) => {
+      for (const item of root.querySelectorAll('.related-item[data-related-id]')) {
+        item.addEventListener('click', () => {
+          const targetId = item.getAttribute('data-related-id');
+          if (targetId) openRecord(targetId, 'records');
+        });
+      }
+    },
+  });
 }
 
 function openSupervisorProfile(name) {
