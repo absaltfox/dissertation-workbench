@@ -9,6 +9,7 @@ import {
 } from './core.js';
 import {
   getFilteredDocs,
+  isPhoneView,
   openMatchesModal,
   openResponsivePanel,
   openRecord,
@@ -381,10 +382,28 @@ async function renderPersonDetail(personKey) {
   if (!personDetailEl) return;
   const key = String(personKey || '').toLowerCase().trim();
   const listPerson = getPersonList().find(p => p.key === key);
-  personDetailEl.innerHTML = `<p class="meta">Loading ${escapeHtml(listPerson?.name || 'person')}...</p>`;
+  const loadingHtml = `<p class="meta">Loading ${escapeHtml(listPerson?.name || 'person')}...</p>`;
+  if (isPhoneView()) {
+    openResponsivePanel({
+      title: listPerson?.name || 'Person Profile',
+      eyebrow: 'Loading',
+      bodyHtml: loadingHtml,
+    });
+  } else {
+    personDetailEl.innerHTML = loadingHtml;
+  }
   const person = await peopleIntegrations.loadPersonDetail(key);
   if (!person) {
-    personDetailEl.innerHTML = '<p class="meta">Select a person to view their profile.</p>';
+    const emptyHtml = '<p class="meta">Select a person to view their profile.</p>';
+    if (isPhoneView()) {
+      openResponsivePanel({
+        title: 'Person Profile',
+        eyebrow: 'Not found',
+        bodyHtml: emptyHtml,
+      });
+    } else {
+      personDetailEl.innerHTML = emptyHtml;
+    }
     return;
   }
 
@@ -426,8 +445,8 @@ async function renderPersonDetail(personKey) {
       `).join('')
     : '<p class="meta">No dissertations found.</p>';
 
-  personDetailEl.innerHTML = `
-    <h2 style="margin-bottom:0.3rem">${escapeHtml(person.name)}</h2>
+  const bodyHtml = `
+    ${isPhoneView() ? '' : `<h2 style="margin-bottom:0.3rem">${escapeHtml(person.name)}</h2>`}
     <div class="meta">
       <p>${formatNum(person.docCount)} dissertation(s) &middot; ${person.yearRange}</p>
     </div>
@@ -461,8 +480,23 @@ async function renderPersonDetail(personKey) {
     </div>
   `;
 
+  if (isPhoneView()) {
+    openResponsivePanel({
+      title: person.name,
+      eyebrow: `${formatNum(person.docCount)} dissertation(s)`,
+      bodyHtml,
+      onMount: (root) => attachPersonDetailHandlers(root, person),
+    });
+    return;
+  }
+
+  personDetailEl.innerHTML = bodyHtml;
+  attachPersonDetailHandlers(personDetailEl, person);
+}
+
+function attachPersonDetailHandlers(root, person) {
   // Wire dissertation clicks
-  for (const item of personDetailEl.querySelectorAll('.related-item[data-related-id]')) {
+  for (const item of root.querySelectorAll('.related-item[data-related-id]')) {
     item.addEventListener('click', () => {
       const targetId = item.getAttribute('data-related-id');
       if (targetId) openRecord(targetId, 'records');
@@ -470,7 +504,7 @@ async function renderPersonDetail(personKey) {
   }
 
   // Wire co-supervisor navigation
-  for (const link of personDetailEl.querySelectorAll('[data-person-nav]')) {
+  for (const link of root.querySelectorAll('[data-person-nav]')) {
     link.addEventListener('click', () => {
       const targetKey = link.getAttribute('data-person-nav');
       if (targetKey) openPersonProfile(targetKey);
@@ -478,7 +512,7 @@ async function renderPersonDetail(personKey) {
   }
 
   // Wire concept pill clicks → show matching dissertations for this person
-  for (const pill of personDetailEl.querySelectorAll('[data-person-concept]')) {
+  for (const pill of root.querySelectorAll('[data-person-concept]')) {
     pill.style.cursor = 'pointer';
     pill.addEventListener('click', () => {
       const term = pill.getAttribute('data-person-concept');
@@ -488,7 +522,7 @@ async function renderPersonDetail(personKey) {
   }
 
   // Wire topic pill clicks → show matching dissertations for this person
-  for (const pill of personDetailEl.querySelectorAll('[data-person-topic]')) {
+  for (const pill of root.querySelectorAll('[data-person-topic]')) {
     pill.style.cursor = 'pointer';
     pill.addEventListener('click', () => {
       const topicId = Number(pill.getAttribute('data-person-topic'));

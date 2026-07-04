@@ -2630,6 +2630,11 @@ svg[viewBox] {
     gap: 1rem;
   }
 
+  .phone-screen-body .citation-entries {
+    max-height: none;
+    overflow: visible;
+  }
+
   .phone-screen-body .doc-actions {
     display: grid;
     grid-template-columns: 1fr;

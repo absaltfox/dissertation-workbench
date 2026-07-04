@@ -89,6 +89,10 @@ async function loadAndRenderAnalytics() {
   renderAnalytics();
 }
 
+async function preloadAnalyticsAssets() {
+  await ensureChartLibrary();
+}
+
 function renderAnalytics() {
   renderKpis();
   renderPagesByYear();
@@ -958,6 +962,7 @@ export {
   configureAnalyticsDashboard,
   initAnalyticsDashboard,
   loadAndRenderAnalytics,
+  preloadAnalyticsAssets,
   renderAnalytics,
   renderCooccurrence,
   renderConceptTimeline,

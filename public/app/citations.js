@@ -140,30 +140,78 @@ async function selectCitationDoc(docId) {
   const requestToken = ++state.citationRequestToken;
   state.citationDocId = docId;
   renderCitationDocs();
+  const doc = (state.citationDocs || []).find((item) => item.id === docId) || {};
 
-  citationListTitleEl.textContent = 'Works Cited';
-  citationEntriesEl.innerHTML = '<p class="meta">Loading citations...</p>';
+  if (isPhoneView()) {
+    openResponsivePanel({
+      title: doc.title || 'Works Cited',
+      eyebrow: [doc.author || '', doc.year || '', `${formatNum(doc.citationCount || 0)} refs`].filter(Boolean).join(' \u00B7 '),
+      bodyHtml: '<p class="meta">Loading citations...</p>',
+    });
+  } else {
+    citationListTitleEl.textContent = 'Works Cited';
+    citationEntriesEl.innerHTML = '<p class="meta">Loading citations...</p>';
+  }
 
   try {
     const res = await fetch(`/api/documents/${encodeURIComponent(docId)}/citations`);
     if (requestToken !== state.citationRequestToken) return;
     if (!res.ok) {
-      citationEntriesEl.innerHTML = '<p class="meta">Failed to load citations.</p>';
+      const errorHtml = '<p class="meta">Failed to load citations.</p>';
+      if (isPhoneView()) {
+        openResponsivePanel({
+          title: doc.title || 'Works Cited',
+          eyebrow: 'Error',
+          bodyHtml: errorHtml,
+        });
+      } else {
+        citationEntriesEl.innerHTML = errorHtml;
+      }
       return;
     }
     const data = await res.json();
     if (requestToken !== state.citationRequestToken) return;
     const citations = data.citations || [];
     if (!citations.length) {
-      citationEntriesEl.innerHTML = '<p class="meta">No citations found.</p>';
-      citationListTitleEl.textContent = 'Works Cited';
+      const emptyHtml = '<p class="meta">No citations found.</p>';
+      if (isPhoneView()) {
+        openResponsivePanel({
+          title: doc.title || 'Works Cited',
+          eyebrow: 'No parsed citations',
+          bodyHtml: emptyHtml,
+        });
+      } else {
+        citationEntriesEl.innerHTML = emptyHtml;
+        citationListTitleEl.textContent = 'Works Cited';
+      }
       return;
     }
-    citationListTitleEl.textContent = `Works Cited (${citations.length})`;
-    renderCitationList(citations);
+    if (isPhoneView()) {
+      openResponsivePanel({
+        title: doc.title || 'Works Cited',
+        eyebrow: `${formatNum(citations.length)} reference${citations.length === 1 ? '' : 's'}`,
+        bodyHtml: '<div class="citation-entries citation-phone-entries"></div>',
+        onMount: (root) => {
+          const list = root.querySelector('.citation-phone-entries');
+          if (list) renderCitationList(citations, list);
+        },
+      });
+    } else {
+      citationListTitleEl.textContent = `Works Cited (${citations.length})`;
+      renderCitationList(citations);
+    }
   } catch {
     if (requestToken !== state.citationRequestToken) return;
-    citationEntriesEl.innerHTML = '<p class="meta">Connection error.</p>';
+    const errorHtml = '<p class="meta">Connection error.</p>';
+    if (isPhoneView()) {
+      openResponsivePanel({
+        title: doc.title || 'Works Cited',
+        eyebrow: 'Error',
+        bodyHtml: errorHtml,
+      });
+    } else {
+      citationEntriesEl.innerHTML = errorHtml;
+    }
   }
 }
 
@@ -252,10 +300,10 @@ function attachSummonHandlers(container) {
   }
 }
 
-function renderCitationList(citations) {
+function renderCitationList(citations, container = citationEntriesEl) {
   state.selectedCitationIds = new Set();
   const selectAllHtml = `<div class="citation-select-all"><label><input type="checkbox" id="selectAllCitations" /> Select all</label></div>`;
-  citationEntriesEl.innerHTML = selectAllHtml + citations
+  container.innerHTML = selectAllHtml + citations
     .map((c) => {
       const citeCount = Math.max(1, Number(c.total_docs) || 1);
       const badge = `<span class="citation-count">${formatNum(citeCount)}</span>`;
@@ -263,9 +311,9 @@ function renderCitationList(citations) {
     })
     .join('');
 
-  const selectAllCb = document.getElementById('selectAllCitations');
+  const selectAllCb = container.querySelector('#selectAllCitations');
   selectAllCb.addEventListener('change', () => {
-    for (const cb of citationEntriesEl.querySelectorAll('.citation-entry-check')) {
+    for (const cb of container.querySelectorAll('.citation-entry-check')) {
       cb.checked = selectAllCb.checked;
       const id = cb.dataset.checkCiteId;
       if (selectAllCb.checked) state.selectedCitationIds.add(id);
@@ -273,13 +321,13 @@ function renderCitationList(citations) {
     }
   });
 
-  for (const cb of citationEntriesEl.querySelectorAll('.citation-entry-check')) {
+  for (const cb of container.querySelectorAll('.citation-entry-check')) {
     cb.addEventListener('change', (e) => {
       e.stopPropagation();
       const id = cb.dataset.checkCiteId;
       if (cb.checked) state.selectedCitationIds.add(id);
       else state.selectedCitationIds.delete(id);
-      const allChecks = citationEntriesEl.querySelectorAll('.citation-entry-check');
+      const allChecks = container.querySelectorAll('.citation-entry-check');
       const allChecked = Array.from(allChecks).every((c) => c.checked);
       selectAllCb.checked = allChecked;
       selectAllCb.indeterminate = !allChecked && state.selectedCitationIds.size > 0;
@@ -287,7 +335,7 @@ function renderCitationList(citations) {
     cb.addEventListener('click', (e) => e.stopPropagation());
   }
 
-  for (const entry of citationEntriesEl.querySelectorAll('.citation-entry[data-citation-id]')) {
+  for (const entry of container.querySelectorAll('.citation-entry[data-citation-id]')) {
     entry.addEventListener('click', (e) => {
       if (e.target.closest('.citation-entry-check')) return;
       showCitingDissertations(
@@ -298,7 +346,7 @@ function renderCitationList(citations) {
     });
   }
 
-  attachSummonHandlers(citationEntriesEl);
+  attachSummonHandlers(container);
 }
 
 async function showCitingDissertations(citationId, citationText, totalDocs = null) {

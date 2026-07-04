@@ -222,6 +222,7 @@ const state = {
   analyticsLoaded: false,
   analyticsLoading: false,
   analyticsLoadingKey: '',
+  analyticsLoadingPromise: null,
   analyticsRequestToken: 0,
   user: null, // { username } or null
   pendingLogin: null,

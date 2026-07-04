@@ -751,32 +751,48 @@ async function loadData({ refresh = false } = {}) {
   }
 }
 
-async function loadAnalytics() {
+function applyAnalyticsPayload(data) {
+  const { documents = [], ...analyticsPayload } = data || {};
+  mergeDocuments(documents);
+  Object.assign(state.payload, analyticsPayload);
+  state.analyticsLoaded = true;
+}
+
+async function loadAnalytics({ silent = false } = {}) {
   if (!state.payload) return;
   const key = dataKey();
-  if (state.analyticsLoading && state.analyticsLoadingKey === key) return;
+  if (state.analyticsLoading && state.analyticsLoadingKey === key) {
+    return state.analyticsLoadingPromise;
+  }
+  const cached = state.tabData.analyticsByFilterKey.get(key);
+  if (cached) {
+    applyAnalyticsPayload(cached);
+    return cached;
+  }
   const requestToken = state.analyticsRequestToken + 1;
   state.analyticsRequestToken = requestToken;
   state.analyticsLoadingKey = key;
   state.analyticsLoading = true;
-  try {
-    const data = state.tabData.analyticsByFilterKey.get(key)
-      || await fetchWorkbenchJson('/api/workbench/analytics', { filters: true });
-    if (requestToken !== state.analyticsRequestToken || key !== dataKey()) return;
-    state.tabData.analyticsByFilterKey.set(key, data);
-    const { documents = [], ...analyticsPayload } = data;
-    mergeDocuments(documents);
-    Object.assign(state.payload, analyticsPayload);
-    state.analyticsLoaded = true;
-  } catch (error) {
-    if (requestToken !== state.analyticsRequestToken) return;
-    setStatus(`Failed to load analytics: ${error.message}`, true);
-  } finally {
-    if (requestToken === state.analyticsRequestToken) {
-      state.analyticsLoading = false;
-      state.analyticsLoadingKey = '';
+  state.analyticsLoadingPromise = (async () => {
+    try {
+      const data = await fetchWorkbenchJson('/api/workbench/analytics', { filters: true });
+      if (requestToken !== state.analyticsRequestToken || key !== dataKey()) return null;
+      state.tabData.analyticsByFilterKey.set(key, data);
+      applyAnalyticsPayload(data);
+      return data;
+    } catch (error) {
+      if (requestToken !== state.analyticsRequestToken) return null;
+      if (!silent) setStatus(`Failed to load analytics: ${error.message}`, true);
+      return null;
+    } finally {
+      if (requestToken === state.analyticsRequestToken) {
+        state.analyticsLoading = false;
+        state.analyticsLoadingKey = '';
+        state.analyticsLoadingPromise = null;
+      }
     }
-  }
+  })();
+  return state.analyticsLoadingPromise;
 }
 
 export {

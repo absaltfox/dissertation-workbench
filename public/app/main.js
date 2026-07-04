@@ -64,6 +64,7 @@ let analyticsModulePromise = null;
 let topicVisualsModulePromise = null;
 let adminModulePromise = null;
 let documentFilterTimer = null;
+let analyticsWarmupTimer = null;
 
 async function ensureCitationsModule() {
   if (!citationsModulePromise) {
@@ -129,6 +130,23 @@ async function ensureAdminModule() {
     });
   }
   return adminModulePromise;
+}
+
+function scheduleAnalyticsWarmup() {
+  window.clearTimeout(analyticsWarmupTimer);
+  analyticsWarmupTimer = window.setTimeout(async () => {
+    if (!state.payload || state.analyticsLoaded) return;
+    if (document.querySelector('#tab-analytics.active')) return;
+    try {
+      const analytics = await ensureAnalyticsModule();
+      await Promise.all([
+        loadAnalytics({ silent: true }),
+        analytics.preloadAnalyticsAssets?.(),
+      ]);
+    } catch {
+      // Background warming should not interrupt the visible workflow.
+    }
+  }, 350);
 }
 
 async function activateTab(tabName, { updateUrl = true, resetToken = '' } = {}) {
@@ -211,6 +229,8 @@ async function onFacetChange() {
   if (document.querySelector('#tab-analytics.active')) {
     const analytics = await ensureAnalyticsModule();
     await analytics.loadAndRenderAnalytics();
+  } else {
+    scheduleAnalyticsWarmup();
   }
 }
 
@@ -373,6 +393,7 @@ configureData({
   afterDataLoad: async () => {
     const active = document.querySelector('.tab-panel.active')?.id?.replace(/^tab-/, '') || 'records';
     if (active !== 'records') await activateTab(active, { updateUrl: false });
+    if (active !== 'analytics') scheduleAnalyticsWarmup();
   },
   renderAnalytics: async () => {
     const analytics = await ensureAnalyticsModule();
