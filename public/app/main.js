@@ -23,9 +23,12 @@ import {
   loadDocumentDetail,
   loadDocumentPage,
   loadPeopleData,
+  loadPersonDetail,
   populateFacetFilters,
   prefetchDocumentDetails,
   renderAll,
+  resetCitationDocPager,
+  resetPeoplePager,
   updateFacetCount,
 } from './data.js';
 
@@ -41,6 +44,8 @@ const {
   exportBibTeXBtn,
   exportRISBtn,
   facetChipsEl,
+  facetFilterBarEl,
+  facetToggleEl,
   filterAffiliationEl,
   filterDegreeEl,
   filterProgramEl,
@@ -73,7 +78,7 @@ async function ensureCitationsModule() {
 async function ensurePeopleModule() {
   if (!peopleModulePromise) {
     peopleModulePromise = import('./people.js').then((mod) => {
-      mod.configurePeople({ activateTab });
+      mod.configurePeople({ activateTab, loadPersonDetail });
       mod.initPeople();
       return mod;
     });
@@ -131,16 +136,16 @@ async function activateTab(tabName, { updateUrl = true, resetToken = '' } = {}) 
 
   if (tabName === 'citations' && state.payload) {
     const citations = await ensureCitationsModule();
-    await loadCitationDocuments();
+    if (!state.citationDocs.length) await loadCitationDocuments({ reset: true });
     citations.renderCitationDocs();
     citations.activateCitationTab('browse');
   }
 
   if (tabName === 'people' && state.payload) {
     const people = await ensurePeopleModule();
-    await loadPeopleData();
+    if (!state.peopleRows.length) await loadPeopleData({ reset: true });
     people.renderPersonTable();
-    if (state.selectedPersonKey) people.renderPersonDetail(state.selectedPersonKey);
+    if (state.selectedPersonKey) await people.renderPersonDetail(state.selectedPersonKey);
   }
 
   if (tabName === 'analytics' && state.payload) {
@@ -169,6 +174,14 @@ async function onFacetChange() {
   state.analyticsLoaded = false;
   state.analyticsRequestToken += 1;
   state.analyticsLoadingKey = '';
+  state.citationDocs = [];
+  state.citationDocId = null;
+  state.selectedCitationIds = new Set();
+  resetCitationDocPager();
+  state.peopleRows = [];
+  state.peopleDetailByKey = new Map();
+  state.selectedPersonKey = null;
+  resetPeoplePager();
   resetDerivedCaches();
   await loadDocumentPage({ reset: true });
   updateFacetCount();
@@ -184,13 +197,16 @@ async function onFacetChange() {
   renderAll();
   if (document.querySelector('#tab-citations.active')) {
     const citations = await ensureCitationsModule();
-    await loadCitationDocuments();
+    await loadCitationDocuments({ reset: true });
     citations.renderCitationDocs();
+    citationListTitleEl.textContent = 'Works Cited';
+    citationEntriesEl.innerHTML = '<p class="meta">Select a document to view its works cited.</p>';
   }
   if (document.querySelector('#tab-people.active')) {
     const people = await ensurePeopleModule();
-    await loadPeopleData();
+    await loadPeopleData({ reset: true });
     people.renderPersonTable();
+    dom.personDetailEl.innerHTML = '<p class="meta">Select a person to view their profile.</p>';
   }
   if (document.querySelector('#tab-analytics.active')) {
     const analytics = await ensureAnalyticsModule();
@@ -298,6 +314,10 @@ function bindFirstScreenEvents() {
   filterDegreeEl.addEventListener('change', onFacetChange);
   filterProgramEl.addEventListener('change', onFacetChange);
   filterAffiliationEl.addEventListener('change', onFacetChange);
+  facetToggleEl?.addEventListener('click', () => {
+    const isOpen = facetFilterBarEl.classList.toggle('is-open');
+    facetToggleEl.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+  });
   clearFacetsBtn.addEventListener('click', () => {
     filterDegreeEl.value = filterProgramEl.value = filterAffiliationEl.value = '';
     onFacetChange();

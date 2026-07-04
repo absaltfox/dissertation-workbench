@@ -195,6 +195,8 @@ const personSortHeaders = Array.from(document.querySelectorAll('[data-person-sor
 
 // Facet filter bar
 const facetFilterBarEl    = document.getElementById('facetFilterBar');
+const facetToggleEl       = document.getElementById('facetToggle');
+const facetToggleSummaryEl = document.getElementById('facetToggleSummary');
 const filterDegreeEl      = document.getElementById('filterDegree');
 const filterProgramEl     = document.getElementById('filterProgram');
 const filterAffiliationEl = document.getElementById('filterAffiliation');
@@ -236,12 +238,30 @@ const state = {
     generation: 0,
   },
   documentPrefetchTimer: null,
+  citationDocs: [],
+  citationDocPager: {
+    offset: 0,
+    limit: 50,
+    total: 0,
+    withCitations: 0,
+    loading: false,
+    done: false,
+  },
   citationDocId: null,
   citationFilterText: '',
   citationRequestToken: 0,
   selectedDocIds: new Set(),
   selectedCitationIds: new Set(),
   activeFilters: { degree: '', program: '', affiliation: '' },
+  peopleRows: [],
+  peopleDetailByKey: new Map(),
+  peoplePager: {
+    offset: 0,
+    limit: 50,
+    total: 0,
+    loading: false,
+    done: false,
+  },
   personFilterText: '',
   personSortKey: 'docCount',
   personSortDir: 'desc',
@@ -482,19 +502,29 @@ function formatRefreshDate(value) {
 function setRefreshRuleFromPayload() {
   if (!refreshRuleEl) return;
   const docs = state.payload?.documents || [];
-  const supervisors = new Set();
-  for (const doc of docs) {
-    for (const supervisor of doc.supervisors || []) {
-      const name = String(supervisor || '').trim();
-      if (name) supervisors.add(name.toLowerCase());
+  const summary = state.payload?.summary || {};
+  const documentTotal = Number.isFinite(Number(summary.documents))
+    ? Number(summary.documents)
+    : (Number.isFinite(Number(state.documentPager?.total)) && Number(state.documentPager.total) > 0
+      ? Number(state.documentPager.total)
+      : docs.length);
+  let supervisorTotal = Number.isFinite(Number(summary.supervisors)) ? Number(summary.supervisors) : null;
+  if (supervisorTotal === null) {
+    const supervisors = new Set();
+    for (const doc of docs) {
+      for (const supervisor of doc.supervisors || []) {
+        const name = String(supervisor || '').trim();
+        if (name) supervisors.add(name.toLowerCase());
+      }
     }
+    supervisorTotal = supervisors.size;
   }
 
   refreshRuleEl.classList.remove('error');
   refreshRuleEl.innerHTML = [
     `Last refreshed ${escapeHtml(formatRefreshDate(state.payload?.generatedAt))}`,
-    `${formatNum(docs.length)} dissertations`,
-    `${formatNum(supervisors.size)} supervisors`
+    `${formatNum(documentTotal)} dissertations`,
+    `${formatNum(supervisorTotal)} supervisors`
   ].map((part) => `<span>${part}</span>`).join('<span class="dot" aria-hidden="true"></span>');
 }
 
@@ -879,6 +909,8 @@ const dom = {
   personCountEl,
   personSortHeaders,
   facetFilterBarEl,
+  facetToggleEl,
+  facetToggleSummaryEl,
   filterDegreeEl,
   filterProgramEl,
   filterAffiliationEl,

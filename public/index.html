@@ -35,34 +35,40 @@
       </section>
 
       <nav class="tabs reveal" role="tablist" aria-label="Views">
-        <button class="tab-btn active" data-tab="records" role="tab" aria-selected="true">Document Explorer</button>
-        <button class="tab-btn" data-tab="citations" role="tab" aria-selected="false">Citation Explorer</button>
-        <button class="tab-btn" data-tab="people" role="tab" aria-selected="false">Person Explorer</button>
-        <button class="tab-btn" data-tab="analytics" role="tab" aria-selected="false">Analytics Dashboard</button>
-        <button class="tab-btn" data-tab="about" role="tab" aria-selected="false">About this Tool</button>
-        <button class="tab-btn" data-tab="admin" role="tab" aria-selected="false">Admin</button>
+        <button class="tab-btn active" data-tab="records" data-mobile-label="Docs" role="tab" aria-selected="true">Document Explorer</button>
+        <button class="tab-btn" data-tab="citations" data-mobile-label="Cites" role="tab" aria-selected="false">Citation Explorer</button>
+        <button class="tab-btn" data-tab="people" data-mobile-label="People" role="tab" aria-selected="false">Person Explorer</button>
+        <button class="tab-btn" data-tab="analytics" data-mobile-label="Stats" role="tab" aria-selected="false">Analytics Dashboard</button>
+        <button class="tab-btn" data-tab="about" data-mobile-label="About" role="tab" aria-selected="false">About this Tool</button>
+        <button class="tab-btn" data-tab="admin" data-mobile-label="Admin" role="tab" aria-selected="false">Admin</button>
       </nav>
 
       <div id="facetFilterBar" class="facet-filter-bar reveal" hidden>
-        <div class="facet-filter-controls">
-          <div class="facet-group">
-            <label class="facet-label" for="filterDegree">Degree</label>
-            <select id="filterDegree" class="facet-select"><option value="">All</option></select>
+        <button id="facetToggle" class="facet-toggle" type="button" aria-expanded="false" aria-controls="facetFilterContent">
+          <span>Filters</span>
+          <span id="facetToggleSummary" class="facet-toggle-summary">All dissertations</span>
+        </button>
+        <div id="facetFilterContent" class="facet-filter-content">
+          <div class="facet-filter-controls">
+            <div class="facet-group">
+              <label class="facet-label" for="filterDegree">Degree</label>
+              <select id="filterDegree" class="facet-select"><option value="">All</option></select>
+            </div>
+            <div class="facet-group">
+              <label class="facet-label" for="filterProgram">Program</label>
+              <select id="filterProgram" class="facet-select"><option value="">All</option></select>
+            </div>
+            <div class="facet-group">
+              <label class="facet-label" for="filterAffiliation">Affiliation</label>
+              <select id="filterAffiliation" class="facet-select"><option value="">All</option></select>
+            </div>
+            <div class="facet-filter-right">
+              <span id="facetCount" class="facet-count"></span>
+              <button id="clearFacets" class="btn ghost btn-sm">&times; Clear</button>
+            </div>
           </div>
-          <div class="facet-group">
-            <label class="facet-label" for="filterProgram">Program</label>
-            <select id="filterProgram" class="facet-select"><option value="">All</option></select>
-          </div>
-          <div class="facet-group">
-            <label class="facet-label" for="filterAffiliation">Affiliation</label>
-            <select id="filterAffiliation" class="facet-select"><option value="">All</option></select>
-          </div>
-          <div class="facet-filter-right">
-            <span id="facetCount" class="facet-count"></span>
-            <button id="clearFacets" class="btn ghost btn-sm">&times; Clear</button>
-          </div>
+          <div id="facetChips" class="facet-chips"></div>
         </div>
-        <div id="facetChips" class="facet-chips"></div>
       </div>
 
       <!-- Document Explorer -->

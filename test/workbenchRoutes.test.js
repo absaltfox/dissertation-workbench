@@ -202,9 +202,36 @@ test('workbench analytics and citation document slices are filter-aware', async 
   assert.deepEqual(medAnalytics.body.documents.map((doc) => doc.id), ['wb-doc-4']);
 
   const citations = await request(app)
-    .get('/api/workbench/citations/documents?maxRecords=10&degree=Doctor%20of%20Education%20-%20EdD')
+    .get('/api/workbench/citations/documents?maxRecords=10&degree=Doctor%20of%20Education%20-%20EdD&limit=1')
     .expect('content-type', /application\/json/)
     .expect(200);
   assert.deepEqual(citations.body.documents.map((doc) => doc.id), ['wb-doc-1']);
+  assert.equal(citations.body.source.total, 1);
+  assert.equal(citations.body.source.withCitations, 1);
+  assert.equal(citations.body.source.hasMore, false);
   assert.deepEqual(Object.keys(citations.body.documents[0]).sort(), ['author', 'citationCount', 'id', 'title', 'year'].sort());
+});
+
+test('workbench people list is paged and person detail loads relationships on demand', async () => {
+  const people = await request(app)
+    .get('/api/workbench/people?maxRecords=10&limit=1&offset=0')
+    .expect('content-type', /application\/json/)
+    .expect(200);
+
+  assert.equal(people.body.people.length, 1);
+  assert.equal(people.body.source.total, 3);
+  assert.equal(people.body.source.hasMore, true);
+  assert.equal(people.body.people[0].name, 'Jane Supervisor');
+  assert.equal(people.body.people[0].docCount, 2);
+  assert.equal(Object.prototype.hasOwnProperty.call(people.body.people[0], 'docs'), false);
+
+  const detail = await request(app)
+    .get('/api/workbench/people/jane%20supervisor?maxRecords=10')
+    .expect('content-type', /application\/json/)
+    .expect(200);
+
+  assert.equal(detail.body.person.name, 'Jane Supervisor');
+  assert.equal(detail.body.person.docCount, 2);
+  assert.deepEqual(detail.body.person.docs.map((doc) => doc.id).sort(), ['wb-doc-1', 'wb-doc-2']);
+  assert.ok(detail.body.person.topConcepts.some((concept) => concept.term === 'staged loading'));
 });

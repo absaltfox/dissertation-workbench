@@ -155,6 +155,17 @@ function parseDocumentPageRequest(req) {
   return { offset, limit, q, sortKey, sortDir };
 }
 
+function parsePagedRequest(req, defaultSortKey = '', defaultSortDir = 'asc') {
+  const page = parseDocumentPageRequest(req);
+  const hasSortDir = String(getQueryValue(req, 'sortDir') || '').trim() !== '';
+  return {
+    ...page,
+    sortKey: page.sortKey || defaultSortKey,
+    sortDir: hasSortDir ? page.sortDir : defaultSortDir,
+    role: String(getQueryValue(req, 'role') || '').trim(),
+  };
+}
+
 function bootstrapDoc(doc) {
   return {
     id: doc.id,
@@ -216,6 +227,188 @@ function citationDoc(doc) {
     year: doc.year || null,
     citationCount: doc.citationCount || 0,
   };
+}
+
+function citationDocSortValue(doc, key) {
+  switch (key) {
+    case 'title': return String(doc.title || '').toLowerCase();
+    case 'author': return String(doc.author || '').toLowerCase();
+    case 'year': return Number(doc.year || 0);
+    case 'citationCount': return Number(doc.citationCount || 0);
+    default: return '';
+  }
+}
+
+function sortCitationDocs(documents = [], sortKey = 'citationCount', sortDir = 'desc') {
+  const dir = sortDir === 'asc' ? 1 : -1;
+  return [...documents].sort((a, b) => {
+    const av = citationDocSortValue(a, sortKey);
+    const bv = citationDocSortValue(b, sortKey);
+    if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * dir || String(a.title || '').localeCompare(String(b.title || ''));
+    if (av < bv) return -1 * dir;
+    if (av > bv) return 1 * dir;
+    return 0;
+  });
+}
+
+function isValidPersonName(name) {
+  if (!name) return false;
+  const n = String(name || '').trim();
+  if (n.length < 3) return false;
+  const words = n.split(/\s+/);
+  if (words.length < 2) return false;
+  if (/^(University|UBC|SFU|Columbia|of\s|&\s|Research$)/i.test(n)) return false;
+  if (words.every((w) => w.replace(/\./g, '').length <= 2)) return false;
+  return true;
+}
+
+function mergeAffiliationNames(affiliations = []) {
+  return Array.from(new Set(affiliations.map((value) => String(value || '').trim()).filter(Boolean))).sort();
+}
+
+function buildTopicSummaryForDocs(docs = []) {
+  const topicCounts = new Map();
+  for (const doc of docs) {
+    if (doc.topicId == null) continue;
+    topicCounts.set(doc.topicId, (topicCounts.get(doc.topicId) || 0) + 1);
+  }
+  return Array.from(topicCounts.entries())
+    .map(([topicId, count]) => ({ topicId, count }))
+    .sort((a, b) => b.count - a.count);
+}
+
+function buildPersonRows(documents = []) {
+  const people = new Map();
+
+  for (const doc of documents) {
+    const docPersonKeys = new Set();
+    for (const name of (doc.supervisors || [])) {
+      if (!isValidPersonName(name)) continue;
+      const key = String(name || '').toLowerCase().trim();
+      if (!key) continue;
+      docPersonKeys.add(key);
+      let person = people.get(key);
+      if (!person) {
+        person = { key, name, roles: new Set(), docs: [], affiliations: new Set(), conceptMap: new Map(), methMap: new Map(), coSupervisors: new Set() };
+        people.set(key, person);
+      }
+      person.roles.add('Supervisor');
+      person.docs.push(doc);
+      for (const concept of (doc.conceptTerms || [])) person.conceptMap.set(concept, (person.conceptMap.get(concept) || 0) + 1);
+      for (const methodology of (doc.methodologies || [])) person.methMap.set(methodology, (person.methMap.get(methodology) || 0) + 1);
+      for (const other of (doc.supervisors || [])) {
+        const otherKey = String(other || '').toLowerCase().trim();
+        if (otherKey && otherKey !== key) person.coSupervisors.add(other);
+      }
+    }
+
+    for (const member of (doc.committee || [])) {
+      const name = member.name;
+      if (!isValidPersonName(name)) continue;
+      const key = String(name || '').toLowerCase().trim();
+      if (!key) continue;
+      let person = people.get(key);
+      if (!person) {
+        person = { key, name, roles: new Set(), docs: [], affiliations: new Set(), conceptMap: new Map(), methMap: new Map(), coSupervisors: new Set() };
+        people.set(key, person);
+      }
+      const role = member.role || 'Committee Member';
+      person.roles.add(role);
+      if (member.affiliation) person.affiliations.add(member.affiliation);
+      if (!docPersonKeys.has(key)) {
+        person.docs.push(doc);
+        for (const concept of (doc.conceptTerms || [])) person.conceptMap.set(concept, (person.conceptMap.get(concept) || 0) + 1);
+        for (const methodology of (doc.methodologies || [])) person.methMap.set(methodology, (person.methMap.get(methodology) || 0) + 1);
+      }
+      docPersonKeys.add(key);
+    }
+  }
+
+  return Array.from(people.values()).map((person) => {
+    const years = person.docs.map((doc) => doc.year).filter(Boolean).sort((a, b) => a - b);
+    const topConcepts = Array.from(person.conceptMap.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12)
+      .map(([term, count]) => ({ term, count }));
+    const methodologies = Array.from(person.methMap.entries())
+      .sort((a, b) => b[1] - a[1])
+      .map(([methodology, count]) => ({ methodology, count }));
+    return {
+      key: person.key,
+      name: person.name,
+      roles: Array.from(person.roles),
+      docCount: person.docs.length,
+      docs: person.docs,
+      affiliations: mergeAffiliationNames(Array.from(person.affiliations)),
+      yearRange: years.length ? `${years[0]}\u2013${years[years.length - 1]}` : '\u2013',
+      yearMin: years[0] || 9999,
+      topConcepts,
+      methodologies,
+      coSupervisors: Array.from(person.coSupervisors),
+      topicSummary: buildTopicSummaryForDocs(person.docs),
+    };
+  });
+}
+
+function personListRow(person) {
+  return {
+    key: person.key,
+    name: person.name,
+    roles: person.roles,
+    docCount: person.docCount,
+    affiliations: person.affiliations,
+    yearRange: person.yearRange,
+    yearMin: person.yearMin,
+  };
+}
+
+function personDetailRow(person) {
+  return {
+    ...personListRow(person),
+    topConcepts: person.topConcepts,
+    methodologies: person.methodologies,
+    coSupervisors: person.coSupervisors,
+    topicSummary: person.topicSummary,
+    docs: person.docs.map((doc) => ({
+      ...bootstrapDoc(doc),
+      themes: doc.themes || [],
+      conceptTerms: doc.conceptTerms || [],
+      methodologies: doc.methodologies || [],
+      topicId: doc.topicId ?? null,
+      topicProbability: doc.topicProbability ?? null,
+    })),
+  };
+}
+
+function searchPeople(people = [], q = '') {
+  if (!q) return people;
+  return people.filter((person) =>
+    String(person.name || '').toLowerCase().includes(q) ||
+    (person.roles || []).some((role) => String(role || '').toLowerCase().includes(q)) ||
+    (person.affiliations || []).some((affiliation) => String(affiliation || '').toLowerCase().includes(q))
+  );
+}
+
+function personSortValue(person, key) {
+  switch (key) {
+    case 'name': return String(person.name || '').toLowerCase();
+    case 'docCount': return Number(person.docCount || 0);
+    case 'roles': return (person.roles || []).join(', ').toLowerCase();
+    case 'years': return Number(person.yearMin || 9999);
+    default: return '';
+  }
+}
+
+function sortPeople(people = [], sortKey = 'docCount', sortDir = 'desc') {
+  const dir = sortDir === 'asc' ? 1 : -1;
+  return [...people].sort((a, b) => {
+    const av = personSortValue(a, sortKey);
+    const bv = personSortValue(b, sortKey);
+    if (typeof av === 'number' && typeof bv === 'number') return (av - bv || String(a.name || '').localeCompare(String(b.name || ''))) * dir;
+    if (av < bv) return -1 * dir;
+    if (av > bv) return 1 * dir;
+    return 0;
+  });
 }
 
 function analyticsDoc(doc) {
@@ -566,24 +759,50 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const params = await parseMetricsRequest(req, res);
     if (!params) return;
     const filters = activeFilters(req);
-    const key = `workbench:people:${sourceCacheKey(params)}:${JSON.stringify(filters)}`;
+    const pageRequest = parsePagedRequest(req, 'docCount', 'desc');
+    const key = `workbench:people:${sourceCacheKey(params)}:${JSON.stringify(filters)}:${JSON.stringify(pageRequest)}`;
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
       const { records } = await metricRecordsForParams(params, loadSyncModule);
       const filtered = filterDocuments(records, filters);
+      let people = buildPersonRows(filtered);
+      if (pageRequest.role) people = people.filter((person) => person.roles.includes(pageRequest.role));
+      people = searchPeople(people, pageRequest.q);
+      people = sortPeople(people, pageRequest.sortKey, pageRequest.sortDir);
+      const total = people.length;
+      const pageRows = people.slice(pageRequest.offset, pageRequest.offset + pageRequest.limit);
       return {
         generatedAt: new Date().toISOString(),
-        documents: filtered.map((doc) => ({
-          ...bootstrapDoc(doc),
-          role: 'Supervisor',
-          committee: Array.isArray(doc.committee) ? doc.committee : [],
-          themes: doc.themes || [],
-          conceptTerms: doc.conceptTerms || [],
-          methodologies: doc.methodologies || [],
-          topicId: doc.topicId ?? null,
-          topicProbability: doc.topicProbability ?? null,
-        })),
+        source: {
+          total,
+          offset: pageRequest.offset,
+          limit: pageRequest.limit,
+          hasMore: pageRequest.offset + pageRows.length < total,
+        },
+        people: pageRows.map(personListRow),
       };
     });
+    res.status(200).json(payload);
+  }));
+
+  router.get('/workbench/people/:personKey', asyncHandler(async (req, res) => {
+    const params = await parseMetricsRequest(req, res);
+    if (!params) return;
+    const filters = activeFilters(req);
+    const personKey = String(req.params.personKey || '').toLowerCase().trim();
+    const key = `workbench:people:detail:${sourceCacheKey(params)}:${JSON.stringify(filters)}:${personKey}`;
+    const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
+      const { records } = await metricRecordsForParams(params, loadSyncModule);
+      const filtered = filterDocuments(records, filters);
+      const person = buildPersonRows(filtered).find((row) => row.key === personKey);
+      return {
+        generatedAt: new Date().toISOString(),
+        person: person ? personDetailRow(person) : null,
+      };
+    });
+    if (!payload.person) {
+      res.status(404).json({ error: 'Person not found' });
+      return;
+    }
     res.status(200).json(payload);
   }));
 
@@ -591,14 +810,28 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const params = await parseMetricsRequest(req, res);
     if (!params) return;
     const filters = activeFilters(req);
-    const key = `workbench:citations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`;
+    const pageRequest = parsePagedRequest(req, 'citationCount', 'desc');
+    const key = `workbench:citations:${sourceCacheKey(params)}:${JSON.stringify(filters)}:${JSON.stringify(pageRequest)}`;
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
       const { documents } = await cachedDocumentsForParams(params, loadSyncModule);
       await applyCitationCountsToDocuments(documents);
       await applyCommitteeMembersToDocuments(documents);
+      let rows = filterDocuments(documents, filters);
+      rows = searchDocuments(rows, pageRequest.q);
+      rows = sortCitationDocs(rows, pageRequest.sortKey, pageRequest.sortDir || 'desc');
+      const total = rows.length;
+      const withCitations = rows.filter((doc) => (doc.citationCount || 0) > 0).length;
+      const pageRows = rows.slice(pageRequest.offset, pageRequest.offset + pageRequest.limit);
       return {
         generatedAt: new Date().toISOString(),
-        documents: filterDocuments(documents, filters).map(citationDoc),
+        source: {
+          total,
+          withCitations,
+          offset: pageRequest.offset,
+          limit: pageRequest.limit,
+          hasMore: pageRequest.offset + pageRows.length < total,
+        },
+        documents: pageRows.map(citationDoc),
       };
     });
     res.status(200).json(payload);

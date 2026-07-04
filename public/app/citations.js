@@ -7,11 +7,13 @@ import {
   state,
 } from './core.js';
 import {
-  getFilteredDocs,
   isPhoneView,
   openResponsivePanel,
   openRecord,
 } from './documents.js';
+import {
+  loadCitationDocuments,
+} from './data.js';
 
 const {
   citationDocFilterEl,
@@ -30,6 +32,7 @@ const {
 } = dom;
 
 let citationsInitialized = false;
+let citationDocFilterTimer = null;
 
 function initCitations() {
   if (citationsInitialized) return;
@@ -37,12 +40,27 @@ function initCitations() {
 
   citationDocFilterEl?.addEventListener('input', () => {
     state.citationFilterText = citationDocFilterEl.value.trim();
-    renderCitationDocs();
+    window.clearTimeout(citationDocFilterTimer);
+    citationDocFilterTimer = window.setTimeout(async () => {
+      await loadCitationDocuments({ reset: true });
+      renderCitationDocs();
+      citationListTitleEl.textContent = 'Works Cited';
+      citationEntriesEl.innerHTML = '<p class="meta">Select a document to view its works cited.</p>';
+    }, 250);
   });
 
   for (const btn of citationTabButtons) {
     btn.addEventListener('click', () => activateCitationTab(btn.dataset.citationTab));
   }
+
+  const citationTableWrap = citationDocsTableEl?.closest('.table-wrap');
+  citationTableWrap?.addEventListener('scroll', async () => {
+    const remaining = citationTableWrap.scrollHeight - citationTableWrap.scrollTop - citationTableWrap.clientHeight;
+    if (remaining < 320 && !state.citationDocPager.loading && !state.citationDocPager.done) {
+      await loadCitationDocuments();
+      renderCitationDocs();
+    }
+  });
 
   exportCitationBibTeXBtn?.addEventListener('click', () => {
     const texts = getSelectedCitationTexts();
@@ -77,24 +95,16 @@ function getSelectedCitationTexts() {
 // --- Citation Explorer ---
 
 function renderCitationDocs() {
-  let docs = getFilteredDocs();
-  if (state.citationFilterText) {
-    const q = state.citationFilterText.toLowerCase();
-    docs = docs.filter((doc) =>
-      (doc.title || '').toLowerCase().includes(q) ||
-      (doc.author || '').toLowerCase().includes(q) ||
-      String(doc.year || '').includes(q)
-    );
+  const docs = state.citationDocs || [];
+  const pager = state.citationDocPager || {};
+  const headerEl = citationDocsTableEl.closest('.panel')?.querySelector('h2');
+  if (headerEl) {
+    headerEl.textContent = pager.total
+      ? `Dissertations (${formatNum(pager.withCitations || 0)} with parsed citations, ${formatNum(pager.total)} total)`
+      : 'Dissertations';
   }
 
-  // Sort docs with citations to top, then by citation count descending
-  docs = [...docs].sort((a, b) => (b.citationCount || 0) - (a.citationCount || 0));
-
-  const withCitations = docs.filter((d) => d.citationCount > 0).length;
-  const headerEl = citationDocsTableEl.closest('.panel')?.querySelector('h2');
-  if (headerEl) headerEl.textContent = `Dissertations (${withCitations} with parsed citations)`;
-
-  citationDocsTableEl.innerHTML = docs
+  const rows = docs
     .map((doc) => {
       const count = doc.citationCount || 0;
       const active = doc.id === state.citationDocId ? ' active' : '';
@@ -109,6 +119,15 @@ function renderCitationDocs() {
       `;
     })
     .join('');
+  const footer = pager.loading
+    ? '<tr class="document-page-status"><td colspan="4">Loading dissertations...</td></tr>'
+    : (!docs.length
+      ? '<tr class="document-page-status"><td colspan="4">No matching dissertations found.</td></tr>'
+      : (!pager.done && pager.total
+        ? `<tr class="document-page-status"><td colspan="4">Showing ${formatNum(docs.length)} of ${formatNum(pager.total)} dissertations</td></tr>`
+        : ''));
+
+  citationDocsTableEl.innerHTML = rows + footer;
 
   for (const row of citationDocsTableEl.querySelectorAll('.citation-doc-row')) {
     row.addEventListener('click', () => {

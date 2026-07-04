@@ -23,6 +23,7 @@ const {
   facetChipsEl,
   facetCountEl,
   facetFilterBarEl,
+  facetToggleSummaryEl,
   filterAffiliationEl,
   filterDegreeEl,
   filterProgramEl,
@@ -43,8 +44,8 @@ function configureData(hooks = {}) {
 // --- Facet filter helpers ---
 
 function updateFacetCount() {
-  const total    = state.payload?.documents?.length || 0;
-  const filtered = getFilteredDocs().length;
+  const total = Number(state.payload?.summary?.documents || state.documentPager?.total || state.payload?.documents?.length || 0);
+  const filtered = Number(state.documentPager?.total || getFilteredDocs().length);
   const { degree, program, affiliation } = state.activeFilters;
   const active = !!(degree || program || affiliation);
 
@@ -68,6 +69,9 @@ function updateFacetCount() {
       `<button class="facet-chip-remove" data-chip-key="${c.key}" aria-label="Remove ${escapeHtml(c.dim)} filter">&times;</button>` +
     `</span>`
   ).join('');
+  if (facetToggleSummaryEl) {
+    facetToggleSummaryEl.textContent = chips.length ? `${chips.length} active` : 'All dissertations';
+  }
 }
 
 function populateFacetFilters({ reset = true } = {}) {
@@ -475,6 +479,21 @@ function resetDocumentPager() {
   state.documentPager.generation += 1;
 }
 
+function resetCitationDocPager() {
+  state.citationDocPager.offset = 0;
+  state.citationDocPager.total = 0;
+  state.citationDocPager.withCitations = 0;
+  state.citationDocPager.done = false;
+  state.citationDocPager.loading = false;
+}
+
+function resetPeoplePager() {
+  state.peoplePager.offset = 0;
+  state.peoplePager.total = 0;
+  state.peoplePager.done = false;
+  state.peoplePager.loading = false;
+}
+
 async function loadDocumentPage({ reset = false } = {}) {
   if (!state.payload || state.documentPager.loading) return;
   if (reset) {
@@ -515,6 +534,7 @@ async function loadDocumentPage({ reset = false } = {}) {
       state.payload.summary.documents = state.documentPager.total;
     }
     renderDocuments();
+    setRefreshRuleFromPayload();
     updateFacetCount();
   } catch (error) {
     setStatus(`Failed to load documents: ${error.message}`, true);
@@ -567,28 +587,92 @@ async function prefetchDocumentDetails(docIds = []) {
   await Promise.all(workers);
 }
 
-async function loadCitationDocuments() {
+async function loadCitationDocuments({ reset = false } = {}) {
   if (!state.payload) return;
-  const key = dataKey();
-  if (state.tabData.citationsByFilterKey.has(key)) {
-    mergeDocuments(state.tabData.citationsByFilterKey.get(key).documents || []);
-    return;
+  if (reset) {
+    resetCitationDocPager();
+    state.citationDocs = [];
+    state.citationDocId = null;
+    state.selectedCitationIds = new Set();
   }
-  const data = await fetchWorkbenchJson('/api/workbench/citations/documents', { filters: true });
-  state.tabData.citationsByFilterKey.set(key, data);
-  mergeDocuments(data.documents || []);
+  if (state.citationDocPager.loading || state.citationDocPager.done) return;
+  state.citationDocPager.loading = true;
+  try {
+    const params = new URLSearchParams(getCurrentParams());
+    for (const [key, value] of Object.entries(currentFilterParams())) params.set(key, value);
+    params.set('offset', String(state.citationDocPager.offset));
+    params.set('limit', String(state.citationDocPager.limit));
+    params.set('sortKey', 'citationCount');
+    params.set('sortDir', 'desc');
+    if (state.citationFilterText) params.set('q', state.citationFilterText);
+
+    const res = await fetch(`/api/workbench/citations/documents?${params.toString()}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.message || err.error || `Request failed with ${res.status}`);
+    }
+    const data = await res.json();
+    const rows = data.documents || [];
+    state.citationDocs = [...state.citationDocs, ...rows];
+    state.citationDocPager.total = data.source?.total ?? state.citationDocPager.total;
+    state.citationDocPager.withCitations = data.source?.withCitations ?? state.citationDocPager.withCitations;
+    state.citationDocPager.offset += rows.length;
+    state.citationDocPager.done = !data.source?.hasMore || rows.length === 0;
+  } catch (error) {
+    setStatus(`Failed to load citation documents: ${error.message}`, true);
+    state.citationDocPager.done = true;
+  } finally {
+    state.citationDocPager.loading = false;
+  }
 }
 
-async function loadPeopleData() {
+async function loadPeopleData({ reset = false } = {}) {
   if (!state.payload) return;
-  const key = dataKey();
-  if (state.tabData.peopleByFilterKey.has(key)) {
-    mergeDocuments(state.tabData.peopleByFilterKey.get(key).documents || []);
-    return;
+  if (reset) {
+    resetPeoplePager();
+    state.peopleRows = [];
+    state.selectedPersonKey = null;
+    state.peopleDetailByKey = new Map();
   }
-  const data = await fetchWorkbenchJson('/api/workbench/people', { filters: true });
-  state.tabData.peopleByFilterKey.set(key, data);
-  mergeDocuments(data.documents || []);
+  if (state.peoplePager.loading || state.peoplePager.done) return;
+  state.peoplePager.loading = true;
+  try {
+    const params = new URLSearchParams(getCurrentParams());
+    for (const [key, value] of Object.entries(currentFilterParams())) params.set(key, value);
+    params.set('offset', String(state.peoplePager.offset));
+    params.set('limit', String(state.peoplePager.limit));
+    params.set('sortKey', state.personSortKey || 'docCount');
+    params.set('sortDir', state.personSortDir || 'desc');
+    if (state.personFilterText) params.set('q', state.personFilterText);
+    if (state.personRoleFilter) params.set('role', state.personRoleFilter);
+
+    const res = await fetch(`/api/workbench/people?${params.toString()}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.message || err.error || `Request failed with ${res.status}`);
+    }
+    const data = await res.json();
+    const rows = data.people || [];
+    state.peopleRows = [...state.peopleRows, ...rows];
+    state.peoplePager.total = data.source?.total ?? state.peoplePager.total;
+    state.peoplePager.offset += rows.length;
+    state.peoplePager.done = !data.source?.hasMore || rows.length === 0;
+  } catch (error) {
+    setStatus(`Failed to load people: ${error.message}`, true);
+    state.peoplePager.done = true;
+  } finally {
+    state.peoplePager.loading = false;
+  }
+}
+
+async function loadPersonDetail(personKey) {
+  const key = String(personKey || '').toLowerCase().trim();
+  if (!key) return null;
+  if (state.peopleDetailByKey.has(key)) return state.peopleDetailByKey.get(key);
+  const data = await fetchWorkbenchJson(`/api/workbench/people/${encodeURIComponent(key)}`, { filters: true });
+  const person = data.person || null;
+  if (person) state.peopleDetailByKey.set(key, person);
+  return person;
 }
 
 async function loadVisualizationData() {
@@ -633,6 +717,11 @@ async function loadData({ refresh = false } = {}) {
     state.tabData.visualizationsByFilterKey = new Map();
     state.tabData.peopleByFilterKey = new Map();
     state.tabData.citationsByFilterKey = new Map();
+    state.citationDocs = [];
+    resetCitationDocPager();
+    state.peopleRows = [];
+    state.peopleDetailByKey = new Map();
+    resetPeoplePager();
     state.activeDataKey = dataKey(params, {});
     state.analyticsLoaded = false;
     resetDerivedCaches();
@@ -703,11 +792,14 @@ export {
   loadDocumentDetail,
   loadDocumentPage,
   loadPeopleData,
+  loadPersonDetail,
   loadVisualizationData,
   mergeDocuments,
   populateFacetFilters,
   prefetchDocumentDetails,
+  resetCitationDocPager,
   renderAll,
   renderAnalytics,
+  resetPeoplePager,
   updateFacetCount,
 };

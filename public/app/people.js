@@ -15,6 +15,7 @@ import {
 } from './documents.js';
 import {
   getAnalytics,
+  loadPeopleData,
 } from './data.js';
 const {
   docDetailsEl,
@@ -30,8 +31,10 @@ const {
 } = dom;
 
 let peopleInitialized = false;
+let personFilterTimer = null;
 const peopleIntegrations = {
   activateTab: async () => {},
+  loadPersonDetail: async () => null,
 };
 
 function configurePeople(integrations = {}) {
@@ -42,12 +45,12 @@ function initPeople() {
   if (peopleInitialized) return;
   peopleInitialized = true;
 
-  personTableEl?.addEventListener('click', (e) => {
+  personTableEl?.addEventListener('click', async (e) => {
     const row = e.target.closest('.doc-row[data-person-key]');
     if (row) {
       state.selectedPersonKey = row.dataset.personKey;
       renderPersonTable();
-      renderPersonDetail(state.selectedPersonKey);
+      await renderPersonDetail(state.selectedPersonKey);
     }
   });
 
@@ -60,18 +63,35 @@ function initPeople() {
         state.personSortKey = key;
         state.personSortDir = key === 'name' ? 'asc' : 'desc';
       }
-      renderPersonTable();
+      loadPeopleData({ reset: true }).then(() => renderPersonTable());
     });
   }
 
+  const peopleTableWrap = personTableEl?.closest('.table-wrap');
+  peopleTableWrap?.addEventListener('scroll', async () => {
+    const remaining = peopleTableWrap.scrollHeight - peopleTableWrap.scrollTop - peopleTableWrap.clientHeight;
+    if (remaining < 320 && !state.peoplePager.loading && !state.peoplePager.done) {
+      await loadPeopleData();
+      renderPersonTable();
+    }
+  });
+
   personFilterEl?.addEventListener('input', () => {
     state.personFilterText = personFilterEl.value.trim();
-    renderPersonTable();
+    window.clearTimeout(personFilterTimer);
+    personFilterTimer = window.setTimeout(async () => {
+      await loadPeopleData({ reset: true });
+      renderPersonTable();
+      personDetailEl.innerHTML = '<p class="meta">Select a person to view their profile.</p>';
+    }, 250);
   });
 
   personRoleFilterEl?.addEventListener('change', () => {
     state.personRoleFilter = personRoleFilterEl.value;
-    renderPersonTable();
+    loadPeopleData({ reset: true }).then(() => {
+      renderPersonTable();
+      personDetailEl.innerHTML = '<p class="meta">Select a person to view their profile.</p>';
+    });
   });
 }
 
@@ -205,9 +225,18 @@ function renderSupervisorProfile(profile) {
   });
 }
 
-function openSupervisorProfile(name) {
-  const docs = state.payload?.documents || [];
-  const profile = buildSupervisorProfile(name, docs);
+async function openSupervisorProfile(name) {
+  const person = await peopleIntegrations.loadPersonDetail(String(name || '').toLowerCase().trim());
+  const profile = person
+    ? {
+        name: person.name,
+        count: person.docCount,
+        yearRange: person.yearRange,
+        dissertations: person.docs || [],
+        topConcepts: person.topConcepts || [],
+        methodologies: person.methodologies || [],
+      }
+    : buildSupervisorProfile(name, state.payload?.documents || []);
   renderSupervisorProfile(profile);
 }
 
@@ -309,52 +338,12 @@ function buildPersonList(docs) {
 }
 
 function getPersonList() {
-  if (!state.payload) return [];
-  return buildPersonList(getFilteredDocs());
+  return state.peopleRows || [];
 }
 
 function renderPersonTable() {
   if (!personTableEl) return;
-  let people = getPersonList();
-
-  // Role filter
-  if (state.personRoleFilter) {
-    people = people.filter(p => p.roles.includes(state.personRoleFilter));
-  }
-
-  // Text filter
-  if (state.personFilterText) {
-    const q = state.personFilterText.toLowerCase();
-    people = people.filter(p =>
-      p.name.toLowerCase().includes(q) ||
-      p.roles.some(r => r.toLowerCase().includes(q)) ||
-      p.affiliations.some(a => a.toLowerCase().includes(q))
-    );
-  }
-
-  // Sort
-  const dir = state.personSortDir === 'asc' ? 1 : -1;
-  people = [...people].sort((a, b) => {
-    switch (state.personSortKey) {
-      case 'name': {
-        const cmp = a.name.localeCompare(b.name);
-        return cmp * dir;
-      }
-      case 'docCount': {
-        const cmp = a.docCount - b.docCount || a.name.localeCompare(b.name);
-        return cmp * dir;
-      }
-      case 'roles': {
-        const cmp = a.roles.join(', ').localeCompare(b.roles.join(', '));
-        return cmp * dir;
-      }
-      case 'years': {
-        const cmp = a.yearMin - b.yearMin || a.name.localeCompare(b.name);
-        return cmp * dir;
-      }
-      default: return 0;
-    }
-  });
+  const people = getPersonList();
 
   // Update sort header indicators
   for (const th of personSortHeaders) {
@@ -365,7 +354,7 @@ function renderPersonTable() {
   }
 
   // Render rows
-  personTableEl.innerHTML = people.map(p => `
+  const rows = people.map(p => `
     <tr class="doc-row${state.selectedPersonKey === p.key ? ' active' : ''}" data-person-key="${escapeHtml(p.key)}">
       <td>${escapeHtml(p.name)}</td>
       <td>${p.docCount}</td>
@@ -373,15 +362,27 @@ function renderPersonTable() {
       <td>${escapeHtml(p.yearRange)}</td>
     </tr>
   `).join('');
+  const pager = state.peoplePager || {};
+  const footer = pager.loading
+    ? '<tr class="document-page-status"><td colspan="4">Loading people...</td></tr>'
+    : (!people.length
+      ? '<tr class="document-page-status"><td colspan="4">No matching people found.</td></tr>'
+      : (!pager.done && pager.total
+        ? `<tr class="document-page-status"><td colspan="4">Showing ${formatNum(people.length)} of ${formatNum(pager.total)} people</td></tr>`
+        : ''));
+  personTableEl.innerHTML = rows + footer;
 
   // Count
-  personCountEl.textContent = `${people.length} ${people.length === 1 ? 'person' : 'people'}`;
+  const total = Number.isFinite(Number(pager.total)) && pager.total > 0 ? pager.total : people.length;
+  personCountEl.textContent = `${formatNum(total)} ${total === 1 ? 'person' : 'people'}`;
 }
 
-function renderPersonDetail(personKey) {
+async function renderPersonDetail(personKey) {
   if (!personDetailEl) return;
-  const people = getPersonList();
-  const person = people.find(p => p.key === personKey);
+  const key = String(personKey || '').toLowerCase().trim();
+  const listPerson = getPersonList().find(p => p.key === key);
+  personDetailEl.innerHTML = `<p class="meta">Loading ${escapeHtml(listPerson?.name || 'person')}...</p>`;
+  const person = await peopleIntegrations.loadPersonDetail(key);
   if (!person) {
     personDetailEl.innerHTML = '<p class="meta">Select a person to view their profile.</p>';
     return;
