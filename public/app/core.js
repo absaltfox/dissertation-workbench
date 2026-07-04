@@ -220,6 +220,15 @@ const state = {
   sortKey: null,   // 'title' | 'author' | 'year' | 'degree' | 'pages' | null
   sortDir: 'asc',  // 'asc' | 'desc'
   filterText: '',
+  documentPager: {
+    offset: 0,
+    limit: 50,
+    total: 0,
+    loading: false,
+    done: false,
+    generation: 0,
+  },
+  documentPrefetchTimer: null,
   citationDocId: null,
   citationFilterText: '',
   citationRequestToken: 0,

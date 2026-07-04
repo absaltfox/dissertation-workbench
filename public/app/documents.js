@@ -27,6 +27,7 @@ const documentIntegrations = {
   getCitationHelpers: async () => documentIntegrations,
   loadDocumentDetail: async () => null,
   openSupervisorProfile: () => {},
+  prefetchDocumentDetails: async () => {},
   sanitizeBibKey: (value) => String(value || '').replace(/\W+/g, '_'),
   topicDisplayLabel: (label) => String(label || '').replace(/^-?\d+_/, '').replace(/_/g, ' '),
 };
@@ -197,10 +198,18 @@ function updateSortHeaders() {
   }
 }
 
+function scheduleVisibleDetailPrefetch(docIds = []) {
+  if (!docIds.length) return;
+  window.clearTimeout(state.documentPrefetchTimer);
+  state.documentPrefetchTimer = window.setTimeout(() => {
+    documentIntegrations.prefetchDocumentDetails(docIds.slice(0, 12));
+  }, 250);
+}
+
 function renderDocuments() {
   const docs = getFilteredSortedDocs();
 
-  documentsTableEl.innerHTML = docs
+  const rows = docs
     .map((doc) => {
       const active = doc.id === state.selectedDocId ? ' active' : '';
       const checked = state.selectedDocIds.has(doc.id) ? ' checked' : '';
@@ -217,9 +226,20 @@ function renderDocuments() {
       `;
     })
     .join('');
+  const pager = state.documentPager || {};
+  const footer = pager.loading
+    ? '<tr class="document-page-status"><td colspan="7">Loading documents...</td></tr>'
+    : (!docs.length
+      ? '<tr class="document-page-status"><td colspan="7">No matching documents found.</td></tr>'
+      : (!pager.done && pager.total
+        ? `<tr class="document-page-status"><td colspan="7">Showing ${formatNum(docs.length)} of ${formatNum(pager.total)} documents</td></tr>`
+        : ''));
+
+  documentsTableEl.innerHTML = rows + footer;
 
   syncSelectAllDocs();
   updateSortHeaders();
+  scheduleVisibleDetailPrefetch(docs.map((doc) => doc.id));
 }
 
 function syncSelectAllDocs() {

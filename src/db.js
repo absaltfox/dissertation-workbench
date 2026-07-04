@@ -505,7 +505,7 @@ export async function listAllDocumentMetadata() {
   }).filter(Boolean);
 }
 
-export async function listCachedDocuments({ syncKey, limit = 1000 } = {}) {
+export async function listCachedDocuments({ syncKey, limit = 1000, offset = 0 } = {}) {
   const args = [];
   let sql = `
     SELECT d.doc_id, d.metadata_json,
@@ -518,8 +518,8 @@ export async function listCachedDocuments({ syncKey, limit = 1000 } = {}) {
     sql += ' WHERE d.sync_key = ?';
     args.push(syncKey);
   }
-  sql += ' ORDER BY d.year DESC, d.title LIMIT ?';
-  args.push(limit);
+  sql += ' ORDER BY d.year DESC, d.title LIMIT ? OFFSET ?';
+  args.push(limit, offset);
   const rows = await all(sql, args);
   return rows.map((row) => {
     try {

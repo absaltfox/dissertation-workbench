@@ -20,8 +20,10 @@ import {
   loadCitationDocuments,
   loadData,
   loadDocumentDetail,
+  loadDocumentPage,
   loadPeopleData,
   populateFacetFilters,
+  prefetchDocumentDetails,
   renderAll,
   updateFacetCount,
 } from './data.js';
@@ -53,6 +55,7 @@ let peopleModulePromise = null;
 let analyticsModulePromise = null;
 let topicVisualsModulePromise = null;
 let adminModulePromise = null;
+let documentFilterTimer = null;
 
 async function ensureCitationsModule() {
   if (!citationsModulePromise) {
@@ -162,6 +165,7 @@ async function onFacetChange() {
   state.activeFilters.affiliation = filterAffiliationEl.value;
   state.analyticsLoaded = false;
   resetDerivedCaches();
+  await loadDocumentPage({ reset: true });
   updateFacetCount();
 
   const filteredDocs = getFilteredDocs();
@@ -211,13 +215,16 @@ function bindFirstScreenEvents() {
         state.sortKey = key;
         state.sortDir = 'asc';
       }
-      renderDocuments();
+      loadDocumentPage({ reset: true });
     });
   }
 
   docFilterEl.addEventListener('input', () => {
     state.filterText = docFilterEl.value.trim();
-    renderDocuments();
+    window.clearTimeout(documentFilterTimer);
+    documentFilterTimer = window.setTimeout(() => {
+      loadDocumentPage({ reset: true });
+    }, 250);
   });
 
   docModalCloseBtn.addEventListener('click', closeDocModal);
@@ -313,6 +320,12 @@ function bindFirstScreenEvents() {
     syncSelectAllDocs();
   });
 
+  const documentScrollWrap = documentsTableEl.closest('.table-wrap');
+  documentScrollWrap?.addEventListener('scroll', () => {
+    const remaining = documentScrollWrap.scrollHeight - documentScrollWrap.scrollTop - documentScrollWrap.clientHeight;
+    if (remaining < 320) loadDocumentPage();
+  });
+
   for (const [idx, node] of document.querySelectorAll('.reveal').entries()) {
     node.style.animationDelay = `${idx * 70}ms`;
   }
@@ -326,6 +339,7 @@ configureDocuments({
     const people = await ensurePeopleModule();
     people.openSupervisorProfile(name);
   },
+  prefetchDocumentDetails,
 });
 
 configureData({

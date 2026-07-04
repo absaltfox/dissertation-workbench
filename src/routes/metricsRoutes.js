@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { buildMetricsPayloadFromRecords, collectMetricRecords, collectMetrics } from '../metrics.js';
+import { buildMetricsPayloadFromRecords, collectMetricRecords, collectMetrics, enrichDocumentSignals } from '../metrics.js';
 import {
   ALLOW_PUBLIC_REFRESH, CACHE_TTL_MS, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT
 } from '../config.js';
@@ -145,6 +145,16 @@ function facetValues(documents = []) {
   };
 }
 
+function parseDocumentPageRequest(req) {
+  const offset = Math.trunc(Math.max(0, parseNumberParam(getQueryValue(req, 'offset'), 0)));
+  const requestedLimit = parseNumberParam(getQueryValue(req, 'limit'), 50);
+  const limit = Math.trunc(Math.min(100, Math.max(1, requestedLimit)));
+  const q = String(getQueryValue(req, 'q') || '').trim().toLowerCase();
+  const sortKey = String(getQueryValue(req, 'sortKey') || '').trim();
+  const sortDir = String(getQueryValue(req, 'sortDir') || '').trim() === 'desc' ? 'desc' : 'asc';
+  return { offset, limit, q, sortKey, sortDir };
+}
+
 function bootstrapDoc(doc) {
   return {
     id: doc.id,
@@ -159,6 +169,43 @@ function bootstrapDoc(doc) {
     wordCount: doc.wordCount ?? null,
     citationCount: doc.citationCount || 0,
   };
+}
+
+function documentSortValue(doc, key) {
+  switch (key) {
+    case 'title': return String(doc.title || '').toLowerCase();
+    case 'author': return String(doc.author || '').toLowerCase();
+    case 'year': return Number(doc.year || 0);
+    case 'degree': return String(doc.degree || doc.type || '').toLowerCase();
+    case 'pages': return Number(doc.pages || 0);
+    case 'wordCount': return Number(doc.wordCount || 0);
+    default: return '';
+  }
+}
+
+function sortDocumentRows(documents = [], sortKey = '', sortDir = 'asc') {
+  if (!sortKey) return documents;
+  const dir = sortDir === 'desc' ? -1 : 1;
+  return [...documents].sort((a, b) => {
+    const av = documentSortValue(a, sortKey);
+    const bv = documentSortValue(b, sortKey);
+    if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * dir;
+    if (av < bv) return -1 * dir;
+    if (av > bv) return 1 * dir;
+    return 0;
+  });
+}
+
+function searchDocuments(documents = [], q = '') {
+  if (!q) return documents;
+  return documents.filter((doc) =>
+    String(doc.title || '').toLowerCase().includes(q) ||
+    String(doc.author || '').toLowerCase().includes(q) ||
+    (doc.supervisors || []).some((name) => String(name || '').toLowerCase().includes(q)) ||
+    String(doc.degree || '').toLowerCase().includes(q) ||
+    String(doc.program || '').toLowerCase().includes(q) ||
+    String(doc.year || '').includes(q)
+  );
 }
 
 function citationDoc(doc) {
@@ -282,24 +329,71 @@ function visualizationSlice(payload) {
 }
 
 async function cachedDocumentsForParams(params, loadSyncModule) {
+  const documentCache = await documentCacheForParams(params, loadSyncModule);
+  const documents = await listCachedDocuments({
+    syncKey: documentCache.syncKey,
+    limit: params.maxRecords,
+  });
+  return { documents, documentCache };
+}
+
+async function documentCacheForParams(params, loadSyncModule) {
   const { getSyncKeyForOptions } = await loadSyncModule();
   const syncKey = getSyncKeyForOptions(params);
   const syncCacheStats = await getDocumentCacheStats(syncKey);
   const hasExactSyncCache = syncCacheStats.total > 0;
   const cacheStats = hasExactSyncCache ? syncCacheStats : await getDocumentCacheStats();
-  const documents = await listCachedDocuments({
-    syncKey: hasExactSyncCache ? syncKey : null,
-    limit: params.maxRecords,
-  });
   return {
-    documents,
-    documentCache: {
-      syncKey: hasExactSyncCache ? syncKey : null,
-      requestedSyncKey: syncKey,
-      exactSyncKeyMatch: hasExactSyncCache,
-      recordsAvailable: cacheStats.total,
-      lastSyncedAt: cacheStats.lastSyncedAt,
+    syncKey: hasExactSyncCache ? syncKey : null,
+    requestedSyncKey: syncKey,
+    exactSyncKeyMatch: hasExactSyncCache,
+    recordsAvailable: cacheStats.total,
+    lastSyncedAt: cacheStats.lastSyncedAt,
+  };
+}
+
+async function documentPageForParams(params, loadSyncModule, pageRequest, filters = {}) {
+  const documentCache = await documentCacheForParams(params, loadSyncModule);
+  const needsFullPass = Boolean(
+    pageRequest.q ||
+    pageRequest.sortKey ||
+    filters.degree ||
+    filters.program ||
+    filters.affiliation
+  );
+  const documents = await listCachedDocuments({
+    syncKey: documentCache.syncKey,
+    limit: needsFullPass ? params.maxRecords : pageRequest.limit,
+    offset: needsFullPass ? 0 : pageRequest.offset,
+  });
+
+  let rows = documents;
+  if (needsFullPass) {
+    rows = filterDocuments(rows, filters);
+    rows = searchDocuments(rows, pageRequest.q);
+    rows = sortDocumentRows(rows, pageRequest.sortKey, pageRequest.sortDir);
+  }
+
+  const total = needsFullPass
+    ? rows.length
+    : Math.min(params.maxRecords, documentCache.recordsAvailable || params.maxRecords);
+  const pageRows = needsFullPass
+    ? rows.slice(pageRequest.offset, pageRequest.offset + pageRequest.limit)
+    : rows;
+
+  await applyCitationCountsToDocuments(pageRows);
+  await applyCommitteeMembersToDocuments(pageRows);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    source: {
+      documentCache,
+      offset: pageRequest.offset,
+      limit: pageRequest.limit,
+      total,
+      hasMore: pageRequest.offset + pageRows.length < total,
     },
+    documents: pageRows.map(bootstrapDoc),
   };
 }
 
@@ -324,8 +418,6 @@ async function metricRecordsForParams(params, loadSyncModule) {
 
 export async function buildWorkbenchBootstrapPayload(params, loadSyncModule) {
   const { documents, documentCache } = await cachedDocumentsForParams(params, loadSyncModule);
-  await applyCitationCountsToDocuments(documents);
-  await applyCommitteeMembersToDocuments(documents);
   const rows = documents.map(bootstrapDoc);
   return {
     generatedAt: new Date().toISOString(),
@@ -349,7 +441,7 @@ export async function buildWorkbenchBootstrapPayload(params, loadSyncModule) {
       supervisors: new Set(rows.flatMap((doc) => doc.supervisors || []).map((name) => String(name || '').toLowerCase()).filter(Boolean)).size,
     },
     facets: facetValues(rows),
-    documents: rows,
+    documents: [],
   };
 }
 
@@ -389,6 +481,18 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     res.status(200).json(payload);
   }));
 
+  router.get('/workbench/documents', asyncHandler(async (req, res) => {
+    const params = await parseMetricsRequest(req, res);
+    if (!params) return;
+    const filters = activeFilters(req);
+    const pageRequest = parseDocumentPageRequest(req);
+    const key = `workbench:document-page:${sourceCacheKey(params)}:${JSON.stringify(filters)}:${JSON.stringify(pageRequest)}`;
+    const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
+      return documentPageForParams(params, loadSyncModule, pageRequest, filters);
+    });
+    res.status(200).json(payload);
+  }));
+
   router.get('/workbench/documents/:docId', asyncHandler(async (req, res) => {
     const params = await parseMetricsRequest(req, res);
     if (!params) return;
@@ -400,6 +504,7 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       await applyStoredFileMetricsToDocuments([doc]);
       await applyCitationCountsToDocuments([doc]);
       await applyCommitteeMembersToDocuments([doc]);
+      enrichDocumentSignals([doc]);
       const topicMap = await loadDocumentTopics([doc.id]);
       const topic = topicMap.get(doc.id);
       if (topic) {
@@ -411,8 +516,6 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
         ? null
         : topics.find((item) => item.topicId === doc.topicId) || null;
       const { documents } = await cachedDocumentsForParams(params, loadSyncModule);
-      await applyCitationCountsToDocuments(documents);
-      await applyCommitteeMembersToDocuments(documents);
       const related = relatedDocumentsFor(doc, documents);
       return { document: detailDoc(doc, related, topicInfo) };
     });

@@ -70,22 +70,30 @@ function updateFacetCount() {
   ).join('');
 }
 
-function populateFacetFilters() {
+function populateFacetFilters({ reset = true } = {}) {
   const docs = state.payload?.documents || [];
-  const degrees      = [...new Set(docs.map(d => d.degree).filter(Boolean))].sort();
-  const programs     = [...new Set(docs.map(d => d.program).filter(Boolean))].sort();
-  const affiliations = [...new Set(docs.flatMap(d => d.affiliation || []).map(normalizeAffiliation).filter(Boolean))].sort();
+  const facets = state.payload?.facets || {};
+  const degrees = (facets.degree?.length ? facets.degree : [...new Set(docs.map(d => d.degree).filter(Boolean))]).sort();
+  const programs = (facets.program?.length ? facets.program : [...new Set(docs.map(d => d.program).filter(Boolean))]).sort();
+  const affiliations = (facets.affiliation?.length
+    ? facets.affiliation
+    : [...new Set(docs.flatMap(d => d.affiliation || []).map(normalizeAffiliation).filter(Boolean))]
+  ).sort();
+  const current = { ...state.activeFilters };
 
   const populate = (el, values, allLabel) => {
     el.innerHTML = `<option value="">${allLabel}</option>` +
       values.map(v => `<option value="${escapeHtml(v)}">${escapeHtml(v)}</option>`).join('');
-    el.value = '';
+    el.value = reset ? '' : (values.includes(current[el.dataset.filterKey]) ? current[el.dataset.filterKey] : '');
   };
+  filterDegreeEl.dataset.filterKey = 'degree';
+  filterProgramEl.dataset.filterKey = 'program';
+  filterAffiliationEl.dataset.filterKey = 'affiliation';
   populate(filterDegreeEl,      degrees,      'All');
   populate(filterProgramEl,     programs,     'All');
   populate(filterAffiliationEl, affiliations, 'All');
 
-  state.activeFilters = { degree: '', program: '', affiliation: '' };
+  if (reset) state.activeFilters = { degree: '', program: '', affiliation: '' };
   facetFilterBarEl.hidden = false;
   updateFacetCount();
 }
@@ -425,10 +433,16 @@ function mergeDocuments(rows = []) {
   if (!state.payload) return;
   const docs = state.payload.documents || [];
   const index = new Map(docs.map((doc, idx) => [doc.id, idx]));
+  const preserveNonEmptyArrays = ['themes', 'conceptTerms', 'methodologies'];
   for (const row of rows) {
     if (!row?.id) continue;
     const existing = state.documentsById.get(row.id) || {};
     const merged = { ...existing, ...row };
+    for (const field of preserveNonEmptyArrays) {
+      if (Array.isArray(existing[field]) && existing[field].length && Array.isArray(row[field]) && !row[field].length) {
+        merged[field] = existing[field];
+      }
+    }
     state.documentsById.set(row.id, merged);
     if (index.has(row.id)) docs[index.get(row.id)] = merged;
     else {
@@ -453,16 +467,104 @@ async function fetchWorkbenchJson(path, { filters = false, refresh = false } = {
   return res.json();
 }
 
-async function loadDocumentDetail(docId) {
+function resetDocumentPager() {
+  state.documentPager.offset = 0;
+  state.documentPager.total = 0;
+  state.documentPager.done = false;
+  state.documentPager.loading = false;
+  state.documentPager.generation += 1;
+}
+
+async function loadDocumentPage({ reset = false } = {}) {
+  if (!state.payload || state.documentPager.loading) return;
+  if (reset) {
+    resetDocumentPager();
+    state.payload.documents = [];
+    state.documentsById = new Map();
+    state.selectedDocId = null;
+    state.selectedDocIds = new Set();
+  }
+  if (state.documentPager.done) return;
+
+  state.documentPager.loading = true;
+  renderDocuments();
+  try {
+    const params = new URLSearchParams(getCurrentParams());
+    params.set('offset', String(state.documentPager.offset));
+    params.set('limit', String(state.documentPager.limit));
+    if (state.filterText) params.set('q', state.filterText);
+    if (state.sortKey) {
+      params.set('sortKey', state.sortKey);
+      params.set('sortDir', state.sortDir);
+    }
+    for (const [key, value] of Object.entries(currentFilterParams())) params.set(key, value);
+
+    const res = await fetch(`/api/workbench/documents?${params.toString()}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.message || err.error || `Request failed with ${res.status}`);
+    }
+    const data = await res.json();
+    const rows = data.documents || [];
+    mergeDocuments(rows);
+    state.documentPager.total = data.source?.total ?? state.documentPager.total;
+    state.documentPager.offset += rows.length;
+    state.documentPager.done = !data.source?.hasMore || rows.length === 0;
+    if (!state.selectedDocId) state.selectedDocId = state.payload.documents?.[0]?.id || null;
+    if (state.payload?.summary && Number.isFinite(Number(state.documentPager.total))) {
+      state.payload.summary.documents = state.documentPager.total;
+    }
+    renderDocuments();
+    updateFacetCount();
+  } catch (error) {
+    setStatus(`Failed to load documents: ${error.message}`, true);
+    state.documentPager.done = true;
+  } finally {
+    state.documentPager.loading = false;
+    renderDocuments();
+  }
+}
+
+async function loadDocumentDetail(docId, { merge = true } = {}) {
   if (!docId) return null;
-  if (state.detailByDocId.has(docId)) return state.detailByDocId.get(docId);
+  if (state.detailByDocId.has(docId)) {
+    const cached = state.detailByDocId.get(docId);
+    if (merge) mergeDocuments([cached]);
+    return cached;
+  }
   const data = await fetchWorkbenchJson(`/api/workbench/documents/${encodeURIComponent(docId)}`);
   const detail = data.document;
   if (detail) {
     state.detailByDocId.set(docId, detail);
-    mergeDocuments([detail]);
+    if (merge) mergeDocuments([detail]);
   }
   return detail || null;
+}
+
+const prefetchingDocIds = new Set();
+
+async function prefetchDocumentDetails(docIds = []) {
+  const generation = state.documentPager.generation;
+  const pending = docIds
+    .filter((id) => id && !state.detailByDocId.has(id) && !prefetchingDocIds.has(id))
+    .slice(0, 10);
+  const workers = Array.from({ length: Math.min(2, pending.length) }, async () => {
+    while (pending.length) {
+      const docId = pending.shift();
+      prefetchingDocIds.add(docId);
+      try {
+        const detail = await loadDocumentDetail(docId, { merge: false });
+        if (detail && generation === state.documentPager.generation && state.documentsById.has(docId)) {
+          mergeDocuments([detail]);
+        }
+      } catch {
+        // Background prefetch should never interrupt the visible workflow.
+      } finally {
+        prefetchingDocIds.delete(docId);
+      }
+    }
+  });
+  await Promise.all(workers);
 }
 
 async function loadCitationDocuments() {
@@ -524,7 +626,8 @@ async function loadData({ refresh = false } = {}) {
     }
 
     state.payload = await res.json();
-    state.documentsById = new Map((state.payload.documents || []).map((doc) => [doc.id, doc]));
+    state.payload.documents = [];
+    state.documentsById = new Map();
     state.detailByDocId = new Map();
     state.tabData.analyticsByFilterKey = new Map();
     state.tabData.visualizationsByFilterKey = new Map();
@@ -541,8 +644,10 @@ async function loadData({ refresh = false } = {}) {
     state.selectedPersonKey = null;
     state.selectedDocIds = new Set();
     docFilterEl.value = '';
-    renderAll();
+    resetDocumentPager();
     populateFacetFilters();
+    renderAll();
+    await loadDocumentPage({ reset: true });
     setRefreshRuleFromPayload();
     hideStatus();
     await dataHooks.afterDataLoad();
@@ -587,10 +692,12 @@ export {
   loadCitationDocuments,
   loadData,
   loadDocumentDetail,
+  loadDocumentPage,
   loadPeopleData,
   loadVisualizationData,
   mergeDocuments,
   populateFacetFilters,
+  prefetchDocumentDetails,
   renderAll,
   renderAnalytics,
   updateFacetCount,

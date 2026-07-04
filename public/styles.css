@@ -592,6 +592,13 @@ tbody tr:nth-child(even) {
   background: rgba(8, 90, 99, 0.10);
 }
 
+.document-page-status td {
+  color: var(--ink-soft);
+  font-family: var(--sans);
+  text-align: center;
+  background: var(--panel);
+}
+
 /* --- Document modal --- */
 
 .doc-modal-overlay {

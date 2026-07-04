@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import express from 'express';
 import request from 'supertest';
 
 let tempDir;
@@ -12,6 +13,7 @@ let ensureStorage;
 let saveDocumentMetadata;
 let saveFileMetric;
 let saveCitations;
+let createMetricsRouter;
 
 test.before(async () => {
   tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-workbench-routes-'));
@@ -22,7 +24,7 @@ test.before(async () => {
   process.env.PDF_CACHE_DIR = path.join(tempDir, 'pdf-cache');
   process.env.FULL_TEXT_CACHE_DIR = path.join(tempDir, 'full-text-cache');
 
-  ({ app } = await import('../src/server.js'));
+  ({ createMetricsRouter } = await import('../src/routes/metricsRoutes.js'));
   ({
     closeDb,
     ensureStorage,
@@ -33,6 +35,12 @@ test.before(async () => {
 
   await ensureStorage();
   await seedWorkbenchDocs();
+  app = express();
+  app.use('/api', createMetricsRouter({
+    metricsCache: new Map(),
+    metricsInflight: new Map(),
+    loadSyncModule: async () => ({ getSyncKeyForOptions: () => null }),
+  }));
 });
 
 test.after(async () => {
@@ -95,18 +103,30 @@ async function seedWorkbenchDocs() {
   ], (text) => String(text).toLowerCase());
 }
 
-test('workbench bootstrap returns lean document rows only', async () => {
+test('workbench bootstrap returns source metadata and facets without preloading rows', async () => {
   const res = await request(app)
     .get('/api/workbench/bootstrap?maxRecords=10')
     .expect('content-type', /application\/json/)
     .expect(200);
 
-  assert.equal(res.body.documents.length, 2);
+  assert.equal(res.body.documents.length, 0);
+  assert.equal(res.body.summary.documents, 2);
   assert.deepEqual(res.body.facets.degree.sort(), ['Doctor of Education - EdD', 'Doctor of Philosophy - PhD'].sort());
-  const doc = res.body.documents.find((item) => item.id === 'wb-doc-1');
-  assert.equal(doc.title, 'Fast Loading One');
-  assert.equal(doc.wordCount, 1200);
-  assert.equal(doc.citationCount, 1);
+});
+
+test('workbench document page returns projected rows on demand', async () => {
+  const res = await request(app)
+    .get('/api/workbench/documents?maxRecords=10&limit=1&offset=0')
+    .expect('content-type', /application\/json/)
+    .expect(200);
+
+  assert.equal(res.body.documents.length, 1);
+  assert.equal(res.body.source.total, 2);
+  assert.equal(res.body.source.hasMore, true);
+  const doc = res.body.documents[0];
+  assert.equal(doc.title, 'Fast Loading Two');
+  assert.equal(doc.wordCount, 1400);
+  assert.equal(doc.citationCount, 0);
   assert.equal(Object.prototype.hasOwnProperty.call(doc, 'abstract'), false);
   assert.equal(Object.prototype.hasOwnProperty.call(doc, 'conceptTerms'), false);
   assert.equal(Object.prototype.hasOwnProperty.call(doc, 'methodologies'), false);

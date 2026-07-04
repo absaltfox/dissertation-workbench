@@ -930,6 +930,21 @@ function normalizeStoredRecordShape(rec) {
   return rec;
 }
 
+export function enrichDocumentSignals(records = []) {
+  const conceptDict = loadConceptDictionary();
+  const normalizedRecords = records.map(normalizeStoredRecordShape);
+  for (const rec of normalizedRecords) {
+    if (!rec.conceptTerms.length) {
+      rec.conceptTerms = docConceptTerms(rec, 12, conceptDict);
+    }
+    if (!rec.methodologies.length) {
+      rec.methodologies = detectMethodologies([rec.title, rec.abstract, rec.subjects.join(' ')].join(' '));
+    }
+  }
+  assignTfidfThemes(normalizedRecords);
+  return normalizedRecords;
+}
+
 export async function collectMetricRecords(options = {}) {
   await ensureStorage();
   await getDb();
