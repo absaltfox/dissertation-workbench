@@ -14,6 +14,7 @@ let saveDocumentMetadata;
 let saveFileMetric;
 let saveCitations;
 let createMetricsRouter;
+let sourceCacheKey;
 
 test.before(async () => {
   tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-workbench-routes-'));
@@ -24,7 +25,7 @@ test.before(async () => {
   process.env.PDF_CACHE_DIR = path.join(tempDir, 'pdf-cache');
   process.env.FULL_TEXT_CACHE_DIR = path.join(tempDir, 'full-text-cache');
 
-  ({ createMetricsRouter } = await import('../src/routes/metricsRoutes.js'));
+  ({ createMetricsRouter, sourceCacheKey } = await import('../src/routes/metricsRoutes.js'));
   ({
     closeDb,
     ensureStorage,
@@ -47,6 +48,15 @@ test.after(async () => {
   await closeDb?.();
   if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
 });
+
+async function waitFor(predicate, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(predicate(), true);
+}
 
 async function seedWorkbenchDocs() {
   const docs = [
@@ -164,6 +174,54 @@ test('workbench document page returns projected rows on demand', async () => {
   assert.equal(Object.prototype.hasOwnProperty.call(doc, 'abstract'), false);
   assert.equal(Object.prototype.hasOwnProperty.call(doc, 'conceptTerms'), false);
   assert.equal(Object.prototype.hasOwnProperty.call(doc, 'methodologies'), false);
+});
+
+test('expired workbench slices serve stale payloads while refreshing in background', async () => {
+  const metricsCache = new Map();
+  const metricsInflight = new Map();
+  const staleApp = express();
+  staleApp.use('/api', createMetricsRouter({
+    metricsCache,
+    metricsInflight,
+    loadSyncModule: async () => ({ getSyncKeyForOptions: () => null }),
+  }));
+  const params = {
+    maxRecords: 10,
+    pageSize: 20,
+    scanLimit: 1000,
+    subjectLimit: 25,
+    index: undefined,
+    query: undefined,
+    term: undefined,
+    source: undefined,
+    apiKey: undefined,
+    downloadFiles: false,
+    forceDownload: false,
+    recomputeFromCache: false,
+    isAdminRequest: false,
+  };
+  const key = `workbench:bootstrap:${sourceCacheKey(params)}`;
+  metricsCache.set(key, {
+    timestamp: 0,
+    payload: {
+      generatedAt: 'stale',
+      source: {},
+      summary: { documents: 999, supervisors: 0 },
+      facets: { degree: [], program: [], affiliation: [] },
+      documents: [],
+    },
+  });
+
+  const res = await request(staleApp)
+    .get('/api/workbench/bootstrap?maxRecords=10')
+    .expect('content-type', /application\/json/)
+    .expect(200);
+
+  assert.equal(res.body.generatedAt, 'stale');
+  assert.equal(res.body.summary.documents, 999);
+
+  await waitFor(() => metricsCache.get(key)?.payload?.summary?.documents === 4);
+  assert.equal(metricsCache.get(key).payload.generatedAt === 'stale', false);
 });
 
 test('workbench document detail returns heavy modal fields on demand', async () => {

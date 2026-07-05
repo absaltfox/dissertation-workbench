@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   PORT, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT, EXPOSE_ERROR_DETAILS,
-  DEFAULT_TERM, DEFAULT_SOURCE, TRUST_PROXY, validateRuntimeSecrets
+  DEFAULT_TERM, DEFAULT_SOURCE, TRUST_PROXY, WORKBENCH_CACHE_REFRESH_MS, validateRuntimeSecrets
 } from './config.js';
 import {
   checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb
@@ -23,9 +23,8 @@ import { createAdminTopicLabelsRouter } from './routes/adminTopicLabelsRoutes.js
 import { createAdminUsersRouter } from './routes/adminUsersRoutes.js';
 import { createInternalWorkerRouter } from './routes/internalWorkerRoutes.js';
 import {
-  buildWorkbenchBootstrapPayload,
   createMetricsRouter,
-  sourceCacheKey,
+  warmWorkbenchLandingCache,
 } from './routes/metricsRoutes.js';
 import { createPublicRouter } from './routes/publicRoutes.js';
 
@@ -36,6 +35,7 @@ const publicDir = path.join(__dirname, '..', 'public');
 const metricsCache = new Map();
 const metricsInflight = new Map();
 let stopDailyConceptScheduler = null;
+let stopWorkbenchCacheWarmup = null;
 
 // Sync pulls in the metrics/PDF pipeline and is only needed for admin import
 // workflows. Loading it lazily keeps normal API startup cheaper and avoids
@@ -133,47 +133,48 @@ export async function start() {
     logger.info(`Dissertation Workbench running at http://localhost:${PORT}`);
   });
 
-  // Warm the workbench bootstrap cache so the first browser load is served quickly.
-  const _warmupApiKey = await getConfiguredApiKey();
-  // The browser always sends maxRecords=9999 (UI default), which the server caps to
-  // PUBLIC_MAX_RECORDS. The scan limit is derived from the uncapped value, then capped
-  // to PUBLIC_SCAN_LIMIT. We replicate that math here so the warmup key matches the
-  // first browser request exactly.
-  // Other values must mirror the HTML input defaults in public/index.html:
-  //   subjectLimit=20, downloadFiles=0, index='', term=DEFAULT_TERM, source=DEFAULT_SOURCE.
-  const _warmupParams = {
-    maxRecords: PUBLIC_MAX_RECORDS,
-    pageSize: 20,
-    scanLimit: PUBLIC_SCAN_LIMIT,
-    subjectLimit: 20,
-    index: '',
-    query: undefined,
-    term: DEFAULT_TERM,
-    source: DEFAULT_SOURCE,
-    apiKey: _warmupApiKey || undefined,
-    downloadFiles: false,
-    forceDownload: false,
-    recomputeFromCache: false,
-    refresh: false,
-    isAdminRequest: false,
-    requestedDownloadFiles: false,
-    requestedRecomputeFromCache: false,
-  };
-  const _warmupBootstrapKey = `workbench:bootstrap:${sourceCacheKey(_warmupParams)}`;
-  const _warmupPromise = Promise.resolve().then(() => (
-    buildWorkbenchBootstrapPayload(_warmupParams, loadSyncModule)
-  ));
-  metricsInflight.set(_warmupBootstrapKey, _warmupPromise);
-  _warmupPromise.then((payload) => {
-    metricsCache.set(_warmupBootstrapKey, { timestamp: Date.now(), payload });
-    logger.info('Workbench bootstrap cache warmed on startup', {
-      documents: payload?.summary?.documents || 0,
+  const warmWorkbenchCache = async (trigger = 'scheduled') => {
+    const apiKey = await getConfiguredApiKey();
+    // Mirror public/index.html defaults after public guardrails are applied.
+    const params = {
+      maxRecords: PUBLIC_MAX_RECORDS,
+      pageSize: 20,
+      scanLimit: PUBLIC_SCAN_LIMIT,
+      subjectLimit: 20,
+      index: '',
+      query: undefined,
+      term: DEFAULT_TERM,
+      source: DEFAULT_SOURCE,
+      apiKey: apiKey || undefined,
+      downloadFiles: false,
+      forceDownload: false,
+      recomputeFromCache: false,
+      refresh: false,
+      isAdminRequest: false,
+      requestedDownloadFiles: false,
+      requestedRecomputeFromCache: false,
+    };
+    const payload = await warmWorkbenchLandingCache({
+      metricsCache,
+      metricsInflight,
+      loadSyncModule,
+      params,
     });
-  }).catch((e) => {
-    logger.warn('Startup workbench bootstrap cache warmup failed', { error: e.message });
-  }).finally(() => {
-    metricsInflight.delete(_warmupBootstrapKey);
+    logger.info('Workbench landing cache warmed', {
+      trigger,
+      documents: payload?.bootstrap?.summary?.documents || 0,
+      firstPage: payload?.documentPage?.documents?.length || 0,
+    });
+  };
+  warmWorkbenchCache('startup').catch((e) => {
+    logger.warn('Workbench landing cache warmup failed', { trigger: 'startup', error: e.message });
   });
+  const workbenchCacheWarmupTimer = setInterval(() => {
+    warmWorkbenchCache('scheduled').catch((e) => {
+      logger.warn('Workbench landing cache warmup failed', { trigger: 'scheduled', error: e.message });
+    });
+  }, WORKBENCH_CACHE_REFRESH_MS);
+  stopWorkbenchCacheWarmup = () => clearInterval(workbenchCacheWarmupTimer);
 
   stopDailyConceptScheduler = scheduleDailyConceptRebuild();
   logger.info('Scheduled daily concept rebuild job', { hourLocal: 2 });
@@ -194,6 +195,10 @@ export async function start() {
     if (stopDailyConceptScheduler) {
       stopDailyConceptScheduler();
       stopDailyConceptScheduler = null;
+    }
+    if (stopWorkbenchCacheWarmup) {
+      stopWorkbenchCacheWarmup();
+      stopWorkbenchCacheWarmup = null;
     }
     
     server.close(() => {

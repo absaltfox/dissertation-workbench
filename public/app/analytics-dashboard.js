@@ -50,6 +50,7 @@ const {
 } = dom;
 
 let analyticsInitialized = false;
+const analyticsPanelEl = document.getElementById('tab-analytics');
 const analyticsIntegrations = {
   ensureTopicVisuals: async () => null,
   openSupervisorProfile: async () => {},
@@ -83,10 +84,21 @@ async function setActiveAnalyticsTab(tabName) {
   renderAnalytics();
 }
 
+function setAnalyticsRefreshing(isRefreshing) {
+  if (!analyticsPanelEl) return;
+  analyticsPanelEl.classList.toggle('analytics-refreshing', !!isRefreshing);
+  analyticsPanelEl.setAttribute('aria-busy', isRefreshing ? 'true' : 'false');
+}
+
 async function loadAndRenderAnalytics() {
-  await loadAnalytics();
-  await ensureChartLibrary();
-  renderAnalytics();
+  setAnalyticsRefreshing(true);
+  try {
+    await loadAnalytics();
+    await ensureChartLibrary();
+    renderAnalytics();
+  } finally {
+    setAnalyticsRefreshing(false);
+  }
 }
 
 async function preloadAnalyticsAssets() {
@@ -982,6 +994,7 @@ export {
   renderWordCloud,
   renderWordsByYear,
   setActiveAnalyticsTab,
+  setAnalyticsRefreshing,
   topicDisplayLabel,
   wrapLabel,
 };

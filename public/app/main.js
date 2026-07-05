@@ -186,51 +186,58 @@ async function applyRouteFromHash() {
 }
 
 async function onFacetChange() {
-  state.activeFilters.degree = filterDegreeEl.value;
-  state.activeFilters.program = filterProgramEl.value;
-  state.activeFilters.affiliation = filterAffiliationEl.value;
-  state.analyticsLoaded = false;
-  state.analyticsRequestToken += 1;
-  state.analyticsLoadingKey = '';
-  state.citationDocs = [];
-  state.citationDocId = null;
-  state.selectedCitationIds = new Set();
-  resetCitationDocPager();
-  state.peopleRows = [];
-  state.peopleDetailByKey = new Map();
-  state.selectedPersonKey = null;
-  resetPeoplePager();
-  resetDerivedCaches();
-  await loadDocumentPage({ reset: true });
-  updateFacetCount();
+  const analyticsTabActive = !!document.querySelector('#tab-analytics.active');
+  const activeAnalytics = analyticsTabActive ? await ensureAnalyticsModule() : null;
+  activeAnalytics?.setAnalyticsRefreshing(true);
 
-  const filteredDocs = getFilteredDocs();
-  if (!filteredDocs.some(d => d.id === state.selectedDocId)) state.selectedDocId = null;
-  if (!filteredDocs.some(d => d.id === state.citationDocId)) {
+  try {
+    state.activeFilters.degree = filterDegreeEl.value;
+    state.activeFilters.program = filterProgramEl.value;
+    state.activeFilters.affiliation = filterAffiliationEl.value;
+    state.analyticsLoaded = false;
+    state.analyticsRequestToken += 1;
+    state.analyticsLoadingKey = '';
+    state.citationDocs = [];
     state.citationDocId = null;
-    citationEntriesEl.innerHTML = '<p class="meta">Select a document to view its works cited.</p>';
-    citationListTitleEl.textContent = 'Works Cited';
-  }
+    state.selectedCitationIds = new Set();
+    resetCitationDocPager();
+    state.peopleRows = [];
+    state.peopleDetailByKey = new Map();
+    state.selectedPersonKey = null;
+    resetPeoplePager();
+    resetDerivedCaches();
+    await loadDocumentPage({ reset: true });
+    updateFacetCount();
 
-  renderAll();
-  if (document.querySelector('#tab-citations.active')) {
-    const citations = await ensureCitationsModule();
-    await loadCitationDocuments({ reset: true });
-    citations.renderCitationDocs();
-    citationListTitleEl.textContent = 'Works Cited';
-    citationEntriesEl.innerHTML = '<p class="meta">Select a document to view its works cited.</p>';
-  }
-  if (document.querySelector('#tab-people.active')) {
-    const people = await ensurePeopleModule();
-    await loadPeopleData({ reset: true });
-    people.renderPersonTable();
-    dom.personDetailEl.innerHTML = '<p class="meta">Select a person to view their profile.</p>';
-  }
-  if (document.querySelector('#tab-analytics.active')) {
-    const analytics = await ensureAnalyticsModule();
-    await analytics.loadAndRenderAnalytics();
-  } else {
-    scheduleAnalyticsWarmup();
+    const filteredDocs = getFilteredDocs();
+    if (!filteredDocs.some(d => d.id === state.selectedDocId)) state.selectedDocId = null;
+    if (!filteredDocs.some(d => d.id === state.citationDocId)) {
+      state.citationDocId = null;
+      citationEntriesEl.innerHTML = '<p class="meta">Select a document to view its works cited.</p>';
+      citationListTitleEl.textContent = 'Works Cited';
+    }
+
+    renderAll();
+    if (document.querySelector('#tab-citations.active')) {
+      const citations = await ensureCitationsModule();
+      await loadCitationDocuments({ reset: true });
+      citations.renderCitationDocs();
+      citationListTitleEl.textContent = 'Works Cited';
+      citationEntriesEl.innerHTML = '<p class="meta">Select a document to view its works cited.</p>';
+    }
+    if (document.querySelector('#tab-people.active')) {
+      const people = await ensurePeopleModule();
+      await loadPeopleData({ reset: true });
+      people.renderPersonTable();
+      dom.personDetailEl.innerHTML = '<p class="meta">Select a person to view their profile.</p>';
+    }
+    if (analyticsTabActive) {
+      await activeAnalytics.loadAndRenderAnalytics();
+    } else {
+      scheduleAnalyticsWarmup();
+    }
+  } finally {
+    activeAnalytics?.setAnalyticsRefreshing(false);
   }
 }
 

@@ -94,7 +94,6 @@ export function sourceCacheKey(params) {
     hasApiKey: Boolean(params.apiKey),
     downloadFiles: params.downloadFiles,
     recomputeFromCache: params.recomputeFromCache,
-    refresh: params.refresh,
     isAdminRequest: params.isAdminRequest,
   });
 }
@@ -639,10 +638,23 @@ export async function buildWorkbenchBootstrapPayload(params, loadSyncModule) {
   };
 }
 
+function startBackgroundSliceRefresh(cache, inflight, key, compute) {
+  if (inflight.has(key)) return;
+  const promise = compute().then((payload) => {
+    cache.set(key, { timestamp: Date.now(), payload });
+    return payload;
+  }).catch(() => null).finally(() => inflight.delete(key));
+  inflight.set(key, promise);
+}
+
 async function cachedSlice(cache, inflight, key, refresh, compute) {
+  const cached = cache.get(key);
   if (!refresh) {
-    const cached = cache.get(key);
     if (cached && Date.now() - cached.timestamp < WORKBENCH_SLICE_TTL_MS) return cached.payload;
+    if (cached) {
+      startBackgroundSliceRefresh(cache, inflight, key, compute);
+      return cached.payload;
+    }
   }
   if (inflight.has(key)) return inflight.get(key);
   const promise = compute().then((payload) => {
@@ -651,6 +663,36 @@ async function cachedSlice(cache, inflight, key, refresh, compute) {
   }).finally(() => inflight.delete(key));
   inflight.set(key, promise);
   return promise;
+}
+
+export async function warmWorkbenchLandingCache({ metricsCache, metricsInflight, loadSyncModule, params }) {
+  const filters = {};
+  const pageRequest = { offset: 0, limit: 50, q: '', sortKey: '', sortDir: 'asc' };
+  const slices = [
+    {
+      key: `workbench:bootstrap:${sourceCacheKey(params)}`,
+      compute: () => buildWorkbenchBootstrapPayload(params, loadSyncModule),
+    },
+    {
+      key: `workbench:document-page:${sourceCacheKey(params)}:${JSON.stringify(filters)}:${JSON.stringify(pageRequest)}`,
+      compute: () => documentPageForParams(params, loadSyncModule, pageRequest, filters),
+    },
+  ];
+
+  const results = await Promise.all(slices.map(({ key, compute }) => {
+    if (metricsInflight.has(key)) return metricsInflight.get(key);
+    const promise = compute().then((payload) => {
+      metricsCache.set(key, { timestamp: Date.now(), payload });
+      return payload;
+    }).finally(() => metricsInflight.delete(key));
+    metricsInflight.set(key, promise);
+    return promise;
+  }));
+
+  return {
+    bootstrap: results[0],
+    documentPage: results[1],
+  };
 }
 
 /**

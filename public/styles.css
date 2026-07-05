@@ -179,13 +179,7 @@ body {
 }
 
 .hero-context {
-  margin-top: 0.85rem;
-  max-width: 980px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 0.75rem 1.2rem;
-  padding-top: 0.75rem;
-  border-top: 1px solid var(--line);
+  display: none;
 }
 
 .hero-context p {
@@ -1017,6 +1011,78 @@ body.phone-screen-open {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
+}
+
+#tab-analytics.analytics-refreshing {
+  cursor: progress;
+}
+
+#tab-analytics.analytics-refreshing .analytics-tab-section.active .panel,
+#tab-analytics.analytics-refreshing .kpi {
+  position: relative;
+  overflow: hidden;
+}
+
+#tab-analytics.analytics-refreshing .analytics-tab-section.active .panel > *,
+#tab-analytics.analytics-refreshing .kpi > * {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#tab-analytics.analytics-refreshing .analytics-tab-section.active .panel::after,
+#tab-analytics.analytics-refreshing .kpi::after {
+  content: "";
+  position: absolute;
+  inset: 1rem;
+  border-radius: 8px;
+  background:
+    linear-gradient(90deg, rgba(244, 241, 234, 0), rgba(255, 255, 255, 0.78), rgba(244, 241, 234, 0)) 0 0 / 220% 100%,
+    linear-gradient(rgba(220, 226, 221, 0.9), rgba(220, 226, 221, 0.9)) 0 0.2rem / 42% 0.8rem no-repeat,
+    linear-gradient(rgba(231, 222, 207, 0.95), rgba(231, 222, 207, 0.95)) 0 2.1rem / 88% 1.2rem no-repeat,
+    linear-gradient(rgba(231, 222, 207, 0.78), rgba(231, 222, 207, 0.78)) 0 4.1rem / 72% 1.2rem no-repeat,
+    linear-gradient(rgba(231, 222, 207, 0.62), rgba(231, 222, 207, 0.62)) 0 6.1rem / 54% 1.2rem no-repeat;
+  animation: analytics-skeleton-shimmer 1.15s ease-in-out infinite;
+  pointer-events: none;
+}
+
+#tab-analytics.analytics-refreshing .kpis:empty {
+  min-height: 92px;
+  position: relative;
+}
+
+#tab-analytics.analytics-refreshing .kpis:empty::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background:
+    linear-gradient(90deg, rgba(244, 241, 234, 0), rgba(255, 255, 255, 0.78), rgba(244, 241, 234, 0)) 0 0 / 220% 100%,
+    linear-gradient(rgba(220, 226, 221, 0.9), rgba(220, 226, 221, 0.9)) 1rem 1rem / 26% 0.8rem no-repeat,
+    linear-gradient(rgba(231, 222, 207, 0.95), rgba(231, 222, 207, 0.95)) 1rem 2.5rem / 18% 1.4rem no-repeat,
+    linear-gradient(rgba(220, 226, 221, 0.9), rgba(220, 226, 221, 0.9)) 38% 1rem / 26% 0.8rem no-repeat,
+    linear-gradient(rgba(231, 222, 207, 0.95), rgba(231, 222, 207, 0.95)) 38% 2.5rem / 18% 1.4rem no-repeat,
+    linear-gradient(rgba(220, 226, 221, 0.9), rgba(220, 226, 221, 0.9)) 74% 1rem / 20% 0.8rem no-repeat,
+    linear-gradient(rgba(231, 222, 207, 0.95), rgba(231, 222, 207, 0.95)) 74% 2.5rem / 16% 1.4rem no-repeat;
+  animation: analytics-kpi-skeleton-shimmer 1.15s ease-in-out infinite;
+}
+
+@keyframes analytics-skeleton-shimmer {
+  0% { background-position: -180% 0, 0 0.2rem, 0 2.1rem, 0 4.1rem, 0 6.1rem; }
+  100% { background-position: 180% 0, 0 0.2rem, 0 2.1rem, 0 4.1rem, 0 6.1rem; }
+}
+
+@keyframes analytics-kpi-skeleton-shimmer {
+  0% { background-position: -180% 0, 1rem 1rem, 1rem 2.5rem, 38% 1rem, 38% 2.5rem, 74% 1rem, 74% 2.5rem; }
+  100% { background-position: 180% 0, 1rem 1rem, 1rem 2.5rem, 38% 1rem, 38% 2.5rem, 74% 1rem, 74% 2.5rem; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #tab-analytics.analytics-refreshing .analytics-tab-section.active .panel::after,
+  #tab-analytics.analytics-refreshing .kpi::after,
+  #tab-analytics.analytics-refreshing .kpis:empty::before {
+    animation: none;
+  }
 }
 
 .axis {

@@ -32,6 +32,7 @@ export const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL || '';
 export const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN || '';
 export const PORT = Number(process.env.PORT || 3000);
 export const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60 * 1000);
+export const WORKBENCH_CACHE_REFRESH_MS = Number(process.env.WORKBENCH_CACHE_REFRESH_MS || 10 * 60 * 1000);
 export const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024; // 200 MB
 export const DOWNLOAD_TIMEOUT_MS = 30_000; // 30 seconds
 export const TRUST_PROXY = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '');
