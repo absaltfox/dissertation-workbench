@@ -1,4 +1,4 @@
-# Dissertation Intelligence Workbench (Node.js)
+# Dissertation Workbench (Node.js)
 
 The Dissertation Workbench attempts to do a number of different things at the same time. On a technical level, it demonstrates how a node.js app can integrate with the UBC Open Collections API, extracting metadata relating to dissertations and theses -- such as abstracts, authors, departments, etc. In addition, the workbench uses the metadata and the documents themselves to create new metadata. It does this by employing a variety of different strategies, including:
 
