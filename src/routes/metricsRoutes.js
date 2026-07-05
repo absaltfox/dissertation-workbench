@@ -276,25 +276,82 @@ function buildTopicSummaryForDocs(docs = []) {
     .sort((a, b) => b.count - a.count);
 }
 
+function createPersonRowSeed(key, name) {
+  return {
+    key,
+    name,
+    roles: new Set(),
+    docs: [],
+    docRoles: new Map(),
+    affiliations: new Set(),
+    conceptMap: new Map(),
+    methMap: new Map(),
+    coSupervisors: new Set(),
+  };
+}
+
+function docRoleKey(doc) {
+  return doc.id || [doc.title, doc.author, doc.year].map((value) => String(value || '').trim()).join('|');
+}
+
+function addPersonDocument(person, doc, role) {
+  const key = docRoleKey(doc);
+  if (!key) return;
+  let roleSet = person.docRoles.get(key);
+  if (!roleSet) {
+    roleSet = new Set();
+    person.docRoles.set(key, roleSet);
+    person.docs.push(doc);
+    for (const concept of (doc.conceptTerms || [])) person.conceptMap.set(concept, (person.conceptMap.get(concept) || 0) + 1);
+    for (const methodology of (doc.methodologies || [])) person.methMap.set(methodology, (person.methMap.get(methodology) || 0) + 1);
+  }
+  roleSet.add(role || 'Committee Member');
+}
+
+const PERSON_ROLE_ORDER = [
+  'Supervisor',
+  'Co-Supervisor',
+  'Supervisory Committee Member',
+  'Committee Member',
+  'University Examiner',
+  'External Examiner',
+];
+
+function sortPersonRoles(roles = []) {
+  return [...roles].sort((a, b) => {
+    const ai = PERSON_ROLE_ORDER.indexOf(a);
+    const bi = PERSON_ROLE_ORDER.indexOf(b);
+    if (ai !== -1 || bi !== -1) return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+    return String(a).localeCompare(String(b));
+  });
+}
+
+function buildRoleGroups(person) {
+  const docByKey = new Map(person.docs.map((doc) => [docRoleKey(doc), doc]));
+  return sortPersonRoles(person.roles).map((role) => ({
+    role,
+    docs: Array.from(person.docRoles.entries())
+      .filter(([, roleSet]) => roleSet.has(role))
+      .map(([key]) => docByKey.get(key))
+      .filter(Boolean),
+  })).filter((group) => group.docs.length);
+}
+
 function buildPersonRows(documents = []) {
   const people = new Map();
 
   for (const doc of documents) {
-    const docPersonKeys = new Set();
     for (const name of (doc.supervisors || [])) {
       if (!isValidPersonName(name)) continue;
       const key = String(name || '').toLowerCase().trim();
       if (!key) continue;
-      docPersonKeys.add(key);
       let person = people.get(key);
       if (!person) {
-        person = { key, name, roles: new Set(), docs: [], affiliations: new Set(), conceptMap: new Map(), methMap: new Map(), coSupervisors: new Set() };
+        person = createPersonRowSeed(key, name);
         people.set(key, person);
       }
       person.roles.add('Supervisor');
-      person.docs.push(doc);
-      for (const concept of (doc.conceptTerms || [])) person.conceptMap.set(concept, (person.conceptMap.get(concept) || 0) + 1);
-      for (const methodology of (doc.methodologies || [])) person.methMap.set(methodology, (person.methMap.get(methodology) || 0) + 1);
+      addPersonDocument(person, doc, 'Supervisor');
       for (const other of (doc.supervisors || [])) {
         const otherKey = String(other || '').toLowerCase().trim();
         if (otherKey && otherKey !== key) person.coSupervisors.add(other);
@@ -308,18 +365,13 @@ function buildPersonRows(documents = []) {
       if (!key) continue;
       let person = people.get(key);
       if (!person) {
-        person = { key, name, roles: new Set(), docs: [], affiliations: new Set(), conceptMap: new Map(), methMap: new Map(), coSupervisors: new Set() };
+        person = createPersonRowSeed(key, name);
         people.set(key, person);
       }
       const role = member.role || 'Committee Member';
       person.roles.add(role);
       if (member.affiliation) person.affiliations.add(member.affiliation);
-      if (!docPersonKeys.has(key)) {
-        person.docs.push(doc);
-        for (const concept of (doc.conceptTerms || [])) person.conceptMap.set(concept, (person.conceptMap.get(concept) || 0) + 1);
-        for (const methodology of (doc.methodologies || [])) person.methMap.set(methodology, (person.methMap.get(methodology) || 0) + 1);
-      }
-      docPersonKeys.add(key);
+      addPersonDocument(person, doc, role);
     }
   }
 
@@ -335,9 +387,11 @@ function buildPersonRows(documents = []) {
     return {
       key: person.key,
       name: person.name,
-      roles: Array.from(person.roles),
+      roles: sortPersonRoles(person.roles),
       docCount: person.docs.length,
       docs: person.docs,
+      docRoles: person.docRoles,
+      roleGroups: buildRoleGroups(person),
       affiliations: mergeAffiliationNames(Array.from(person.affiliations)),
       yearRange: years.length ? `${years[0]}\u2013${years[years.length - 1]}` : '\u2013',
       yearMin: years[0] || 9999,
@@ -362,19 +416,26 @@ function personListRow(person) {
 }
 
 function personDetailRow(person) {
+  const detailDocForPerson = (doc) => ({
+    ...bootstrapDoc(doc),
+    themes: doc.themes || [],
+    conceptTerms: doc.conceptTerms || [],
+    methodologies: doc.methodologies || [],
+    topicId: doc.topicId ?? null,
+    topicProbability: doc.topicProbability ?? null,
+    personRoles: Array.from(person.docRoles?.get(docRoleKey(doc)) || []),
+  });
+
   return {
     ...personListRow(person),
     topConcepts: person.topConcepts,
     methodologies: person.methodologies,
     coSupervisors: person.coSupervisors,
     topicSummary: person.topicSummary,
-    docs: person.docs.map((doc) => ({
-      ...bootstrapDoc(doc),
-      themes: doc.themes || [],
-      conceptTerms: doc.conceptTerms || [],
-      methodologies: doc.methodologies || [],
-      topicId: doc.topicId ?? null,
-      topicProbability: doc.topicProbability ?? null,
+    docs: person.docs.map(detailDocForPerson),
+    roleGroups: (person.roleGroups || []).map((group) => ({
+      role: group.role,
+      docs: group.docs.map(detailDocForPerson),
     })),
   };
 }

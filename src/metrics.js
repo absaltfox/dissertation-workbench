@@ -370,7 +370,7 @@ export function buildDocumentSyncKey({ baseUrl, requestedIndex, query, term, sou
 }
 
 function docConceptTerms(rec, limit = 12, dict = null) {
-  if (Array.isArray(rec?.conceptTerms)) {
+  if (Array.isArray(rec?.conceptTerms) && rec.conceptTerms.length) {
     return rec.conceptTerms.slice(0, limit);
   }
   const { canonicalSet, variantMap, idfMap, conceptMeta, sourceDocuments } = dict || loadConceptDictionary();
@@ -1026,9 +1026,7 @@ export async function collectMetricRecords(options = {}) {
 }
 
 export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjectLimit = 25) {
-  const normalizedRecords = records.map(normalizeStoredRecordShape);
-
-  assignTfidfThemes(normalizedRecords);
+  const normalizedRecords = enrichDocumentSignals(records);
 
   const metrics = buildMetrics(normalizedRecords, subjectLimit);
   await saveRunMetrics(sourceMeta, metrics);

@@ -824,6 +824,30 @@ body.phone-screen-open {
   gap: 0.45rem;
 }
 
+.person-role-group {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.person-role-group + .person-role-group {
+  margin-top: 0.85rem;
+}
+
+.person-role-group-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+  font-family: var(--sans);
+  font-size: 0.78rem;
+  color: var(--ink-soft);
+}
+
+.person-role-group-heading span:first-child {
+  color: var(--ink);
+  font-weight: 700;
+}
+
 .related-item {
   border: 1px solid var(--line);
   border-radius: 10px;

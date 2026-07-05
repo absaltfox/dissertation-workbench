@@ -13,6 +13,7 @@ let ensureStorage;
 let saveDocumentMetadata;
 let saveFileMetric;
 let saveCitations;
+let saveCommitteeMembers;
 let createMetricsRouter;
 let sourceCacheKey;
 
@@ -32,6 +33,7 @@ test.before(async () => {
     saveDocumentMetadata,
     saveFileMetric,
     saveCitations,
+    saveCommitteeMembers,
   } = await import('../src/db.js'));
 
   await ensureStorage();
@@ -59,6 +61,21 @@ async function waitFor(predicate, timeoutMs = 1000) {
 }
 
 async function seedWorkbenchDocs() {
+  await fs.mkdir(path.join(tempDir, 'concepts'), { recursive: true });
+  await fs.writeFile(path.join(tempDir, 'concepts', 'latest.json'), JSON.stringify({
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    source: { documents: 4 },
+    stats: { concepts: 4, aliases: 0 },
+    concepts: [
+      { canonical: 'staged loading', variants: [], docFreq: 2, idf: 2 },
+      { canonical: 'responsive document exploration', variants: [], docFreq: 1, idf: 2 },
+      { canonical: 'analytics filtering', variants: [], docFreq: 1, idf: 2 },
+      { canonical: 'word count sensitive', variants: [], docFreq: 1, idf: 2 },
+    ],
+    variantToCanonical: {},
+  }, null, 2));
+
   const docs = [
     {
       id: 'wb-doc-1',
@@ -105,6 +122,7 @@ async function seedWorkbenchDocs() {
       supervisors: ['Alex Supervisor'],
       abstract: 'Performance loading work with staged loading and responsive document exploration.',
       subjects: ['Performance'],
+      conceptTerms: [],
       methodologies: [],
     },
     {
@@ -119,7 +137,7 @@ async function seedWorkbenchDocs() {
       supervisors: ['Morgan Supervisor'],
       abstract: 'A masters thesis about word-count-sensitive analytics filtering.',
       subjects: ['Analytics'],
-      conceptTerms: ['analytics filtering'],
+      conceptTerms: [],
       methodologies: ['Survey'],
       themes: ['analytics'],
     },
@@ -142,6 +160,10 @@ async function seedWorkbenchDocs() {
   await saveCitations('wb-doc-1', [
     { text: 'Fixture, A. (2020). A useful citation.' },
   ], (text) => String(text).toLowerCase());
+
+  await saveCommitteeMembers('wb-doc-4', [
+    { name: 'Alex Supervisor', role: 'University Examiner', affiliation: 'UBC' },
+  ], 'test');
 }
 
 test('workbench bootstrap returns source metadata and facets without preloading rows', async () => {
@@ -258,6 +280,16 @@ test('workbench analytics and citation document slices are filter-aware', async 
   assert.equal(medAnalytics.body.metrics.recordCount, 1);
   assert.equal(medAnalytics.body.metrics.overallWordCount.mean, 2400);
   assert.deepEqual(medAnalytics.body.documents.map((doc) => doc.id), ['wb-doc-4']);
+  assert.ok(medAnalytics.body.documents[0].conceptTerms.includes('analytics filtering'));
+  assert.ok(medAnalytics.body.ngramCloud.some((entry) => entry.term === 'analytics filtering'));
+
+  const phdAnalytics = await request(app)
+    .get('/api/workbench/analytics?maxRecords=10&degree=Doctor%20of%20Philosophy%20-%20PhD')
+    .expect('content-type', /application\/json/)
+    .expect(200);
+  const generatedPhdDoc = phdAnalytics.body.documents.find((doc) => doc.id === 'wb-doc-3');
+  assert.ok(generatedPhdDoc.conceptTerms.includes('responsive document exploration'));
+  assert.ok(phdAnalytics.body.ngramCloud.some((entry) => entry.term === 'responsive document exploration'));
 
   const citations = await request(app)
     .get('/api/workbench/citations/documents?maxRecords=10&degree=Doctor%20of%20Education%20-%20EdD&limit=1')
@@ -292,4 +324,26 @@ test('workbench people list is paged and person detail loads relationships on de
   assert.equal(detail.body.person.docCount, 2);
   assert.deepEqual(detail.body.person.docs.map((doc) => doc.id).sort(), ['wb-doc-1', 'wb-doc-2']);
   assert.ok(detail.body.person.topConcepts.some((concept) => concept.term === 'staged loading'));
+
+  const roleDetail = await request(app)
+    .get('/api/workbench/people/alex%20supervisor?maxRecords=10')
+    .expect('content-type', /application\/json/)
+    .expect(200);
+
+  assert.equal(roleDetail.body.person.docCount, 2);
+  assert.deepEqual(roleDetail.body.person.roles, ['Supervisor', 'University Examiner']);
+  assert.deepEqual(
+    roleDetail.body.person.roleGroups.map((group) => [group.role, group.docs.map((doc) => doc.id)]),
+    [
+      ['Supervisor', ['wb-doc-3']],
+      ['University Examiner', ['wb-doc-4']],
+    ]
+  );
+  assert.deepEqual(
+    roleDetail.body.person.docs.map((doc) => [doc.id, doc.personRoles]).sort(),
+    [
+      ['wb-doc-3', ['Supervisor']],
+      ['wb-doc-4', ['University Examiner']],
+    ]
+  );
 });

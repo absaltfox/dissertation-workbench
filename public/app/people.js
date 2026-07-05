@@ -159,6 +159,44 @@ function renderTopicTokens(docs) {
   ).join('');
 }
 
+function renderRelatedDocumentItem(doc) {
+  return `
+    <div class="related-item" data-related-id="${escapeHtml(doc.id)}">
+      <strong>${escapeHtml(doc.title || '(Untitled)')}</strong>
+      <p>${escapeHtml(doc.author || 'Unknown')} &middot; ${doc.year || '-'} &middot; ${escapeHtml(doc.degree || '-')}</p>
+    </div>
+  `;
+}
+
+function roleGroupsForPerson(person) {
+  if (Array.isArray(person.roleGroups) && person.roleGroups.length) {
+    return person.roleGroups.filter((group) => Array.isArray(group.docs) && group.docs.length);
+  }
+  const groups = new Map();
+  for (const doc of (person.docs || [])) {
+    const roles = Array.isArray(doc.personRoles) && doc.personRoles.length ? doc.personRoles : ['Dissertations'];
+    for (const role of roles) {
+      if (!groups.has(role)) groups.set(role, []);
+      groups.get(role).push(doc);
+    }
+  }
+  return Array.from(groups.entries()).map(([role, docs]) => ({ role, docs }));
+}
+
+function renderRoleGroupedDissertations(person) {
+  const groups = roleGroupsForPerson(person);
+  if (!groups.length) return '<p class="meta">No dissertations found.</p>';
+  return groups.map((group) => `
+    <section class="person-role-group">
+      <div class="person-role-group-heading">
+        <span>${escapeHtml(group.role || 'Role')}</span>
+        <span>${formatNum(group.docs.length)} ${group.docs.length === 1 ? 'dissertation' : 'dissertations'}</span>
+      </div>
+      <div class="related-list">${group.docs.map(renderRelatedDocumentItem).join('')}</div>
+    </section>
+  `).join('');
+}
+
 function renderSupervisorProfile(profile) {
   docModalTitleEl.textContent = `Supervisor: ${profile.name}`;
 
@@ -181,12 +219,7 @@ function renderSupervisorProfile(profile) {
     : '<p class="meta">No methodology signals.</p>';
 
   const dissertationList = profile.dissertations.length
-    ? profile.dissertations.map((doc) => `
-        <div class="related-item" data-related-id="${escapeHtml(doc.id)}">
-          <strong>${escapeHtml(doc.title || '(Untitled)')}</strong>
-          <p>${escapeHtml(doc.author || 'Unknown')} &middot; ${doc.year || '-'} &middot; ${escapeHtml(doc.degree || '-')}</p>
-        </div>
-      `).join('')
+    ? profile.dissertations.map(renderRelatedDocumentItem).join('')
     : '<p class="meta">No dissertations found.</p>';
 
   const topicTokens = renderTopicTokens(profile.dissertations);
@@ -256,25 +289,38 @@ function isValidPersonName(name) {
 
 function buildPersonList(docs) {
   const people = new Map();
+  const ensurePerson = (key, name) => {
+    let person = people.get(key);
+    if (!person) {
+      person = { name, roles: new Set(), docs: [], docRoles: new Map(), affiliations: new Set(), conceptMap: new Map(), methMap: new Map(), coSupervisors: new Set() };
+      people.set(key, person);
+    }
+    return person;
+  };
+  const docKey = (doc) => doc.id || [doc.title, doc.author, doc.year].map((value) => String(value || '').trim()).join('|');
+  const addPersonDoc = (person, doc, role) => {
+    const key = docKey(doc);
+    if (!key) return;
+    let roles = person.docRoles.get(key);
+    if (!roles) {
+      roles = new Set();
+      person.docRoles.set(key, roles);
+      person.docs.push(doc);
+      for (const c of (doc.conceptTerms || [])) person.conceptMap.set(c, (person.conceptMap.get(c) || 0) + 1);
+      for (const m of (doc.methodologies || [])) person.methMap.set(m, (person.methMap.get(m) || 0) + 1);
+    }
+    roles.add(role || 'Committee Member');
+  };
 
   for (const doc of docs) {
-    const docPersonKeys = new Set();
-
     // Process supervisors
     for (const name of (doc.supervisors || [])) {
       if (!isValidPersonName(name)) continue;
       const key = name.toLowerCase().trim();
       if (!key) continue;
-      docPersonKeys.add(key);
-      let person = people.get(key);
-      if (!person) {
-        person = { name, roles: new Set(), docs: [], affiliations: new Set(), conceptMap: new Map(), methMap: new Map(), coSupervisors: new Set() };
-        people.set(key, person);
-      }
+      const person = ensurePerson(key, name);
       person.roles.add('Supervisor');
-      person.docs.push(doc);
-      for (const c of (doc.conceptTerms || [])) person.conceptMap.set(c, (person.conceptMap.get(c) || 0) + 1);
-      for (const m of (doc.methodologies || [])) person.methMap.set(m, (person.methMap.get(m) || 0) + 1);
+      addPersonDoc(person, doc, 'Supervisor');
       // Track co-supervisors
       for (const other of (doc.supervisors || [])) {
         const otherKey = other.toLowerCase().trim();
@@ -288,24 +334,14 @@ function buildPersonList(docs) {
       if (!isValidPersonName(name)) continue;
       const key = name.toLowerCase().trim();
       if (!key) continue;
-      let person = people.get(key);
-      if (!person) {
-        person = { name, roles: new Set(), docs: [], affiliations: new Set(), conceptMap: new Map(), methMap: new Map(), coSupervisors: new Set() };
-        people.set(key, person);
-      }
+      const person = ensurePerson(key, name);
       const role = member.role || 'Committee Member';
       person.roles.add(role);
       if (member.affiliation) {
         const norm = normalizeAffiliation(member.affiliation);
         if (norm) person.affiliations.add(norm);
       }
-      // Only add doc if not already counted from supervisors
-      if (!docPersonKeys.has(key)) {
-        person.docs.push(doc);
-        for (const c of (doc.conceptTerms || [])) person.conceptMap.set(c, (person.conceptMap.get(c) || 0) + 1);
-        for (const m of (doc.methodologies || [])) person.methMap.set(m, (person.methMap.get(m) || 0) + 1);
-      }
-      docPersonKeys.add(key);
+      addPersonDoc(person, doc, role);
     }
   }
 
@@ -325,7 +361,14 @@ function buildPersonList(docs) {
       name: p.name,
       roles: Array.from(p.roles),
       docCount: p.docs.length,
-      docs: p.docs,
+      docs: p.docs.map((doc) => ({ ...doc, personRoles: Array.from(p.docRoles.get(docKey(doc)) || []) })),
+      roleGroups: Array.from(p.roles).map((role) => ({
+        role,
+        docs: Array.from(p.docRoles.entries())
+          .filter(([, roles]) => roles.has(role))
+          .map(([key]) => p.docs.find((doc) => docKey(doc) === key))
+          .filter(Boolean),
+      })).filter((group) => group.docs.length),
       affiliations: mergeAffiliations(Array.from(p.affiliations)),
       yearRange: years.length ? `${years[0]}\u2013${years[years.length - 1]}` : '\u2013',
       yearMin: years[0] || 9999,
@@ -436,14 +479,7 @@ async function renderPersonDetail(personKey) {
       ).join(', ')
     : '';
 
-  const dissertationList = person.docs.length
-    ? person.docs.map(doc => `
-        <div class="related-item" data-related-id="${escapeHtml(doc.id)}">
-          <strong>${escapeHtml(doc.title || '(Untitled)')}</strong>
-          <p>${escapeHtml(doc.author || 'Unknown')} &middot; ${doc.year || '-'} &middot; ${escapeHtml(doc.degree || '-')}</p>
-        </div>
-      `).join('')
-    : '<p class="meta">No dissertations found.</p>';
+  const dissertationList = renderRoleGroupedDissertations(person);
 
   const bodyHtml = `
     ${isPhoneView() ? '' : `<h2 style="margin-bottom:0.3rem">${escapeHtml(person.name)}</h2>`}
@@ -474,8 +510,8 @@ async function renderPersonDetail(personKey) {
       </div>
       ${coSupHtml ? `<div><p class="detail-section-title">Supervisory Network</p><div class="token-list">${coSupHtml}</div></div>` : ''}
       <div>
-        <p class="detail-section-title">Dissertations</p>
-        <div class="related-list">${dissertationList}</div>
+        <p class="detail-section-title">Dissertations by Role</p>
+        ${dissertationList}
       </div>
     </div>
   `;
