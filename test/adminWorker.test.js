@@ -72,6 +72,15 @@ async function writeTextPdf(filePath, lines) {
   await fs.writeFile(filePath, body, 'binary');
 }
 
+async function waitFor(predicate, timeoutMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(await predicate(), true);
+}
+
 test.before(async () => {
   testDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-worker-tests-'));
   process.env.SKIP_LOCAL_ENV = '1';
@@ -306,9 +315,12 @@ test('in-process catalogue lookup jobs can be cancelled cooperatively', async ()
     params: { limit: 5, pendingOnly: true },
   });
   let abortSeen = false;
+  let lookupStartedResolve;
+  const lookupStarted = new Promise((resolve) => { lookupStartedResolve = resolve; });
 
   runCatalogueLookupJob(jobId, 5, {
     runLookup: ({ signal }) => new Promise((resolve, reject) => {
+      lookupStartedResolve();
       signal.addEventListener('abort', () => {
         abortSeen = true;
         reject(new CatalogueLookupCancelledError());
@@ -316,6 +328,7 @@ test('in-process catalogue lookup jobs can be cancelled cooperatively', async ()
     }),
   });
 
+  await lookupStarted;
   const result = await cancelInProcessAdminJob(jobId);
 
   assert.equal(result.ok, true);
@@ -327,6 +340,44 @@ test('in-process catalogue lookup jobs can be cancelled cooperatively', async ()
   assert.ok(job.cancelledAt);
   assert.ok(job.finishedAt);
   assert.match(job.log, /cancelled by administrator/i);
+});
+
+test('in-process catalogue lookup jobs publish heartbeat and progress', async () => {
+  await ensureStorage();
+  const jobId = await createAdminJob({
+    type: 'catalogue_lookup',
+    label: 'Catalogue Progress Test',
+    params: { limit: 5, pendingOnly: true },
+  });
+
+  runCatalogueLookupJob(jobId, 5, {
+    runLookup: async ({ onProgress }) => {
+      await onProgress({
+        phase: 'lookup',
+        detail: 'Testing progress update',
+        page: 1,
+        pageProcessed: 3,
+        pageTotal: 5,
+        pageSize: 5,
+        stats: { processed: 3, found: 1, notFound: 1, skipped: 0, failed: 1 },
+      });
+      return { processed: 5, found: 2, notFound: 2, skipped: 0, failed: 1 };
+    },
+  });
+
+  await waitFor(async () => (await getAdminJob(jobId))?.status === 'completed');
+  const job = await getAdminJob(jobId);
+  assert.equal(job.runnerType, 'in_process');
+  assert.match(job.runnerId, /^web:/);
+  assert.equal(job.runnerState, 'completed');
+  assert.ok(job.claimedAt);
+  assert.ok(job.heartbeatAt);
+  assert.equal(job.result.processed, 5);
+  assert.equal(job.result.failed, 1);
+  assert.equal(job.progress.phase, 'complete');
+  assert.equal(job.progress.counts.found, 2);
+  assert.equal(job.progress.counts.failed, 1);
+  assert.match(job.log, /Catalogue lookup completed/i);
 });
 
 test('transient YAZ failures are not saved as completed catalogue lookups', async () => {
@@ -350,22 +401,20 @@ test('transient YAZ failures are not saved as completed catalogue lookups', asyn
   const [pending] = await listPendingLookups(1);
   assert.ok(pending?.id);
 
-  await assert.rejects(
-    () => runPendingCatalogueLookups({
-      pageSize: 1,
-      isYazAvailable: async () => true,
-      lookupBatch: async () => [{
-        found: null,
-        hits: null,
-        author: 'Bakke',
-        title: 'Bonds of organization',
-        error: 'yaz-client timed out',
-        transient: true,
-      }],
-    }),
-    /transient failures were not saved/
-  );
+  const stats = await runPendingCatalogueLookups({
+    pageSize: 1,
+    isYazAvailable: async () => true,
+    lookupBatch: async () => [{
+      found: null,
+      hits: null,
+      author: 'Bakke',
+      title: 'Bonds of organization',
+      error: 'yaz-client timed out',
+      transient: true,
+    }],
+  });
 
+  assert.deepEqual(stats, { processed: 1, found: 0, notFound: 0, skipped: 0, failed: 1 });
   assert.equal(await loadCatalogueLookup(pending.id), null);
 });
 

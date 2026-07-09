@@ -467,7 +467,7 @@ export async function lookupCitationBatch(citationTexts, {
 
           if (onProgress) {
             const completed = items.filter((_, j) => results[j] !== undefined).length;
-            onProgress(completed, items.length);
+            await onProgress(completed, items.length);
           }
         }
       } else {
@@ -492,7 +492,7 @@ export async function lookupCitationBatch(citationTexts, {
 
           if (onProgress) {
             const completed = items.filter((_, j) => results[j] !== undefined).length;
-            onProgress(completed, items.length);
+            await onProgress(completed, items.length);
           }
         }
       }
@@ -516,7 +516,7 @@ export async function lookupCitationBatch(citationTexts, {
 
   // Report final progress for skipped items
   if (onProgress) {
-    onProgress(items.length, items.length);
+    await onProgress(items.length, items.length);
   }
 
   return results;
@@ -534,11 +534,14 @@ export async function runPendingCatalogueLookups({
   signal,
   lookupBatch = lookupCitationBatch,
   isYazAvailable = checkYazAvailability,
+  onProgress,
 } = {}) {
   throwIfAborted(signal);
   if (!(await isYazAvailable())) {
     logger.warn('Skipping automatic catalogue lookups — yaz-client not available');
-    return { processed: 0, found: 0, notFound: 0, skipped: 0, failed: 0 };
+    const stats = { processed: 0, found: 0, notFound: 0, skipped: 0, failed: 0 };
+    await onProgress?.({ phase: 'complete', stats, detail: 'yaz-client not available' });
+    return stats;
   }
 
   let totalProcessed = 0;
@@ -546,12 +549,31 @@ export async function runPendingCatalogueLookups({
   let totalNotFound = 0;
   let totalSkipped = 0;
   let totalFailed = 0;
+  let pageNumber = 0;
+
+  const currentStats = () => ({
+    processed: totalProcessed,
+    found: totalFound,
+    notFound: totalNotFound,
+    skipped: totalSkipped,
+    failed: totalFailed,
+  });
 
   // Process in pages until no pending citations remain
   while (true) {
     throwIfAborted(signal);
     const pending = await listPendingLookups(pageSize);
     if (!pending.length) break;
+    pageNumber += 1;
+    await onProgress?.({
+      phase: 'lookup',
+      page: pageNumber,
+      pageSize,
+      pageTotal: pending.length,
+      pageProcessed: 0,
+      stats: currentStats(),
+      detail: `Looking up ${pending.length} pending citation${pending.length === 1 ? '' : 's'}`,
+    });
 
     const texts = pending.map((row) => row.citation_text);
     const structuredFieldsList = pending.map((row) => ({
@@ -560,13 +582,29 @@ export async function runPendingCatalogueLookups({
       year: row.year || null,
       source: row.source || null,
     }));
-    const results = await lookupBatch(texts, { structuredFieldsList, signal });
+    const results = await lookupBatch(texts, {
+      structuredFieldsList,
+      signal,
+      onProgress: async (pageProcessed, pageTotal) => {
+        await onProgress?.({
+          phase: 'lookup',
+          page: pageNumber,
+          pageSize,
+          pageTotal,
+          pageProcessed,
+          stats: currentStats(),
+          detail: `Looked up ${pageProcessed} of ${pageTotal} citation${pageTotal === 1 ? '' : 's'} in current batch`,
+        });
+      },
+    });
 
+    let pageFailed = 0;
     for (let i = 0; i < pending.length; i++) {
       throwIfAborted(signal);
       const result = results[i];
       if (!result || result.transient) {
         totalFailed++;
+        pageFailed++;
         continue;
       }
       await saveCatalogueLookup(pending[i].id, {
@@ -580,7 +618,7 @@ export async function runPendingCatalogueLookups({
       else totalSkipped++;
     }
 
-    totalProcessed = totalFound + totalNotFound + totalSkipped;
+    totalProcessed = totalFound + totalNotFound + totalSkipped + totalFailed;
     logger.info('Catalogue lookup progress', {
       processed: totalProcessed,
       found: totalFound,
@@ -589,16 +627,18 @@ export async function runPendingCatalogueLookups({
       failed: totalFailed,
     });
 
-    if (totalFailed > 0) {
-      const error = new Error(`YAZ lookup failed for ${totalFailed} citation(s); transient failures were not saved and can be retried.`);
-      error.code = 'YAZ_TRANSIENT_FAILURE';
-      error.transient = true;
-      error.stats = { processed: totalProcessed, found: totalFound, notFound: totalNotFound, skipped: totalSkipped, failed: totalFailed };
-      throw error;
-    }
+    await onProgress?.({
+      phase: 'page_complete',
+      page: pageNumber,
+      pageSize,
+      pageTotal: pending.length,
+      pageProcessed: pending.length,
+      stats: currentStats(),
+      detail: `Completed catalogue lookup batch ${pageNumber}`,
+    });
 
     // If we got fewer than a full page, we're done
-    if (pending.length < pageSize) break;
+    if (pageFailed > 0 || pending.length < pageSize) break;
   }
 
   if (totalProcessed > 0) {
@@ -611,5 +651,7 @@ export async function runPendingCatalogueLookups({
     });
   }
 
-  return { processed: totalProcessed, found: totalFound, notFound: totalNotFound, skipped: totalSkipped, failed: totalFailed };
+  const stats = currentStats();
+  await onProgress?.({ phase: 'complete', stats, detail: 'Catalogue lookups complete' });
+  return stats;
 }

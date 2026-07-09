@@ -1092,7 +1092,7 @@ function summarizeJobResult(job) {
   if (job.error) return job.error;
   const result = job.result || {};
   if (job.type === 'catalogue_lookup') {
-    return `${formatNum(result.processed || 0)} checked, ${formatNum(result.found || 0)} found`;
+    return `${formatNum(result.processed || 0)} checked, ${formatNum(result.found || 0)} found, ${formatNum(result.notFound || 0)} not found, ${formatNum(result.skipped || 0)} skipped, ${formatNum(result.failed || 0)} failed`;
   }
   if (job.type === 'bertopic') {
     return `${formatNum(result.topics || 0)} topics, ${formatNum(result.assignedDocuments || 0)} documents`;
@@ -1130,9 +1130,18 @@ function workerJobDetail(job) {
 
 function formatJobCounts(counts = {}) {
   const parts = [];
+  if (counts.pageProcessed != null && counts.pageTotal != null) {
+    parts.push(`batch ${formatNum(counts.pageProcessed)} / ${formatNum(counts.pageTotal)}`);
+  }
   if (counts.processed != null && counts.total != null) {
     parts.push(`${formatNum(counts.processed)} / ${formatNum(counts.total)}`);
+  } else if (counts.processed != null) {
+    parts.push(`${formatNum(counts.processed)} checked`);
   }
+  if (counts.found != null) parts.push(`${formatNum(counts.found)} found`);
+  if (counts.notFound != null) parts.push(`${formatNum(counts.notFound)} not found`);
+  if (counts.skipped != null) parts.push(`${formatNum(counts.skipped)} skipped`);
+  if (counts.failed != null) parts.push(`${formatNum(counts.failed)} failed`);
   if (counts.citations != null) parts.push(`${formatNum(counts.citations)} citations`);
   if (counts.fuzzyMatches != null) parts.push(`${formatNum(counts.fuzzyMatches)} fuzzy`);
   if (counts.exactMatches != null) parts.push(`${formatNum(counts.exactMatches)} exact`);

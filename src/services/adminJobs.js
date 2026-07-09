@@ -2,7 +2,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { BERTOPIC_PYTHON_COMMAND, BERTOPIC_TIMEOUT_MS, SQLITE_PATH } from '../config.js';
-import { appendAdminJobLog, getAdminJob, getTopicBuildStatus, updateAdminJob } from '../db.js';
+import {
+  appendAdminJobLog,
+  claimAdminJob,
+  getAdminJob,
+  getTopicBuildStatus,
+  updateAdminJob,
+  updateAdminJobProgress,
+} from '../db.js';
 import { isCatalogueLookupCancelledError, runPendingCatalogueLookups } from '../catalogue.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -21,16 +28,89 @@ export function isAdminJobRunning(type) {
 
 export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCatalogueLookups } = {}) {
   const controller = new AbortController();
+  const id = Number(jobId);
+  const runnerId = `web:${process.pid}`;
   runningAdminJobs.add('catalogue_lookup');
-  runningInProcessAdminJobs.set(Number(jobId), {
+  runningInProcessAdminJobs.set(id, {
     type: 'catalogue_lookup',
     controller,
   });
-  runLookup({ pageSize: limit, signal: controller.signal })
+
+  let lastProgressWriteAt = 0;
+  const writeProgress = async ({
+    phase = 'lookup',
+    detail = null,
+    stats = {},
+    page = null,
+    pageProcessed = null,
+    pageTotal = null,
+    pageSize = limit,
+  } = {}) => {
+    const now = Date.now();
+    const isMilestone = phase !== 'lookup' || pageProcessed === 0 || pageProcessed === pageTotal;
+    if (!isMilestone && now - lastProgressWriteAt < 5_000) return;
+    lastProgressWriteAt = now;
+    const status = phase === 'complete' ? 'completed' : 'running';
+    await updateAdminJobProgress(id, {
+      phase,
+      currentTask: 'Z39.50 catalogue lookup',
+      tasks: [{
+        key: 'catalogue_lookup',
+        label: 'Z39.50 catalogue lookup',
+        status,
+        detail,
+        counts: {
+          processed: stats.processed || 0,
+          found: stats.found || 0,
+          notFound: stats.notFound || 0,
+          skipped: stats.skipped || 0,
+          failed: stats.failed || 0,
+          page,
+          pageProcessed,
+          pageTotal,
+          pageSize,
+        },
+      }],
+      counts: {
+        processed: stats.processed || 0,
+        found: stats.found || 0,
+        notFound: stats.notFound || 0,
+        skipped: stats.skipped || 0,
+        failed: stats.failed || 0,
+      },
+    });
+  };
+
+  (async () => {
+    await claimAdminJob(id, runnerId);
+    await updateAdminJob(id, {
+      runnerType: 'in_process',
+      runnerId,
+      runnerState: 'starting',
+    });
+    await appendAdminJobLog(id, `Started in-process catalogue lookup runner ${runnerId}.\n`);
+    await writeProgress({
+      phase: 'starting',
+      detail: `Preparing to process up to ${limit} pending citations per batch`,
+      stats: { processed: 0, found: 0, notFound: 0, skipped: 0, failed: 0 },
+    });
+    return runLookup({
+      pageSize: limit,
+      signal: controller.signal,
+      onProgress: writeProgress,
+    });
+  })()
     .then(async (stats) => {
+      await writeProgress({
+        phase: 'complete',
+        detail: 'Catalogue lookup job completed',
+        stats,
+      });
+      await appendAdminJobLog(jobId, `Catalogue lookup completed: ${stats.processed || 0} processed, ${stats.found || 0} found, ${stats.notFound || 0} not found, ${stats.skipped || 0} skipped, ${stats.failed || 0} failed.\n`);
       await updateAdminJob(jobId, {
         status: 'completed',
         result: stats,
+        runnerState: 'completed',
         finishedAt: new Date().toISOString(),
       });
     })
@@ -40,6 +120,7 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
         await updateAdminJob(jobId, {
           status: 'cancelled',
           error: null,
+          runnerState: 'cancelled',
           cancelledAt: now,
           finishedAt: now,
         });
@@ -49,12 +130,13 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
         status: 'failed',
         error: error?.message || String(error),
         result: error?.stats || null,
+        runnerState: 'failed',
         finishedAt: new Date().toISOString(),
       });
     })
     .finally(() => {
       runningAdminJobs.delete('catalogue_lookup');
-      runningInProcessAdminJobs.delete(Number(jobId));
+      runningInProcessAdminJobs.delete(id);
     });
 }
 
