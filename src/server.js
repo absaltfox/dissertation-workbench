@@ -17,6 +17,7 @@ import { getConfiguredApiKey } from './secrets.js';
 import { getTrustedClientIp } from './requestSecurity.js';
 import { applyCompression, applySecurityHeaders } from './middleware/http.js';
 import { requireAdmin, requireCsrf } from './middleware/adminAuth.js';
+import { createPublicRateLimit } from './middleware/rateLimit.js';
 import { createAuthRouter } from './routes/authRoutes.js';
 import { createAdminJobsRouter } from './routes/adminJobsRoutes.js';
 import { createAdminImportRouter } from './routes/adminImportRoutes.js';
@@ -121,6 +122,7 @@ app.use('/api/admin', requireAdmin, createAdminOperationsRouter({ loadSyncModule
 app.use('/api/admin', requireAdmin, createAdminTopicLabelsRouter({ clearMetricsCache }));
 app.use('/api/admin', requireAdmin, createAdminJobsRouter({ loadSyncModule, clearMetricsCache }));
 app.use('/api/internal', createInternalWorkerRouter());
+app.use('/api', createPublicRateLimit());
 app.use('/api', createPublicRouter());
 app.use('/api', createMetricsRouter({ metricsCache, metricsInflight, loadSyncModule }));
 
