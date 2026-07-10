@@ -1019,11 +1019,11 @@ export async function collectMetricRecords(options = {}) {
   return { records: normalizedRecords, sourceMeta, subjectLimit };
 }
 
-export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjectLimit = 25) {
+export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjectLimit = 25, { persistRun = false } = {}) {
   const normalizedRecords = enrichDocumentSignals(records);
 
   const metrics = buildMetrics(normalizedRecords, subjectLimit);
-  await saveRunMetrics(sourceMeta, metrics);
+  if (persistRun) await saveRunMetrics(sourceMeta, metrics);
 
   // Load BERTopic results if available
   let topicData = null;
@@ -1087,5 +1087,7 @@ export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjec
 
 export async function collectMetrics(options = {}) {
   const { records, sourceMeta, subjectLimit } = await collectMetricRecords(options);
-  return buildMetricsPayloadFromRecords(records, sourceMeta, subjectLimit);
+  return buildMetricsPayloadFromRecords(records, sourceMeta, subjectLimit, {
+    persistRun: Boolean(options.persistRun),
+  });
 }

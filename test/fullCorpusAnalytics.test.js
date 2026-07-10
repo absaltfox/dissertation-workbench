@@ -10,6 +10,7 @@ let tempDir;
 let app;
 let saveDocumentMetadata;
 let closeDb;
+let getDbFn;
 
 const SYNC_KEY = 'full-corpus-test-key';
 const loadSyncModule = async () => ({ getSyncKeyForOptions: () => SYNC_KEY });
@@ -42,6 +43,7 @@ test.before(async () => {
   const db = await import('../src/db.js');
   saveDocumentMetadata = db.saveDocumentMetadata;
   closeDb = db.closeDb;
+  getDbFn = db.getDb;
   await db.ensureStorage();
 
   for (let i = 1; i <= 5; i++) {
@@ -101,4 +103,13 @@ test('person explorer merges middle-initial name variants', async () => {
   const kellys = res.body.people.filter((p) => /kelly/i.test(p.name));
   assert.equal(kellys.length, 1);
   assert.equal(kellys[0].docCount, 2);
+});
+
+test('anonymous analytics reads do not write metric_runs rows', async () => {
+  const client = await getDbFn();
+  const before = Number((await client.execute('SELECT COUNT(*) AS c FROM metric_runs')).rows[0].c);
+  const res = await request(app).get('/api/workbench/analytics?refresh=0&subjectLimit=10');
+  assert.equal(res.status, 200);
+  const after = Number((await client.execute('SELECT COUNT(*) AS c FROM metric_runs')).rows[0].c);
+  assert.equal(after, before);
 });

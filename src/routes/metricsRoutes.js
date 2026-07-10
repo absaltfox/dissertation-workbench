@@ -839,7 +839,9 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
       const { records, sourceMeta, subjectLimit } = await metricRecordsForParams(params, loadSyncModule);
       const filtered = filterDocuments(records, filters);
-      const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit);
+      const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit, {
+        persistRun: params.isAdminRequest && params.refresh,
+      });
       return analyticsSlice(full);
     });
     res.status(200).json(payload);
@@ -853,7 +855,9 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
       const { records, sourceMeta, subjectLimit } = await metricRecordsForParams(params, loadSyncModule);
       const filtered = filterDocuments(records, filters);
-      const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit);
+      const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit, {
+        persistRun: params.isAdminRequest && params.refresh,
+      });
       return visualizationSlice(full);
     });
     res.status(200).json(payload);
@@ -1036,6 +1040,7 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
         applyStoredFileMetrics: true,
         applyCitationCounts: true,
         applyCommitteeMembers: true,
+        persistRun: isAdminRequest && refresh,
       });
       payload.source.documentCache = {
         syncKey: hasExactSyncCache ? syncKey : null,

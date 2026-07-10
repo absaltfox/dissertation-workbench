@@ -1106,6 +1106,10 @@ export async function saveRunMetrics(source, metrics) {
     INSERT INTO metric_runs (run_key, source_json, metrics_json, created_at)
     VALUES (?, ?, ?, ?)
   `, [runKey, JSON.stringify(source), JSON.stringify(metrics), now]);
+  await run(`
+    DELETE FROM metric_runs
+    WHERE id NOT IN (SELECT id FROM metric_runs ORDER BY created_at DESC, id DESC LIMIT 100)
+  `);
 }
 
 export async function listRecentRuns(limit = 50) {
