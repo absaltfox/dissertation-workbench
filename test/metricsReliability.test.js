@@ -32,5 +32,10 @@ test('length chart reliability filters exclude metadata-only and tiny counts', (
   assert.equal(hasReliableWordCount({ wordCount: 92, wordCountSource: 'metadata_text' }), false);
   assert.equal(hasReliablePageCount({ pages: 1, pagesSource: 'estimated_from_metadata_words' }), false);
   assert.equal(hasReliableWordCount({ wordCount: 75_000, wordCountSource: 'dspace_full_text' }), true);
-  assert.equal(hasReliablePageCount({ pages: 250, pagesSource: 'estimated_from_full_text_words' }), true);
+  assert.equal(hasReliablePageCount({ pages: 250, pagesSource: 'estimated_from_full_text_words' }), false);
+});
+
+test('page counts estimated from full-text words are not treated as reliable', () => {
+  assert.equal(hasReliablePageCount({ pages: 250, pagesSource: 'estimated_from_full_text_words' }), false);
+  assert.equal(hasReliablePageCount({ pages: 250, pagesSource: 'downloaded_pdf' }), true);
 });
