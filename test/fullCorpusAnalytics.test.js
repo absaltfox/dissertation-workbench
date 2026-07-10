@@ -83,3 +83,22 @@ test('bootstrap summary counts the full corpus', async () => {
   assert.equal(res.status, 200);
   assert.equal(res.body.summary.documents, 5);
 });
+
+test('person explorer merges middle-initial name variants', async () => {
+  await saveDocumentMetadata({
+    ...makeDoc(6),
+    id: '1.0000006',
+    supervisors: ['Deirdre M. Kelly'],
+  }, { syncKey: SYNC_KEY });
+  await saveDocumentMetadata({
+    ...makeDoc(7),
+    id: '1.0000007',
+    supervisors: ['Deirdre Kelly'],
+  }, { syncKey: SYNC_KEY });
+
+  const res = await request(app).get('/api/workbench/people?q=kelly');
+  assert.equal(res.status, 200);
+  const kellys = res.body.people.filter((p) => /kelly/i.test(p.name));
+  assert.equal(kellys.length, 1);
+  assert.equal(kellys[0].docCount, 2);
+});

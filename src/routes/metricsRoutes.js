@@ -13,6 +13,7 @@ import { getConfiguredApiKey } from '../secrets.js';
 import { parseBooleanParam, parseNumberParam, validateMetricsParams } from '../validate.js';
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
 import { hasValidCsrf } from '../middleware/adminAuth.js';
+import { stripMiddleInitials, supervisorNameKey } from '../supervisors.js';
 
 const WORKBENCH_SLICE_TTL_MS = CACHE_TTL_MS;
 
@@ -330,23 +331,31 @@ function buildRoleGroups(person) {
   })).filter((group) => group.docs.length);
 }
 
+function personKeyFor(name) {
+  const key = supervisorNameKey(name);
+  if (key) return stripMiddleInitials(key);
+  return String(name || '').toLowerCase().trim();
+}
+
 function buildPersonRows(documents = []) {
   const people = new Map();
 
   for (const doc of documents) {
     for (const name of (doc.supervisors || [])) {
       if (!isValidPersonName(name)) continue;
-      const key = String(name || '').toLowerCase().trim();
+      const key = personKeyFor(name);
       if (!key) continue;
       let person = people.get(key);
       if (!person) {
         person = createPersonRowSeed(key, name);
         people.set(key, person);
+      } else if (String(name || '').length > String(person.name || '').length) {
+        person.name = name;
       }
       person.roles.add('Supervisor');
       addPersonDocument(person, doc, 'Supervisor');
       for (const other of (doc.supervisors || [])) {
-        const otherKey = String(other || '').toLowerCase().trim();
+        const otherKey = personKeyFor(other);
         if (otherKey && otherKey !== key) person.coSupervisors.add(other);
       }
     }
@@ -354,12 +363,14 @@ function buildPersonRows(documents = []) {
     for (const member of (doc.committee || [])) {
       const name = member.name;
       if (!isValidPersonName(name)) continue;
-      const key = String(name || '').toLowerCase().trim();
+      const key = personKeyFor(name);
       if (!key) continue;
       let person = people.get(key);
       if (!person) {
         person = createPersonRowSeed(key, name);
         people.set(key, person);
+      } else if (String(name || '').length > String(person.name || '').length) {
+        person.name = name;
       }
       const role = member.role || 'Committee Member';
       person.roles.add(role);
