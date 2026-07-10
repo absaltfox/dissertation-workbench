@@ -83,18 +83,11 @@ async function parseMetricsRequest(req, res) {
 
 export function sourceCacheKey(params) {
   return JSON.stringify({
-    maxRecords: params.maxRecords,
-    pageSize: params.pageSize,
-    scanLimit: params.scanLimit,
     subjectLimit: params.subjectLimit,
     index: params.index,
     query: params.query,
     term: params.term,
     source: params.source,
-    hasApiKey: Boolean(params.apiKey),
-    downloadFiles: params.downloadFiles,
-    recomputeFromCache: params.recomputeFromCache,
-    isAdminRequest: params.isAdminRequest,
   });
 }
 
@@ -584,10 +577,7 @@ function visualizationSlice(payload) {
 
 async function cachedDocumentsForParams(params, loadSyncModule) {
   const documentCache = await documentCacheForParams(params, loadSyncModule);
-  const documents = await listCachedDocuments({
-    syncKey: documentCache.syncKey,
-    limit: params.maxRecords,
-  });
+  const documents = await listCachedDocuments({ syncKey: documentCache.syncKey });
   return { documents, documentCache };
 }
 
@@ -617,7 +607,7 @@ async function documentPageForParams(params, loadSyncModule, pageRequest, filter
   );
   const documents = await listCachedDocuments({
     syncKey: documentCache.syncKey,
-    limit: needsFullPass ? params.maxRecords : pageRequest.limit,
+    limit: needsFullPass ? null : pageRequest.limit,
     offset: needsFullPass ? 0 : pageRequest.offset,
   });
 
@@ -630,7 +620,7 @@ async function documentPageForParams(params, loadSyncModule, pageRequest, filter
 
   const total = needsFullPass
     ? rows.length
-    : Math.min(params.maxRecords, documentCache.recordsAvailable || params.maxRecords);
+    : (documentCache.recordsAvailable || rows.length);
   const pageRows = needsFullPass
     ? rows.slice(pageRequest.offset, pageRequest.offset + pageRequest.limit)
     : rows;
@@ -1027,7 +1017,6 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       const cacheStats = hasExactSyncCache ? syncCacheStats : await getDocumentCacheStats();
       const cachedDocuments = await listCachedDocuments({
         syncKey: hasExactSyncCache ? syncKey : null,
-        limit: effectiveMaxRecords,
       });
       const payload = await collectMetrics({
         ...sourceOptions,

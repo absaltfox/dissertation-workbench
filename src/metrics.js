@@ -975,7 +975,10 @@ export async function collectMetricRecords(options = {}) {
     }
   }
 
-  const normalizedRecords = records.slice(0, maxRecords).map(normalizeStoredRecordShape);
+  // Cached-document reads serve the full stored corpus; maxRecords only
+  // bounds live Open Collections paging above.
+  const limitedRecords = usesCachedDocuments ? records : records.slice(0, maxRecords);
+  const normalizedRecords = limitedRecords.map(normalizeStoredRecordShape);
 
   if (!options.skipFileEnrichment) {
     await enrichDocumentsWithFileAnalysis(normalizedRecords, {
