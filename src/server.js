@@ -9,6 +9,7 @@ import {
   checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb, hasRunningAdminJob
 } from './db.js';
 import { ensureDefaultAdmin } from './auth.js';
+import { createBoundedCache } from './boundedCache.js';
 import { getConceptPipelineStatus } from './conceptsPipeline.js';
 import { createAndStartAdminWorkerJob } from './services/adminWorker.js';
 import { logger } from './logger.js';
@@ -33,7 +34,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, '..', 'public');
 
-const metricsCache = new Map();
+const metricsCache = createBoundedCache(300);
 const metricsInflight = new Map();
 let stopDailyConceptScheduler = null;
 let stopWorkbenchCacheWarmup = null;
