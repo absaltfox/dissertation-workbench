@@ -14,6 +14,12 @@ import {
 } from './db.js';
 import { logger } from './logger.js';
 import { dedupeSupervisorNames } from './supervisors.js';
+import { safeFetchDownloadUrl } from './urlSafety.js';
+
+let downloadSafetyOptions = {};
+export function _setDownloadSafetyOptionsForTests(options) {
+  downloadSafetyOptions = options || {};
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -707,7 +713,7 @@ async function fetchJsonWithTimeout(url) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { signal: controller.signal });
+    const res = await safeFetchDownloadUrl(String(url), { signal: controller.signal }, downloadSafetyOptions);
     if (!res.ok) return null;
     return await res.json();
   } finally {
@@ -719,7 +725,7 @@ async function fetchTextWithTimeout(url) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { signal: controller.signal });
+    const res = await safeFetchDownloadUrl(String(url), { signal: controller.signal }, downloadSafetyOptions);
     if (!res.ok) return null;
     const contentType = res.headers.get('content-type') || '';
     if (!contentType.includes('text/plain') && !contentType.includes('text/')) return null;
@@ -733,7 +739,7 @@ async function fetchBytesWithTimeout(url) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { signal: controller.signal });
+    const res = await safeFetchDownloadUrl(String(url), { signal: controller.signal }, downloadSafetyOptions);
     if (!res.ok) return null;
     const contentLength = Number(res.headers.get('content-length') || 0);
     if (contentLength > MAX_DOWNLOAD_BYTES) {
@@ -829,7 +835,14 @@ export async function fetchPdfForDocument(doc) {
     const retrieveUrl = dspaceRestUrl(`/rest/bitstreams/${id}/retrieve`);
     const result = await fetchBytesWithTimeout(retrieveUrl);
     if (!result?.bytes?.length) return null;
-    if (!result.contentType.includes('pdf') && !String(pdfBitstream?.name || '').toLowerCase().endsWith('.pdf')) {
+
+    const looksLikePdf = result.bytes.subarray(0, 5).toString('latin1') === '%PDF-';
+    if (!looksLikePdf) {
+      const preview = result.bytes.subarray(0, 4096).toString('utf8');
+      if (result.contentType.includes('html') && detectDownloadBlockPage(preview)) {
+        logger.warn('PDF download blocked by security page', { docId: doc?.id });
+        return { blocked: true, downloadUrl: result.finalUrl || retrieveUrl.toString() };
+      }
       return null;
     }
 
@@ -1804,7 +1817,10 @@ export async function analyzeDocumentFile(doc, options) {
   await onProgress?.({ phase: 'pdf_download', label: 'Downloading PDF from cIRcle', status: 'running' });
 
   const resolved = await fetchPdfForDocument(doc);
-  if (resolved) {
+  if (resolved?.blocked) {
+    doc.downloadError = 'Download blocked by UBC security page; reduce PDF_DOWNLOAD_RATE_PER_MIN and retry later.';
+  }
+  if (resolved && !resolved.blocked) {
     await onProgress?.({
       phase: 'pdf_download',
       label: 'Downloaded PDF from cIRcle',
@@ -1905,11 +1921,11 @@ export async function analyzeDocumentFile(doc, options) {
     return;
   }
 
-  doc.downloadStatus = 'not_found';
+  doc.downloadStatus = resolved?.blocked ? 'blocked' : 'not_found';
   if (!doc.downloadError) doc.downloadError = 'No downloadable PDF could be resolved for this record.';
 
   await saveFileMetric(doc.id, {
-    status: 'not_found',
+    status: doc.downloadStatus,
     error: doc.downloadError,
     pdfPath: stored?.pdf_path || null,
     downloadUrl: stored?.download_url || null,

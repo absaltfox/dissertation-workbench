@@ -99,6 +99,8 @@ test.before(async () => {
   ({ runImportPdfAdminJob } = await import('../src/services/importPdfJobRunner.js'));
   ({ runThemeRecomputeAdminJob } = await import('../src/services/themeJobRunner.js'));
   ({ analyzeDocumentFile } = await import('../src/pdf.js'));
+  const { _setDownloadSafetyOptionsForTests } = await import('../src/pdf.js');
+  _setDownloadSafetyOptionsForTests({ resolveHost: async () => [{ address: '142.103.96.1' }] });
   ({
     appendAdminJobLog,
     claimAdminJob,
