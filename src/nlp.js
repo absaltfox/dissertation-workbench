@@ -321,6 +321,38 @@ export function topTfidfTermsFromText(text, documentFrequency, documentCount, li
     .map(({ term }) => term);
 }
 
+const THEME_LOW_SIGNAL_TOKENS = new Set([
+  'abstract', 'academic', 'approach', 'based', 'chapter', 'chapters', 'current',
+  'data', 'findings', 'framework', 'method', 'methods', 'methodology',
+  'participant', 'participants', 'purpose', 'result', 'results', 'student',
+  'students', 'using'
+]);
+
+export function documentThemeTerms(doc, limit = 12) {
+  const text = [
+    doc?.title,
+    doc?.abstract,
+    Array.isArray(doc?.subjects) ? doc.subjects.join(' ') : doc?.subjects,
+    doc?.program,
+    doc?.degree,
+  ].join(' ');
+  const counts = countTermsFromText(text);
+  return Array.from(counts.entries())
+    .filter(([term]) => !THEME_LOW_SIGNAL_TOKENS.has(term))
+    .map(([term, count]) => {
+      const titleText = String(doc?.title || '').toLowerCase();
+      const subjectText = Array.isArray(doc?.subjects)
+        ? doc.subjects.join(' ').toLowerCase()
+        : String(doc?.subjects || '').toLowerCase();
+      const titleBonus = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(titleText) ? 2 : 0;
+      const subjectBonus = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(subjectText) ? 1 : 0;
+      return { term, score: count + titleBonus + subjectBonus, count };
+    })
+    .sort((a, b) => b.score - a.score || b.count - a.count || a.term.localeCompare(b.term))
+    .slice(0, limit)
+    .map(({ term }) => term);
+}
+
 export function buildWordCloud(records, maxTerms = 70) {
   const textForRecord = (rec) => [rec.title, rec.abstract, rec.subjects.join(' '), rec.program, rec.degree].join(' ');
   const df = buildDocumentFrequency(records, textForRecord);

@@ -13,7 +13,7 @@ import {
 import {
   toArray, flattenText, extractYear, parsePageCount, buildWordCloud,
   buildMethodologyStats, extractNgrams, detectMethodologies, isLowSignalConceptPhrase,
-  isLowSignalConceptTerm, buildDocumentFrequency, topTfidfTermsFromText
+  isLowSignalConceptTerm, documentThemeTerms
 } from './nlp.js';
 import { fetchPage, extractHits, resolveIndexName, collectCandidateUrls } from './api.js';
 import { enrichDocumentsWithFileAnalysis } from './pdf.js';
@@ -426,17 +426,6 @@ function docConceptTerms(rec, limit = 12, dict = null) {
     .sort((a, b) => b.score - a.score || b.count - a.count || a.canonical.localeCompare(b.canonical))
     .slice(0, limit)
     .map(({ canonical }) => canonical);
-}
-
-function themeTextForRecord(rec) {
-  return [rec.title, rec.abstract, rec.subjects.join(' '), rec.program, rec.degree].join(' ');
-}
-
-function assignTfidfThemes(records, limit = 12) {
-  const documentFrequency = buildDocumentFrequency(records, themeTextForRecord);
-  for (const rec of records) {
-    rec.themes = topTfidfTermsFromText(themeTextForRecord(rec), documentFrequency, records.length, limit);
-  }
 }
 
 function buildConceptCloud(records, maxTerms = 60) {
@@ -940,8 +929,10 @@ export function enrichDocumentSignals(records = []) {
     if (!rec.methodologies.length) {
       rec.methodologies = detectMethodologies([rec.title, rec.abstract, rec.subjects.join(' ')].join(' '));
     }
+    if (!rec.themes.length) {
+      rec.themes = documentThemeTerms(rec, 12);
+    }
   }
-  assignTfidfThemes(normalizedRecords);
   return normalizedRecords;
 }
 

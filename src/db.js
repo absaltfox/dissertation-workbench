@@ -7,6 +7,7 @@ import { logger } from './logger.js';
 import { dedupeSupervisorNames, normalizePersonName, supervisorNameKey } from './supervisors.js';
 import { encryptMfaSecret, decryptMfaSecret } from './secretCrypto.js';
 import { jaroWinkler } from './fuzzyMatch.js';
+import { documentThemeTerms } from './nlp.js';
 
 let db;
 let schemaReady;
@@ -409,7 +410,20 @@ function documentColumns(doc, syncKey = null, source = null) {
   };
 }
 
+function withStoredThemes(doc) {
+  if (!doc || typeof doc !== 'object') return doc;
+  const themes = Array.isArray(doc.themes)
+    ? doc.themes.map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
+  if (themes.length) return doc;
+  return {
+    ...doc,
+    themes: documentThemeTerms(doc, 12),
+  };
+}
+
 export async function saveDocumentMetadata(doc, { syncKey = null, source = null } = {}) {
+  doc = withStoredThemes(doc);
   const now = new Date().toISOString();
   const cols = documentColumns(doc, syncKey, source);
   await run(`
@@ -438,6 +452,7 @@ export async function saveDocumentMetadata(doc, { syncKey = null, source = null 
 }
 
 function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now = new Date().toISOString()) {
+  doc = withStoredThemes(doc);
   const cols = documentColumns(doc, syncKey, source);
   return {
     sql: `
@@ -503,6 +518,45 @@ export async function listAllDocumentMetadata() {
       return null;
     }
   }).filter(Boolean);
+}
+
+export async function recomputeStoredDocumentThemes({ limit = null, docIds = null, onProgress = null } = {}) {
+  let rows;
+  const requestedIds = Array.isArray(docIds) ? docIds.map((id) => String(id || '').trim()).filter(Boolean) : [];
+  if (requestedIds.length) {
+    rows = [];
+    const chunkSize = 999;
+    for (let i = 0; i < requestedIds.length; i += chunkSize) {
+      const chunk = requestedIds.slice(i, i + chunkSize);
+      const placeholders = chunk.map(() => '?').join(', ');
+      rows.push(...await all(`SELECT doc_id, metadata_json FROM documents WHERE doc_id IN (${placeholders}) ORDER BY doc_id`, chunk));
+    }
+  } else {
+    rows = await all('SELECT doc_id, metadata_json FROM documents ORDER BY doc_id');
+  }
+  const max = limit == null ? rows.length : Math.min(Number(limit) || 0, rows.length);
+  const client = await getDb();
+  let processed = 0;
+  let updated = 0;
+  let failed = 0;
+  for (const row of rows.slice(0, max)) {
+    processed += 1;
+    try {
+      const doc = JSON.parse(row.metadata_json);
+      const next = { ...doc, themes: documentThemeTerms(doc, 12) };
+      await client.execute({
+        sql: 'UPDATE documents SET metadata_json = ?, updated_at = ? WHERE doc_id = ?',
+        args: [JSON.stringify(next), new Date().toISOString(), row.doc_id],
+      });
+      updated += 1;
+    } catch {
+      failed += 1;
+    }
+    if (onProgress && (processed === max || processed % 50 === 0)) {
+      await onProgress({ processed, total: max, updated, failed });
+    }
+  }
+  return { processed, total: max, updated, failed };
 }
 
 export async function listCachedDocuments({ syncKey, limit = 1000, offset = 0 } = {}) {

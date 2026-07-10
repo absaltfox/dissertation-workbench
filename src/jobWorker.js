@@ -5,6 +5,7 @@ import {
 import { ADMIN_WORKER_TIMEOUT_MS } from './config.js';
 import { createWorkerArtifactClientFromEnv } from './workerArtifacts.js';
 import { runImportPdfAdminJob } from './services/importPdfJobRunner.js';
+import { runThemeRecomputeAdminJob } from './services/themeJobRunner.js';
 
 const jobId = Number(process.env.ADMIN_JOB_ID || 0);
 let finished = false;
@@ -45,7 +46,7 @@ async function main() {
   });
 
   let run;
-  if (claimed.type === 'bertopic' || claimed.type === 'topic_labels') {
+  if (claimed.type === 'bertopic' || claimed.type === 'topic_labels' || claimed.type === 'concept_rebuild') {
     const { spawn } = await import('node:child_process');
     const path = await import('node:path');
     const { fileURLToPath } = await import('node:url');
@@ -54,7 +55,10 @@ async function main() {
     const __filename = fileURLToPath(import.meta.url);
     const __dirname = path.dirname(__filename);
     const scriptPath = path.join(__dirname, '..', 'scripts', 'build-topics.py');
-    const args = claimed.type === 'topic_labels'
+    const conceptScriptPath = path.join(__dirname, '..', 'scripts', 'build-concepts.py');
+    const args = claimed.type === 'concept_rebuild'
+      ? [conceptScriptPath]
+      : claimed.type === 'topic_labels'
       ? [scriptPath, '--labels-only', ...(claimed.params?.topicId != null ? ['--topic-id', String(claimed.params.topicId)] : [])]
       : [scriptPath];
 
@@ -73,6 +77,8 @@ async function main() {
         else reject(new Error(`Local Python process exited with code ${code}`));
       });
     });
+  } else if (claimed.type === 'theme_recompute') {
+    run = runThemeRecomputeAdminJob(claimed);
   } else {
     run = runImportPdfAdminJob(claimed, {
       artifactClient: createWorkerArtifactClientFromEnv(),

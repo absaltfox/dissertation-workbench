@@ -14,6 +14,7 @@ let cancelAdminWorkerJob;
 let CatalogueLookupCancelledError;
 let WorkerArtifactClient;
 let runImportPdfAdminJob;
+let runThemeRecomputeAdminJob;
 let runCatalogueLookupJob;
 let runPendingCatalogueLookups;
 let analyzeDocumentFile;
@@ -30,6 +31,7 @@ let hasRunningAdminJob;
 let finishAdminJob;
 let getDb;
 let loadDocumentCitations;
+let loadDocumentMetadata;
 let listTopicLabelReviews;
 let loadCatalogueLookup;
 let loadStoredFileMetric;
@@ -95,6 +97,7 @@ test.before(async () => {
   ({ CatalogueLookupCancelledError, runPendingCatalogueLookups } = await import('../src/catalogue.js'));
   ({ WorkerArtifactClient } = await import('../src/workerArtifacts.js'));
   ({ runImportPdfAdminJob } = await import('../src/services/importPdfJobRunner.js'));
+  ({ runThemeRecomputeAdminJob } = await import('../src/services/themeJobRunner.js'));
   ({ analyzeDocumentFile } = await import('../src/pdf.js'));
   ({
     appendAdminJobLog,
@@ -110,6 +113,7 @@ test.before(async () => {
     finishAdminJob,
     getDb,
     loadDocumentCitations,
+    loadDocumentMetadata,
     listTopicLabelReviews,
     loadCatalogueLookup,
     loadStoredFileMetric,
@@ -202,6 +206,32 @@ test('topic label Fly worker payload uses labeler image and labels-only command'
   } finally {
     if (previousLabelerImage === undefined) delete process.env.LABELER_WORKER_IMAGE;
     else process.env.LABELER_WORKER_IMAGE = previousLabelerImage;
+  }
+});
+
+test('PatternRank concept rebuild Fly worker payload uses Python NLP worker', () => {
+  const previousBertopicImage = process.env.BERTOPIC_WORKER_IMAGE;
+  process.env.BERTOPIC_WORKER_IMAGE = 'registry.fly.io/dissertation-workbench:worker-latest';
+
+  try {
+    const payload = buildFlyWorkerMachinePayload({
+      image: 'registry.fly.io/dissertation-workbench:deployment-123',
+      jobId: 45,
+      token: 'secret-token',
+      timeoutMs: 12345,
+      jobType: 'concept_rebuild',
+    });
+
+    assert.equal(payload.config.image, 'registry.fly.io/dissertation-workbench:worker-latest');
+    assert.deepEqual(payload.config.init.exec, ['python3', 'scripts/build-concepts.py']);
+    assert.equal(payload.config.env.ADMIN_JOB_ID, '45');
+    assert.equal(payload.config.env.ADMIN_JOB_ARTIFACT_TOKEN, 'secret-token');
+    assert.equal(payload.config.env.HF_HUB_OFFLINE, '1');
+    assert.equal(payload.config.env.TRANSFORMERS_OFFLINE, '1');
+    assert.equal(payload.config.guest.memory_mb >= 2048, true);
+  } finally {
+    if (previousBertopicImage === undefined) delete process.env.BERTOPIC_WORKER_IMAGE;
+    else process.env.BERTOPIC_WORKER_IMAGE = previousBertopicImage;
   }
 });
 
@@ -454,6 +484,40 @@ test('one-shot job worker claims unsupported jobs and marks them failed', async 
   assert.equal(job.runnerState, 'failed');
   assert.match(job.error, /Unsupported import\/PDF admin job type/);
   assert.match(job.log, /Worker claimed job/);
+});
+
+test('theme recompute job refreshes durable document themes with progress', async () => {
+  await ensureStorage();
+  const docId = `theme-recompute-${Date.now()}`;
+  await saveDocumentMetadata({
+    id: docId,
+    title: 'Digital Equity in Rural Learning Communities',
+    author: 'Theme Runner',
+    abstract: 'Digital access, rural learning, and online teaching shaped community education.',
+    subjects: ['Educational technology', 'Rural education'],
+    themes: ['stale-theme'],
+  });
+  const jobId = await createAdminJob({
+    type: 'theme_recompute',
+    label: 'Stored Theme Recompute Test',
+    params: {},
+    runnerType: 'local',
+  });
+
+  const result = await runThemeRecomputeAdminJob(await getAdminJob(jobId));
+  const job = await getAdminJob(jobId);
+  const stored = await loadDocumentMetadata(docId);
+
+  assert.equal(result.ok, true);
+  assert.equal(job.status, 'completed');
+  assert.equal(job.runnerState, 'completed');
+  assert.equal(job.progress?.phase, 'complete');
+  assert.equal(job.progress?.counts?.updated >= 1, true);
+  assert.equal(result.processed >= 1, true);
+  assert.equal(Array.isArray(stored.themes), true);
+  assert.equal(stored.themes.includes('stale-theme'), false);
+  assert.ok(stored.themes.includes('digital') || stored.themes.includes('rural') || stored.themes.includes('learning'));
+  assert.match(job.log, /Stored theme recompute finished/);
 });
 
 test('Fly worker cancel preserves running state when machine destroy fails', async () => {

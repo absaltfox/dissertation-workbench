@@ -6,6 +6,8 @@ const {
   stemForSim,
   phraseSimilarity,
   extractDocPhrases,
+  isAcceptableConceptLabelExpression,
+  phraseContextSupportScore,
   computePhraseQuality,
   shouldKeepPhrase,
 } = _testing;
@@ -53,6 +55,47 @@ test('extractDocPhrases extracts bigrams and trigrams while filtering stop words
   assert.ok(!phrases.has('education policy'));
   // "this study explores" contains stop words "this", "study"
   assert.ok(!phrases.has('this study'));
+});
+
+test('concept label expression gate rejects rhetorical title fragments', () => {
+  assert.equal(isAcceptableConceptLabelExpression('educational technology'), true);
+  assert.equal(isAcceptableConceptLabelExpression('first nation communities'), true);
+  assert.equal(isAcceptableConceptLabelExpression('technology implementation among'), false);
+  assert.equal(isAcceptableConceptLabelExpression('cross cultural lens'), false);
+  assert.equal(isAcceptableConceptLabelExpression('lens reflection'), false);
+});
+
+test('extractDocPhrases rejects subtitle fragments from BC First Nation title example', () => {
+  const doc = {
+    title: 'Educational technology implementation among BC first nation communities : a cross-cultural lens reflection',
+    abstract: '',
+    subjects: [],
+  };
+
+  const phrases = extractDocPhrases(doc);
+
+  assert.ok(phrases.has('educational technology'));
+  assert.ok(phrases.has('educational technology implementation'));
+  assert.ok(phrases.has('first nation communities'));
+  assert.ok(!phrases.has('cross cultural lens'));
+  assert.ok(!phrases.has('cultural lens reflection'));
+  assert.ok(!phrases.has('lens reflection'));
+});
+
+test('phraseContextSupportScore rewards non-title evidence for concept reranking', () => {
+  const titleOnly = {
+    title: 'Educational technology implementation among BC first nation communities',
+    abstract: '',
+    subjects: [],
+  };
+  const supported = {
+    title: 'Educational technology implementation among BC first nation communities',
+    abstract: 'The dissertation studies educational technology in First Nation communities and local technology implementation.',
+    subjects: ['First Nations education', 'Educational technology'],
+  };
+
+  assert.ok(phraseContextSupportScore('educational technology', supported) > phraseContextSupportScore('educational technology', titleOnly));
+  assert.ok(phraseContextSupportScore('cross cultural lens', { title: 'A cross-cultural lens reflection', abstract: '', subjects: [] }) < 0.5);
 });
 
 test('computePhraseQuality computes score based on length and nested characteristics', () => {

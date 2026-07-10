@@ -6,6 +6,7 @@ import os from 'node:os';
 import request from 'supertest';
 import { app } from '../src/server.js';
 import { createSession, destroySession, getSessionCsrfToken } from '../src/auth.js';
+import { getConceptPipelineStatus } from '../src/conceptsPipeline.js';
 import {
   closeDb, createAdminJob, finishAdminJob, hashAdminJobToken, saveCitations,
   saveCommitteeMembers, saveDocumentMetadata, saveFileMetric
@@ -390,6 +391,47 @@ test('internal worker artifact endpoints require token and stream cache files', 
     .expect(401);
 
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+test('internal worker endpoint accepts concept dictionary artifacts for running jobs', async () => {
+  const token = 'concept-artifact-token-test';
+  const jobId = await createAdminJob({
+    type: 'concept_rebuild',
+    label: 'Concept Artifact Test',
+    params: { method: 'patternrank' },
+    artifactTokenHash: hashAdminJobToken(token),
+  });
+  const artifact = {
+    version: 2,
+    generatedAt: new Date().toISOString(),
+    source: { documents: 1, method: 'patternrank', model: 'test-model' },
+    stats: { concepts: 1, aliases: 0 },
+    concepts: [{ canonical: 'educational technology', variants: [], docFreq: 1, idf: 0, patternRankScore: 0.9 }],
+    variantToCanonical: {},
+  };
+
+  await request(app)
+    .put(`/api/internal/jobs/${jobId}/artifacts/concepts/latest`)
+    .send(artifact)
+    .set('content-type', 'application/json')
+    .expect('content-type', /application\/json/)
+    .expect(401);
+
+  const upload = await request(app)
+    .put(`/api/internal/jobs/${jobId}/artifacts/concepts/latest`)
+    .set('authorization', `Bearer ${token}`)
+    .set('content-type', 'application/json')
+    .send(artifact)
+    .expect('content-type', /application\/json/)
+    .expect(200);
+
+  assert.equal(upload.body.ok, true);
+  assert.equal(upload.body.stats.concepts, 1);
+  const status = await getConceptPipelineStatus();
+  assert.equal(status.stats.concepts, 1);
+  assert.match(status.message, /PatternRank concept rebuild completed/);
+
+  await finishAdminJob(jobId, { status: 'completed', runnerState: 'completed' });
 });
 
 test('admin cannot delete their own account', async () => {

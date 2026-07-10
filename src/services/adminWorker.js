@@ -83,17 +83,20 @@ async function resolveWorkerImage() {
 export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = ADMIN_WORKER_TIMEOUT_MS, jobType = null }) {
   const isBertopic = jobType === 'bertopic';
   const isTopicLabels = jobType === 'topic_labels';
+  const isConceptRebuild = jobType === 'concept_rebuild';
   const workerImage = isTopicLabels
     ? (process.env.LABELER_WORKER_IMAGE || LABELER_WORKER_IMAGE || process.env.BERTOPIC_WORKER_IMAGE || image)
-    : isBertopic
+    : isBertopic || isConceptRebuild
     ? (process.env.BERTOPIC_WORKER_IMAGE || image)
     : image;
   const execCmd = isTopicLabels
     ? ['python3', 'scripts/build-topics.py', '--labels-only']
+    : isConceptRebuild
+    ? ['python3', 'scripts/build-concepts.py']
     : isBertopic
     ? ['python3', 'scripts/build-topics.py']
     : ['node', 'src/jobWorker.js'];
-  const memoryMb = isBertopic || isTopicLabels
+  const memoryMb = isBertopic || isTopicLabels || isConceptRebuild
     ? Math.max(2048, FLY_WORKER_MEMORY_MB)
     : FLY_WORKER_MEMORY_MB;
 
@@ -103,6 +106,9 @@ export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = 
     ADMIN_WORKER_TIMEOUT_MS: String(timeoutMs),
     DOCUMENT_SYNC_ENABLED: '0',
     DOCUMENT_SYNC_ON_START: '0',
+    FLY_APP_NAME: process.env.FLY_APP_NAME || '',
+    PORT: process.env.PORT || '',
+    WORKER_ARTIFACT_BASE_URL: process.env.WORKER_ARTIFACT_BASE_URL || '',
     TURSO_DATABASE_URL: process.env.TURSO_DATABASE_URL || '',
     TURSO_AUTH_TOKEN: process.env.TURSO_AUTH_TOKEN || '',
     SQLITE_PATH: process.env.SQLITE_PATH || '',

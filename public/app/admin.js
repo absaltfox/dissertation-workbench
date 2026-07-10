@@ -69,6 +69,7 @@ const {
   previewImportRuleBtn,
   publishPassingTopicLabelsBtn,
   rebuildConceptsBtn,
+  recomputeThemesBtn,
   refreshCacheBtn,
   refreshJobsBtn,
   refreshMetadataRuleBtn,
@@ -115,6 +116,7 @@ function initAdmin() {
   saveSettingsBtn?.addEventListener('click', handleSaveSettings);
   syncDocumentsBtn?.addEventListener('click', handleSyncDocuments);
   rebuildConceptsBtn?.addEventListener('click', handleRebuildConcepts);
+  recomputeThemesBtn?.addEventListener('click', handleRecomputeThemes);
   importRuleForm?.addEventListener('submit', handleSaveImportRule);
   newImportRuleBtn?.addEventListener('click', () => setImportRuleForm({}));
   previewImportRuleBtn?.addEventListener('click', handlePreviewImportRule);
@@ -1073,14 +1075,39 @@ async function handleRebuildConcepts() {
       alert(data.error || 'Concept rebuild failed');
       return;
     }
-    const aliases = data.stats?.aliases ?? '?';
-    setStatus(`Concept rebuild complete (${aliases} aliases).`);
+    setStatus(data.alreadyRunning
+      ? `Concept rebuild is already running as job ${data.jobId}.`
+      : `Concept rebuild started as job ${data.jobId}.`);
+    await loadJobs();
     await loadConceptPipelineStatus();
   } catch {
     alert('Connection error');
   } finally {
     rebuildConceptsBtn.disabled = false;
     rebuildConceptsBtn.textContent = 'Rebuild Concept Dictionary';
+  }
+}
+
+async function handleRecomputeThemes() {
+  if (!recomputeThemesBtn) return;
+  recomputeThemesBtn.disabled = true;
+  recomputeThemesBtn.textContent = 'Recomputing...';
+  try {
+    const res = await fetch('/api/admin/themes/recompute', { method: 'POST', headers: csrfHeaders() });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || 'Theme recompute failed');
+      return;
+    }
+    setStatus(data.alreadyRunning
+      ? `Theme recompute is already running as job ${data.jobId}.`
+      : `Theme recompute started as job ${data.jobId}.`);
+    await loadJobs();
+  } catch {
+    alert('Connection error');
+  } finally {
+    recomputeThemesBtn.disabled = false;
+    recomputeThemesBtn.textContent = 'Recompute Stored Themes';
   }
 }
 
@@ -1096,6 +1123,12 @@ function summarizeJobResult(job) {
   }
   if (job.type === 'bertopic') {
     return `${formatNum(result.topics || 0)} topics, ${formatNum(result.assignedDocuments || 0)} documents`;
+  }
+  if (job.type === 'concept_rebuild') {
+    return `${formatNum(result.concepts || 0)} concepts, ${formatNum(result.candidates || 0)} candidates, ${formatNum(result.rejected || 0)} rejected`;
+  }
+  if (job.type === 'theme_recompute') {
+    return `${formatNum(result.updated || 0)} updated, ${formatNum(result.failed || 0)} failed`;
   }
   if (job.type === 'document_sync' || job.type === 'import_rules_sync') {
     return `${formatNum(result.totalSaved || 0)} saved, ${formatNum(result.totalSkipped || 0)} skipped`;
@@ -1141,6 +1174,12 @@ function formatJobCounts(counts = {}) {
   if (counts.found != null) parts.push(`${formatNum(counts.found)} found`);
   if (counts.notFound != null) parts.push(`${formatNum(counts.notFound)} not found`);
   if (counts.skipped != null) parts.push(`${formatNum(counts.skipped)} skipped`);
+  if (counts.candidates != null) parts.push(`${formatNum(counts.candidates)} candidates`);
+  if (counts.accepted != null) parts.push(`${formatNum(counts.accepted)} accepted`);
+  if (counts.rejected != null) parts.push(`${formatNum(counts.rejected)} rejected`);
+  if (counts.concepts != null) parts.push(`${formatNum(counts.concepts)} concepts`);
+  if (counts.aliases != null) parts.push(`${formatNum(counts.aliases)} aliases`);
+  if (counts.updated != null) parts.push(`${formatNum(counts.updated)} updated`);
   if (counts.failed != null) parts.push(`${formatNum(counts.failed)} failed`);
   if (counts.citations != null) parts.push(`${formatNum(counts.citations)} citations`);
   if (counts.fuzzyMatches != null) parts.push(`${formatNum(counts.fuzzyMatches)} fuzzy`);

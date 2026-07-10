@@ -1,0 +1,4 @@
+app = "dissertation-workbench"
+
+[build]
+  dockerfile = "Dockerfile.worker"

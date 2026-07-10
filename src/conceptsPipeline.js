@@ -56,11 +56,135 @@ const STRONG_HEAD_TOKENS = new Set([
   'research', 'health', 'curriculum', 'assessment', 'justice', 'knowledge'
 ]);
 
+const LABEL_CONNECTOR_TOKENS = new Set([
+  'aboard', 'about', 'above', 'across', 'after', 'against', 'along', 'among',
+  'around', 'before', 'behind', 'below', 'beneath', 'beside', 'between',
+  'beyond', 'during', 'except', 'following', 'inside', 'into', 'near',
+  'outside', 'through', 'toward', 'towards', 'under', 'until', 'within',
+  'without', 'because', 'whether', 'while', 'whereas'
+]);
+
+const LABEL_FRAGMENT_HEAD_TOKENS = new Set([
+  'aim', 'aims', 'area', 'areas', 'case', 'cases', 'chapter', 'chapters',
+  'component', 'components', 'context', 'contexts', 'example', 'examples',
+  'factor', 'factors', 'finding', 'findings', 'issue', 'issues', 'lens',
+  'level', 'levels', 'matter', 'matters', 'need', 'needs', 'pattern',
+  'patterns', 'problem', 'problems', 'reflection', 'reflections', 'result',
+  'results', 'role', 'roles', 'section', 'sections', 'theme', 'themes',
+  'topic', 'topics', 'view', 'views', 'way', 'ways'
+]);
+
+const LABEL_FRAGMENT_START_TOKENS = new Set([
+  'aim', 'aims', 'case', 'cases', 'cross', 'finding', 'findings', 'lens',
+  'reflection', 'reflections', 'result', 'results', 'role', 'roles',
+  'theme', 'themes', 'view', 'views'
+]);
+
+const KNOWN_LABEL_PHRASES = new Set([
+  'case study',
+  'cross cultural communication',
+  'cross cultural education',
+  'cross cultural learning',
+  'professional learning'
+]);
+
 function splitWords(text) {
   return canonicalizeDomainText(text)
     .split(/\s+/)
     .map((w) => w.trim())
     .filter(Boolean);
+}
+
+function normalizedPhrase(phrase) {
+  return String(phrase || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function containsContiguousTokens(words, tokens) {
+  if (!tokens.length || tokens.length > words.length) return false;
+  for (let i = 0; i <= words.length - tokens.length; i++) {
+    let ok = true;
+    for (let j = 0; j < tokens.length; j++) {
+      if (words[i + j] !== tokens[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return true;
+  }
+  return false;
+}
+
+function isAcceptableConceptLabelExpression(phrase) {
+  const normalized = normalizedPhrase(phrase);
+  if (!normalized) return false;
+  if (KNOWN_LABEL_PHRASES.has(normalized)) return true;
+
+  const tokens = normalized.split(' ').filter(Boolean);
+  if (tokens.length < 2 || tokens.length > 3) return false;
+  if (new Set(tokens).size < tokens.length) return false;
+  if (tokens.some((token) => LABEL_CONNECTOR_TOKENS.has(token))) return false;
+
+  const head = tokens[tokens.length - 1];
+  if (LABEL_FRAGMENT_HEAD_TOKENS.has(head)) return false;
+  if (LABEL_FRAGMENT_START_TOKENS.has(tokens[0]) && !KNOWN_LABEL_PHRASES.has(normalized)) return false;
+
+  // Avoid subtitle/rhetorical expressions such as "cross cultural lens" and
+  // "cultural lens reflection"; they read as prose framing, not concept labels.
+  if (tokens.some((token) => token === 'lens' || token === 'reflection' || token === 'reflections')) return false;
+
+  return true;
+}
+
+function conceptSegmentsForDoc(doc) {
+  const titleSegments = (doc.title || '').split(/[:;,]/).map((s) => s.trim()).filter(Boolean);
+  const abstractSegments = (doc.abstract || '').split(/[/,]/).map((s) => s.trim()).filter(Boolean);
+  const subjectSegments = (doc.subjects || []).join('/').split('/').map((s) => s.trim()).filter(Boolean);
+  return [
+    ...titleSegments.map((text) => ({ type: 'title', text })),
+    ...abstractSegments.map((text) => ({ type: 'abstract', text })),
+    ...subjectSegments.map((text) => ({ type: 'subject', text })),
+  ];
+}
+
+function phraseContextSupportScore(phrase, doc) {
+  const tokens = normalizedPhrase(phrase).split(' ').filter(Boolean);
+  if (!tokens.length) return 0;
+  let best = 0;
+  let titleHasPhrase = false;
+  let nonTitleTokenSupport = 0;
+  const nonTitleTokens = new Set();
+
+  for (const segment of conceptSegmentsForDoc(doc)) {
+    const words = splitWords(segment.text);
+    if (segment.type !== 'title') {
+      for (const word of words) nonTitleTokens.add(word);
+    }
+    if (!containsContiguousTokens(words, tokens)) continue;
+    if (segment.type === 'title') titleHasPhrase = true;
+    const sourceWeight = segment.type === 'subject' ? 1.1 : segment.type === 'abstract' ? 0.9 : 0.85;
+    const compactness = tokens.length / Math.max(tokens.length, words.length);
+    best = Math.max(best, sourceWeight + (compactness * 0.35));
+  }
+
+  for (const token of tokens) {
+    if (nonTitleTokens.has(token)) nonTitleTokenSupport += 1;
+  }
+
+  const head = tokens[tokens.length - 1];
+  if (STRONG_HEAD_TOKENS.has(head)) best += 0.2;
+  if (LABEL_FRAGMENT_HEAD_TOKENS.has(head)) best -= 0.75;
+  if (titleHasPhrase && nonTitleTokenSupport > 0) {
+    best += Math.min(0.35, (nonTitleTokenSupport / tokens.length) * 0.35);
+  }
+
+  return Math.max(0, Math.round(best * 1000) / 1000);
+}
+
+function phraseContextScore(phrase, docIndexes, docs) {
+  const ids = Array.from(docIndexes || []);
+  if (!ids.length) return 0;
+  const sum = ids.reduce((total, docIndex) => total + phraseContextSupportScore(phrase, docs[docIndex] || {}), 0);
+  return Math.round((sum / ids.length) * 1000) / 1000;
 }
 
 // Cardinal number words produce meaningless methodology phrases like "three schools",
@@ -109,6 +233,7 @@ function extractDocPhrases(doc, maxPerDoc = 140) {
         if (window.some(isSkippableToken)) continue;
         const phrase = window.join(' ');
         if (isLowSignalConceptPhrase(phrase)) continue;
+        if (!isAcceptableConceptLabelExpression(phrase)) continue;
         phrases.add(phrase);
         if (phrases.size >= maxPerDoc) return phrases;
       }
@@ -238,8 +363,10 @@ function computePhraseQuality(entry, nestedStats) {
   const strongHeadBoost = STRONG_HEAD_TOKENS.has(head) ? 0.5 : 0;
   const weakTokenPenalty = tokens.filter((t) => WEAK_ANYWHERE_TOKENS.has(t)).length * 0.35;
   const shortPenalty = tokens.length < 2 ? 0.5 : 0;
+  const labelPenalty = isAcceptableConceptLabelExpression(entry.phrase) ? 0 : 2.5;
+  const contextBoost = Math.min(0.75, Math.max(0, entry.contextScore || 0) * 0.25);
 
-  return cValue + strongHeadBoost - weakHeadPenalty - weakTokenPenalty - shortPenalty;
+  return cValue + strongHeadBoost + contextBoost - weakHeadPenalty - weakTokenPenalty - shortPenalty - labelPenalty;
 }
 
 function shouldKeepPhrase(entry, qualityScore) {
@@ -247,6 +374,8 @@ function shouldKeepPhrase(entry, qualityScore) {
   const hasWeakAnywhere = entry.tokens.some((t) => WEAK_ANYWHERE_TOKENS.has(t));
   const hasDisallowedLowSignal = entry.tokens.some((t) => DISALLOWED_LOW_SIGNAL_TOKENS.has(t));
 
+  if (!isAcceptableConceptLabelExpression(entry.phrase)) return false;
+  if ((entry.contextScore || 0) < 0.65 && entry.docFreq < 6 && !STRONG_HEAD_TOKENS.has(head)) return false;
   if (hasDisallowedLowSignal && entry.docFreq < 6) return false;
   if (WEAK_HEAD_TOKENS.has(head) && entry.docFreq < 3) return false;
   if (WEAK_HEAD_TOKENS.has(head)) {
@@ -265,7 +394,9 @@ function consolidateConcepts(concepts) {
     byCanonical.set(concept.canonical, {
       canonical: concept.canonical,
       variants: [...concept.variants],
-      docFreq: concept.docFreq
+      docFreq: concept.docFreq,
+      contextScore: concept.contextScore || 0,
+      qualityScore: concept.qualityScore || null
     });
   }
 
@@ -295,6 +426,10 @@ function consolidateConcepts(concepts) {
 
     target.variants.push(source.canonical, ...source.variants);
     target.variants = Array.from(new Set(target.variants.filter((v) => v !== target.canonical)));
+    target.contextScore = Math.max(target.contextScore || 0, source.contextScore || 0);
+    if (source.qualityScore != null) {
+      target.qualityScore = Math.max(target.qualityScore || 0, source.qualityScore);
+    }
     byCanonical.delete(source.canonical);
   }
 
@@ -323,6 +458,25 @@ export async function getConceptPipelineStatus() {
       message: 'No concept rebuild has run yet.'
     };
   }
+}
+
+export async function persistConceptArtifact(artifact, { trigger = 'worker', message = null } = {}) {
+  if (!artifact || typeof artifact !== 'object') {
+    throw new Error('Concept artifact must be an object.');
+  }
+  const generatedAt = artifact.generatedAt || new Date().toISOString();
+  artifact.generatedAt = generatedAt;
+  await ensureConceptPaths();
+  await fs.writeFile(LATEST_PATH, JSON.stringify(artifact, null, 2));
+  await writeStatus({
+    status: 'idle',
+    trigger,
+    lastRunAt: generatedAt,
+    lastSuccessAt: generatedAt,
+    message: message || `Concept rebuild completed (${artifact.stats?.aliases ?? 0} aliases).`,
+    stats: artifact.stats || null
+  });
+  return { ok: true, artifact };
 }
 
 async function acquireLock() {
@@ -375,7 +529,8 @@ export async function rebuildConceptDictionary({ trigger = 'manual' } = {}) {
       phraseStats.set(phrase, {
         phrase,
         docFreq: ids.size,
-        tokens: phrase.split(' ')
+        tokens: phrase.split(' '),
+        contextScore: phraseContextScore(phrase, ids, docs)
       });
     }
 
@@ -422,7 +577,9 @@ export async function rebuildConceptDictionary({ trigger = 'manual' } = {}) {
       concepts.push({
         canonical,
         variants,
-        docFreq
+        docFreq,
+        contextScore: filteredPhraseStats.get(canonical)?.contextScore || 0,
+        qualityScore: Math.round((qualityStats.get(canonical) || 0) * 1000) / 1000
       });
       for (const variant of variants) {
         variantToCanonical[variant] = canonical;
@@ -463,6 +620,9 @@ export async function rebuildConceptDictionary({ trigger = 'manual' } = {}) {
       if (tokens.some((t) => DISALLOWED_LOW_SIGNAL_TOKENS.has(t))) continue;
       if (multiDocCanonicals.has(phrase)) continue;
       if (variantToCanonical[phrase]) continue;
+      if (!isAcceptableConceptLabelExpression(phrase)) continue;
+      const contextScore = phraseContextScore(phrase, ids, docs);
+      if (contextScore < 0.8 && !STRONG_HEAD_TOKENS.has(head)) continue;
 
       // 2-gram nesting check: suppress if a containing 3-gram exists in
       // the same document's phrase set (prevents "undergoing significant"
@@ -488,7 +648,8 @@ export async function rebuildConceptDictionary({ trigger = 'manual' } = {}) {
         canonical: phrase,
         variants: [],
         docFreq: 1,
-        idf: Math.log((N + 1) / 2)
+        idf: Math.log((N + 1) / 2),
+        contextScore
       });
       multiDocCanonicals.add(phrase);
       singleDocCount.added += 1;
@@ -513,16 +674,7 @@ export async function rebuildConceptDictionary({ trigger = 'manual' } = {}) {
       variantToCanonical
     };
 
-    await ensureConceptPaths();
-    await fs.writeFile(LATEST_PATH, JSON.stringify(artifact, null, 2));
-    await writeStatus({
-      status: 'idle',
-      trigger,
-      lastRunAt: generatedAt,
-      lastSuccessAt: generatedAt,
-      message: `Concept rebuild completed (${artifact.stats.aliases} aliases).`,
-      stats: artifact.stats
-    });
+    await persistConceptArtifact(artifact, { trigger });
 
     logger.info('Concept dictionary rebuilt', artifact.stats);
     return { ok: true, artifact };
@@ -571,6 +723,8 @@ export const _testing = {
   stemForSim,
   phraseSimilarity,
   extractDocPhrases,
+  isAcceptableConceptLabelExpression,
+  phraseContextSupportScore,
   computePhraseQuality,
   shouldKeepPhrase,
 };

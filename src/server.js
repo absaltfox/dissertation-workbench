@@ -6,10 +6,11 @@ import {
   DEFAULT_TERM, DEFAULT_SOURCE, TRUST_PROXY, WORKBENCH_CACHE_REFRESH_MS, validateRuntimeSecrets
 } from './config.js';
 import {
-  checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb
+  checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb, hasRunningAdminJob
 } from './db.js';
 import { ensureDefaultAdmin } from './auth.js';
-import { getConceptPipelineStatus, rebuildConceptDictionary, scheduleDailyConceptRebuild } from './conceptsPipeline.js';
+import { getConceptPipelineStatus } from './conceptsPipeline.js';
+import { createAndStartAdminWorkerJob } from './services/adminWorker.js';
 import { logger } from './logger.js';
 import { getConfiguredApiKey } from './secrets.js';
 import { getTrustedClientIp } from './requestSecurity.js';
@@ -36,12 +37,51 @@ const metricsCache = new Map();
 const metricsInflight = new Map();
 let stopDailyConceptScheduler = null;
 let stopWorkbenchCacheWarmup = null;
+const DAILY_CONCEPT_REBUILD_HOUR_LOCAL = 2;
 
 // Sync pulls in the metrics/PDF pipeline and is only needed for admin import
 // workflows. Loading it lazily keeps normal API startup cheaper and avoids
 // unnecessary side effects during lightweight route tests.
 async function loadSyncModule() {
   return import('./sync.js');
+}
+
+function msUntilNextDailyConceptRebuild() {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(DAILY_CONCEPT_REBUILD_HOUR_LOCAL, 0, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  return next.getTime() - now.getTime();
+}
+
+async function startConceptRebuildJob(trigger) {
+  const runningId = await hasRunningAdminJob('concept_rebuild');
+  if (runningId) {
+    logger.info('Concept rebuild job already running', { trigger, jobId: runningId });
+    return { alreadyRunning: true, jobId: runningId };
+  }
+  const result = await createAndStartAdminWorkerJob({
+    type: 'concept_rebuild',
+    label: trigger === 'scheduled' ? 'Scheduled PatternRank Concept Rebuild' : 'Startup PatternRank Concept Rebuild',
+    params: { method: 'patternrank', trigger },
+  });
+  logger.info('Concept rebuild job started', { trigger, jobId: result.jobId, runnerType: result.runnerType });
+  return result;
+}
+
+function scheduleDailyConceptRebuildJob() {
+  let timer = null;
+  const scheduleNext = () => {
+    timer = setTimeout(() => {
+      startConceptRebuildJob('scheduled')
+        .catch((error) => logger.error('Scheduled concept rebuild job failed to start', { error: error?.message || String(error) }))
+        .finally(scheduleNext);
+    }, msUntilNextDailyConceptRebuild());
+  };
+  scheduleNext();
+  return () => {
+    if (timer) clearTimeout(timer);
+  };
 }
 
 // --- Request helpers ---
@@ -176,12 +216,12 @@ export async function start() {
   }, WORKBENCH_CACHE_REFRESH_MS);
   stopWorkbenchCacheWarmup = () => clearInterval(workbenchCacheWarmupTimer);
 
-  stopDailyConceptScheduler = scheduleDailyConceptRebuild();
-  logger.info('Scheduled daily concept rebuild job', { hourLocal: 2 });
+  stopDailyConceptScheduler = scheduleDailyConceptRebuildJob();
+  logger.info('Scheduled daily concept rebuild job', { hourLocal: DAILY_CONCEPT_REBUILD_HOUR_LOCAL });
   const conceptStatus = await getConceptPipelineStatus();
   if (!conceptStatus?.lastSuccessAt) {
-    rebuildConceptDictionary({ trigger: 'startup' }).catch((error) => {
-      logger.error('Startup concept rebuild failed', { error: error?.message || String(error) });
+    startConceptRebuildJob('startup').catch((error) => {
+      logger.error('Startup concept rebuild job failed to start', { error: error?.message || String(error) });
     });
   }
 

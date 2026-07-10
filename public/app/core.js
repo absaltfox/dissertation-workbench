@@ -81,6 +81,7 @@ const refreshBtn = document.getElementById('refreshBtn');
 const saveSettingsBtn = document.getElementById('saveSettingsBtn');
 const syncDocumentsBtn = document.getElementById('syncDocumentsBtn');
 const rebuildConceptsBtn = document.getElementById('rebuildConceptsBtn');
+const recomputeThemesBtn = document.getElementById('recomputeThemesBtn');
 const documentSyncStatusEl = document.getElementById('documentSyncStatus');
 const conceptPipelineStatusEl = document.getElementById('conceptPipelineStatus');
 const importRuleForm = document.getElementById('importRuleForm');
@@ -808,6 +809,7 @@ const dom = {
   saveSettingsBtn,
   syncDocumentsBtn,
   rebuildConceptsBtn,
+  recomputeThemesBtn,
   documentSyncStatusEl,
   conceptPipelineStatusEl,
   importRuleForm,

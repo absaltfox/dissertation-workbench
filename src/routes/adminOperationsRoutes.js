@@ -5,7 +5,7 @@ import {
   loadDocumentMetadata, hasRunningAdminJob
 } from '../db.js';
 import { deleteCachedPdf } from '../pdf.js';
-import { getConceptPipelineStatus, rebuildConceptDictionary } from '../conceptsPipeline.js';
+import { getConceptPipelineStatus } from '../conceptsPipeline.js';
 import { extractSearchTerms, runPendingCatalogueLookups } from '../catalogue.js';
 import { getConfiguredApiKey } from '../secrets.js';
 import { parseBooleanParam, parseNumberParam } from '../validate.js';
@@ -78,12 +78,33 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
   }));
 
   router.post('/concepts/rebuild', asyncHandler(async (_req, res) => {
-    const result = await rebuildConceptDictionary({ trigger: 'manual' });
-    if (!result.ok) {
-      res.status(409).json({ ok: false, error: result.error || 'Rebuild failed' });
+    const runningId = await hasRunningAdminJob('concept_rebuild');
+    if (runningId) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
       return;
     }
-    res.status(200).json({ ok: true, stats: result.artifact?.stats || null });
+    const result = await createAndStartAdminWorkerJob({
+      type: 'concept_rebuild',
+      label: 'PatternRank Concept Rebuild',
+      params: { method: 'patternrank' },
+    });
+    clearMetricsCache();
+    res.status(202).json({ ok: true, started: true, ...result });
+  }));
+
+  router.post('/themes/recompute', asyncHandler(async (_req, res) => {
+    const runningId = await hasRunningAdminJob('theme_recompute');
+    if (runningId) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
+      return;
+    }
+    const result = await createAndStartAdminWorkerJob({
+      type: 'theme_recompute',
+      label: 'Stored Theme Recompute',
+      params: { method: 'document_theme_terms' },
+    });
+    clearMetricsCache();
+    res.status(202).json({ ok: true, started: true, ...result });
   }));
 
   router.get('/catalogue-lookup/stats', asyncHandler(async (_req, res) => {

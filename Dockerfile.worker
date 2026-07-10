@@ -30,6 +30,7 @@ COPY --from=builder /root/.local /root/.local
 COPY --from=builder /root/.cache/huggingface /root/.cache/huggingface
 
 COPY scripts/build-topics.py ./scripts/build-topics.py
+COPY scripts/build-concepts.py ./scripts/build-concepts.py
 
 ENV PATH=/root/.local/bin:$PATH
 ENV PYTHONUNBUFFERED=1

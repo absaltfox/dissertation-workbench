@@ -6,6 +6,7 @@ import {
 import {
   saveFullTextArtifactForDoc, savePdfArtifactForDoc
 } from '../pdf.js';
+import { persistConceptArtifact } from '../conceptsPipeline.js';
 import { MAX_DOWNLOAD_BYTES } from '../config.js';
 import { asyncHandler } from '../middleware/http.js';
 
@@ -32,6 +33,14 @@ async function requireWorkerToken(req, res, next) {
   next();
 }
 
+async function requireJobWorkerToken(req, res, next) {
+  if (!await validateAdminJobArtifactToken(req.params.jobId, bearerToken(req))) {
+    res.status(401).json({ error: 'Invalid worker artifact token' });
+    return;
+  }
+  next();
+}
+
 async function sendArtifact(res, filePath, contentType) {
   if (!filePath) {
     res.status(404).json({ error: 'Artifact not found' });
@@ -49,7 +58,7 @@ async function sendArtifact(res, filePath, contentType) {
 export function createInternalWorkerRouter() {
   const router = Router();
   const rawBody = express.raw({
-    type: ['application/pdf', 'application/octet-stream', 'text/plain', 'text/*'],
+    type: ['application/pdf', 'application/octet-stream', 'application/json', 'text/plain', 'text/*'],
     limit: MAX_DOWNLOAD_BYTES,
   });
 
@@ -85,6 +94,34 @@ export function createInternalWorkerRouter() {
       sourceUrl: req.get('x-source-url') || '',
     });
     res.status(200).json(artifact);
+  }));
+
+  router.put('/jobs/:jobId/artifacts/concepts/latest', requireJobWorkerToken, rawBody, asyncHandler(async (req, res) => {
+    let artifact;
+    if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+      artifact = req.body;
+    } else {
+      const text = Buffer.isBuffer(req.body) ? req.body.toString('utf8') : String(req.body || '');
+      if (!text.trim()) {
+        res.status(400).json({ error: 'Concept artifact upload body is empty' });
+        return;
+      }
+      try {
+        artifact = JSON.parse(text);
+      } catch {
+        res.status(400).json({ error: 'Concept artifact upload body must be JSON' });
+        return;
+      }
+    }
+    if (!artifact || typeof artifact !== 'object') {
+      res.status(400).json({ error: 'Concept artifact upload body must be JSON' });
+      return;
+    }
+    const result = await persistConceptArtifact(artifact, {
+      trigger: 'worker',
+      message: `PatternRank concept rebuild completed (${artifact.stats?.concepts ?? 0} concepts).`,
+    });
+    res.status(200).json({ ok: true, stats: result.artifact?.stats || null });
   }));
 
   return router;

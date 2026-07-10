@@ -7,11 +7,14 @@ import {
   closeDb,
   ensureStorage,
   listCachedDocuments,
+  loadDocumentMetadata,
+  recomputeStoredDocumentThemes,
   saveCitations,
   saveCommitteeMembers,
   saveDocumentMetadata,
   saveFileMetric,
 } from '../src/db.js';
+import { enrichDocumentSignals } from '../src/metrics.js';
 
 test.after(async () => {
   await closeDb();
@@ -64,6 +67,76 @@ test('cached documents overlay persisted file metrics without enrichment work', 
   assert.equal(docs[0].fileBytes, 123456);
   assert.equal(docs[0].downloadStatus, 'downloaded');
   assert.equal(docs[0].downloadError, null);
+});
+
+test('document metadata saves durable themes for later cached reads', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const docId = `test-theme-storage-${suffix}`;
+  await saveDocumentMetadata({
+    id: docId,
+    title: 'Digital Equity and Rural Learning',
+    author: 'Theme Tester',
+    year: 2026,
+    abstract: 'Digital access and rural learning shaped online teaching.',
+    subjects: ['Educational technology', 'Rural education'],
+  });
+
+  const stored = await loadDocumentMetadata(docId);
+  assert.ok(Array.isArray(stored.themes));
+  assert.ok(stored.themes.includes('digital'));
+
+  const docs = await listCachedDocuments({ limit: 1000 });
+  const cached = docs.find((doc) => doc.id === docId);
+  assert.ok(cached);
+  assert.deepEqual(cached.themes, stored.themes);
+});
+
+test('metrics enrichment preserves stored themes instead of recomputing per request', () => {
+  const docs = enrichDocumentSignals([
+    {
+      id: 'stored-theme-doc',
+      title: 'Completely Different Vocabulary',
+      abstract: 'Completely different vocabulary appears repeatedly.',
+      subjects: ['Vocabulary'],
+      themes: ['persisted-theme'],
+      methodologies: [],
+      conceptTerms: [],
+    },
+    {
+      id: 'comparison-doc',
+      title: 'Vocabulary Comparison',
+      abstract: 'Vocabulary comparison text.',
+      subjects: ['Comparison'],
+      themes: ['comparison-theme'],
+      methodologies: [],
+      conceptTerms: [],
+    },
+  ]);
+
+  assert.deepEqual(docs[0].themes, ['persisted-theme']);
+  assert.deepEqual(docs[1].themes, ['comparison-theme']);
+});
+
+test('stored themes can be manually recomputed across documents', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const docId = `test-theme-recompute-${suffix}`;
+  await saveDocumentMetadata({
+    id: docId,
+    title: 'Community Literacy Practice',
+    author: 'Theme Tester',
+    year: 2026,
+    abstract: 'Community literacy practice and adult learning.',
+    subjects: ['Adult education'],
+    themes: ['stale'],
+  });
+
+  const result = await recomputeStoredDocumentThemes({ docIds: [docId] });
+  assert.ok(result.updated >= 1);
+  const stored = await loadDocumentMetadata(docId);
+  assert.ok(!stored.themes.includes('stale'));
+  assert.ok(stored.themes.includes('community') || stored.themes.includes('literacy'));
 });
 
 test('stored file metrics can overlay freshly fetched metadata records', async () => {
