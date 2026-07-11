@@ -72,18 +72,21 @@ test('permanent lookup failures are persisted and drain the pending queue', asyn
     error: 'Missing hits in batch output block',
   }));
 
+  const pendingBefore = (await listPendingLookups(100)).length;
+  assert.ok(pendingBefore >= 2, 'fixture should have pending citations to drain');
+
   const stats = await runPendingCatalogueLookups({
     pageSize: 2,
     isYazAvailable: async () => true,
     lookupBatch: failingBatch,
   });
-  // The new fuzzy-merge test added 2 extra distinct Fullan citations; total pending = 4.
-  assert.equal(stats.failed, 4);
+  // Assert failed count matches the pending citations we had before draining
+  assert.equal(stats.failed, pendingBefore);
 
   const stillPending = await listPendingLookups(10);
   assert.equal(stillPending.length, 0);
 
   const summary = await getCatalogueLookupStats();
-  assert.equal(summary.failed, 4);
+  assert.equal(summary.failed, pendingBefore);
   assert.equal(summary.pending, 0);
 });
