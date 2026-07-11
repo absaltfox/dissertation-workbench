@@ -74,7 +74,7 @@ function mockBitstreamFetch(retrieveResponse) {
 test('block pages served as PDFs are detected and reported as blocked', async () => {
   mockBitstreamFetch((url) => fakeResponse({
     body: '<html>Your request was blocked because our system detected unusual activity. Reference ID: abc. Sorry for the inconvenience.</html>',
-    contentType: 'text/html',
+    contentType: 'text/HTML',
     url,
   }));
   const result = await fetchPdfForDocument(doc);

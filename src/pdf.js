@@ -839,7 +839,7 @@ export async function fetchPdfForDocument(doc) {
     const looksLikePdf = result.bytes.subarray(0, 5).toString('latin1') === '%PDF-';
     if (!looksLikePdf) {
       const preview = result.bytes.subarray(0, 4096).toString('utf8');
-      if (result.contentType.includes('html') && detectDownloadBlockPage(preview)) {
+      if (result.contentType.toLowerCase().includes('html') && detectDownloadBlockPage(preview)) {
         logger.warn('PDF download blocked by security page', { docId: doc?.id });
         return { blocked: true, downloadUrl: result.finalUrl || retrieveUrl.toString() };
       }
