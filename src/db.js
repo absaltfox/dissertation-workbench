@@ -1526,6 +1526,7 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
   const existingCitations = (await all('SELECT id, citation_hash, citation_text, author, title, year FROM citations'))
     .map(prepareCitationForMatching);
   const matchIndex = buildCitationMatchIndex(existingCitations);
+  const linkedIds = [];
   const counts = {
     processed: 0,
     total: citations.length,
@@ -1599,6 +1600,7 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
         VALUES (?, ?, ?)
         ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
       `, [docId, matchedId, now]);
+      linkedIds.push(matchedId);
     } else {
       counts.newCitations += 1;
       await run(`
@@ -1625,6 +1627,7 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
           VALUES (?, ?, ?)
           ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
         `, [docId, row.id, now]);
+        linkedIds.push(row.id);
       }
     }
     counts.processed += 1;
@@ -1637,6 +1640,7 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
       });
     }
   }
+  return linkedIds;
 }
 
 export async function loadDocumentCitations(docId) {
@@ -1688,6 +1692,24 @@ export async function loadDocsByCitation(citationId) {
 
 export async function clearDocumentCitations(docId) {
   await run('DELETE FROM document_citations WHERE doc_id = ?', [docId]);
+  await exec('DELETE FROM catalogue_lookups WHERE citation_id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
+  await exec('DELETE FROM citations WHERE id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
+}
+
+export async function replaceDocumentCitationLinks(docId, keepCitationIds = []) {
+  const keep = new Set(
+    (keepCitationIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
+  );
+  const existing = await all('SELECT citation_id FROM document_citations WHERE doc_id = ?', [docId]);
+  const stale = existing
+    .map((row) => Number(row.citation_id))
+    .filter((id) => !keep.has(id));
+  const chunkSize = 900;
+  for (let i = 0; i < stale.length; i += chunkSize) {
+    const chunk = stale.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(', ');
+    await run(`DELETE FROM document_citations WHERE doc_id = ? AND citation_id IN (${placeholders})`, [docId, ...chunk]);
+  }
   await exec('DELETE FROM catalogue_lookups WHERE citation_id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
   await exec('DELETE FROM citations WHERE id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
 }

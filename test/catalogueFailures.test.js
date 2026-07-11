@@ -90,3 +90,30 @@ test('permanent lookup failures are persisted and drain the pending queue', asyn
   assert.equal(summary.failed, pendingBefore);
   assert.equal(summary.pending, 0);
 });
+
+test('re-extracting the same citations keeps catalogue lookups', async () => {
+  const db = await import('../src/db.js');
+  const hashFn = (text) => `keep-${text}`;
+  const docId = '1.0300001';
+  const citeA = 'Dewey, J. (1938). Experience and education. New York: Macmillan.';
+  const citeB = 'Freire, P. (1970). Pedagogy of the oppressed. New York: Continuum.';
+
+  const firstIds = await db.saveCitations(docId, [citeA, citeB], hashFn);
+  assert.equal(firstIds.length, 2);
+  await db.saveCatalogueLookup(firstIds[0], {
+    hits: 3, queryAuthor: 'Dewey', queryTitle: 'Experience and education', bibId: '12345',
+  });
+
+  // Simulate reparse: same citations extracted again, then stale-link pruning.
+  const secondIds = await db.saveCitations(docId, [citeA, citeB], hashFn);
+  await db.replaceDocumentCitationLinks(docId, secondIds);
+  assert.deepEqual([...secondIds].sort(), [...firstIds].sort());
+  const lookup = await db.loadCatalogueLookup(firstIds[0]);
+  assert.equal(Number(lookup.hits), 3);
+
+  // Reparse that drops citeB: its link, citation, and lookup are GC'd.
+  const thirdIds = await db.saveCitations(docId, [citeA], hashFn);
+  await db.replaceDocumentCitationLinks(docId, thirdIds);
+  const remaining = await db.loadDocumentCitations(docId);
+  assert.equal(remaining.length, 1);
+});

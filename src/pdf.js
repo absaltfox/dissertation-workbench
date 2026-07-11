@@ -10,7 +10,7 @@ import {
 } from './config.js';
 import {
   loadStoredFileMetric, saveFileMetric, saveDocumentMetadata, saveCommitteeMembers,
-  loadCommitteeMembers, saveCitations, clearDocumentCitations, loadDocumentCitations, deleteCommitteeMembersByRoles
+  loadCommitteeMembers, saveCitations, replaceDocumentCitationLinks, loadDocumentCitations, deleteCommitteeMembersByRoles
 } from './db.js';
 import { logger } from './logger.js';
 import { dedupeSupervisorNames } from './supervisors.js';
@@ -1626,11 +1626,12 @@ export async function extractAndSaveParsedData(doc, fullText, pdfPath, {
         status: 'completed',
         counts: { citations: citations.length },
       });
-      await clearDocumentCitations(doc.id);
+      let linkedIds = [];
       if (citations.length) {
-        await saveCitations(doc.id, citations, normalizeCitation, { onProgress });
+        linkedIds = await saveCitations(doc.id, citations, normalizeCitation, { onProgress });
       }
-      doc.citationCount = citations.length || (await loadDocumentCitations(doc.id)).length;
+      await replaceDocumentCitationLinks(doc.id, linkedIds);
+      doc.citationCount = (await loadDocumentCitations(doc.id)).length;
     } catch (err) {
       logger.warn('Failed to extract citations from PDF', { docId: doc.id, error: err.message });
     }
