@@ -311,9 +311,20 @@ function docNgrams(rec, limit = 8) {
     .map((entry) => entry.term);
 }
 
+const EMPTY_CONCEPT_DICT = {
+  canonicalSet: new Set(), variantMap: {}, idfMap: new Map(),
+  conceptMeta: new Map(), multiDocSet: new Set(), sourceDocuments: 0,
+};
+let conceptDictCache = { mtimeMs: -1, value: null };
+
 function loadConceptDictionary() {
+  const dictPath = path.join(DATA_DIR, 'concepts', 'latest.json');
   try {
-    const raw = fs.readFileSync(path.join(DATA_DIR, 'concepts', 'latest.json'), 'utf-8');
+    const stat = fs.statSync(dictPath);
+    if (conceptDictCache.value && conceptDictCache.mtimeMs === stat.mtimeMs) {
+      return conceptDictCache.value;
+    }
+    const raw = fs.readFileSync(dictPath, 'utf-8');
     const parsed = JSON.parse(raw);
     const conceptMeta = new Map();
     for (const concept of (parsed.concepts || [])) {
@@ -333,9 +344,11 @@ function loadConceptDictionary() {
     // co-occur across the corpus. Single-doc concepts (docFreq=1) dominate the
     // IDF-based ranking but are useless for co-occurrence analysis.
     const multiDocSet = new Set((parsed.concepts || []).filter((c) => (c.docFreq ?? 1) >= 2).map((c) => c.canonical));
-    return { canonicalSet, variantMap, idfMap, conceptMeta, multiDocSet, sourceDocuments };
+    const value = { canonicalSet, variantMap, idfMap, conceptMeta, multiDocSet, sourceDocuments };
+    conceptDictCache = { mtimeMs: stat.mtimeMs, value };
+    return value;
   } catch {
-    return { canonicalSet: new Set(), variantMap: {}, idfMap: new Map(), conceptMeta: new Map(), multiDocSet: new Set(), sourceDocuments: 0 };
+    return EMPTY_CONCEPT_DICT;
   }
 }
 

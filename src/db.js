@@ -902,11 +902,17 @@ export async function finishAdminJob(id, patch = {}) {
 
 export async function appendAdminJobLog(id, line, limit = 12000) {
   if (!id) return;
-  const row = await get('SELECT log FROM admin_jobs WHERE id = ?', [id]);
-  const previous = row?.log || '';
-  const text = `${previous}${previous && !previous.endsWith('\n') ? '\n' : ''}${String(line || '')}`;
-  const tailed = text.length > limit ? text.slice(text.length - limit) : text;
-  await updateAdminJob(id, { log: tailed });
+  const text = String(line || '');
+  if (!text) return;
+  await run(`
+    UPDATE admin_jobs
+    SET log = CASE
+      WHEN length(COALESCE(log, '') || ?) > ?
+        THEN substr(COALESCE(log, '') || ?, length(COALESCE(log, '') || ?) - ? + 1)
+      ELSE COALESCE(log, '') || ?
+    END
+    WHERE id = ?
+  `, [text, limit, text, text, limit, text, id]);
 }
 
 export async function getAdminJob(id) {

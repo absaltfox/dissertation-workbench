@@ -1011,3 +1011,12 @@ test('running jobs with no timeout and stale heartbeats get reaped', async () =>
   const job = await getAdminJob(jobId);
   assert.equal(job.status, 'timed_out');
 });
+
+test('appendAdminJobLog trims to the tail limit atomically', async () => {
+  const jobId = await createAdminJob({ type: 'log_test', label: 'Log test', params: null });
+  await appendAdminJobLog(jobId, 'first line\n');
+  await appendAdminJobLog(jobId, 'x'.repeat(50), 40);
+  const job = await getAdminJob(jobId);
+  assert.equal(job.log.length, 40);
+  assert.equal(job.log, 'x'.repeat(40));
+});
