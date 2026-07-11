@@ -9,6 +9,7 @@ let runPendingCatalogueLookups;
 let saveCitations;
 let listPendingLookups;
 let getCatalogueLookupStats;
+let getCitationStats;
 let closeDb;
 
 test.before(async () => {
@@ -22,6 +23,7 @@ test.before(async () => {
   saveCitations = db.saveCitations;
   listPendingLookups = db.listPendingLookups;
   getCatalogueLookupStats = db.getCatalogueLookupStats;
+  getCitationStats = db.getCitationStats;
   closeDb = db.closeDb;
   await db.ensureStorage();
 
@@ -35,6 +37,30 @@ test.before(async () => {
 test.after(async () => {
   await closeDb();
   await fs.rm(tempDir, { recursive: true, force: true });
+});
+
+test('saveCitations does not merge different works by the same author', async () => {
+  const hashFn = (text) => `h-${text}`;
+  await saveCitations('1.0200001', [
+    { text: 'Fullan, M. (1991). The new meaning of educational change. New York: Teachers College Press.', year: '1991' },
+  ], hashFn);
+  await saveCitations('1.0200002', [
+    { text: 'Fullan, M. (1992). The new meaning of successful school improvement. New York: Teachers College Press.', year: '1992' },
+  ], hashFn);
+  const stats = await getCitationStats();
+  // The 1991 and 1992 works are different — they must NOT be merged.
+  // getCitationStats counts all citations; the before() setup added 2 (Smith 1990, Jones 1991),
+  // so we now expect 4 total (2 pre-existing + 2 Fullan).
+  const fullanTotal = Number(stats.total_citations) - 2; // subtract pre-existing
+  assert.equal(fullanTotal, 2, `Expected 2 distinct Fullan citations, got ${fullanTotal} (total=${stats.total_citations})`);
+
+  // Same work, minimal OCR punctuation variant (trailing period dropped), same year: still merges.
+  await saveCitations('1.0200003', [
+    { text: 'Fullan, M. (1991). The new meaning of educational change. New York: Teachers College Press', year: '1991' },
+  ], hashFn);
+  const stats2 = await getCitationStats();
+  const fullanTotal2 = Number(stats2.total_citations) - 2;
+  assert.equal(fullanTotal2, 2, `OCR variant of same 1991 work should still merge; got ${fullanTotal2} (total=${stats2.total_citations})`);
 });
 
 test('permanent lookup failures are persisted and drain the pending queue', async () => {
@@ -51,12 +77,13 @@ test('permanent lookup failures are persisted and drain the pending queue', asyn
     isYazAvailable: async () => true,
     lookupBatch: failingBatch,
   });
-  assert.equal(stats.failed, 2);
+  // The new fuzzy-merge test added 2 extra distinct Fullan citations; total pending = 4.
+  assert.equal(stats.failed, 4);
 
   const stillPending = await listPendingLookups(10);
   assert.equal(stillPending.length, 0);
 
   const summary = await getCatalogueLookupStats();
-  assert.equal(summary.failed, 2);
+  assert.equal(summary.failed, 4);
   assert.equal(summary.pending, 0);
 });

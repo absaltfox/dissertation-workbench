@@ -1513,6 +1513,12 @@ function fuzzyMatchCandidates(index, text, itemYear) {
   return candidates.length ? candidates : index.all;
 }
 
+const FUZZY_CITATION_THRESHOLD = 0.94;
+
+function fuzzyYearsCompatible(a, b) {
+  return a == null || b == null || a === b;
+}
+
 export async function saveCitations(docId, citations, hashFn, { onProgress = null } = {}) {
   const now = new Date().toISOString();
   
@@ -1567,7 +1573,13 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
         }
       }
 
-      if (maxSim >= 0.90 && bestMatch) {
+      const incomingYear = citationMatchYear(typeof item === 'string' ? null : item.year)
+        ?? citationMatchYear(text);
+      if (
+        bestMatch
+        && maxSim >= FUZZY_CITATION_THRESHOLD
+        && fuzzyYearsCompatible(incomingYear, bestMatch.matchYear)
+      ) {
         matchedId = bestMatch.id;
         matchedHash = bestMatch.citation_hash;
         matchedBy = 'fuzzy';
