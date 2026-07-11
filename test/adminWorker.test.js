@@ -956,3 +956,28 @@ test('PDF analysis with artifact client saves web-owned durable PDF path', async
   assert.equal(stored.page_source, 'downloaded_pdf');
   assert.equal(stored.pdf_path.includes('oc-pdf-'), false);
 });
+
+test('fly worker payload forwards runtime credentials and throttles', () => {
+  const prev = {
+    UBC_API_KEY: process.env.UBC_API_KEY,
+    API_KEY_ENCRYPTION_KEY: process.env.API_KEY_ENCRYPTION_KEY,
+    PDF_DOWNLOAD_RATE_PER_MIN: process.env.PDF_DOWNLOAD_RATE_PER_MIN,
+    NODE_ENV: process.env.NODE_ENV,
+  };
+  process.env.UBC_API_KEY = 'test-oc-key';
+  process.env.API_KEY_ENCRYPTION_KEY = 'test-enc-key';
+  process.env.PDF_DOWNLOAD_RATE_PER_MIN = '4';
+  process.env.NODE_ENV = 'production';
+  try {
+    const payload = buildFlyWorkerMachinePayload({ image: 'img', jobId: 42, token: 'tok' });
+    assert.equal(payload.config.env.UBC_API_KEY, 'test-oc-key');
+    assert.equal(payload.config.env.API_KEY_ENCRYPTION_KEY, 'test-enc-key');
+    assert.equal(payload.config.env.PDF_DOWNLOAD_RATE_PER_MIN, '4');
+    assert.equal(payload.config.env.NODE_ENV, 'production');
+  } finally {
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
