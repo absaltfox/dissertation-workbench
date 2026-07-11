@@ -20,6 +20,13 @@ async function getPublicAdminSettings() {
   };
 }
 
+// Keys the admin UI saves (public/app/core.js getCurrentParams). apiKey has
+// its own encrypted path below; everything else is dropped.
+const ALLOWED_SETTING_KEYS = new Set([
+  'index', 'query', 'term', 'source', 'maxRecords', 'pageSize',
+  'scanLimit', 'subjectLimit', 'downloadFiles', 'recomputeFromCache',
+]);
+
 /**
  * Creates admin user and settings endpoints.
  *
@@ -137,6 +144,7 @@ export function createAdminUsersRouter() {
     const body = req.body || {};
     for (const [key, value] of Object.entries(body)) {
       if (key === 'apiKey') continue;
+      if (!ALLOWED_SETTING_KEYS.has(key)) continue;
       await setSetting(key, String(value));
     }
     if (Object.prototype.hasOwnProperty.call(body, 'apiKey')) {
