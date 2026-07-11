@@ -1733,6 +1733,7 @@ export async function getCatalogueLookupStats() {
       (SELECT COUNT(*) FROM catalogue_lookups) AS total,
       (SELECT COUNT(*) FROM catalogue_lookups WHERE hits > 0) AS found,
       (SELECT COUNT(*) FROM catalogue_lookups WHERE hits = 0) AS not_found,
+      (SELECT COUNT(*) FROM catalogue_lookups WHERE hits = -1) AS failed,
       (SELECT COUNT(*) FROM catalogue_lookups WHERE hits IS NULL) AS skipped,
       (
         (SELECT COUNT(*) FROM citations)
@@ -1749,6 +1750,7 @@ export async function getCatalogueLookupStats() {
     total: Number(row?.total || 0),
     found: Number(row?.found || 0),
     not_found: Number(row?.not_found || 0),
+    failed: Number(row?.failed || 0),
     skipped: Number(row?.skipped || 0),
     pending: Number(row?.pending || 0),
   };
