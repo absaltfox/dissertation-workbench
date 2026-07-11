@@ -964,9 +964,12 @@ export async function validateAdminJobArtifactToken(id, token, { docId = null } 
   return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
 }
 
+const STALE_HEARTBEAT_MS = 30 * 60 * 1000;
+
 export async function reapStaleAdminJobs(type = null) {
   const now = new Date().toISOString();
-  const args = [now, now];
+  const staleCutoff = new Date(Date.now() - STALE_HEARTBEAT_MS).toISOString();
+  const args = [now, now, staleCutoff];
   let sql = `
     UPDATE admin_jobs
     SET status = 'timed_out',
@@ -975,8 +978,10 @@ export async function reapStaleAdminJobs(type = null) {
         finished_at = ?,
         artifact_token_hash = NULL
     WHERE status = 'running'
-      AND timeout_at IS NOT NULL
-      AND timeout_at <= ?
+      AND (
+        (timeout_at IS NOT NULL AND timeout_at <= ?)
+        OR (timeout_at IS NULL AND COALESCE(heartbeat_at, claimed_at, started_at) <= ?)
+      )
   `;
   if (type) {
     sql += ' AND type = ?';

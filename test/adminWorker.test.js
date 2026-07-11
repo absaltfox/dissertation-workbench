@@ -28,6 +28,7 @@ let getAdminJob;
 let hashAdminJobToken;
 let heartbeatAdminJob;
 let hasRunningAdminJob;
+let updateAdminJob;
 let finishAdminJob;
 let getDb;
 let loadDocumentCitations;
@@ -127,6 +128,7 @@ test.before(async () => {
     selectTopicLabelCandidate,
     updateTopicManualLabel,
     deleteTopicLabelOverride,
+    updateAdminJob,
     validateAdminJobArtifactToken,
   } = await import('../src/db.js'));
 });
@@ -993,4 +995,19 @@ test('fly worker payload forwards runtime credentials and throttles', () => {
       else process.env[key] = value;
     }
   }
+});
+
+test('running jobs with no timeout and stale heartbeats get reaped', async () => {
+  const jobId = await createAdminJob({
+    type: 'catalogue_lookup_reap_test',
+    label: 'Stale lookup',
+    params: null,
+  });
+  const stale = new Date(Date.now() - 45 * 60 * 1000).toISOString();
+  await updateAdminJob(jobId, { heartbeatAt: stale });
+
+  const runningId = await hasRunningAdminJob('catalogue_lookup_reap_test');
+  assert.equal(runningId, null);
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'timed_out');
 });
