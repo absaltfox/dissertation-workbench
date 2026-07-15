@@ -28,6 +28,7 @@ let getAdminJob;
 let hashAdminJobToken;
 let heartbeatAdminJob;
 let hasRunningAdminJob;
+let updateAdminJob;
 let finishAdminJob;
 let getDb;
 let loadDocumentCitations;
@@ -99,6 +100,8 @@ test.before(async () => {
   ({ runImportPdfAdminJob } = await import('../src/services/importPdfJobRunner.js'));
   ({ runThemeRecomputeAdminJob } = await import('../src/services/themeJobRunner.js'));
   ({ analyzeDocumentFile } = await import('../src/pdf.js'));
+  const { _setDownloadSafetyOptionsForTests } = await import('../src/pdf.js');
+  _setDownloadSafetyOptionsForTests({ resolveHost: async () => [{ address: '142.103.96.1' }] });
   ({
     appendAdminJobLog,
     claimAdminJob,
@@ -125,6 +128,7 @@ test.before(async () => {
     selectTopicLabelCandidate,
     updateTopicManualLabel,
     deleteTopicLabelOverride,
+    updateAdminJob,
     validateAdminJobArtifactToken,
   } = await import('../src/db.js'));
 });
@@ -953,4 +957,66 @@ test('PDF analysis with artifact client saves web-owned durable PDF path', async
   assert.equal(Number(stored.page_count), 1);
   assert.equal(stored.page_source, 'downloaded_pdf');
   assert.equal(stored.pdf_path.includes('oc-pdf-'), false);
+});
+
+test('fly worker payload forwards runtime credentials and throttles', () => {
+  const keys = [
+    'UBC_API_KEY', 'API_KEY_ENCRYPTION_KEY', 'PDF_DOWNLOAD_RATE_PER_MIN', 'NODE_ENV',
+    'UBC_API_BASE_URL', 'GROBID_URL', 'GROBID_APP_NAME', 'GROBID_FLY_API_TOKEN', 'FLY_API_TOKEN',
+  ];
+  const prev = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  process.env.UBC_API_KEY = 'test-oc-key';
+  process.env.API_KEY_ENCRYPTION_KEY = 'test-enc-key';
+  process.env.PDF_DOWNLOAD_RATE_PER_MIN = '4';
+  process.env.NODE_ENV = 'production';
+  process.env.UBC_API_BASE_URL = 'https://oc-index.test';
+  process.env.GROBID_URL = 'http://grobid.test:8070';
+  process.env.GROBID_APP_NAME = 'wb-grobid';
+  process.env.GROBID_FLY_API_TOKEN = 'grobid-token';
+  process.env.FLY_API_TOKEN = 'fly-token';
+  try {
+    const payload = buildFlyWorkerMachinePayload({ image: 'img', jobId: 42, token: 'tok' });
+    assert.equal(payload.config.env.UBC_API_KEY, 'test-oc-key');
+    assert.equal(payload.config.env.API_KEY_ENCRYPTION_KEY, 'test-enc-key');
+    assert.equal(payload.config.env.PDF_DOWNLOAD_RATE_PER_MIN, '4');
+    assert.equal(payload.config.env.NODE_ENV, 'production');
+    assert.equal(payload.config.env.UBC_API_BASE_URL, 'https://oc-index.test');
+    assert.equal(payload.config.env.GROBID_URL, 'http://grobid.test:8070');
+    assert.equal(payload.config.env.GROBID_APP_NAME, 'wb-grobid');
+    assert.equal(payload.config.env.GROBID_FLY_API_TOKEN, 'grobid-token');
+
+    // Fallback branch: without GROBID_FLY_API_TOKEN, FLY_API_TOKEN is used.
+    delete process.env.GROBID_FLY_API_TOKEN;
+    const fallback = buildFlyWorkerMachinePayload({ image: 'img', jobId: 43, token: 'tok' });
+    assert.equal(fallback.config.env.GROBID_FLY_API_TOKEN, 'fly-token');
+  } finally {
+    for (const [key, value] of Object.entries(prev)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('running jobs with no timeout and stale heartbeats get reaped', async () => {
+  const jobId = await createAdminJob({
+    type: 'catalogue_lookup_reap_test',
+    label: 'Stale lookup',
+    params: null,
+  });
+  const stale = new Date(Date.now() - 45 * 60 * 1000).toISOString();
+  await updateAdminJob(jobId, { heartbeatAt: stale });
+
+  const runningId = await hasRunningAdminJob('catalogue_lookup_reap_test');
+  assert.equal(runningId, null);
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'timed_out');
+});
+
+test('appendAdminJobLog trims to the tail limit atomically', async () => {
+  const jobId = await createAdminJob({ type: 'log_test', label: 'Log test', params: null });
+  await appendAdminJobLog(jobId, 'first line\n');
+  await appendAdminJobLog(jobId, 'x'.repeat(50), 40);
+  const job = await getAdminJob(jobId);
+  assert.equal(job.log.length, 40);
+  assert.equal(job.log, 'x'.repeat(40));
 });

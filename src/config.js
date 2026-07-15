@@ -36,7 +36,7 @@ export const WORKBENCH_CACHE_REFRESH_MS = Number(process.env.WORKBENCH_CACHE_REF
 export const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024; // 200 MB
 export const DOWNLOAD_TIMEOUT_MS = 30_000; // 30 seconds
 export const TRUST_PROXY = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '');
-export const PDF_ALLOWED_HOSTS = (process.env.PDF_ALLOWED_HOSTS || 'open.library.ubc.ca,oc-index.library.ubc.ca')
+export const PDF_ALLOWED_HOSTS = (process.env.PDF_ALLOWED_HOSTS || 'open.library.ubc.ca,oc-index.library.ubc.ca,circle.library.ubc.ca')
   .split(',')
   .map((host) => host.trim().toLowerCase())
   .filter(Boolean);

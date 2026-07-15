@@ -607,6 +607,18 @@ export async function runPendingCatalogueLookups({
         pageFailed++;
         continue;
       }
+      if (result.error) {
+        // Permanent failure (unparseable output, bad query): record hits = -1 so
+        // this citation leaves the pending queue instead of being retried forever.
+        await saveCatalogueLookup(pending[i].id, {
+          hits: -1,
+          queryAuthor: result.author,
+          queryTitle: result.title,
+          bibId: null,
+        });
+        totalFailed++;
+        continue;
+      }
       await saveCatalogueLookup(pending[i].id, {
         hits: result.hits,
         queryAuthor: result.author,

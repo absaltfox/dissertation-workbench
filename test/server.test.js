@@ -283,15 +283,17 @@ test('metrics reads from stored app tables without Open Collections fetches', as
 
     assert.equal(res.body.source.servedFromCache, true);
     assert.equal(res.body.source.documentCache.exactSyncKeyMatch, false);
-    assert.equal(res.body.documents.length, 1);
-    assert.equal(res.body.documents[0].id, docId);
-    assert.equal(res.body.documents[0].pages, 180);
-    assert.equal(res.body.documents[0].wordCount, 50000);
-    assert.equal(res.body.documents[0].bodyWordCount, 47000);
-    assert.equal(res.body.documents[0].citationCount, 1);
-    assert.deepEqual(res.body.documents[0].supervisors, ['Sam Supervisor']);
-    assert.ok(res.body.documents[0].committee.some((member) => member.role === 'University Examiner'));
-    assert.ok(res.body.documents[0].committee.some((member) => member.role === 'External Examiner'));
+    // Full corpus is now returned; maxRecords no longer truncates cached reads.
+    assert.ok(res.body.documents.length >= 1);
+    const storedDoc = res.body.documents.find((d) => d.id === docId);
+    assert.ok(storedDoc, 'stored fixture document should be present in full corpus');
+    assert.equal(storedDoc.pages, 180);
+    assert.equal(storedDoc.wordCount, 50000);
+    assert.equal(storedDoc.bodyWordCount, 47000);
+    assert.equal(storedDoc.citationCount, 1);
+    assert.deepEqual(storedDoc.supervisors, ['Sam Supervisor']);
+    assert.ok(storedDoc.committee.some((member) => member.role === 'University Examiner'));
+    assert.ok(storedDoc.committee.some((member) => member.role === 'External Examiner'));
   } finally {
     globalThis.fetch = originalFetch;
   }

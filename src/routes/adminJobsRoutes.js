@@ -3,11 +3,12 @@ import {
   countPendingLookups, createAdminJob, getCatalogueLookupStats, getTopicBuildStatus,
   hasRunningAdminJob, listAdminJobs, listPendingLookups, listRecentSyncRuns
 } from '../db.js';
+import { ADMIN_WORKER_TIMEOUT_MS } from '../config.js';
 import { extractSearchTerms } from '../catalogue.js';
 import { getConceptPipelineStatus } from '../conceptsPipeline.js';
 import { parseBooleanParam, parseNumberParam } from '../validate.js';
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
-import { cancelInProcessAdminJob, isAdminJobRunning, runCatalogueLookupJob } from '../services/adminJobs.js';
+import { cancelInProcessAdminJob, runCatalogueLookupJob } from '../services/adminJobs.js';
 import { cancelAdminWorkerJob, createAndStartAdminWorkerJob } from '../services/adminWorker.js';
 
 /**
@@ -63,9 +64,7 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
       return;
     }
 
-    const runningId = isAdminJobRunning('catalogue_lookup')
-      ? (await hasRunningAdminJob('catalogue_lookup'))
-      : await hasRunningAdminJob('catalogue_lookup');
+    const runningId = await hasRunningAdminJob('catalogue_lookup');
     if (runningId) {
       res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
       return;
@@ -74,6 +73,7 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
       type: 'catalogue_lookup',
       label: 'Z39.50 Catalogue Lookups',
       params: { limit, pendingOnly: true },
+      timeoutAt: new Date(Date.now() + ADMIN_WORKER_TIMEOUT_MS).toISOString(),
     });
     // Run out-of-band so catalogue lookups do not hold the HTTP connection open.
     runCatalogueLookupJob(jobId, limit);

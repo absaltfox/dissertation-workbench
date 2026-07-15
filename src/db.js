@@ -559,7 +559,7 @@ export async function recomputeStoredDocumentThemes({ limit = null, docIds = nul
   return { processed, total: max, updated, failed };
 }
 
-export async function listCachedDocuments({ syncKey, limit = 1000, offset = 0 } = {}) {
+export async function listCachedDocuments({ syncKey, limit = null, offset = 0 } = {}) {
   const args = [];
   let sql = `
     SELECT d.doc_id, d.metadata_json,
@@ -572,8 +572,11 @@ export async function listCachedDocuments({ syncKey, limit = 1000, offset = 0 } 
     sql += ' WHERE d.sync_key = ?';
     args.push(syncKey);
   }
-  sql += ' ORDER BY d.year DESC, d.title LIMIT ? OFFSET ?';
-  args.push(limit, offset);
+  sql += ' ORDER BY d.year DESC, d.title';
+  if (limit != null) {
+    sql += ' LIMIT ? OFFSET ?';
+    args.push(limit, offset);
+  }
   const rows = await all(sql, args);
   return rows.map((row) => {
     try {
@@ -899,11 +902,17 @@ export async function finishAdminJob(id, patch = {}) {
 
 export async function appendAdminJobLog(id, line, limit = 12000) {
   if (!id) return;
-  const row = await get('SELECT log FROM admin_jobs WHERE id = ?', [id]);
-  const previous = row?.log || '';
-  const text = `${previous}${previous && !previous.endsWith('\n') ? '\n' : ''}${String(line || '')}`;
-  const tailed = text.length > limit ? text.slice(text.length - limit) : text;
-  await updateAdminJob(id, { log: tailed });
+  const text = String(line || '');
+  if (!text) return;
+  await run(`
+    UPDATE admin_jobs
+    SET log = CASE
+      WHEN length(COALESCE(log, '') || ?) > ?
+        THEN substr(COALESCE(log, '') || ?, length(COALESCE(log, '') || ?) - ? + 1)
+      ELSE COALESCE(log, '') || ?
+    END
+    WHERE id = ?
+  `, [text, limit, text, text, limit, text, id]);
 }
 
 export async function getAdminJob(id) {
@@ -961,9 +970,12 @@ export async function validateAdminJobArtifactToken(id, token, { docId = null } 
   return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
 }
 
+const STALE_HEARTBEAT_MS = 30 * 60 * 1000;
+
 export async function reapStaleAdminJobs(type = null) {
   const now = new Date().toISOString();
-  const args = [now, now];
+  const staleCutoff = new Date(Date.now() - STALE_HEARTBEAT_MS).toISOString();
+  const args = [now, now, staleCutoff];
   let sql = `
     UPDATE admin_jobs
     SET status = 'timed_out',
@@ -972,8 +984,10 @@ export async function reapStaleAdminJobs(type = null) {
         finished_at = ?,
         artifact_token_hash = NULL
     WHERE status = 'running'
-      AND timeout_at IS NOT NULL
-      AND timeout_at <= ?
+      AND (
+        (timeout_at IS NOT NULL AND timeout_at <= ?)
+        OR (timeout_at IS NULL AND COALESCE(heartbeat_at, claimed_at, started_at) <= ?)
+      )
   `;
   if (type) {
     sql += ' AND type = ?';
@@ -1103,6 +1117,10 @@ export async function saveRunMetrics(source, metrics) {
     INSERT INTO metric_runs (run_key, source_json, metrics_json, created_at)
     VALUES (?, ?, ?, ?)
   `, [runKey, JSON.stringify(source), JSON.stringify(metrics), now]);
+  await run(`
+    DELETE FROM metric_runs
+    WHERE id NOT IN (SELECT id FROM metric_runs ORDER BY created_at DESC, id DESC LIMIT 100)
+  `);
 }
 
 export async function listRecentRuns(limit = 50) {
@@ -1501,6 +1519,12 @@ function fuzzyMatchCandidates(index, text, itemYear) {
   return candidates.length ? candidates : index.all;
 }
 
+const FUZZY_CITATION_THRESHOLD = 0.94;
+
+function fuzzyYearsCompatible(a, b) {
+  return a == null || b == null || a === b;
+}
+
 export async function saveCitations(docId, citations, hashFn, { onProgress = null } = {}) {
   const now = new Date().toISOString();
   
@@ -1508,6 +1532,7 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
   const existingCitations = (await all('SELECT id, citation_hash, citation_text, author, title, year FROM citations'))
     .map(prepareCitationForMatching);
   const matchIndex = buildCitationMatchIndex(existingCitations);
+  const linkedIds = [];
   const counts = {
     processed: 0,
     total: citations.length,
@@ -1555,7 +1580,13 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
         }
       }
 
-      if (maxSim >= 0.90 && bestMatch) {
+      const incomingYear = citationMatchYear(typeof item === 'string' ? null : item.year)
+        ?? citationMatchYear(text);
+      if (
+        bestMatch
+        && maxSim >= FUZZY_CITATION_THRESHOLD
+        && fuzzyYearsCompatible(incomingYear, bestMatch.matchYear)
+      ) {
         matchedId = bestMatch.id;
         matchedHash = bestMatch.citation_hash;
         matchedBy = 'fuzzy';
@@ -1575,6 +1606,7 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
         VALUES (?, ?, ?)
         ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
       `, [docId, matchedId, now]);
+      linkedIds.push(matchedId);
     } else {
       counts.newCitations += 1;
       await run(`
@@ -1601,6 +1633,7 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
           VALUES (?, ?, ?)
           ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
         `, [docId, row.id, now]);
+        linkedIds.push(row.id);
       }
     }
     counts.processed += 1;
@@ -1613,6 +1646,7 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
       });
     }
   }
+  return linkedIds;
 }
 
 export async function loadDocumentCitations(docId) {
@@ -1664,6 +1698,24 @@ export async function loadDocsByCitation(citationId) {
 
 export async function clearDocumentCitations(docId) {
   await run('DELETE FROM document_citations WHERE doc_id = ?', [docId]);
+  await exec('DELETE FROM catalogue_lookups WHERE citation_id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
+  await exec('DELETE FROM citations WHERE id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
+}
+
+export async function replaceDocumentCitationLinks(docId, keepCitationIds = []) {
+  const keep = new Set(
+    (keepCitationIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
+  );
+  const existing = await all('SELECT citation_id FROM document_citations WHERE doc_id = ?', [docId]);
+  const stale = existing
+    .map((row) => Number(row.citation_id))
+    .filter((id) => !keep.has(id));
+  const chunkSize = 900;
+  for (let i = 0; i < stale.length; i += chunkSize) {
+    const chunk = stale.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(', ');
+    await run(`DELETE FROM document_citations WHERE doc_id = ? AND citation_id IN (${placeholders})`, [docId, ...chunk]);
+  }
   await exec('DELETE FROM catalogue_lookups WHERE citation_id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
   await exec('DELETE FROM citations WHERE id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
 }
@@ -1721,6 +1773,7 @@ export async function getCatalogueLookupStats() {
       (SELECT COUNT(*) FROM catalogue_lookups) AS total,
       (SELECT COUNT(*) FROM catalogue_lookups WHERE hits > 0) AS found,
       (SELECT COUNT(*) FROM catalogue_lookups WHERE hits = 0) AS not_found,
+      (SELECT COUNT(*) FROM catalogue_lookups WHERE hits = -1) AS failed,
       (SELECT COUNT(*) FROM catalogue_lookups WHERE hits IS NULL) AS skipped,
       (
         (SELECT COUNT(*) FROM citations)
@@ -1737,6 +1790,7 @@ export async function getCatalogueLookupStats() {
     total: Number(row?.total || 0),
     found: Number(row?.found || 0),
     not_found: Number(row?.not_found || 0),
+    failed: Number(row?.failed || 0),
     skipped: Number(row?.skipped || 0),
     pending: Number(row?.pending || 0),
   };

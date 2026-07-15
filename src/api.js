@@ -99,8 +99,6 @@ export async function fetchPage({ baseUrl, index, apiKey, from, pageSize, query,
     params.push(`source=${encodedSource}`);
   }
 
-  if (apiKey) params.push(`api_key=${encodeURIComponent(apiKey)}`);
-
   const searchUrl = `${apiRoot}?${params.join('&')}`;
   logger.info('API fetch', { url: searchUrl.replace(/api_key=[^&]+/, 'api_key=***') });
 
@@ -148,8 +146,6 @@ export async function fetchSearchAggregations({ baseUrl, index, apiKey, query, t
       .replace(/%20/gi, '+');
     params.push(`term=${encodedTerm}`);
   }
-  if (apiKey) params.push(`api_key=${encodeURIComponent(apiKey)}`);
-
   const searchUrl = `${apiRoot}?${params.join('&')}`;
   logger.info('API aggregation fetch', { url: searchUrl.replace(/api_key=[^&]+/, 'api_key=***') });
 
@@ -211,7 +207,6 @@ export async function resolveIndexName(baseUrl, requestedIndex, apiKey) {
   }
 
   const url = new URL('/collections', baseUrl);
-  if (apiKey) url.searchParams.set('api_key', apiKey);
 
   try {
     const res = await fetch(url, { headers });

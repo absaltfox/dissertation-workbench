@@ -13,6 +13,7 @@ import { getConfiguredApiKey } from '../secrets.js';
 import { parseBooleanParam, parseNumberParam, validateMetricsParams } from '../validate.js';
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
 import { hasValidCsrf } from '../middleware/adminAuth.js';
+import { stripMiddleInitials, supervisorNameKey } from '../supervisors.js';
 
 const WORKBENCH_SLICE_TTL_MS = CACHE_TTL_MS;
 
@@ -83,18 +84,11 @@ async function parseMetricsRequest(req, res) {
 
 export function sourceCacheKey(params) {
   return JSON.stringify({
-    maxRecords: params.maxRecords,
-    pageSize: params.pageSize,
-    scanLimit: params.scanLimit,
     subjectLimit: params.subjectLimit,
     index: params.index,
     query: params.query,
     term: params.term,
     source: params.source,
-    hasApiKey: Boolean(params.apiKey),
-    downloadFiles: params.downloadFiles,
-    recomputeFromCache: params.recomputeFromCache,
-    isAdminRequest: params.isAdminRequest,
   });
 }
 
@@ -337,23 +331,31 @@ function buildRoleGroups(person) {
   })).filter((group) => group.docs.length);
 }
 
+function personKeyFor(name) {
+  const key = supervisorNameKey(name);
+  if (key) return stripMiddleInitials(key);
+  return String(name || '').toLowerCase().trim();
+}
+
 function buildPersonRows(documents = []) {
   const people = new Map();
 
   for (const doc of documents) {
     for (const name of (doc.supervisors || [])) {
       if (!isValidPersonName(name)) continue;
-      const key = String(name || '').toLowerCase().trim();
+      const key = personKeyFor(name);
       if (!key) continue;
       let person = people.get(key);
       if (!person) {
         person = createPersonRowSeed(key, name);
         people.set(key, person);
+      } else if (String(name || '').length > String(person.name || '').length) {
+        person.name = name;
       }
       person.roles.add('Supervisor');
       addPersonDocument(person, doc, 'Supervisor');
       for (const other of (doc.supervisors || [])) {
-        const otherKey = String(other || '').toLowerCase().trim();
+        const otherKey = personKeyFor(other);
         if (otherKey && otherKey !== key) person.coSupervisors.add(other);
       }
     }
@@ -361,12 +363,14 @@ function buildPersonRows(documents = []) {
     for (const member of (doc.committee || [])) {
       const name = member.name;
       if (!isValidPersonName(name)) continue;
-      const key = String(name || '').toLowerCase().trim();
+      const key = personKeyFor(name);
       if (!key) continue;
       let person = people.get(key);
       if (!person) {
         person = createPersonRowSeed(key, name);
         people.set(key, person);
+      } else if (String(name || '').length > String(person.name || '').length) {
+        person.name = name;
       }
       const role = member.role || 'Committee Member';
       person.roles.add(role);
@@ -584,10 +588,7 @@ function visualizationSlice(payload) {
 
 async function cachedDocumentsForParams(params, loadSyncModule) {
   const documentCache = await documentCacheForParams(params, loadSyncModule);
-  const documents = await listCachedDocuments({
-    syncKey: documentCache.syncKey,
-    limit: params.maxRecords,
-  });
+  const documents = await listCachedDocuments({ syncKey: documentCache.syncKey });
   return { documents, documentCache };
 }
 
@@ -617,7 +618,7 @@ async function documentPageForParams(params, loadSyncModule, pageRequest, filter
   );
   const documents = await listCachedDocuments({
     syncKey: documentCache.syncKey,
-    limit: needsFullPass ? params.maxRecords : pageRequest.limit,
+    limit: needsFullPass ? null : pageRequest.limit,
     offset: needsFullPass ? 0 : pageRequest.offset,
   });
 
@@ -630,7 +631,7 @@ async function documentPageForParams(params, loadSyncModule, pageRequest, filter
 
   const total = needsFullPass
     ? rows.length
-    : Math.min(params.maxRecords, documentCache.recordsAvailable || params.maxRecords);
+    : (documentCache.recordsAvailable || rows.length);
   const pageRows = needsFullPass
     ? rows.slice(pageRequest.offset, pageRequest.offset + pageRequest.limit)
     : rows;
@@ -838,7 +839,9 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
       const { records, sourceMeta, subjectLimit } = await metricRecordsForParams(params, loadSyncModule);
       const filtered = filterDocuments(records, filters);
-      const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit);
+      const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit, {
+        persistRun: params.isAdminRequest && params.refresh,
+      });
       return analyticsSlice(full);
     });
     res.status(200).json(payload);
@@ -852,7 +855,9 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
       const { records, sourceMeta, subjectLimit } = await metricRecordsForParams(params, loadSyncModule);
       const filtered = filterDocuments(records, filters);
-      const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit);
+      const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit, {
+        persistRun: params.isAdminRequest && params.refresh,
+      });
       return visualizationSlice(full);
     });
     res.status(200).json(payload);
@@ -1027,7 +1032,6 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       const cacheStats = hasExactSyncCache ? syncCacheStats : await getDocumentCacheStats();
       const cachedDocuments = await listCachedDocuments({
         syncKey: hasExactSyncCache ? syncKey : null,
-        limit: effectiveMaxRecords,
       });
       const payload = await collectMetrics({
         ...sourceOptions,
@@ -1036,6 +1040,7 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
         applyStoredFileMetrics: true,
         applyCitationCounts: true,
         applyCommitteeMembers: true,
+        persistRun: isAdminRequest && refresh,
       });
       payload.source.documentCache = {
         syncKey: hasExactSyncCache ? syncKey : null,

@@ -9,6 +9,7 @@ import {
   checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb, hasRunningAdminJob
 } from './db.js';
 import { ensureDefaultAdmin } from './auth.js';
+import { createBoundedCache } from './boundedCache.js';
 import { getConceptPipelineStatus } from './conceptsPipeline.js';
 import { createAndStartAdminWorkerJob } from './services/adminWorker.js';
 import { logger } from './logger.js';
@@ -16,6 +17,7 @@ import { getConfiguredApiKey } from './secrets.js';
 import { getTrustedClientIp } from './requestSecurity.js';
 import { applyCompression, applySecurityHeaders } from './middleware/http.js';
 import { requireAdmin, requireCsrf } from './middleware/adminAuth.js';
+import { createPublicRateLimit } from './middleware/rateLimit.js';
 import { createAuthRouter } from './routes/authRoutes.js';
 import { createAdminJobsRouter } from './routes/adminJobsRoutes.js';
 import { createAdminImportRouter } from './routes/adminImportRoutes.js';
@@ -33,7 +35,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const publicDir = path.join(__dirname, '..', 'public');
 
-const metricsCache = new Map();
+const metricsCache = createBoundedCache(300);
 const metricsInflight = new Map();
 let stopDailyConceptScheduler = null;
 let stopWorkbenchCacheWarmup = null;
@@ -120,6 +122,7 @@ app.use('/api/admin', requireAdmin, createAdminOperationsRouter({ loadSyncModule
 app.use('/api/admin', requireAdmin, createAdminTopicLabelsRouter({ clearMetricsCache }));
 app.use('/api/admin', requireAdmin, createAdminJobsRouter({ loadSyncModule, clearMetricsCache }));
 app.use('/api/internal', createInternalWorkerRouter());
+app.use('/api', createPublicRateLimit());
 app.use('/api', createPublicRouter());
 app.use('/api', createMetricsRouter({ metricsCache, metricsInflight, loadSyncModule }));
 

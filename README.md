@@ -106,9 +106,9 @@ Open Collections API calls belong to Admin import/sync flows such as import-rule
 Supported query params:
 
 - `index`, `query`, `term`, `source`: identify the preferred stored sync key. They do not trigger live Open Collections reads from this endpoint.
-- `maxRecords`: default `200`; anonymous public requests are capped by `PUBLIC_MAX_RECORDS`.
+- `maxRecords`: bounds live Open Collections paging during admin sync only. Dashboard reads always serve the entire stored corpus (optionally narrowed by `degree`/`program`/`affiliation` filters).
 - `pageSize`: default `20`, maximum `100`.
-- `scanLimit`: default `max(1000, maxRecords * 10)`; anonymous public requests are capped by `PUBLIC_SCAN_LIMIT`.
+- `scanLimit`: default `max(1000, maxRecords * 10)`. Public guardrails cap anonymous request *rates* (120 requests/minute per IP), not corpus coverage.
 - `subjectLimit`: default `25`.
 - `downloadFiles` and `recomputeFromCache` are ignored by this read-only dashboard endpoint. PDF downloads, cIRcle full-text fetches, and file recomputation only run through Admin-triggered sync/cache actions.
 - `refresh=1`: bypasses the in-memory metrics cache. It does not fetch upstream metadata or force PDF/full-text enrichment.
@@ -117,7 +117,7 @@ Open Collections API keys are applied server-side for Admin import/sync work. Br
 
 ### Public Endpoints
 
-These endpoints are available to the browser without an admin session. Expensive metrics options are still capped or blocked by the public guardrail settings listed below.
+These endpoints are available to the browser without an admin session. Anonymous `/api` requests are rate-limited per IP; authenticated admin sessions are exempt. Expensive metrics options are still capped or blocked by the public guardrail settings listed below.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -190,9 +190,10 @@ Use `.env.development.example` and `.env.production.example` as the canonical te
 - `UBC_API_BASE_URL`: default `https://oc-index.library.ubc.ca`.
 - `UBC_INDEX`: Open Collections index. Code default is empty; the example env files set `24`.
 - `UBC_QUERY`, `UBC_TERM`, `UBC_SOURCE`: default Open Collections query scope.
-- `UBC_API_KEY`: optional Open Collections API key. When set in env, it is authoritative and the admin UI cannot replace it.
+- `UBC_API_KEY`: optional Open Collections API key; sent via request headers only. When set in env, it is authoritative and the admin UI cannot replace it.
 - `APP_DATA_DIR`: data directory, default `./data`.
 - `PDF_CACHE_DIR`: PDF cache directory, default `${APP_DATA_DIR}/pdf-cache`.
+- `PDF_ALLOWED_HOSTS`: comma-separated hosts allowed for PDF downloads, default `open.library.ubc.ca,oc-index.library.ubc.ca,circle.library.ubc.ca`.
 - `FULL_TEXT_CACHE_DIR`: extracted cIRcle full-text cache directory, default `${APP_DATA_DIR}/full-text-cache`.
 - `SQLITE_PATH`: local SQLite/libSQL file path, default `${APP_DATA_DIR}/metrics.sqlite`.
 - `TURSO_DATABASE_URL`: optional remote libSQL/Turso URL. If omitted, local SQLite is used.
@@ -323,3 +324,8 @@ In production, startup validates secret configuration. The API-key encryption ke
 - Pending citation catalogue lookups use Z39.50 through `yaz-client`.
 - BERTopic reads cached document abstracts from the database, uses `allenai/specter2_base`, and writes topic assignments back to the database.
 - Per-document attributes, PDF metrics, sync runs, citations, catalogue lookups, admin jobs, users, and run-level metric snapshots are persisted through libSQL: local SQLite by default, or Turso when `TURSO_DATABASE_URL` is set.
+- Metric run snapshots (`metric_runs`) are recorded only when an admin forces `refresh=1`; the table keeps the latest 100 runs.
+- Blocked PDF downloads (UBC security page) are stored with status `blocked`; lower `PDF_DOWNLOAD_RATE_PER_MIN` before retrying.
+- Catalogue lookups that permanently fail to parse are stored with `hits = -1` and reported as `failed` in lookup stats; they are not retried automatically.
+- Admin settings accept a fixed key set; unknown keys in `PUT /api/admin/settings` are ignored.
+- First-login MFA enrollment happens after password verification; anyone holding the bootstrap password before first login can enroll their own authenticator. Complete first login promptly after deploying.

@@ -64,16 +64,36 @@ export function applyCompression(req, res, next) {
   const originalWrite = res.write.bind(res);
   const originalEnd = res.end.bind(res);
   const chunks = [];
+  const MAX_COMPRESS_BUFFER_BYTES = 8 * 1024 * 1024;
+  let buffered = 0;
+  let bypassed = false;
+
+  const bypass = () => {
+    if (bypassed) return;
+    bypassed = true;
+    res.write = originalWrite;
+    res.end = originalEnd;
+    for (const chunk of chunks) originalWrite(chunk);
+    chunks.length = 0;
+  };
 
   res.write = (chunk, chunkEncoding, callback) => {
+    if (bypassed) return originalWrite(chunk, chunkEncoding, callback);
     if (chunk) {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, chunkEncoding));
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, chunkEncoding);
+      chunks.push(buf);
+      buffered += buf.length;
+      if (buffered > MAX_COMPRESS_BUFFER_BYTES) bypass();
     }
     if (typeof callback === 'function') callback();
     return true;
   };
 
   res.end = (chunk, chunkEncoding, callback) => {
+    if (bypassed) {
+      originalEnd(chunk, chunkEncoding, callback);
+      return;
+    }
     let encodingArg = chunkEncoding;
     let callbackArg = callback;
     if (typeof encodingArg === 'function') {

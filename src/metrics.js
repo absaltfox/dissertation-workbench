@@ -57,7 +57,7 @@ function unique(values) {
 const MIN_RELIABLE_WORD_COUNT = 1000;
 const MIN_RELIABLE_PAGE_COUNT = 10;
 const UNRELIABLE_WORD_SOURCES = new Set(['metadata_text']);
-const UNRELIABLE_PAGE_SOURCES = new Set(['estimated_from_metadata_words']);
+const UNRELIABLE_PAGE_SOURCES = new Set(['estimated_from_metadata_words', 'estimated_from_full_text_words']);
 
 function extractOcId(value) {
   const text = String(value || '').trim();
@@ -311,9 +311,20 @@ function docNgrams(rec, limit = 8) {
     .map((entry) => entry.term);
 }
 
+const EMPTY_CONCEPT_DICT = {
+  canonicalSet: new Set(), variantMap: {}, idfMap: new Map(),
+  conceptMeta: new Map(), multiDocSet: new Set(), sourceDocuments: 0,
+};
+let conceptDictCache = { mtimeMs: -1, value: null };
+
 function loadConceptDictionary() {
+  const dictPath = path.join(DATA_DIR, 'concepts', 'latest.json');
   try {
-    const raw = fs.readFileSync(path.join(DATA_DIR, 'concepts', 'latest.json'), 'utf-8');
+    const stat = fs.statSync(dictPath);
+    if (conceptDictCache.value && conceptDictCache.mtimeMs === stat.mtimeMs) {
+      return conceptDictCache.value;
+    }
+    const raw = fs.readFileSync(dictPath, 'utf-8');
     const parsed = JSON.parse(raw);
     const conceptMeta = new Map();
     for (const concept of (parsed.concepts || [])) {
@@ -333,9 +344,11 @@ function loadConceptDictionary() {
     // co-occur across the corpus. Single-doc concepts (docFreq=1) dominate the
     // IDF-based ranking but are useless for co-occurrence analysis.
     const multiDocSet = new Set((parsed.concepts || []).filter((c) => (c.docFreq ?? 1) >= 2).map((c) => c.canonical));
-    return { canonicalSet, variantMap, idfMap, conceptMeta, multiDocSet, sourceDocuments };
+    const value = { canonicalSet, variantMap, idfMap, conceptMeta, multiDocSet, sourceDocuments };
+    conceptDictCache = { mtimeMs: stat.mtimeMs, value };
+    return value;
   } catch {
-    return { canonicalSet: new Set(), variantMap: {}, idfMap: new Map(), conceptMeta: new Map(), multiDocSet: new Set(), sourceDocuments: 0 };
+    return EMPTY_CONCEPT_DICT;
   }
 }
 
@@ -975,7 +988,10 @@ export async function collectMetricRecords(options = {}) {
     }
   }
 
-  const normalizedRecords = records.slice(0, maxRecords).map(normalizeStoredRecordShape);
+  // Cached-document reads serve the full stored corpus; maxRecords only
+  // bounds live Open Collections paging above.
+  const limitedRecords = usesCachedDocuments ? records : records.slice(0, maxRecords);
+  const normalizedRecords = limitedRecords.map(normalizeStoredRecordShape);
 
   if (!options.skipFileEnrichment) {
     await enrichDocumentsWithFileAnalysis(normalizedRecords, {
@@ -1016,11 +1032,11 @@ export async function collectMetricRecords(options = {}) {
   return { records: normalizedRecords, sourceMeta, subjectLimit };
 }
 
-export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjectLimit = 25) {
+export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjectLimit = 25, { persistRun = false } = {}) {
   const normalizedRecords = enrichDocumentSignals(records);
 
   const metrics = buildMetrics(normalizedRecords, subjectLimit);
-  await saveRunMetrics(sourceMeta, metrics);
+  if (persistRun) await saveRunMetrics(sourceMeta, metrics);
 
   // Load BERTopic results if available
   let topicData = null;
@@ -1084,5 +1100,7 @@ export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjec
 
 export async function collectMetrics(options = {}) {
   const { records, sourceMeta, subjectLimit } = await collectMetricRecords(options);
-  return buildMetricsPayloadFromRecords(records, sourceMeta, subjectLimit);
+  return buildMetricsPayloadFromRecords(records, sourceMeta, subjectLimit, {
+    persistRun: Boolean(options.persistRun),
+  });
 }

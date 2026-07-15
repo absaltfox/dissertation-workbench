@@ -25,3 +25,4 @@ fly.grobid.toml
 __pycache__/
 *.pyc
 .venv/
+.superpowers/
