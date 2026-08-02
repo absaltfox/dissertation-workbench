@@ -1696,10 +1696,17 @@ export async function loadDocsByCitation(citationId) {
   `, [citationId]);
 }
 
-export async function clearDocumentCitations(docId) {
-  await run('DELETE FROM document_citations WHERE doc_id = ?', [docId]);
-  await exec('DELETE FROM catalogue_lookups WHERE citation_id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
-  await exec('DELETE FROM citations WHERE id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
+// Re-extraction entry point: saves the new citation set, then prunes only the
+// links that no longer match, so catalogue lookups on surviving citations are
+// preserved. Replaces the old clearDocumentCitations + saveCitations pattern,
+// which destroyed catalogue lookups for citations that survived the reparse.
+export async function reextractDocumentCitations(docId, citations, hashFn, options = {}) {
+  let linkedIds = [];
+  if (citations.length) {
+    linkedIds = await saveCitations(docId, citations, hashFn, options);
+  }
+  await replaceDocumentCitationLinks(docId, linkedIds);
+  return linkedIds;
 }
 
 export async function replaceDocumentCitationLinks(docId, keepCitationIds = []) {

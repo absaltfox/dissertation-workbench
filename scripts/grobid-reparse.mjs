@@ -14,7 +14,7 @@
  */
 
 import fs from 'node:fs/promises';
-import { ensureStorage, getDb, clearDocumentCitations, saveCitations, loadDocumentCitations } from '../src/db.js';
+import { ensureStorage, getDb, reextractDocumentCitations, loadDocumentCitations } from '../src/db.js';
 import { parseBibliographyWithGrobid, normalizeCitation } from '../src/pdf.js';
 import { GROBID_URL } from '../src/config.js';
 import { runPendingCatalogueLookups } from '../src/catalogue.js';
@@ -91,10 +91,7 @@ for (const row of rows) {
     console.log(`  doc ${doc_id}: ${oldCount} → ${newCount} citations (${deltaStr}), ${structured} structured`);
 
     if (!dryRun) {
-      await clearDocumentCitations(doc_id);
-      if (citations.length) {
-        await saveCitations(doc_id, citations, normalizeCitation);
-      }
+      await reextractDocumentCitations(doc_id, citations, normalizeCitation);
     }
 
     totalOld += oldCount;

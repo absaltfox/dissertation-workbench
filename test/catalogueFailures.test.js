@@ -117,3 +117,31 @@ test('re-extracting the same citations keeps catalogue lookups', async () => {
   const remaining = await db.loadDocumentCitations(docId);
   assert.equal(remaining.length, 1);
 });
+
+test('reextractDocumentCitations preserves lookups and prunes stale links', async () => {
+  const db = await import('../src/db.js');
+  const hashFn = (text) => `rex-${text}`;
+  const docId = '1.0400001';
+  const citeA = 'Vygotsky, L. (1978). Mind in society. Cambridge: Harvard University Press.';
+  const citeB = 'Bruner, J. (1960). The process of education. Cambridge: Harvard University Press.';
+
+  const firstIds = await db.reextractDocumentCitations(docId, [citeA, citeB], hashFn);
+  assert.equal(firstIds.length, 2);
+  await db.saveCatalogueLookup(firstIds[0], {
+    hits: 1, queryAuthor: 'Vygotsky', queryTitle: 'Mind in society', bibId: '99',
+  });
+
+  // Same citations again: IDs are stable and the lookup survives.
+  const secondIds = await db.reextractDocumentCitations(docId, [citeA, citeB], hashFn);
+  assert.deepEqual([...secondIds].sort(), [...firstIds].sort());
+  const lookup = await db.loadCatalogueLookup(firstIds[0]);
+  assert.equal(Number(lookup.hits), 1);
+
+  // Dropping citeB prunes only its link.
+  await db.reextractDocumentCitations(docId, [citeA], hashFn);
+  assert.equal((await db.loadDocumentCitations(docId)).length, 1);
+
+  // An empty extraction clears the document's citations.
+  await db.reextractDocumentCitations(docId, [], hashFn);
+  assert.equal((await db.loadDocumentCitations(docId)).length, 0);
+});

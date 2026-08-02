@@ -10,7 +10,7 @@
  */
 
 import fs from 'node:fs/promises';
-import { ensureStorage, getDb, clearDocumentCitations, saveCitations, loadDocumentCitations } from '../src/db.js';
+import { ensureStorage, getDb, reextractDocumentCitations, loadDocumentCitations } from '../src/db.js';
 import { analyzePdfAtPath, parseBibliographyWithAnyStyle, parseBibliography, normalizeCitation } from '../src/pdf.js';
 
 const dryRun = process.argv.includes('--dry-run');
@@ -66,10 +66,7 @@ for (const row of rows) {
     console.log(`  doc ${doc_id}: ${oldCount} → ${newCount} citations (${deltaStr})`);
 
     if (!dryRun) {
-      await clearDocumentCitations(doc_id);
-      if (newCitations.length) {
-        await saveCitations(doc_id, newCitations, normalizeCitation);
-      }
+      await reextractDocumentCitations(doc_id, newCitations, normalizeCitation);
     }
 
     totalOld += oldCount;
