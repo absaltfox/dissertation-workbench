@@ -97,6 +97,23 @@ async function tryExec(client, sql) {
   }
 }
 
+export async function addColumnIfMissing(client, table, column, definition) {
+  const hasColumn = async () => {
+    const result = await client.execute(`PRAGMA table_info(${table})`);
+    return result.rows.some((row) => String(row.name) === column);
+  };
+  if (await hasColumn()) return;
+  try {
+    await client.execute(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  } catch (error) {
+    // Another web/worker process may have applied the same idempotent migration
+    // after our schema read. Accept only that verified outcome; all other errors
+    // remain startup failures.
+    if (await hasColumn()) return;
+    throw error;
+  }
+}
+
 async function ensureSchema(client) {
   await client.executeMultiple(`
     CREATE TABLE IF NOT EXISTS documents (
@@ -213,6 +230,7 @@ async function ensureSchema(client) {
       requested_index TEXT,
       query TEXT,
       source TEXT,
+      content_mode TEXT NOT NULL DEFAULT 'metadata_only',
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -363,6 +381,7 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_path TEXT');
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_bytes INTEGER');
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_source_url TEXT');
+  await addColumnIfMissing(client, 'import_rules', 'content_mode', "TEXT NOT NULL DEFAULT 'metadata_only'");
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_sync_key ON documents(sync_key)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree ON documents(degree)');
@@ -1298,6 +1317,7 @@ function importRuleFromRow(row) {
     index: row.requested_index || '',
     query: row.query || '',
     source: row.source || '',
+    contentMode: row.content_mode || 'metadata_only',
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1305,7 +1325,7 @@ function importRuleFromRow(row) {
 
 export async function listImportRules() {
   const rows = await all(`
-    SELECT id, name, degree, program, affiliation, requested_index, query, source, created_at, updated_at
+    SELECT id, name, degree, program, affiliation, requested_index, query, source, content_mode, created_at, updated_at
     FROM import_rules
     ORDER BY updated_at DESC, name
   `);
@@ -1314,7 +1334,7 @@ export async function listImportRules() {
 
 export async function getImportRule(id) {
   const row = await get(`
-    SELECT id, name, degree, program, affiliation, requested_index, query, source, created_at, updated_at
+    SELECT id, name, degree, program, affiliation, requested_index, query, source, content_mode, created_at, updated_at
     FROM import_rules
     WHERE id = ?
   `, [id]);
@@ -1328,9 +1348,9 @@ export async function saveImportRule(rule) {
   const createdAt = existing?.created_at || now;
   await run(`
     INSERT INTO import_rules (
-      id, name, degree, program, affiliation, requested_index, query, source, created_at, updated_at
+      id, name, degree, program, affiliation, requested_index, query, source, content_mode, created_at, updated_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       name = excluded.name,
       degree = excluded.degree,
@@ -1339,6 +1359,7 @@ export async function saveImportRule(rule) {
       requested_index = excluded.requested_index,
       query = excluded.query,
       source = excluded.source,
+      content_mode = excluded.content_mode,
       updated_at = excluded.updated_at
   `, [
     id,
@@ -1349,6 +1370,7 @@ export async function saveImportRule(rule) {
     rule.index || null,
     rule.query || null,
     rule.source || null,
+    rule.contentMode || 'metadata_only',
     createdAt,
     now,
   ]);

@@ -83,7 +83,19 @@ The public `/api/metrics` endpoint is read-only and builds the dashboard from th
 2. Sign in to `Admin`.
 3. Configure/import Open Collections rules in `Admin -> Import`.
 4. Run an import job, usually `Import all` for a new database or `Sync differences` afterward.
-5. Run import/PDF jobs from the Admin UI; on-demand workers process the heavy work outside the web server. Use `npm run worker` only for legacy scheduled sync/catalogue lookup cycles.
+5. Choose a content policy on each saved rule, then use **Import + Enrich Using Rule Policy** when content enrichment is required.
+6. On-demand workers process the heavy work outside the web server. Use `npm run worker` only for legacy scheduled sync/catalogue lookup cycles.
+
+Saved import rules declare one content mode:
+
+- `metadata_only`: never retrieves document content.
+- `full_text_only`: retrieves the repository's extracted `TEXT` derivative, never requests the original PDF, and retains only derived results. Existing legacy full-text cache entries may still be reused.
+- `pdf_stream`: reserved for zero-retention original-PDF processing. Rules may be saved with this mode, but enrichment runs are rejected until the streaming implementation is enabled.
+- `pdf_cache`: retrieves and retains the original PDF. This mode runs only when `ALLOW_ORIGINAL_PDF_RETRIEVAL=1`.
+
+The server snapshots the selected rules into the durable job when it starts, so later rule edits cannot change a running job. The deployment-wide original-PDF guard is checked independently of the UI and rule configuration.
+
+Content policies are fail-closed: unknown values are rejected by the API, worker, and parser; a blocked `pdf_cache` request fails instead of silently changing to another retrieval mode. Cached enrichment is also mode-specific, so full-text-derived metrics do not satisfy a later `pdf_cache` request.
 
 Dashboard reads never page Open Collections. If `/api/metrics` receives query parameters that match a stored sync key, it uses that stored subset; otherwise it falls back to the locally stored corpus. `refresh=1` only bypasses the web process's in-memory metrics payload cache. It does not call Open Collections, download PDFs, recompute file metrics, or extract citations/committee data.
 
@@ -198,7 +210,8 @@ Use `.env.development.example` and `.env.production.example` as the canonical te
 - `SQLITE_PATH`: local SQLite/libSQL file path, default `${APP_DATA_DIR}/metrics.sqlite`.
 - `TURSO_DATABASE_URL`: optional remote libSQL/Turso URL. If omitted, local SQLite is used.
 - `TURSO_AUTH_TOKEN`: required in production when `TURSO_DATABASE_URL` points to Turso/libSQL.
-- `DOWNLOAD_FILES`: default `1`; set `0` to avoid automatic PDF downloads by default. PDF enrichment uses cIRcle REST `ORIGINAL` bitstreams exposed through `digitalResourceOriginalRecord`; full-text fallback uses cIRcle `TEXT` bitstreams.
+- `DOWNLOAD_FILES`: legacy default for direct document-sync and maintenance paths. Saved import rules use their own content mode instead.
+- `ALLOW_ORIGINAL_PDF_RETRIEVAL`: defaults to `0`. When disabled, the PDF retrieval boundary rejects every cIRcle `ORIGINAL` bitstream request, including requests from maintenance paths. Set to `1` only when original-PDF retrieval is an accepted deployment policy.
 - `PDF_DOWNLOAD_RATE_PER_MIN`: optional cIRcle REST PDF download throttle; `0` means unlimited.
 - `CACHE_TTL_MS`: in-memory metrics cache TTL, default `600000`.
 - `TRUST_PROXY`: set `1` behind Fly/reverse proxies.

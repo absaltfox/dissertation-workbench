@@ -6,7 +6,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS,
-  PDF_DOWNLOAD_RATE_PER_MIN, GROBID_URL, GROBID_STARTUP_WAIT_MS, GROBID_FLY_API_TOKEN
+  PDF_DOWNLOAD_RATE_PER_MIN, GROBID_URL, GROBID_STARTUP_WAIT_MS, GROBID_FLY_API_TOKEN,
+  ALLOW_ORIGINAL_PDF_RETRIEVAL
 } from './config.js';
 import {
   loadStoredFileMetric, saveFileMetric, saveDocumentMetadata, saveCommitteeMembers,
@@ -15,6 +16,7 @@ import {
 import { logger } from './logger.js';
 import { dedupeSupervisorNames } from './supervisors.js';
 import { safeFetchDownloadUrl } from './urlSafety.js';
+import { isImportContentMode } from './importRules.js';
 
 let downloadSafetyOptions = {};
 export function _setDownloadSafetyOptionsForTests(options) {
@@ -776,12 +778,13 @@ async function fetchDspaceBitstreams(doc) {
 }
 
 function chooseDspaceTextBitstream(bitstreams) {
-  return (bitstreams || []).find((bitstream) => {
-    const mime = String(bitstream?.mimeType || '').toLowerCase();
-    const bundle = String(bitstream?.bundleName || '').toUpperCase();
-    const name = String(bitstream?.name || '').toLowerCase();
-    return mime.startsWith('text/plain') || bundle === 'TEXT' || name.endsWith('.pdf.txt');
-  }) || null;
+  const candidates = bitstreams || [];
+  return candidates.find((bitstream) => (
+    String(bitstream?.bundleName || '').toUpperCase() === 'TEXT'
+  )) || candidates.find((bitstream) => (
+    String(bitstream?.bundleName || '').toUpperCase() !== 'ORIGINAL'
+    && String(bitstream?.name || '').toLowerCase().endsWith('.pdf.txt')
+  )) || null;
 }
 
 function chooseDspacePdfBitstream(bitstreams) {
@@ -793,7 +796,9 @@ function chooseDspacePdfBitstream(bitstreams) {
   }) || null;
 }
 
-export async function fetchFullTextForDocument(doc, stored = null, { artifactClient = null } = {}) {
+export async function fetchFullTextForDocument(doc, stored = null, {
+  artifactClient = null, persistFullText = true
+} = {}) {
   const cached = await readCachedFullText(doc, stored, artifactClient);
   if (cached) return cached;
 
@@ -810,7 +815,13 @@ export async function fetchFullTextForDocument(doc, stored = null, { artifactCli
     const retrieveUrl = dspaceRestUrl(`/rest/bitstreams/${id}/retrieve`);
     const fullText = await fetchTextWithTimeout(retrieveUrl);
     if (!fullText || fullText.length <= 1000) return null;
-    const cachedText = await writeCachedFullText(doc, fullText, retrieveUrl.toString(), artifactClient);
+    const cachedText = persistFullText
+      ? await writeCachedFullText(doc, fullText, retrieveUrl.toString(), artifactClient)
+      : {
+          fullTextPath: null,
+          fullTextBytes: Buffer.byteLength(fullText, 'utf8'),
+          fullTextSourceUrl: retrieveUrl.toString(),
+        };
     return {
       fullText,
       ...cachedText,
@@ -826,6 +837,12 @@ export async function fetchFullTextForDocument(doc, stored = null, { artifactCli
 }
 
 export async function fetchPdfForDocument(doc) {
+  const originalPdfAllowed = downloadSafetyOptions.allowOriginalPdfRetrieval
+    ?? ALLOW_ORIGINAL_PDF_RETRIEVAL;
+  if (!originalPdfAllowed) {
+    logger.warn('Original PDF retrieval blocked by deployment policy', { docId: doc?.id });
+    return { blocked: true, policyBlocked: true, downloadUrl: null };
+  }
   try {
     const bitstreams = await fetchDspaceBitstreams(doc);
     const pdfBitstream = chooseDspacePdfBitstream(bitstreams);
@@ -912,9 +929,9 @@ async function analyzeDocumentFullText(doc, fullText, {
 
 async function analyzeDocumentFullTextFallback(doc, stored, {
   status = 'full_text', error = null, artifactClient = null, onProgress = null,
-  extractCommittee = true, extractCitations = true
+  extractCommittee = true, extractCitations = true, persistFullText = true
 } = {}) {
-  const result = await fetchFullTextForDocument(doc, stored, { artifactClient });
+  const result = await fetchFullTextForDocument(doc, stored, { artifactClient, persistFullText });
   if (!result?.fullText) return false;
   return analyzeDocumentFullText(doc, result.fullText, {
     stored: {
@@ -1664,8 +1681,12 @@ async function loadStoredParsedData(doc) {
 export async function analyzeDocumentFile(doc, options) {
   const {
     downloadFiles, forceDownload, recomputeFromCache, artifactClient = null, onProgress = null,
-    extractCommittee = true, extractCitations = true
+    extractCommittee = true, extractCitations = true,
+    contentMode = downloadFiles ? 'pdf_cache' : 'full_text_only'
   } = options;
+  if (!isImportContentMode(contentMode)) {
+    throw new Error(`Unsupported content mode: ${contentMode}`);
+  }
   await onProgress?.({ phase: 'cache_lookup', label: 'Checking cached file metrics', status: 'running' });
   const stored = await loadStoredFileMetric(doc.id);
   const hasCachedPdf = stored?.pdf_path && (artifactClient || (await fileExists(stored.pdf_path)));
@@ -1676,6 +1697,47 @@ export async function analyzeDocumentFile(doc, options) {
     status: 'completed',
     counts: { cachedPdf: hasCachedPdf ? 1 : 0, cachedFullText: hasCachedFullTextMetric ? 1 : 0 },
   });
+
+  if (contentMode === 'metadata_only') {
+    doc.downloadStatus = 'metadata_only';
+    return;
+  }
+
+  if (contentMode === 'pdf_stream') {
+    throw new Error('pdf_stream is not available until zero-retention PDF processing is enabled.');
+  }
+
+  if (contentMode === 'full_text_only' && !recomputeFromCache) {
+    if (!forceDownload && hasCachedFullTextMetric) {
+      await applyStoredFullTextMetric(doc, stored);
+      return;
+    }
+    if (await analyzeDocumentFullTextFallback(doc, stored, {
+      status: 'full_text',
+      error: null,
+      artifactClient,
+      onProgress,
+      extractCommittee,
+      extractCitations,
+      persistFullText: false,
+    })) return;
+    doc.downloadStatus = 'not_found';
+    doc.downloadError = 'No extracted full-text derivative is available.';
+    await saveFileMetric(doc.id, {
+      status: doc.downloadStatus,
+      error: doc.downloadError,
+      pdfPath: stored?.pdf_path || null,
+      downloadUrl: stored?.download_url || null,
+      fileBytes: stored?.file_bytes || null,
+      wordCount: stored?.word_count || null,
+      bodyWordCount: stored?.body_word_count || null,
+      ...storedFullTextFields(stored),
+      pageCount: stored?.page_count || null,
+      wordSource: stored?.word_source || null,
+      pageSource: stored?.page_source || null,
+    });
+    return;
+  }
 
   if (recomputeFromCache) {
     if (!hasCachedPdf) {
@@ -1784,7 +1846,7 @@ export async function analyzeDocumentFile(doc, options) {
     return;
   }
 
-  if (!forceDownload && hasCachedFullTextMetric) {
+  if (!forceDownload && hasCachedFullTextMetric && contentMode !== 'pdf_cache') {
     await applyStoredFullTextMetric(doc, stored);
     return;
   }
@@ -1814,7 +1876,9 @@ export async function analyzeDocumentFile(doc, options) {
   await onProgress?.({ phase: 'pdf_download', label: 'Downloading PDF from cIRcle', status: 'running' });
 
   const resolved = await fetchPdfForDocument(doc);
-  if (resolved?.blocked) {
+  if (resolved?.policyBlocked) {
+    throw new Error('Original PDF retrieval is disabled by deployment policy.');
+  } else if (resolved?.blocked) {
     doc.downloadError = 'Download blocked by UBC security page; reduce PDF_DOWNLOAD_RATE_PER_MIN and retry later.';
   }
   if (resolved && !resolved.blocked) {

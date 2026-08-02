@@ -6,11 +6,25 @@ export const IMPORT_RULE_FIELDS = [
   { key: 'affiliation', termField: 'affiliation.raw', label: 'Affiliation' },
 ];
 
+export const IMPORT_CONTENT_MODES = Object.freeze([
+  'metadata_only',
+  'full_text_only',
+  'pdf_stream',
+  'pdf_cache',
+]);
+export const DEFAULT_IMPORT_CONTENT_MODE = 'metadata_only';
+const IMPORT_CONTENT_MODE_SET = new Set(IMPORT_CONTENT_MODES);
+
+export function isImportContentMode(value) {
+  return IMPORT_CONTENT_MODE_SET.has(value);
+}
+
 function clean(value) {
   return String(value ?? '').trim();
 }
 
 export function normalizeImportRule(input = {}) {
+  const requestedContentMode = clean(input.contentMode ?? input.content_mode);
   return {
     id: clean(input.id),
     name: clean(input.name),
@@ -20,6 +34,7 @@ export function normalizeImportRule(input = {}) {
     index: clean(input.index),
     query: clean(input.query),
     source: clean(input.source) || DEFAULT_SOURCE,
+    contentMode: requestedContentMode || DEFAULT_IMPORT_CONTENT_MODE,
   };
 }
 
@@ -34,7 +49,18 @@ export function validateImportRule(input = {}) {
   if (rule.index.length > 100) errors.push('Index must be at most 100 characters.');
   if (rule.query.length > 300) errors.push('Query must be at most 300 characters.');
   if (rule.source.length > 1000) errors.push('Source fields must be at most 1000 characters.');
+  if (!isImportContentMode(rule.contentMode)) {
+    errors.push(`Content mode must be one of: ${IMPORT_CONTENT_MODES.join(', ')}.`);
+  }
   return { rule, errors };
+}
+
+export function contentModeRequestsOriginalPdf(contentMode) {
+  return contentMode === 'pdf_stream' || contentMode === 'pdf_cache';
+}
+
+export function contentModeEnrichesDocuments(contentMode) {
+  return isImportContentMode(contentMode) && contentMode !== 'metadata_only';
 }
 
 export function buildImportRuleTerm(input = {}) {
@@ -56,6 +82,7 @@ export function importRuleToSyncOptions(input = {}, overrides = {}) {
     term: buildImportRuleTerm(rule) || DEFAULT_TERM,
     source: rule.source || DEFAULT_SOURCE,
     ...overrides,
+    contentMode: rule.contentMode,
   };
 }
 

@@ -39,6 +39,7 @@ const {
   importRulesListEl,
   importRunScopeEl,
   importSourceEl,
+  importContentModeEl,
   jobsStatusCardsEl,
   jobsTableEl,
   loginError,
@@ -639,8 +640,20 @@ function getImportRuleFormData() {
     affiliation: importAffiliationEl?.value.trim() || '',
     index: importIndexEl?.value.trim() || '',
     query: importQueryEl?.value.trim() || '',
-    source: importSourceEl?.value.trim() || document.getElementById('s-source')?.value.trim() || ''
+    source: importSourceEl?.value.trim() || document.getElementById('s-source')?.value.trim() || '',
+    contentMode: importContentModeEl?.value || 'metadata_only'
   };
+}
+
+const IMPORT_CONTENT_MODE_LABELS = {
+  metadata_only: 'Metadata only',
+  full_text_only: 'Extracted full text only',
+  pdf_stream: 'Stream PDF',
+  pdf_cache: 'Cache PDF',
+};
+
+function importContentModeLabel(mode) {
+  return IMPORT_CONTENT_MODE_LABELS[mode] || mode || IMPORT_CONTENT_MODE_LABELS.metadata_only;
 }
 
 function importRuleTerm(rule = getImportRuleFormData()) {
@@ -666,7 +679,8 @@ function summarizeImportRule(rule) {
     rule.program ? `Program: ${rule.program}` : '',
     rule.affiliation ? `Affiliation: ${rule.affiliation}` : ''
   ].filter(Boolean);
-  return parts.length ? parts.join(' · ') : 'No filters selected';
+  parts.push(`Content: ${importContentModeLabel(rule.contentMode)}`);
+  return parts.join(' · ');
 }
 
 function renderImportRules() {
@@ -712,6 +726,7 @@ function setImportRuleForm(rule = {}) {
   importIndexEl.value = rule.index ?? document.getElementById('s-index')?.value ?? '';
   importQueryEl.value = rule.query ?? document.getElementById('s-query')?.value ?? '';
   importSourceEl.value = rule.source || document.getElementById('s-source')?.value || '';
+  importContentModeEl.value = rule.contentMode || 'metadata_only';
   deleteImportRuleBtn.hidden = !rule.id;
   importRulePreviewEl.innerHTML = '';
   updateImportGeneratedTerm();
@@ -850,17 +865,27 @@ async function handleRunImportRules(mode, button) {
     import_all: 'Import metadata',
     sync_differences: 'Import new metadata',
     refresh_metadata: 'Refresh existing metadata',
-    sync_missing_pdfs: 'Import and analyze PDFs'
+    sync_missing_pdfs: 'Import and enrich using rule policy'
   };
-  if (!confirm(`${labels[mode]} for ${importScopeLabel()}?`)) return;
+  const selectedRules = state.importRules.filter((rule) => ruleIds.includes(rule.id));
+  const policyCounts = selectedRules.reduce((counts, rule) => {
+    const label = importContentModeLabel(rule.contentMode);
+    counts[label] = (counts[label] || 0) + 1;
+    return counts;
+  }, {});
+  const policySummary = mode === 'sync_missing_pdfs'
+    ? `\n\nContent policies:\n${Object.entries(policyCounts).map(([label, count]) => `- ${label}: ${count}`).join('\n')}`
+    : '';
+  const originalPdfWarning = mode === 'sync_missing_pdfs'
+    && selectedRules.some((rule) => ['pdf_stream', 'pdf_cache'].includes(rule.contentMode))
+    ? '\n\nWarning: at least one selected rule requests original PDFs.'
+    : '';
+  if (!confirm(`${labels[mode]} for ${importScopeLabel()}?${policySummary}${originalPdfWarning}`)) return;
 
   button.disabled = true;
   const originalHtml = button.innerHTML;
   button.innerHTML = '<span class="import-action-title">Running...</span>';
   try {
-    const downloadFiles = mode === 'sync_missing_pdfs'
-      ? '1'
-      : document.getElementById('s-downloadFiles')?.value || '0';
     const res = await fetch('/api/admin/import-rules/run', {
       method: 'POST',
       headers: jsonHeaders(),
@@ -870,8 +895,7 @@ async function handleRunImportRules(mode, button) {
         ruleIds,
         maxRecords: document.getElementById('s-maxRecords')?.value || '9999',
         pageSize: document.getElementById('s-pageSize')?.value || '20',
-        scanLimit: document.getElementById('s-scanLimit')?.value || '50000',
-        downloadFiles
+        scanLimit: document.getElementById('s-scanLimit')?.value || '50000'
       })
     });
     const data = await res.json();

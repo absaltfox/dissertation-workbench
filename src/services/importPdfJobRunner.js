@@ -6,7 +6,9 @@ import {
   analyzeDocumentFile, analyzePdfAtPath, deleteCachedPdf, extractAndSaveParsedData
 } from '../pdf.js';
 import { getConfiguredApiKey } from '../secrets.js';
-import { importRuleToSyncOptions } from '../importRules.js';
+import {
+  contentModeEnrichesDocuments, importRuleToSyncOptions, validateImportRule
+} from '../importRules.js';
 import { IMPORT_PDF_BATCH_SIZE } from '../config.js';
 
 async function log(jobId, message) {
@@ -59,10 +61,11 @@ async function startContinuationJob(job, result, progress) {
   const params = job.params || {};
   if (params.mode !== 'sync_missing_pdfs') return null;
   if (!params.autoContinuePdfBatches) return null;
-  if (!result.ok || !result.pdfBatchLimitReached || Number(result.totalSaved || 0) <= 0) return null;
+  if (!result.ok || !result.pdfBatchLimitReached || Number(result.totalEnriched || 0) <= 0) return null;
 
   const nextParams = {
     ...params,
+    rules: rulesForContinuation(params.rules, result.rules),
     continuationOf: params.continuationOf || job.id,
     previousJobId: job.id,
     skipPdfDocIds: result.pdfAttemptedIds || [],
@@ -100,6 +103,19 @@ async function startContinuationJob(job, result, progress) {
     });
     return { error: message };
   }
+}
+
+export function rulesForContinuation(rules, completedRuleResults) {
+  if (!Array.isArray(rules)) return rules;
+  const completedByRuleId = new Map(
+    (Array.isArray(completedRuleResults) ? completedRuleResults : [])
+      .map((result) => [String(result?.ruleId || ''), result])
+      .filter(([ruleId]) => ruleId)
+  );
+  return rules.filter((rule) => {
+    const result = completedByRuleId.get(String(rule?.id || ''));
+    return !result || Boolean(result.pdfBatchLimitReached);
+  });
 }
 
 async function analyzePdfEntry(entry, artifactClient, {
@@ -234,8 +250,21 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     const selectedIds = Array.isArray(params.ruleIds)
       ? params.ruleIds.map((id) => String(id || '').trim()).filter(Boolean)
       : [];
-    const rules = params.scope === 'all' ? allRules : allRules.filter((rule) => selectedIds.includes(rule.id));
+    const snapshottedRules = Array.isArray(params.rules)
+      ? params.rules.map((input) => {
+          const { rule, errors } = validateImportRule(input);
+          if (errors.length) throw new Error(`Invalid snapshotted import rule: ${errors.join(' ')}`);
+          return rule;
+        })
+      : [];
+    const rules = snapshottedRules.length
+      ? snapshottedRules
+      : params.scope === 'all' ? allRules : allRules.filter((rule) => selectedIds.includes(rule.id));
     if (!rules.length) throw new Error(params.scope === 'all' ? 'No import rules are saved.' : 'Select at least one import rule.');
+    for (const input of rules) {
+      const { errors } = validateImportRule(input);
+      if (errors.length) throw new Error(`Invalid import rule: ${errors.join(' ')}`);
+    }
 
     await log(job.id, `Starting import rules sync (${params.mode}, ${params.scope}).`);
     await progress({ phase: 'import_rules', label: 'Running import rules', status: 'running' });
@@ -243,13 +272,14 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     const perRule = [];
     const pdfBatchSize = readPdfBatchSize(params);
     const attemptedPdfIds = new Set(readDocIdList(params.skipPdfDocIds));
-    const totals = { rulesStarted: 0, totalSeen: 0, totalSaved: 0, totalSkipped: 0 };
+    const totals = { rulesStarted: 0, totalSeen: 0, totalSaved: 0, totalSkipped: 0, totalEnriched: 0 };
     let pdfBatchLimitReached = false;
     for (const rule of rules) {
-      const remainingPdfBatchSize = params.mode === 'sync_missing_pdfs' && pdfBatchSize
-        ? Math.max(0, pdfBatchSize - totals.totalSaved)
+      const enrichesDocuments = contentModeEnrichesDocuments(rule.contentMode);
+      const remainingPdfBatchSize = params.mode === 'sync_missing_pdfs' && enrichesDocuments && pdfBatchSize
+        ? Math.max(0, pdfBatchSize - totals.totalEnriched)
         : 0;
-      if (params.mode === 'sync_missing_pdfs' && pdfBatchSize && remainingPdfBatchSize <= 0) {
+      if (params.mode === 'sync_missing_pdfs' && enrichesDocuments && pdfBatchSize && remainingPdfBatchSize <= 0) {
         pdfBatchLimitReached = true;
         break;
       }
@@ -264,7 +294,6 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       const result = await runDocumentSync({
         ...importRuleToSyncOptions(rule, {
           mode: params.mode,
-          downloadFiles: params.downloadFiles,
           apiKey,
         }),
         artifactClient,
@@ -272,18 +301,22 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
           ...event,
           detail: event.detail || `Syncing ${rule.name}`,
         }),
-        pdfBatchSize: params.mode === 'sync_missing_pdfs' ? remainingPdfBatchSize : 0,
+        pdfBatchSize: params.mode === 'sync_missing_pdfs' && enrichesDocuments ? remainingPdfBatchSize : 0,
         skipPdfDocIds: Array.from(attemptedPdfIds),
       });
       totals.rulesStarted += 1;
       totals.totalSeen += Number(result.totalSeen || 0);
       totals.totalSaved += Number(result.totalSaved || 0);
       totals.totalSkipped += Number(result.totalSkipped || 0);
+      if (params.mode === 'sync_missing_pdfs' && enrichesDocuments) {
+        totals.totalEnriched += Number(result.totalSaved || 0);
+      }
       for (const docId of readDocIdList(result.pdfAttemptedIds)) attemptedPdfIds.add(docId);
       if (result.pdfBatchLimitReached) pdfBatchLimitReached = true;
       perRule.push({
         ruleId: rule.id,
         ruleName: rule.name,
+        contentMode: rule.contentMode,
         syncKey: result.syncKey,
         ok: result.ok,
         totalSeen: result.totalSeen || 0,
@@ -295,7 +328,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         error: result.error || null,
       });
       await log(job.id, `Rule result: ${result.ok ? 'success' : 'failed'}; ${result.totalSaved || 0} saved.`);
-      if (params.mode === 'sync_missing_pdfs' && pdfBatchSize && totals.totalSaved >= pdfBatchSize) {
+      if (params.mode === 'sync_missing_pdfs' && enrichesDocuments && pdfBatchSize && totals.totalEnriched >= pdfBatchSize) {
         pdfBatchLimitReached = true;
         break;
       }

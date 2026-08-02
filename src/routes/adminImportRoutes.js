@@ -4,15 +4,18 @@ import {
   saveImportRule, hasRunningAdminJob
 } from '../db.js';
 import { createAndStartAdminWorkerJob } from '../services/adminWorker.js';
-import { DEFAULT_BASE_URL, DEFAULT_SOURCE, DEFAULT_TERM, IMPORT_PDF_BATCH_SIZE } from '../config.js';
+import {
+  ALLOW_ORIGINAL_PDF_RETRIEVAL, DEFAULT_BASE_URL, DEFAULT_SOURCE, DEFAULT_TERM,
+  IMPORT_PDF_BATCH_SIZE
+} from '../config.js';
 import { fetchPage, extractHits, fetchSearchAggregations, resolveIndexName } from '../api.js';
 import { normalizeRecord } from '../metrics.js';
 import { getConfiguredApiKey } from '../secrets.js';
-import { parseBooleanParam, parseNumberParam } from '../validate.js';
+import { parseNumberParam } from '../validate.js';
 import { asyncHandler } from '../middleware/http.js';
 import {
-  IMPORT_RULE_FIELDS, buildImportRuleTerm, importRuleToSyncOptions,
-  normalizeImportRule, validateImportRule
+  IMPORT_RULE_FIELDS, buildImportRuleTerm, contentModeRequestsOriginalPdf,
+  importRuleToSyncOptions, normalizeImportRule, validateImportRule
 } from '../importRules.js';
 import { logger } from '../logger.js';
 
@@ -26,7 +29,32 @@ function cleanImportRequest(input = {}) {
     index: input.index,
     query: input.query,
     source: input.source || DEFAULT_SOURCE,
+    contentMode: input.contentMode ?? input.content_mode,
   });
+}
+
+function importRuleSnapshot(rule) {
+  return normalizeImportRule(rule);
+}
+
+function contentModeCounts(rules) {
+  return rules.reduce((counts, rule) => {
+    counts[rule.contentMode] = (counts[rule.contentMode] || 0) + 1;
+    return counts;
+  }, {});
+}
+
+function contentPolicyRunError(rules, mode) {
+  const invalidRule = rules.find((rule) => validateImportRule(rule).errors.length);
+  if (invalidRule) return `Import rule "${invalidRule.name || invalidRule.id || 'unknown'}" has an invalid content policy.`;
+  if (mode !== 'sync_missing_pdfs') return null;
+  if (rules.some((rule) => rule.contentMode === 'pdf_stream')) {
+    return 'The pdf_stream content mode will be enabled by the zero-retention processing step and cannot run yet.';
+  }
+  if (!ALLOW_ORIGINAL_PDF_RETRIEVAL && rules.some((rule) => contentModeRequestsOriginalPdf(rule.contentMode))) {
+    return 'Original PDF retrieval is disabled for this deployment. Set ALLOW_ORIGINAL_PDF_RETRIEVAL=1 to run pdf_cache or pdf_stream rules.';
+  }
+  return null;
 }
 
 function toList(value) {
@@ -193,9 +221,15 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
 
   router.post('/import-rules/sync', asyncHandler(async (req, res) => {
     const body = req.body || {};
-    const rule = body.id ? await getImportRule(body.id) : normalizeImportRule(body);
+    const storedRule = body.id ? await getImportRule(body.id) : body;
+    const validation = storedRule ? validateImportRule(storedRule) : null;
+    const rule = validation?.rule || null;
     if (!rule) {
       res.status(404).json({ error: 'Import rule not found' });
+      return;
+    }
+    if (validation.errors.length) {
+      res.status(400).json({ error: 'Validation failed', errors: validation.errors });
       return;
     }
     const mode = String(body.mode || 'import_all');
@@ -210,9 +244,13 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
       syncMaxRecords: body.syncMaxRecords ?? body.scanLimit,
       pageSize: body.pageSize,
       scanLimit: body.scanLimit,
-      downloadFiles: parseBooleanParam(body.downloadFiles, true),
       apiKey: await getConfiguredApiKey(),
     });
+    const policyError = contentPolicyRunError([rule], mode);
+    if (policyError) {
+      res.status(409).json({ error: policyError });
+      return;
+    }
     const runningId = await hasRunningAdminJob('document_sync');
     if (runningId) {
       res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
@@ -250,6 +288,11 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
       res.status(400).json({ error: scope === 'all' ? 'No import rules are saved.' : 'Select at least one import rule.' });
       return;
     }
+    const policyError = contentPolicyRunError(rules, mode);
+    if (policyError) {
+      res.status(409).json({ error: policyError });
+      return;
+    }
 
     const runningId = await hasRunningAdminJob('import_rules_sync');
     if (runningId) {
@@ -264,7 +307,8 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
         mode,
         scope,
         ruleIds: selectedIds,
-        downloadFiles: parseBooleanParam(body.downloadFiles, true),
+        rules: rules.map(importRuleSnapshot),
+        contentModeCounts: contentModeCounts(rules),
         pdfBatchSize: mode === 'sync_missing_pdfs' ? IMPORT_PDF_BATCH_SIZE : null,
         autoContinuePdfBatches: mode === 'sync_missing_pdfs',
       },

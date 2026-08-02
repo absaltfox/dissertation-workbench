@@ -67,6 +67,7 @@ test('fetchFullTextForDocument retrieves cIRcle TEXT bitstream from original rec
       return {
         ok: true,
         json: async () => ([
+          { id: 512973, bundleName: 'LICENSE', mimeType: 'text/plain', name: 'license.txt' },
           { id: 512600, bundleName: 'ORIGINAL', mimeType: 'application/pdf', name: 'doc.pdf' },
           { id: 512974, bundleName: 'TEXT', mimeType: 'text/plain', name: 'doc.pdf.txt' },
         ]),
@@ -94,6 +95,7 @@ test('fetchFullTextForDocument retrieves cIRcle TEXT bitstream from original rec
     assert.equal(await fs.readFile(result.fullTextPath, 'utf8'), longText);
     assert.ok(requested[0].startsWith('https://circle.library.ubc.ca/rest/handle/2429/93916'));
     assert.ok(requested.some((url) => url.includes('/rest/bitstreams/512974/retrieve')));
+    assert.equal(requested.some((url) => url.includes('/rest/bitstreams/512973/retrieve')), false);
     await fs.unlink(result.fullTextPath).catch(() => {});
   } finally {
     globalThis.fetch = originalFetch;

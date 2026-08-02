@@ -13,6 +13,7 @@ let loadStoredFileMetric;
 let runDocumentSync;
 let runImportPdfAdminJob;
 let saveImportRule;
+let rulesForContinuation;
 
 function searchPayload() {
   return {
@@ -48,7 +49,42 @@ test.before(async () => {
   } = await import('../src/db.js'));
   ({ runDocumentSync } = await import('../src/sync.js'));
   ({ runImportPdfAdminJob } = await import('../src/services/importPdfJobRunner.js'));
+  ({ rulesForContinuation } = await import('../src/services/importPdfJobRunner.js'));
   await ensureStorage();
+});
+
+test('continuations retain only the capped enrichment rule and rules not yet processed', () => {
+  const rules = [
+    { id: 'metadata-done', contentMode: 'metadata_only' },
+    { id: 'text-done', contentMode: 'full_text_only' },
+    { id: 'text-capped', contentMode: 'full_text_only' },
+    { id: 'metadata-pending', contentMode: 'metadata_only' },
+  ];
+  const continued = rulesForContinuation(rules, [
+    { ruleId: 'metadata-done', pdfBatchLimitReached: false },
+    { ruleId: 'text-done', pdfBatchLimitReached: false },
+    { ruleId: 'text-capped', pdfBatchLimitReached: true },
+  ]);
+  assert.deepEqual(continued.map((rule) => rule.id), ['text-capped', 'metadata-pending']);
+});
+
+test('worker rejects invalid snapshotted content policies before network access', async () => {
+  const jobId = await createAdminJob({
+    type: 'import_rules_sync',
+    label: 'Invalid Policy Test',
+    params: {
+      mode: 'sync_missing_pdfs',
+      scope: 'selected',
+      ruleIds: ['invalid-rule'],
+      rules: [{ id: 'invalid-rule', name: 'Invalid', contentMode: 'not-a-mode' }],
+      autoContinuePdfBatches: false,
+    },
+    runnerType: 'local',
+  });
+  await assert.rejects(
+    runImportPdfAdminJob(await getAdminJob(jobId)),
+    /Invalid snapshotted import rule/
+  );
 });
 
 test.after(async () => {
@@ -147,12 +183,14 @@ test('import-rule PDF batches share one job-level cap across selected rules', as
     name: `Rule One ${suffix}`,
     degree: `Rule One ${suffix}`,
     source: 'id,title,author',
+    contentMode: 'full_text_only',
   });
   const ruleTwo = await saveImportRule({
     id: `rule-two-${suffix}`,
     name: `Rule Two ${suffix}`,
     degree: `Rule Two ${suffix}`,
     source: 'id,title,author',
+    contentMode: 'full_text_only',
   });
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => {
@@ -183,18 +221,22 @@ test('import-rule PDF batches share one job-level cap across selected rules', as
         mode: 'sync_missing_pdfs',
         scope: 'selected',
         ruleIds: [ruleOne.id, ruleTwo.id],
-        downloadFiles: true,
+        rules: [ruleOne, ruleTwo],
         pdfBatchSize: 2,
         autoContinuePdfBatches: false,
       },
       runnerType: 'local',
     });
+    await saveImportRule({ ...ruleOne, contentMode: 'metadata_only' });
+    await saveImportRule({ ...ruleTwo, contentMode: 'metadata_only' });
     const result = await runImportPdfAdminJob(await getAdminJob(jobId));
 
     assert.equal(result.ok, true);
     assert.equal(result.totalSaved, 2);
+    assert.equal(result.totalEnriched, 2);
     assert.equal(result.pdfBatchLimitReached, true);
     assert.equal(result.rules.length, 1);
+    assert.equal(result.rules[0].contentMode, 'full_text_only');
     if (result.rules[0].ruleId === ruleOne.id) {
       assert.equal((await loadStoredFileMetric(docIds.oneA)).status, 'not_found');
       assert.equal((await loadStoredFileMetric(docIds.oneB)).status, 'not_found');

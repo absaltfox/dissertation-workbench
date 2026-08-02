@@ -194,6 +194,29 @@ test('legacy import-rule sync endpoint uses durable document sync job state', as
   }
 });
 
+test('legacy import-rule sync endpoint rejects invalid content policies', async () => {
+  const token = createSession('admin');
+  try {
+    const res = await request(app)
+      .post('/api/admin/import-rules/sync')
+      .set('Cookie', `session=${token}`)
+      .set('x-csrf-token', getSessionCsrfToken(token))
+      .send({
+        name: 'Invalid content policy',
+        degree: 'Doctor of Education - EdD',
+        contentMode: 'unknown_mode',
+        mode: 'import_all',
+      })
+      .expect('content-type', /application\/json/)
+      .expect(400);
+
+    assert.equal(res.body.error, 'Validation failed');
+    assert.match(res.body.errors.join(' '), /Content mode must be one of/);
+  } finally {
+    destroySession(token);
+  }
+});
+
 test('metrics validates query parameters before collecting data', async () => {
   const res = await request(app)
     .get('/api/metrics?maxRecords=10000')

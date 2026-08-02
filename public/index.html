@@ -503,6 +503,21 @@
                     </div>
                   </fieldset>
                   <fieldset class="settings-section">
+                    <legend>Content Processing</legend>
+                    <div class="settings-grid">
+                      <label class="full">
+                        <span>Content mode</span>
+                        <select id="importContentMode">
+                          <option value="metadata_only" selected>Metadata only — do not retrieve document content</option>
+                          <option value="full_text_only">Extracted full text only — never request the original PDF</option>
+                          <option value="pdf_stream">Stream PDF — zero-retention processing (not enabled yet)</option>
+                          <option value="pdf_cache">Cache PDF — retain the original PDF</option>
+                        </select>
+                      </label>
+                    </div>
+                    <p class="meta">Original PDF modes also require the deployment-wide safety setting. The selected policy is snapshotted when a job starts.</p>
+                  </fieldset>
+                  <fieldset class="settings-section">
                     <legend>Rule</legend>
                     <div class="settings-grid">
                       <label class="full">
@@ -559,8 +574,8 @@
                         <span class="import-action-meta">Fast</span>
                       </button>
                       <button type="button" id="syncMissingPdfsRuleBtn" class="import-action-card primary">
-                        <span class="import-action-title">Import + Analyze PDFs</span>
-                        <span class="import-action-meta">Full text, people, citations</span>
+                        <span class="import-action-title">Import + Enrich Using Rule Policy</span>
+                        <span class="import-action-meta">Content handling follows each saved rule</span>
                       </button>
                     </div>
                     <div class="import-maintenance-actions" aria-label="Maintenance actions">

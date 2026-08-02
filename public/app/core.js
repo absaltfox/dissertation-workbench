@@ -93,6 +93,7 @@ const importAffiliationEl = document.getElementById('importAffiliation');
 const importIndexEl = document.getElementById('importIndex');
 const importQueryEl = document.getElementById('importQuery');
 const importSourceEl = document.getElementById('importSource');
+const importContentModeEl = document.getElementById('importContentMode');
 const importGeneratedTermEl = document.getElementById('importGeneratedTerm');
 const importRulesListEl = document.getElementById('importRulesList');
 const importRulePreviewEl = document.getElementById('importRulePreview');
@@ -821,6 +822,7 @@ const dom = {
   importIndexEl,
   importQueryEl,
   importSourceEl,
+  importContentModeEl,
   importGeneratedTermEl,
   importRulesListEl,
   importRulePreviewEl,

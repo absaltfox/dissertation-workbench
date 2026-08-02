@@ -13,6 +13,9 @@ import {
 import { logger } from './logger.js';
 import { analyzeDocumentFile } from './pdf.js';
 import { DOCUMENT_SYNC_MODES, filterSyncItemsForMode as filterSyncItemsForModeWithExists } from './syncModes.js';
+import {
+  DEFAULT_IMPORT_CONTENT_MODE, contentModeEnrichesDocuments
+} from './importRules.js';
 
 const runningSyncs = new Map();
 export { DOCUMENT_SYNC_MODES };
@@ -59,13 +62,16 @@ function sourceUpdatedAt(raw) {
 export const filterSyncItemsForMode = (items, mode, existsFn = documentExists) =>
   filterSyncItemsForModeWithExists(items, mode, existsFn);
 
-function hasCachedEnrichmentMetric(stored) {
-  return Boolean(stored?.pdf_path)
-    || (
+export function hasCachedEnrichmentMetric(stored, contentMode) {
+  if (contentMode === 'pdf_cache') return Boolean(stored?.pdf_path);
+  if (contentMode === 'full_text_only') {
+    return (
       stored?.word_source === 'dspace_full_text'
       && Number(stored.word_count) > 0
       && Number(stored.page_count) > 0
     );
+  }
+  return false;
 }
 
 function progressDocDetail(doc = {}) {
@@ -74,6 +80,7 @@ function progressDocDetail(doc = {}) {
 
 async function runSync(syncKey, source, apiKey, runId, {
   mode = 'import_all',
+  contentMode = DEFAULT_IMPORT_CONTENT_MODE,
   artifactClient = null,
   onProgress = null,
   pdfBatchSize = 0,
@@ -133,9 +140,10 @@ async function runSync(syncKey, source, apiKey, runId, {
         };
       });
       totalSeen += batch.length;
-      const filtered = await filterSyncItemsForMode(batch, mode);
+      const enrichmentRequested = mode === 'sync_missing_pdfs' && contentModeEnrichesDocuments(contentMode);
+      const filtered = await filterSyncItemsForMode(batch, enrichmentRequested ? mode : 'import_all');
       totalSkipped += filtered.skipped;
-      if (mode === 'sync_missing_pdfs') {
+      if (enrichmentRequested) {
         const missing = [];
         for (const item of filtered.items) {
           if (skippedPdfIds.has(String(item.doc.id))) {
@@ -143,7 +151,7 @@ async function runSync(syncKey, source, apiKey, runId, {
             continue;
           }
           const stored = await loadStoredFileMetric(item.doc.id);
-          if (hasCachedEnrichmentMetric(stored)) {
+          if (hasCachedEnrichmentMetric(stored, contentMode)) {
             totalSkipped += 1;
             continue;
           }
@@ -182,7 +190,8 @@ async function runSync(syncKey, source, apiKey, runId, {
           await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
           pdfAttemptedIds.push(item.doc.id);
           await analyzeDocumentFile(item.doc, {
-            downloadFiles: source.downloadFiles,
+            contentMode,
+            downloadFiles: contentMode === 'pdf_cache' || contentMode === 'pdf_stream',
             forceDownload: false,
             recomputeFromCache: false,
             artifactClient,
@@ -285,6 +294,7 @@ export async function startDocumentSync(options = {}) {
   const runId = await createSyncRun(syncKey, source);
   const task = runSync(syncKey, source, built.apiKey, runId, {
     mode,
+    contentMode: options.contentMode || (options.downloadFiles === false ? 'full_text_only' : 'pdf_cache'),
     artifactClient: options.artifactClient || null,
     onProgress: options.onProgress || null,
     pdfBatchSize: options.pdfBatchSize || 0,
@@ -305,6 +315,7 @@ export async function runDocumentSync(options = {}) {
   const runId = await createSyncRun(syncKey, source);
   const summary = await runSync(syncKey, source, built.apiKey, runId, {
     mode,
+    contentMode: options.contentMode || (options.downloadFiles === false ? 'full_text_only' : 'pdf_cache'),
     artifactClient: options.artifactClient || null,
     onProgress: options.onProgress || null,
     pdfBatchSize: options.pdfBatchSize || 0,
