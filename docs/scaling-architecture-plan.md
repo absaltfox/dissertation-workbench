@@ -22,7 +22,10 @@ Step 1 establishes the content-policy contract and safety boundary:
 - Implemented in Step 2: `pdf_stream` retrieves into bounded worker-local ephemeral storage, parses from a seekable path, removes the owned temporary directory after success or failure, and reaps directories orphaned by a prior worker process before the first streamed retrieval.
 - Implemented in Step 2: SHA-256 content checksums, retrieval/parser provenance, per-document request accounting, and import-job request totals distinguish metadata, extracted-text, and original-PDF access.
 - Implemented in Step 2: existing global byte and original-PDF rate limits apply to the streaming path; streamed results retain derived metrics but create no PDF artifact or persistent temporary path. An independently existing cached PDF remains unchanged.
-- Pending later steps: per-rule fallback, extraction toggles, per-rule byte/concurrency/rate controls, cache retention, object storage, aggregate analytics, and incremental PatternRank.
+- Implemented in Step 3: bootstrap, document, citation, people, person-detail, related-document, large-corpus analytics, and topic-visualization reads use bounded database queries; the legacy composition endpoint is capped by `maxRecords`.
+- Implemented in Step 3: normalized people relationships are maintained as a versioned serving projection, including transactional committee updates and cursor-checkpointed legacy backfill.
+- Implemented in Step 3: the scale harness passes at 1,000, 5,000, 10,000, and 56,000 synthetic metadata records; all measured queries remain below 250 ms locally at 56,000 records and retained heap stays below 4 MB.
+- Pending later steps: per-rule fallback, extraction toggles, per-rule byte/concurrency/rate controls, cache retention, object storage, and incremental PatternRank.
 
 ## Goals
 
@@ -123,10 +126,12 @@ Full-text word counts are only as accurate as the repository's extracted text. P
 ### 4. Analytics serving
 
 - Replace request-time loading of the full document corpus with database-side aggregates.
-- Precompute summaries by corpus, degree, faculty, program, campus, and year.
+- Compute indexed summaries in the database by corpus, degree, program, affiliation/campus, and year; retain a materialized projection only where canonical person normalization cannot be expressed portably in SQL.
 - Paginate document and citation APIs.
-- Incrementally refresh affected aggregate partitions after imports.
+- Update serving projections transactionally with metadata imports and committee changes.
 - Cache small summary responses rather than document collections in the web process.
+
+Step 3 decision: live database aggregates are preferred over materialized summary partitions while the 56,000-record harness remains comfortably inside the latency budget. This avoids invalidation races and stale partitions. Materialized summary partitions should be introduced only when production telemetry exceeds the documented thresholds, without changing the public endpoint contracts.
 
 ### 5. PatternRank
 
@@ -179,11 +184,13 @@ Implementation note: Step 2 completes the zero-retention `pdf_stream` boundary a
 
 ### Phase 3: Metadata-scale serving
 
-- Import the complete metadata corpus with content retrieval disabled.
-- Add database aggregates and pagination.
-- Load-test at 1,000, 5,000, 10,000, and approximately 56,000 records.
+- Implemented: metadata-only import remains independent of content retrieval.
+- Implemented: database aggregates, document/citation/person-detail pagination, related-document queries, and a normalized people projection bound web-process response size.
+- Implemented: compatibility analytics remain detailed for corpora up to 5,000 records; larger corpora use complete persisted-signal aggregates and return at most 100 projected document samples.
+- Implemented: topic visualizations use an explicitly reported 5,000-document topic sample until Phase 4 introduces incremental topic projections.
+- Implemented: load tests cover 1,000, 5,000, 10,000, and 56,000 records, including a populated topic projection.
 
-Exit criterion: web memory remains bounded and key analytics endpoints meet their agreed latency target at full metadata scale.
+Exit criterion met in the local synthetic harness: retained heap growth stays below 64 MB; bootstrap, document-page, and people-page queries stay below 1.5 seconds; analytics and the topic-document page stay below 3 seconds. The final 56,000-record run measured 210 ms for summary, 99 ms for the document page, 40 ms for analytics, 231 ms for people, and 165 ms for the bounded topic page; peak retained growth was 3.7 MB. Production telemetry must be checked after deployment because Turso/Fly network latency is not represented by the local SQLite harness.
 
 ### Phase 4: Incremental PatternRank and citations
 

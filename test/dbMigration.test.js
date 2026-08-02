@@ -50,6 +50,41 @@ test('schema migration adds content policy and provenance fields conservatively'
       );
       INSERT INTO file_metrics (doc_id, word_count, page_count, status, updated_at)
       VALUES ('legacy-doc', 1000, 4, 'downloaded', '2026-01-01T00:00:00.000Z');
+      CREATE TABLE documents (
+        doc_id TEXT PRIMARY KEY,
+        metadata_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO documents (doc_id, metadata_json, updated_at)
+      VALUES (
+        'legacy-serving-doc',
+        '{"id":"legacy-serving-doc","title":"Legacy serving document","supervisors":["Deirdre M. Kelly"]}',
+        '2026-01-01T00:00:00.000Z'
+      );
+      CREATE TABLE committee_members (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        doc_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT,
+        affiliation TEXT,
+        source TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(doc_id, name, role)
+      );
+      INSERT INTO committee_members (doc_id, name, role, affiliation, source, updated_at)
+      VALUES
+        ('legacy-committee-1', 'Already Projected Person', 'Committee Member', NULL, 'pdf', '2026-01-01T00:00:00.000Z'),
+        ('legacy-committee-2', 'Priority M. Person', 'External Examiner', 'PDF University', 'pdf', '2026-01-01T00:00:00.000Z'),
+        ('legacy-committee-2', 'Priority Person', 'External Examiner', 'API University', 'api', '2026-01-02T00:00:00.000Z'),
+        ('legacy-committee-3', 'Newest Person', 'Committee Member', 'New Affiliation', 'pdf', '2026-01-03T00:00:00.000Z'),
+        ('legacy-committee-3', 'Newest M. Person', 'Committee Member', 'Old Affiliation', 'pdf', '2026-01-01T00:00:00.000Z');
+      CREATE TABLE serving_projection_state (
+        projection_key TEXT PRIMARY KEY,
+        projection_value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+      VALUES ('committee_people', 'cursor:1', '2026-01-01T00:00:00.000Z');
     `);
   } finally {
     await client.close();
@@ -60,7 +95,17 @@ test('schema migration adds content policy and provenance fields conservatively'
     const db = await import(${JSON.stringify(dbModuleUrl)});
     const rule = await db.getImportRule('legacy-rule');
     const metric = await db.loadStoredFileMetric('legacy-doc');
-    process.stdout.write(JSON.stringify({ rule, metric }));
+    const people = await db.queryPeoplePage({ limit: 10 });
+    const client = await db.getDb();
+    const projection = await client.execute("SELECT serving_projection_version FROM documents WHERE doc_id = 'legacy-serving-doc'");
+    const committeeProjection = await client.execute("SELECT doc_id, person_key, affiliation, source FROM document_people WHERE source <> 'metadata' ORDER BY doc_id");
+    const committeeState = await client.execute("SELECT projection_value FROM serving_projection_state WHERE projection_key = 'committee_people'");
+    process.stdout.write(JSON.stringify({
+      rule, metric, people,
+      projectionVersion: projection.rows[0]?.serving_projection_version,
+      committeeProjection: committeeProjection.rows,
+      committeeState: committeeState.rows[0]?.projection_value,
+    }));
     await db.closeDb();
   `;
   try {
@@ -79,12 +124,30 @@ test('schema migration adds content policy and provenance fields conservatively'
       ['--input-type=module', '-e', childSource],
       childOptions
     );
-    const migrated = JSON.parse(stdout);
+    const migrated = JSON.parse(stdout.trim().split('\n').at(-1));
     assert.equal(migrated.rule.id, 'legacy-rule');
     assert.equal(migrated.rule.contentMode, 'metadata_only');
     assert.equal(migrated.metric.content_source, null);
     assert.equal(Number(migrated.metric.metadata_request_count), 0);
     assert.equal(Number(migrated.metric.original_pdf_request_count), 0);
+    assert.equal(Number(migrated.projectionVersion), 1);
+    assert.equal(migrated.people.total, 1);
+    assert.equal(migrated.people.people[0].key, 'deirdre kelly');
+    assert.deepEqual(migrated.committeeProjection, [
+      {
+        doc_id: 'legacy-committee-2',
+        person_key: 'priority person',
+        affiliation: 'API University',
+        source: 'api',
+      },
+      {
+        doc_id: 'legacy-committee-3',
+        person_key: 'newest person',
+        affiliation: 'New Affiliation',
+        source: 'pdf',
+      },
+    ]);
+    assert.equal(migrated.committeeState, 'complete');
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

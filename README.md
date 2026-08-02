@@ -103,13 +103,27 @@ Dashboard reads never page Open Collections. If `/api/metrics` receives query pa
 
 ## API
 
-The main frontend endpoint is:
+The frontend uses bounded workbench slices:
+
+```http
+GET /api/workbench/bootstrap
+GET /api/workbench/documents?limit=50&offset=0
+GET /api/workbench/analytics
+GET /api/workbench/people?limit=50&offset=0
+GET /api/workbench/people/:personKey?limit=50&offset=0
+GET /api/workbench/visualizations
+GET /api/workbench/citations/documents?limit=50&offset=0
+```
+
+Bootstrap, filtered/sorted document pages, citation pages, people pages/details, and large-corpus analytics are executed in the database. The web process caches their bounded responses rather than complete document collections. Analytics responses include at most 100 projected document samples when the stored corpus exceeds 5,000 records; persisted aggregate signals cover the complete filtered corpus. Topic visualizations report when their explicit 5,000-document topic sample is truncated.
+
+The legacy composition endpoint remains available:
 
 ```http
 GET /api/metrics
 ```
 
-`/api/metrics` is the dashboard composition endpoint. Its contract is to read local application tables and return the complete dashboard payload:
+`/api/metrics` reads local application tables and returns a compatibility dashboard payload bounded by `maxRecords`:
 
 - `documents`: stored document metadata from `documents`, enriched with persisted `file_metrics` page/word counts, `document_citations` counts, and `committee_members` roles such as supervisors, committee members, university examiners, and external examiners.
 - `metrics`, `wordCloud`, `ngramCloud`, `methodologies`, supervisor/person networks, topic data, and citation co-occurrence values derived from those local rows.
@@ -120,7 +134,7 @@ Open Collections API calls belong to Admin import/sync flows such as import-rule
 Supported query params:
 
 - `index`, `query`, `term`, `source`: identify the preferred stored sync key. They do not trigger live Open Collections reads from this endpoint.
-- `maxRecords`: bounds live Open Collections paging during admin sync only. Dashboard reads always serve the entire stored corpus (optionally narrowed by `degree`/`program`/`affiliation` filters).
+- `maxRecords`: bounds the legacy `/api/metrics` document collection. Workbench summary and aggregate endpoints cover the complete stored corpus and use pagination for document-level rows.
 - `pageSize`: default `20`, maximum `100`.
 - `scanLimit`: default `max(1000, maxRecords * 10)`. Public guardrails cap anonymous request *rates* (120 requests/minute per IP), not corpus coverage.
 - `subjectLimit`: default `25`.
@@ -137,6 +151,13 @@ These endpoints are available to the browser without an admin session. Anonymous
 | --- | --- | --- |
 | `GET` | `/api/health` | Health check with `{ ok, timestamp }`. |
 | `GET` | `/api/metrics` | Builds dashboard metrics from local app tables; does not fetch Open Collections. |
+| `GET` | `/api/workbench/bootstrap` | Returns database-side corpus counts and facet values without document rows. |
+| `GET` | `/api/workbench/documents` | Returns filtered, searched, and sorted document pages, capped at 100 rows per request. |
+| `GET` | `/api/workbench/analytics` | Returns complete database aggregates; detailed in-memory analytics are retained only for corpora of at most 5,000 records. |
+| `GET` | `/api/workbench/people` | Returns paginated people aggregates from the durable serving projection. |
+| `GET` | `/api/workbench/people/:personKey` | Returns corpus-complete person aggregates and a document page capped at 100 rows. |
+| `GET` | `/api/workbench/visualizations` | Returns topic/network visualizations from an explicitly bounded 5,000-document topic sample. |
+| `GET` | `/api/workbench/citations/documents` | Returns paginated citation-bearing document summaries. |
 | `GET` | `/api/documents/:docId/citations` | Returns citations for one cached document, including sharing counts. |
 | `GET` | `/api/citations/top?limit=50` | Returns the most-cited works, capped at 200. |
 | `GET` | `/api/citations/:citationId/documents` | Returns documents that cite a stored citation. |

@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { createClient } from '@libsql/client';
 import { SQLITE_PATH, PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL } from './config.js';
 import { logger } from './logger.js';
-import { dedupeSupervisorNames, normalizePersonName, supervisorNameKey } from './supervisors.js';
+import { dedupeSupervisorNames, normalizePersonName, stripMiddleInitials, supervisorNameKey } from './supervisors.js';
 import { encryptMfaSecret, decryptMfaSecret } from './secretCrypto.js';
 import { jaroWinkler } from './fuzzyMatch.js';
 import { documentThemeTerms } from './nlp.js';
@@ -128,6 +128,7 @@ async function ensureSchema(client) {
       source_json TEXT,
       source_updated_at TEXT,
       synced_at TEXT,
+      serving_projection_version INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL
     );
 
@@ -155,6 +156,23 @@ async function ensureSchema(client) {
       retrieved_bytes INTEGER DEFAULT 0,
       status TEXT,
       error TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS document_people (
+      doc_id TEXT NOT NULL,
+      person_key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      role TEXT NOT NULL,
+      affiliation TEXT,
+      source TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (doc_id, person_key, role, source)
+    );
+
+    CREATE TABLE IF NOT EXISTS serving_projection_state (
+      projection_key TEXT PRIMARY KEY,
+      projection_value TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
 
@@ -376,6 +394,7 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN source_json TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN source_updated_at TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN synced_at TEXT');
+  await addColumnIfMissing(client, 'documents', 'serving_projection_version', 'INTEGER NOT NULL DEFAULT 0');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_secret TEXT');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_enabled INTEGER NOT NULL DEFAULT 0');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_enabled_at TEXT');
@@ -404,6 +423,8 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree ON documents(degree)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_program ON documents(program)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_people_key ON document_people(person_key)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_people_role ON document_people(role)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_import_rules_updated_at ON import_rules(updated_at)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_username ON password_reset_tokens(username)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)');
@@ -413,13 +434,12 @@ async function ensureSchema(client) {
 
   const cleaned = await cleanupCommitteeArtifacts(client);
   if (cleaned > 0) logger.info(`Cleaned up ${cleaned} committee artefact rows`);
+  await backfillDocumentPeopleProjection(client);
 }
 
 export async function cleanupCommitteeArtifacts(dbInstance = null) {
   const client = dbInstance || await getDb();
-  const result = await client.execute(`
-    DELETE FROM committee_members
-    WHERE lower(name) IN (
+  const artifactNames = `
       'additional supervisory committee members:',
       'additional supervisory committee members',
       'examining committee members',
@@ -427,8 +447,12 @@ export async function cleanupCommitteeArtifacts(dbInstance = null) {
       'supervisory committee members',
       'supervisory committee',
       'committee members'
-    )
+  `;
+  const result = await client.execute(`
+    DELETE FROM committee_members
+    WHERE lower(name) IN (${artifactNames})
   `);
+  await client.execute(`DELETE FROM document_people WHERE lower(name) IN (${artifactNames})`);
   return changes(result);
 }
 
@@ -459,33 +483,178 @@ function withStoredThemes(doc) {
   };
 }
 
+function documentPersonKey(name) {
+  const normalized = supervisorNameKey(name);
+  return normalized ? stripMiddleInitials(normalized) : '';
+}
+
+function authoritativeCommitteeRow(rows, personKey) {
+  return (rows || [])
+    .filter((row) => documentPersonKey(row.name) === personKey)
+    .sort((left, right) => {
+      const sourceRank = Number(right.source === 'api') - Number(left.source === 'api');
+      if (sourceRank) return sourceRank;
+      const updatedRank = String(right.updated_at || '').localeCompare(String(left.updated_at || ''));
+      return updatedRank || Number(right.id || 0) - Number(left.id || 0);
+    })[0] || null;
+}
+
+function metadataPeopleStatements(doc, now = new Date().toISOString()) {
+  const statements = [{
+    sql: "DELETE FROM document_people WHERE doc_id = ? AND source = 'metadata'",
+    args: [doc.id],
+  }];
+  const names = dedupeSupervisorNames(Array.isArray(doc.supervisors) ? doc.supervisors : []);
+  for (const name of names) {
+    const key = documentPersonKey(name);
+    if (!key) continue;
+    statements.push({
+      sql: `
+        INSERT INTO document_people (doc_id, person_key, name, role, affiliation, source, updated_at)
+        VALUES (?, ?, ?, 'Supervisor', NULL, 'metadata', ?)
+        ON CONFLICT(doc_id, person_key, role, source) DO UPDATE SET
+          name = excluded.name,
+          updated_at = excluded.updated_at
+      `,
+      args: [doc.id, key, name, now],
+    });
+  }
+  return statements;
+}
+
+async function backfillDocumentPeopleProjection(client) {
+  let total = 0;
+  while (true) {
+    const result = await client.execute(`
+      SELECT doc_id, metadata_json
+      FROM documents
+      WHERE serving_projection_version < 1
+      ORDER BY doc_id
+      LIMIT 500
+    `);
+    if (!result.rows.length) break;
+    const statements = [];
+    const now = new Date().toISOString();
+    for (const row of result.rows) {
+      let doc = null;
+      try { doc = JSON.parse(row.metadata_json); } catch { doc = { id: row.doc_id, supervisors: [] }; }
+      doc.id ||= row.doc_id;
+      statements.push(...metadataPeopleStatements(doc, now));
+      statements.push({
+        sql: 'UPDATE documents SET serving_projection_version = 1 WHERE doc_id = ?',
+        args: [row.doc_id],
+      });
+    }
+    await client.batch(statements, 'write');
+    total += result.rows.length;
+  }
+  if (total) logger.info('Backfilled metadata-serving people projection', { documents: total });
+
+  const state = await client.execute({
+    sql: 'SELECT projection_value FROM serving_projection_state WHERE projection_key = ?',
+    args: ['committee_people'],
+  });
+  const savedCommitteeState = String(state.rows[0]?.projection_value || '');
+  if (savedCommitteeState === '1' || savedCommitteeState === 'complete') return;
+  let cursor = savedCommitteeState.startsWith('cursor:')
+    ? Math.max(0, Number(savedCommitteeState.slice('cursor:'.length)) || 0)
+    : 0;
+  let committeeRows = 0;
+  while (true) {
+    const transaction = await client.transaction('write');
+    try {
+      const result = await transaction.execute({
+        sql: `
+          SELECT id, doc_id, name, role, affiliation, source, updated_at
+          FROM committee_members
+          WHERE id > ?
+          ORDER BY id
+          LIMIT 500
+        `,
+        args: [cursor],
+      });
+      if (!result.rows.length) {
+        await transaction.commit();
+        break;
+      }
+      const statements = [];
+      const relationships = new Map();
+      for (const row of result.rows) {
+        cursor = Number(row.id);
+        const key = documentPersonKey(row.name);
+        if (!key) continue;
+        const role = row.role || 'Committee Member';
+        relationships.set(`${row.doc_id}\u0000${key}\u0000${role}`, {
+          docId: row.doc_id, personKey: key, role,
+        });
+      }
+      for (const { docId, personKey, role } of relationships.values()) {
+        const candidates = await transaction.execute({
+          sql: `SELECT id, name, role, affiliation, source, updated_at
+                FROM committee_members
+                WHERE doc_id = ? AND COALESCE(role, 'Committee Member') = ?`,
+          args: [docId, role],
+        });
+        const winner = authoritativeCommitteeRow(candidates.rows, personKey);
+        statements.push({
+          sql: `
+            DELETE FROM document_people
+            WHERE doc_id = ? AND person_key = ? AND role = ? AND source <> 'metadata'
+          `,
+          args: [docId, personKey, role],
+        });
+        if (winner) statements.push({
+          sql: `
+            INSERT INTO document_people (doc_id, person_key, name, role, affiliation, source, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `,
+          args: [
+            docId, personKey, winner.name, winner.role || 'Committee Member',
+            winner.affiliation || null, winner.source || 'committee', winner.updated_at,
+          ],
+        });
+      }
+      statements.push({
+        sql: `
+          INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+          VALUES ('committee_people', ?, ?)
+          ON CONFLICT(projection_key) DO UPDATE SET
+            projection_value = excluded.projection_value,
+            updated_at = excluded.updated_at
+        `,
+        args: [`cursor:${cursor}`, new Date().toISOString()],
+      });
+      await transaction.batch(statements);
+      await transaction.commit();
+      committeeRows += result.rows.length;
+    } catch (error) {
+      await transaction.rollback().catch(() => {});
+      throw error;
+    } finally {
+      transaction.close();
+    }
+  }
+  await client.execute({
+    sql: `
+      INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+      VALUES ('committee_people', 'complete', ?)
+      ON CONFLICT(projection_key) DO UPDATE SET
+        projection_value = excluded.projection_value,
+        updated_at = excluded.updated_at
+    `,
+    args: [new Date().toISOString()],
+  });
+  if (committeeRows) logger.info('Backfilled committee people projection', { rows: committeeRows });
+}
+
 export async function saveDocumentMetadata(doc, { syncKey = null, source = null } = {}) {
   doc = withStoredThemes(doc);
   const now = new Date().toISOString();
-  const cols = documentColumns(doc, syncKey, source);
-  await run(`
-    INSERT INTO documents (
-      doc_id, metadata_json, sync_key, title, author, year, degree, program,
-      source_json, source_updated_at, synced_at, updated_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(doc_id) DO UPDATE SET
-      metadata_json = excluded.metadata_json,
-      sync_key = COALESCE(excluded.sync_key, documents.sync_key),
-      title = excluded.title,
-      author = excluded.author,
-      year = excluded.year,
-      degree = excluded.degree,
-      program = excluded.program,
-      source_json = COALESCE(excluded.source_json, documents.source_json),
-      source_updated_at = COALESCE(excluded.source_updated_at, documents.source_updated_at),
-      synced_at = COALESCE(excluded.synced_at, documents.synced_at),
-      updated_at = excluded.updated_at
-  `, [
-    doc.id, JSON.stringify(doc), cols.syncKey, cols.title, cols.author, cols.year,
-    cols.degree, cols.program, cols.sourceJson, cols.sourceUpdatedAt,
-    syncKey ? now : null, now
-  ]);
+  const client = await getDb();
+  await client.batch([
+    saveDocumentStatement(doc, { syncKey, source }, now),
+    ...metadataPeopleStatements(doc, now),
+  ], 'write');
 }
 
 function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now = new Date().toISOString()) {
@@ -495,9 +664,9 @@ function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now 
     sql: `
       INSERT INTO documents (
         doc_id, metadata_json, sync_key, title, author, year, degree, program,
-        source_json, source_updated_at, synced_at, updated_at
+        source_json, source_updated_at, synced_at, serving_projection_version, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
       ON CONFLICT(doc_id) DO UPDATE SET
         metadata_json = excluded.metadata_json,
         sync_key = COALESCE(excluded.sync_key, documents.sync_key),
@@ -509,6 +678,7 @@ function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now 
         source_json = COALESCE(excluded.source_json, documents.source_json),
         source_updated_at = COALESCE(excluded.source_updated_at, documents.source_updated_at),
         synced_at = COALESCE(excluded.synced_at, documents.synced_at),
+        serving_projection_version = excluded.serving_projection_version,
         updated_at = excluded.updated_at
     `,
     args: [
@@ -525,10 +695,16 @@ export async function saveDocumentMetadataBatch(items) {
   const now = new Date().toISOString();
   const client = await getDb();
   await client.batch(
-    cleaned.map((item) => saveDocumentStatement(item.doc, {
-      syncKey: item.syncKey || null,
-      source: item.source || null,
-    }, now)),
+    cleaned.flatMap((item) => {
+      const doc = withStoredThemes(item.doc);
+      return [
+        saveDocumentStatement(doc, {
+          syncKey: item.syncKey || null,
+          source: item.source || null,
+        }, now),
+        ...metadataPeopleStatements(doc, now),
+      ];
+    }),
     'write'
   );
   return cleaned.length;
@@ -623,6 +799,643 @@ export async function listCachedDocuments({ syncKey, limit = null, offset = 0 } 
       return null;
     }
   }).filter(Boolean);
+}
+
+function affiliationFilterValues(raw) {
+  const value = String(raw || '').trim().toLowerCase();
+  const groups = [
+    ['ubc', 'university of british columbia', 'the university of british columbia'],
+    ['sfu', 'simon fraser university'],
+    ['uvic', 'university of victoria'],
+    ['tru', 'thompson rivers university'],
+    ['rru', 'royal roads university'],
+  ];
+  return groups.find((group) => group.includes(value)) || [value];
+}
+
+function documentServingFilters({ syncKey = null, degree = '', program = '', affiliation = '', q = '' } = {}) {
+  const clauses = [];
+  const args = [];
+  if (syncKey) {
+    clauses.push('d.sync_key = ?');
+    args.push(syncKey);
+  }
+  if (degree) {
+    clauses.push('d.degree = ?');
+    args.push(degree);
+  }
+  if (program) {
+    clauses.push('d.program = ?');
+    args.push(program);
+  }
+  if (affiliation) {
+    const values = affiliationFilterValues(affiliation);
+    clauses.push(`EXISTS (
+      SELECT 1 FROM json_each(d.metadata_json, '$.affiliation') affiliation
+      WHERE lower(trim(CAST(affiliation.value AS TEXT))) IN (${values.map(() => '?').join(', ')})
+    )`);
+    args.push(...values);
+  }
+  if (q) {
+    const pattern = `%${String(q).toLowerCase()}%`;
+    clauses.push(`(
+      lower(COALESCE(d.title, '')) LIKE ? OR
+      lower(COALESCE(d.author, '')) LIKE ? OR
+      lower(COALESCE(d.degree, '')) LIKE ? OR
+      lower(COALESCE(d.program, '')) LIKE ? OR
+      CAST(d.year AS TEXT) LIKE ? OR
+      EXISTS (
+        SELECT 1 FROM json_each(d.metadata_json, '$.supervisors') supervisor
+        WHERE lower(CAST(supervisor.value AS TEXT)) LIKE ?
+      )
+    )`);
+    args.push(pattern, pattern, pattern, pattern, pattern, pattern);
+  }
+  return {
+    where: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '',
+    args,
+  };
+}
+
+const DOCUMENT_PAGE_SORTS = {
+  title: 'lower(COALESCE(d.title, \'\'))',
+  author: 'lower(COALESCE(d.author, \'\'))',
+  year: 'COALESCE(d.year, 0)',
+  degree: 'lower(COALESCE(d.degree, \'\'))',
+  pages: 'COALESCE(fm.page_count, 0)',
+  wordCount: 'COALESCE(fm.word_count, 0)',
+  citationCount: 'COALESCE(dc.citation_count, 0)',
+};
+
+/**
+ * Database-backed document pagination. Filtering, sorting, citation counts,
+ * and LIMIT/OFFSET all happen before metadata JSON reaches the web process.
+ */
+export async function queryCachedDocumentPage({
+  syncKey = null, filters = {}, q = '', sortKey = '', sortDir = 'asc', limit = 50, offset = 0,
+} = {}) {
+  const queryFilters = documentServingFilters({ syncKey, ...filters, q });
+  const countRow = await get(`SELECT COUNT(*) AS total FROM documents d ${queryFilters.where}`, queryFilters.args);
+  const sortExpression = DOCUMENT_PAGE_SORTS[sortKey] || 'COALESCE(d.year, 0)';
+  const direction = sortKey ? (sortDir === 'asc' ? 'ASC' : 'DESC') : 'DESC';
+  const rows = await all(`
+    SELECT d.doc_id, d.metadata_json,
+           fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
+           fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+           COALESCE(dc.citation_count, 0) AS citation_count
+    FROM documents d
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN (
+      SELECT doc_id, COUNT(*) AS citation_count
+      FROM document_citations
+      GROUP BY doc_id
+    ) dc ON dc.doc_id = d.doc_id
+    ${queryFilters.where}
+    ORDER BY ${sortExpression} ${direction}, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
+    LIMIT ? OFFSET ?
+  `, [...queryFilters.args, Math.max(1, Number(limit) || 50), Math.max(0, Number(offset) || 0)]);
+  const documents = rows.map((row) => {
+    try {
+      const doc = applyStoredFileMetricToDocument(JSON.parse(row.metadata_json), row);
+      doc.citationCount = Number(row.citation_count || 0);
+      return doc;
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
+  return { total: Number(countRow?.total || 0), documents };
+}
+
+/** A bounded document page restricted to documents with persisted topic assignments. */
+export async function queryTopicDocumentPage({
+  syncKey = null, filters = {}, limit = 5000, offset = 0,
+} = {}) {
+  const queryFilters = documentServingFilters({ syncKey, ...filters });
+  const topicJoin = 'JOIN (SELECT DISTINCT doc_id FROM document_topics) dt ON dt.doc_id = d.doc_id';
+  const countRow = await get(`
+    SELECT COUNT(*) AS total
+    FROM documents d
+    ${topicJoin}
+    ${queryFilters.where}
+  `, queryFilters.args);
+  const rows = await all(`
+    SELECT d.doc_id, d.metadata_json,
+           fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
+           fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+           COALESCE(dc.citation_count, 0) AS citation_count
+    FROM documents d
+    ${topicJoin}
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN (
+      SELECT doc_id, COUNT(*) AS citation_count
+      FROM document_citations
+      GROUP BY doc_id
+    ) dc ON dc.doc_id = d.doc_id
+    ${queryFilters.where}
+    ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
+    LIMIT ? OFFSET ?
+  `, [...queryFilters.args, Math.max(1, Number(limit) || 5000), Math.max(0, Number(offset) || 0)]);
+  const documents = rows.map((row) => {
+    try {
+      const doc = applyStoredFileMetricToDocument(JSON.parse(row.metadata_json), row);
+      doc.citationCount = Number(row.citation_count || 0);
+      return doc;
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
+  return { total: Number(countRow?.total || 0), documents };
+}
+
+/** Small, database-side bootstrap aggregates for metadata-scale landing pages. */
+export async function getDocumentServingSummary({ syncKey = null } = {}) {
+  const filters = documentServingFilters({ syncKey });
+  const [summary, degrees, programs, affiliations, supervisors] = await Promise.all([
+    get(`SELECT COUNT(*) AS documents FROM documents d ${filters.where}`, filters.args),
+    all(`SELECT DISTINCT d.degree AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.degree IS NOT NULL AND trim(d.degree) <> '' ORDER BY value`, filters.args),
+    all(`SELECT DISTINCT d.program AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.program IS NOT NULL AND trim(d.program) <> '' ORDER BY value`, filters.args),
+    all(`
+      SELECT DISTINCT trim(CAST(affiliation.value AS TEXT)) AS value
+      FROM documents d, json_each(d.metadata_json, '$.affiliation') affiliation
+      ${filters.where}
+      ${filters.where ? 'AND' : 'WHERE'} trim(CAST(affiliation.value AS TEXT)) <> ''
+      ORDER BY value
+    `, filters.args),
+    get(`
+      SELECT COUNT(DISTINCT p.person_key) AS count
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id
+      ${filters.where}
+      ${filters.where ? 'AND' : 'WHERE'} p.source = 'metadata' AND p.role = 'Supervisor'
+    `, filters.args),
+  ]);
+  return {
+    documents: Number(summary?.documents || 0),
+    supervisors: Number(supervisors?.count || 0),
+    facets: {
+      degree: degrees.map((row) => row.value).filter(Boolean),
+      program: programs.map((row) => row.value).filter(Boolean),
+      affiliation: affiliations.map((row) => row.value).filter(Boolean),
+    },
+  };
+}
+
+export async function queryCitationDocumentPage({
+  syncKey = null, filters = {}, q = '', sortKey = 'citationCount', sortDir = 'desc', limit = 50, offset = 0,
+} = {}) {
+  const queryFilters = documentServingFilters({ syncKey, ...filters, q });
+  const counts = await get(`
+    SELECT COUNT(*) AS total,
+           SUM(CASE WHEN COALESCE(dc.citation_count, 0) > 0 THEN 1 ELSE 0 END) AS with_citations
+    FROM documents d
+    LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
+      ON dc.doc_id = d.doc_id
+    ${queryFilters.where}
+  `, queryFilters.args);
+  const sortExpression = DOCUMENT_PAGE_SORTS[sortKey] || DOCUMENT_PAGE_SORTS.citationCount;
+  const direction = sortDir === 'asc' ? 'ASC' : 'DESC';
+  const rows = await all(`
+    SELECT d.doc_id, d.title, d.author, d.year, COALESCE(dc.citation_count, 0) AS citation_count
+    FROM documents d
+    LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
+      ON dc.doc_id = d.doc_id
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    ${queryFilters.where}
+    ORDER BY ${sortExpression} ${direction}, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
+    LIMIT ? OFFSET ?
+  `, [...queryFilters.args, Math.max(1, Number(limit) || 50), Math.max(0, Number(offset) || 0)]);
+  return {
+    total: Number(counts?.total || 0),
+    withCitations: Number(counts?.with_citations || 0),
+    documents: rows.map((row) => ({
+      id: row.doc_id,
+      title: row.title || '',
+      author: row.author || '',
+      year: row.year == null ? null : Number(row.year),
+      citationCount: Number(row.citation_count || 0),
+    })),
+  };
+}
+
+function numericStats(row = {}) {
+  return {
+    count: Number(row.count || 0),
+    min: row.min == null ? null : Number(row.min),
+    max: row.max == null ? null : Number(row.max),
+    mean: row.mean == null ? null : Math.round(Number(row.mean)),
+    median: row.median == null ? null : Number(row.median),
+  };
+}
+
+async function aggregateNumericSeries({ filters, valueSql, reliabilitySql }) {
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  const rows = await all(`
+    WITH values_by_year AS (
+      SELECT d.year AS year, ${valueSql} AS value
+      FROM documents d
+      LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+      ${filters.where}
+      ${qualifier} d.year IS NOT NULL AND ${reliabilitySql}
+    ), ranked AS (
+      SELECT year, value,
+             ROW_NUMBER() OVER (PARTITION BY year ORDER BY value) AS row_num,
+             COUNT(*) OVER (PARTITION BY year) AS partition_count
+      FROM values_by_year
+    )
+    SELECT year, COUNT(*) AS count, MIN(value) AS min, MAX(value) AS max,
+           AVG(value) AS mean,
+           AVG(CASE
+             WHEN row_num IN ((partition_count + 1) / 2, (partition_count + 2) / 2)
+             THEN value
+           END) AS median
+    FROM ranked
+    GROUP BY year
+    ORDER BY year
+  `, filters.args);
+  return rows.map((row) => ({ year: Number(row.year), ...numericStats(row) }));
+}
+
+/**
+ * Metadata-scale analytics computed as bounded SQL aggregates. This deliberately
+ * returns no document collection; document rows have their own paginated API.
+ */
+export async function getDocumentServingAnalytics({ syncKey = null, filters: requestedFilters = {}, subjectLimit = 25 } = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  const activeWords = 'COALESCE(fm.body_word_count, fm.word_count)';
+  const reliableWords = `${activeWords} >= 1000 AND COALESCE(fm.word_source, '') <> 'metadata_text'`;
+  const reliablePages = `fm.page_count >= 10 AND COALESCE(fm.page_source, '') NOT IN ('estimated_from_metadata_words', 'estimated_from_full_text_words')`;
+
+  const [overall, yearCounts, wordRows, pageRows, themes, concepts, methodologies] = await Promise.all([
+    get(`
+      SELECT COUNT(*) AS record_count,
+             COUNT(CASE WHEN ${reliableWords} THEN 1 END) AS word_count,
+             MIN(CASE WHEN ${reliableWords} THEN ${activeWords} END) AS word_min,
+             MAX(CASE WHEN ${reliableWords} THEN ${activeWords} END) AS word_max,
+             AVG(CASE WHEN ${reliableWords} THEN ${activeWords} END) AS word_mean,
+             COUNT(CASE WHEN ${reliablePages} THEN 1 END) AS page_count,
+             MIN(CASE WHEN ${reliablePages} THEN fm.page_count END) AS page_min,
+             MAX(CASE WHEN ${reliablePages} THEN fm.page_count END) AS page_max,
+             AVG(CASE WHEN ${reliablePages} THEN fm.page_count END) AS page_mean,
+             COUNT(json_extract(d.metadata_json, '$.charCount')) AS char_count,
+             MIN(CAST(json_extract(d.metadata_json, '$.charCount') AS INTEGER)) AS char_min,
+             MAX(CAST(json_extract(d.metadata_json, '$.charCount') AS INTEGER)) AS char_max,
+             AVG(CAST(json_extract(d.metadata_json, '$.charCount') AS INTEGER)) AS char_mean
+      FROM documents d
+      LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+      ${filters.where}
+    `, filters.args),
+    all(`
+      SELECT d.year AS year, COUNT(*) AS count
+      FROM documents d
+      ${filters.where}
+      ${qualifier} d.year IS NOT NULL
+      GROUP BY d.year
+      ORDER BY d.year
+    `, filters.args),
+    aggregateNumericSeries({ filters, valueSql: activeWords, reliabilitySql: reliableWords }),
+    aggregateNumericSeries({ filters, valueSql: 'fm.page_count', reliabilitySql: reliablePages }),
+    all(`
+      SELECT trim(CAST(term.value AS TEXT)) AS term, COUNT(DISTINCT d.doc_id) AS count
+      FROM documents d, json_each(d.metadata_json, '$.themes') term
+      ${filters.where}
+      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
+      GROUP BY term
+      ORDER BY count DESC, term ASC
+      LIMIT 70
+    `, filters.args),
+    all(`
+      SELECT trim(CAST(term.value AS TEXT)) AS term, COUNT(DISTINCT d.doc_id) AS count
+      FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
+      ${filters.where}
+      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
+      GROUP BY term
+      ORDER BY count DESC, term ASC
+      LIMIT ?
+    `, [...filters.args, Math.max(1, Math.min(100, Number(subjectLimit) || 25))]),
+    all(`
+      SELECT trim(CAST(term.value AS TEXT)) AS methodology, COUNT(DISTINCT d.doc_id) AS count
+      FROM documents d, json_each(d.metadata_json, '$.methodologies') term
+      ${filters.where}
+      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
+      GROUP BY methodology
+      ORDER BY count DESC, methodology ASC
+      LIMIT 100
+    `, filters.args),
+  ]);
+
+  const wordStats = {
+    count: Number(overall?.word_count || 0),
+    min: overall?.word_min == null ? null : Number(overall.word_min),
+    max: overall?.word_max == null ? null : Number(overall.word_max),
+    mean: overall?.word_mean == null ? null : Math.round(Number(overall.word_mean)),
+    median: null,
+  };
+  const pageStats = {
+    count: Number(overall?.page_count || 0),
+    min: overall?.page_min == null ? null : Number(overall.page_min),
+    max: overall?.page_max == null ? null : Number(overall.page_max),
+    mean: overall?.page_mean == null ? null : Math.round(Number(overall.page_mean)),
+    median: null,
+  };
+  const charStats = {
+    count: Number(overall?.char_count || 0),
+    min: overall?.char_min == null ? null : Number(overall.char_min),
+    max: overall?.char_max == null ? null : Number(overall.char_max),
+    mean: overall?.char_mean == null ? null : Math.round(Number(overall.char_mean)),
+    median: null,
+  };
+  const conceptRows = concepts.map((row) => ({
+    concept: row.term,
+    docCount: Number(row.count || 0),
+    weightedDocEquivalent: Number(row.count || 0),
+    weightedMean: null,
+  }));
+  const wordRowsByYear = new Map(wordRows.map((row) => [row.year, row]));
+  const byYear = yearCounts.map((row) => {
+    const year = Number(row.year);
+    const wordRow = wordRowsByYear.get(year) || {};
+    return {
+      year,
+      count: Number(row.count || 0),
+      min: wordRow.min ?? null,
+      max: wordRow.max ?? null,
+      mean: wordRow.mean ?? null,
+      median: wordRow.median ?? null,
+    };
+  });
+
+  return {
+    metrics: {
+      recordCount: Number(overall?.record_count || 0),
+      overallWordCount: wordStats,
+      overallPageCount: pageStats,
+      overallCharCount: charStats,
+      byConcept: conceptRows,
+      byYear,
+      avgPagesByYear: pageRows,
+      pageTrend: pageRows.map((row) => ({
+        year: row.year, median: row.median, min: row.min, max: row.max, count: row.count,
+      })),
+    },
+    wordCloud: themes.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
+    ngramCloud: concepts.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
+    methodologies: methodologies.map((row) => ({ methodology: row.methodology, count: Number(row.count || 0) })),
+    supervisorNgramMatrix: { supervisors: [], ngrams: [], conceptIds: [], matrix: [] },
+    termCooccurrence: [],
+    conceptTimeline: [],
+    methodologyConceptMatrix: { methodologies: [], concepts: [], conceptIds: [], matrix: [] },
+    topicData: null,
+    methodologyTopicMatrix: { methodologies: [], topics: [], matrix: [] },
+    documents: [],
+  };
+}
+
+const PEOPLE_PAGE_SORTS = {
+  name: 'lower(name)',
+  docCount: 'doc_count',
+  roles: 'lower(roles)',
+  years: 'year_min',
+};
+
+export async function queryPeoplePage({
+  syncKey = null, filters: requestedFilters = {}, q = '', role = '',
+  sortKey = 'docCount', sortDir = 'desc', limit = 50, offset = 0,
+} = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const extra = [];
+  const extraArgs = [];
+  if (q) {
+    const pattern = `%${String(q).toLowerCase()}%`;
+    extra.push(`(
+      lower(p.name) LIKE ? OR lower(p.role) LIKE ? OR lower(COALESCE(p.affiliation, '')) LIKE ?
+    )`);
+    extraArgs.push(pattern, pattern, pattern);
+  }
+  if (role) {
+    extra.push('p.role = ?');
+    extraArgs.push(role);
+  }
+  const matchWhereSql = extra.length ? `WHERE ${extra.join(' AND ')}` : '';
+  const args = [...filters.args, ...extraArgs];
+  const groupedSql = `
+    WITH filtered_people AS (
+      SELECT p.person_key, p.doc_id, p.name, p.role, p.affiliation, d.year
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id
+      ${filters.where}
+    ), matching_keys AS (
+      SELECT DISTINCT p.person_key
+      FROM filtered_people p
+      ${matchWhereSql}
+    )
+    SELECT p.person_key,
+           MAX(p.name) AS name,
+           GROUP_CONCAT(DISTINCT p.role) AS roles,
+           GROUP_CONCAT(DISTINCT NULLIF(p.affiliation, '')) AS affiliations,
+           COUNT(DISTINCT p.doc_id) AS doc_count,
+           MIN(p.year) AS year_min,
+           MAX(p.year) AS year_max
+    FROM filtered_people p
+    JOIN matching_keys matched ON matched.person_key = p.person_key
+    GROUP BY p.person_key
+  `;
+  const countRow = await get(`SELECT COUNT(*) AS total FROM (${groupedSql}) people`, args);
+  const sortExpression = PEOPLE_PAGE_SORTS[sortKey] || PEOPLE_PAGE_SORTS.docCount;
+  const direction = sortDir === 'asc' ? 'ASC' : 'DESC';
+  const rows = await all(`
+    SELECT * FROM (${groupedSql}) people
+    ORDER BY ${sortExpression} ${direction}, lower(name) ${direction}, person_key ASC
+    LIMIT ? OFFSET ?
+  `, [...args, Math.max(1, Number(limit) || 50), Math.max(0, Number(offset) || 0)]);
+  return {
+    total: Number(countRow?.total || 0),
+    people: rows.map((row) => {
+      const yearMin = row.year_min == null ? null : Number(row.year_min);
+      const yearMax = row.year_max == null ? null : Number(row.year_max);
+      return {
+        key: row.person_key,
+        name: row.name,
+        roles: String(row.roles || '').split(',').filter(Boolean),
+        docCount: Number(row.doc_count || 0),
+        affiliations: String(row.affiliations || '').split(',').filter(Boolean).sort(),
+        yearRange: yearMin == null ? '\u2013' : `${yearMin}\u2013${yearMax}`,
+        yearMin: yearMin ?? 9999,
+      };
+    }),
+  };
+}
+
+/**
+ * Returns corpus-complete person aggregates plus one bounded document page.
+ * Relationship roles are aggregated per document so callers do not need to
+ * load every document merely to reconstruct the person's summary.
+ */
+export async function queryPersonDetailPage({
+  personKey, syncKey = null, filters: requestedFilters = {}, limit = 50, offset = 0,
+} = {}) {
+  const key = String(personKey || '').trim().toLowerCase();
+  if (!key) return null;
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filterClause = filters.where ? `${filters.where} AND` : 'WHERE';
+  const relationArgs = [...filters.args, key];
+  const relationWhere = `${filterClause} p.person_key = ?`;
+  const [summary, conceptRows, methodologyRows, coSupervisorRows, topicRows] = await Promise.all([
+    get(`
+      SELECT MAX(p.name) AS name,
+             GROUP_CONCAT(DISTINCT p.role) AS roles,
+             GROUP_CONCAT(DISTINCT NULLIF(p.affiliation, '')) AS affiliations,
+             COUNT(DISTINCT p.doc_id) AS doc_count,
+             MIN(d.year) AS year_min,
+             MAX(d.year) AS year_max
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id
+      ${relationWhere}
+    `, relationArgs),
+    all(`
+      SELECT trim(CAST(term.value AS TEXT)) AS term, COUNT(DISTINCT p.doc_id) AS count
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id,
+           json_each(d.metadata_json, '$.conceptTerms') term
+      ${relationWhere} AND trim(CAST(term.value AS TEXT)) <> ''
+      GROUP BY term
+      ORDER BY count DESC, term ASC
+      LIMIT 12
+    `, relationArgs),
+    all(`
+      SELECT trim(CAST(term.value AS TEXT)) AS methodology, COUNT(DISTINCT p.doc_id) AS count
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id,
+           json_each(d.metadata_json, '$.methodologies') term
+      ${relationWhere} AND trim(CAST(term.value AS TEXT)) <> ''
+      GROUP BY methodology
+      ORDER BY count DESC, methodology ASC
+      LIMIT 100
+    `, relationArgs),
+    all(`
+      SELECT MAX(other.name) AS person_name
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id
+      JOIN document_people other ON other.doc_id = p.doc_id
+        AND other.person_key <> p.person_key
+        AND other.source = 'metadata' AND other.role = 'Supervisor'
+      ${relationWhere}
+      GROUP BY other.person_key
+      ORDER BY lower(MAX(other.name))
+      LIMIT 100
+    `, relationArgs),
+    all(`
+      SELECT dt.topic_id, COUNT(DISTINCT p.doc_id) AS count
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id
+      JOIN document_topics dt ON dt.doc_id = p.doc_id
+      ${relationWhere}
+      GROUP BY dt.topic_id
+      ORDER BY count DESC, dt.topic_id ASC
+      LIMIT 100
+    `, relationArgs),
+  ]);
+  if (!summary?.name || Number(summary.doc_count || 0) === 0) return null;
+
+  const rows = await all(`
+    WITH person_docs AS (
+      SELECT p.doc_id, GROUP_CONCAT(DISTINCT p.role) AS person_roles
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id
+      ${relationWhere}
+      GROUP BY p.doc_id
+    ), topic_assignment AS (
+      SELECT dt.doc_id, dt.topic_id, dt.probability
+      FROM document_topics dt
+      WHERE dt.topic_id = (
+        SELECT candidate.topic_id
+        FROM document_topics candidate
+        WHERE candidate.doc_id = dt.doc_id
+        ORDER BY COALESCE(candidate.probability, -1) DESC, candidate.topic_id ASC
+        LIMIT 1
+      )
+    )
+    SELECT d.doc_id, d.metadata_json, pd.person_roles,
+           fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
+           fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+           COALESCE(dc.citation_count, 0) AS citation_count,
+           dt.topic_id, dt.probability
+    FROM person_docs pd
+    JOIN documents d ON d.doc_id = pd.doc_id
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
+      ON dc.doc_id = d.doc_id
+    LEFT JOIN topic_assignment dt ON dt.doc_id = d.doc_id
+    ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
+    LIMIT ? OFFSET ?
+  `, [...relationArgs, Math.max(1, Number(limit) || 50), Math.max(0, Number(offset) || 0)]);
+  const documents = rows.map((row) => {
+    try {
+      const doc = applyStoredFileMetricToDocument(JSON.parse(row.metadata_json), row);
+      doc.citationCount = Number(row.citation_count || 0);
+      doc.topicId = row.topic_id == null ? null : Number(row.topic_id);
+      doc.topicProbability = row.probability == null ? null : Number(row.probability);
+      doc.personRoles = String(row.person_roles || '').split(',').filter(Boolean);
+      return doc;
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
+  const yearMin = summary.year_min == null ? null : Number(summary.year_min);
+  const yearMax = summary.year_max == null ? null : Number(summary.year_max);
+  return {
+    person: {
+      key,
+      name: summary.name,
+      roles: String(summary.roles || '').split(',').filter(Boolean),
+      docCount: Number(summary.doc_count || 0),
+      affiliations: String(summary.affiliations || '').split(',').filter(Boolean).sort(),
+      yearRange: yearMin == null ? '\u2013' : `${yearMin}\u2013${yearMax}`,
+      yearMin: yearMin ?? 9999,
+      topConcepts: conceptRows.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
+      methodologies: methodologyRows.map((row) => ({ methodology: row.methodology, count: Number(row.count || 0) })),
+      coSupervisors: coSupervisorRows.map((row) => row.person_name).filter(Boolean),
+      topicSummary: topicRows.map((row) => ({ topicId: Number(row.topic_id), count: Number(row.count || 0) })),
+    },
+    documents,
+  };
+}
+
+export async function queryRelatedDocuments(doc, { syncKey = null, limit = 6 } = {}) {
+  const terms = Array.from(new Set([
+    ...(Array.isArray(doc?.themes) ? doc.themes : []),
+    ...(Array.isArray(doc?.conceptTerms) ? doc.conceptTerms : []),
+  ].map((value) => String(value || '').trim().toLowerCase()).filter(Boolean))).slice(0, 24);
+  if (!doc?.id || !terms.length) return [];
+  const values = terms.map(() => '(?)').join(', ');
+  const syncClause = syncKey ? 'AND d.sync_key = ?' : '';
+  const rows = await all(`
+    WITH target_terms(term) AS (VALUES ${values})
+    SELECT d.doc_id, d.title, d.author, d.year, d.degree,
+           COUNT(DISTINCT target_terms.term) AS overlap
+    FROM documents d
+    JOIN target_terms ON (
+      EXISTS (
+        SELECT 1 FROM json_each(d.metadata_json, '$.themes') theme
+        WHERE lower(CAST(theme.value AS TEXT)) = target_terms.term
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(d.metadata_json, '$.conceptTerms') concept
+        WHERE lower(CAST(concept.value AS TEXT)) = target_terms.term
+      )
+    )
+    WHERE d.doc_id <> ? ${syncClause}
+    GROUP BY d.doc_id, d.title, d.author, d.year, d.degree
+    ORDER BY overlap DESC, d.year DESC, d.title ASC
+    LIMIT ?
+  `, [...terms, doc.id, ...(syncKey ? [syncKey] : []), Math.max(1, Math.min(25, Number(limit) || 6))]);
+  return rows.map((row) => ({
+    id: row.doc_id,
+    title: row.title || '',
+    author: row.author || '',
+    year: row.year == null ? null : Number(row.year),
+    degree: row.degree || '',
+    overlap: Number(row.overlap || 0),
+  }));
 }
 
 export async function applyStoredFileMetricsToDocuments(documents = []) {
@@ -1453,33 +2266,76 @@ export async function checkCacheIntegrity() {
 export async function saveCommitteeMembers(docId, members, source) {
   const now = new Date().toISOString();
   const seen = new Set();
+  const cleaned = [];
   for (const member of members || []) {
-    const role = member.role || null;
+    const role = member.role || 'Committee Member';
     const normalizedName = normalizePersonName(member.name);
     if (!normalizedName) continue;
     const key = `${String(role || '')}:::${supervisorNameKey(normalizedName) || normalizedName.toLowerCase()}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    await run(`
-      INSERT INTO committee_members (doc_id, name, role, affiliation, source, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(doc_id, name, role) DO UPDATE SET
-        affiliation = CASE
-          WHEN committee_members.source = 'api' AND excluded.source <> 'api'
-            THEN committee_members.affiliation
-          ELSE excluded.affiliation
-        END,
-        source = CASE
-          WHEN committee_members.source = 'api' AND excluded.source <> 'api'
-            THEN committee_members.source
-          ELSE excluded.source
-        END,
-        updated_at = CASE
-          WHEN committee_members.source = 'api' AND excluded.source <> 'api'
-            THEN committee_members.updated_at
-          ELSE excluded.updated_at
-        END
-    `, [docId, normalizedName, role, member.affiliation || null, source, now]);
+    const personKey = documentPersonKey(normalizedName);
+    cleaned.push({ member, role, normalizedName, personKey });
+  }
+  if (!cleaned.length) return;
+
+  const client = await getDb();
+  const transaction = await client.transaction('write');
+  try {
+    for (const { member, role, normalizedName, personKey } of cleaned) {
+      await transaction.execute({
+        sql: `
+        INSERT INTO committee_members (doc_id, name, role, affiliation, source, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(doc_id, name, role) DO UPDATE SET
+          affiliation = CASE
+            WHEN committee_members.source = 'api' AND excluded.source <> 'api'
+              THEN committee_members.affiliation
+            ELSE excluded.affiliation
+          END,
+          source = CASE
+            WHEN committee_members.source = 'api' AND excluded.source <> 'api'
+              THEN committee_members.source
+            ELSE excluded.source
+          END,
+          updated_at = CASE
+            WHEN committee_members.source = 'api' AND excluded.source <> 'api'
+              THEN committee_members.updated_at
+            ELSE excluded.updated_at
+          END
+        `,
+        args: [docId, normalizedName, role, member.affiliation || null, source || 'committee', now],
+      });
+      if (!personKey) continue;
+      const candidates = await transaction.execute({
+        sql: `SELECT id, name, role, affiliation, source, updated_at
+              FROM committee_members WHERE doc_id = ? AND role = ?`,
+        args: [docId, role],
+      });
+      const winner = authoritativeCommitteeRow(candidates.rows, personKey);
+      await transaction.execute({
+        sql: `DELETE FROM document_people
+              WHERE doc_id = ? AND person_key = ? AND role = ? AND source <> 'metadata'`,
+        args: [docId, personKey, role],
+      });
+      if (winner) {
+        await transaction.execute({
+          sql: `INSERT INTO document_people
+                (doc_id, person_key, name, role, affiliation, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          args: [
+            docId, personKey, winner.name, winner.role || 'Committee Member',
+            winner.affiliation || null, winner.source || 'committee', winner.updated_at || now,
+          ],
+        });
+      }
+    }
+    await transaction.commit();
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    throw error;
+  } finally {
+    transaction.close();
   }
 }
 
@@ -1493,8 +2349,51 @@ export async function deleteCommitteeMembersByRoles(docId, roles, source = null)
     sql += ' AND source = ?';
     params.push(source);
   }
-  const result = await run(sql, params);
-  return result.changes || 0;
+  const client = await getDb();
+  const transaction = await client.transaction('write');
+  try {
+    const before = await transaction.execute({
+      sql: `SELECT name, role FROM committee_members WHERE doc_id = ? AND role IN (${placeholders})`,
+      args: [docId, ...cleanedRoles],
+    });
+    const affected = new Map();
+    for (const row of before.rows) {
+      const personKey = documentPersonKey(row.name);
+      if (personKey) affected.set(`${personKey}\u0000${row.role}`, { personKey, role: row.role });
+    }
+    const result = await transaction.execute({ sql, args: params });
+    for (const { personKey, role } of affected.values()) {
+      const remaining = await transaction.execute({
+        sql: `SELECT id, name, role, affiliation, source, updated_at
+              FROM committee_members WHERE doc_id = ? AND role = ?`,
+        args: [docId, role],
+      });
+      const winner = authoritativeCommitteeRow(remaining.rows, personKey);
+      await transaction.execute({
+        sql: `DELETE FROM document_people
+              WHERE doc_id = ? AND person_key = ? AND role = ? AND source <> 'metadata'`,
+        args: [docId, personKey, role],
+      });
+      if (winner) {
+        await transaction.execute({
+          sql: `INSERT INTO document_people
+                (doc_id, person_key, name, role, affiliation, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          args: [
+            docId, personKey, winner.name, winner.role || 'Committee Member',
+            winner.affiliation || null, winner.source || 'committee', winner.updated_at || new Date().toISOString(),
+          ],
+        });
+      }
+    }
+    await transaction.commit();
+    return changes(result);
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    throw error;
+  } finally {
+    transaction.close();
+  }
 }
 
 export async function loadCommitteeMembers(docId) {
