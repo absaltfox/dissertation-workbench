@@ -103,6 +103,10 @@ app.use((req, _res, next) => {
   logger.info(`${req.method} ${req.path}`, { ip: getClientIp(req) });
   next();
 });
+// Worker artifact uploads can be substantially larger than normal API JSON.
+// Mount them before the global 64 KB parser so the router's authenticated,
+// route-specific raw body limits handle these requests instead.
+app.use('/api/internal', createInternalWorkerRouter());
 app.use(express.json({ limit: '64kb' }));
 app.use(requireCsrf);
 
@@ -121,7 +125,6 @@ app.use('/api/admin', requireAdmin, createAdminImportRouter({ loadSyncModule, cl
 app.use('/api/admin', requireAdmin, createAdminOperationsRouter({ loadSyncModule, clearMetricsCache }));
 app.use('/api/admin', requireAdmin, createAdminTopicLabelsRouter({ clearMetricsCache }));
 app.use('/api/admin', requireAdmin, createAdminJobsRouter({ loadSyncModule, clearMetricsCache }));
-app.use('/api/internal', createInternalWorkerRouter());
 app.use('/api', createPublicRateLimit());
 app.use('/api', createPublicRouter());
 app.use('/api', createMetricsRouter({ metricsCache, metricsInflight, loadSyncModule }));

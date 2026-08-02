@@ -403,14 +403,22 @@ test('internal worker endpoint accepts concept dictionary artifacts for running 
     params: { method: 'patternrank' },
     artifactTokenHash: hashAdminJobToken(token),
   });
+  const concepts = Array.from({ length: 750 }, (_, index) => ({
+    canonical: `educational technology concept ${index} ${'x'.repeat(40)}`,
+    variants: [],
+    docFreq: 1,
+    idf: 0,
+    patternRankScore: 0.9,
+  }));
   const artifact = {
     version: 2,
     generatedAt: new Date().toISOString(),
     source: { documents: 1, method: 'patternrank', model: 'test-model' },
-    stats: { concepts: 1, aliases: 0 },
-    concepts: [{ canonical: 'educational technology', variants: [], docFreq: 1, idf: 0, patternRankScore: 0.9 }],
+    stats: { concepts: concepts.length, aliases: 0 },
+    concepts,
     variantToCanonical: {},
   };
+  assert.ok(Buffer.byteLength(JSON.stringify(artifact)) > 64 * 1024);
 
   await request(app)
     .put(`/api/internal/jobs/${jobId}/artifacts/concepts/latest`)
@@ -428,9 +436,9 @@ test('internal worker endpoint accepts concept dictionary artifacts for running 
     .expect(200);
 
   assert.equal(upload.body.ok, true);
-  assert.equal(upload.body.stats.concepts, 1);
+  assert.equal(upload.body.stats.concepts, concepts.length);
   const status = await getConceptPipelineStatus();
-  assert.equal(status.stats.concepts, 1);
+  assert.equal(status.stats.concepts, concepts.length);
   assert.match(status.message, /PatternRank concept rebuild completed/);
 
   await finishAdminJob(jobId, { status: 'completed', runnerState: 'completed' });
