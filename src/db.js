@@ -144,6 +144,15 @@ async function ensureSchema(client) {
       page_count INTEGER,
       word_source TEXT,
       page_source TEXT,
+      content_source TEXT,
+      content_checksum TEXT,
+      content_source_url TEXT,
+      content_retrieved_at TEXT,
+      parser_version TEXT,
+      metadata_request_count INTEGER DEFAULT 0,
+      full_text_request_count INTEGER DEFAULT 0,
+      original_pdf_request_count INTEGER DEFAULT 0,
+      retrieved_bytes INTEGER DEFAULT 0,
       status TEXT,
       error TEXT,
       updated_at TEXT NOT NULL
@@ -381,6 +390,15 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_path TEXT');
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_bytes INTEGER');
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_source_url TEXT');
+  await addColumnIfMissing(client, 'file_metrics', 'content_source', 'TEXT');
+  await addColumnIfMissing(client, 'file_metrics', 'content_checksum', 'TEXT');
+  await addColumnIfMissing(client, 'file_metrics', 'content_source_url', 'TEXT');
+  await addColumnIfMissing(client, 'file_metrics', 'content_retrieved_at', 'TEXT');
+  await addColumnIfMissing(client, 'file_metrics', 'parser_version', 'TEXT');
+  await addColumnIfMissing(client, 'file_metrics', 'metadata_request_count', 'INTEGER DEFAULT 0');
+  await addColumnIfMissing(client, 'file_metrics', 'full_text_request_count', 'INTEGER DEFAULT 0');
+  await addColumnIfMissing(client, 'file_metrics', 'original_pdf_request_count', 'INTEGER DEFAULT 0');
+  await addColumnIfMissing(client, 'file_metrics', 'retrieved_bytes', 'INTEGER DEFAULT 0');
   await addColumnIfMissing(client, 'import_rules', 'content_mode', "TEXT NOT NULL DEFAULT 'metadata_only'");
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_sync_key ON documents(sync_key)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
@@ -1038,7 +1056,10 @@ export async function loadStoredFileMetric(docId) {
   return get(`
     SELECT doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count,
            full_text_path, full_text_bytes, full_text_source_url, page_count,
-           word_source, page_source, status, error, updated_at
+           word_source, page_source, content_source, content_checksum,
+           content_source_url, content_retrieved_at, parser_version,
+           metadata_request_count, full_text_request_count,
+           original_pdf_request_count, retrieved_bytes, status, error, updated_at
     FROM file_metrics
     WHERE doc_id = ?
   `, [docId]);
@@ -1050,8 +1071,11 @@ export async function saveFileMetric(docId, payload) {
     INSERT INTO file_metrics (
       doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count,
       full_text_path, full_text_bytes, full_text_source_url, page_count,
-      word_source, page_source, status, error, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      word_source, page_source, content_source, content_checksum,
+      content_source_url, content_retrieved_at, parser_version,
+      metadata_request_count, full_text_request_count,
+      original_pdf_request_count, retrieved_bytes, status, error, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(doc_id) DO UPDATE SET
       pdf_path = excluded.pdf_path,
       download_url = excluded.download_url,
@@ -1064,6 +1088,15 @@ export async function saveFileMetric(docId, payload) {
       page_count = excluded.page_count,
       word_source = excluded.word_source,
       page_source = excluded.page_source,
+      content_source = excluded.content_source,
+      content_checksum = excluded.content_checksum,
+      content_source_url = excluded.content_source_url,
+      content_retrieved_at = excluded.content_retrieved_at,
+      parser_version = excluded.parser_version,
+      metadata_request_count = excluded.metadata_request_count,
+      full_text_request_count = excluded.full_text_request_count,
+      original_pdf_request_count = excluded.original_pdf_request_count,
+      retrieved_bytes = excluded.retrieved_bytes,
       status = excluded.status,
       error = excluded.error,
       updated_at = excluded.updated_at
@@ -1080,6 +1113,15 @@ export async function saveFileMetric(docId, payload) {
     payload.pageCount ?? null,
     payload.wordSource || null,
     payload.pageSource || null,
+    payload.contentSource || null,
+    payload.contentChecksum || null,
+    payload.contentSourceUrl || null,
+    payload.contentRetrievedAt || null,
+    payload.parserVersion || null,
+    payload.metadataRequestCount ?? null,
+    payload.fullTextRequestCount ?? null,
+    payload.originalPdfRequestCount ?? null,
+    payload.retrievedBytes ?? null,
     payload.status || null,
     payload.error || null,
     now
@@ -1094,7 +1136,11 @@ export async function listFileMetrics() {
   const rows = await all(`
     SELECT fm.doc_id, fm.pdf_path, fm.download_url, fm.file_bytes, fm.word_count,
            fm.body_word_count, fm.full_text_path, fm.full_text_bytes, fm.full_text_source_url, fm.page_count,
-           fm.word_source, fm.page_source, fm.status, fm.error, fm.updated_at,
+           fm.word_source, fm.page_source, fm.content_source, fm.content_checksum,
+           fm.content_source_url, fm.content_retrieved_at, fm.parser_version,
+           fm.metadata_request_count, fm.full_text_request_count,
+           fm.original_pdf_request_count, fm.retrieved_bytes,
+           fm.status, fm.error, fm.updated_at,
            d.title, d.author, d.metadata_json
     FROM file_metrics fm
     LEFT JOIN documents d ON d.doc_id = fm.doc_id

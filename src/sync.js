@@ -64,6 +64,14 @@ export const filterSyncItemsForMode = (items, mode, existsFn = documentExists) =
 
 export function hasCachedEnrichmentMetric(stored, contentMode) {
   if (contentMode === 'pdf_cache') return Boolean(stored?.pdf_path);
+  if (contentMode === 'pdf_stream') {
+    return (
+      stored?.content_source === 'streamed_pdf'
+      && Boolean(stored?.content_checksum)
+      && Number(stored.word_count) > 0
+      && Number(stored.page_count) > 0
+    );
+  }
   if (contentMode === 'full_text_only') {
     return (
       stored?.word_source === 'dspace_full_text'
@@ -90,9 +98,26 @@ async function runSync(syncKey, source, apiKey, runId, {
   let totalSeen = 0;
   let totalSaved = 0;
   let totalSkipped = 0;
+  let totalEnrichmentAttempted = 0;
+  let totalEnriched = 0;
+  let totalEnrichmentFailed = 0;
   let apiTotal = null;
   let pdfBatchLimitReached = false;
   const pdfAttemptedIds = [];
+  const requestCounts = {
+    metadata: 0,
+    fullText: 0,
+    originalPdf: 0,
+    retrievedBytes: 0,
+  };
+  const countContentRequest = (event = {}) => {
+    if (event.request && event.source === 'metadata') requestCounts.metadata += 1;
+    if (event.request && event.source === 'full_text') requestCounts.fullText += 1;
+    if (event.request && event.source === 'original_pdf') requestCounts.originalPdf += 1;
+    if (!event.request && Number.isFinite(Number(event.bytes))) {
+      requestCounts.retrievedBytes += Math.max(0, Number(event.bytes));
+    }
+  };
   const skippedPdfIds = new Set(
     (Array.isArray(skipPdfDocIds) ? skipPdfDocIds : [])
       .map((id) => String(id || '').trim())
@@ -114,6 +139,7 @@ async function runSync(syncKey, source, apiKey, runId, {
         status: 'running',
         counts: { processed: totalSeen, total: apiTotal ?? source.maxRecords },
       });
+      requestCounts.metadata += 1;
       const payload = await fetchPage({
         baseUrl: source.baseUrl,
         index,
@@ -155,13 +181,13 @@ async function runSync(syncKey, source, apiKey, runId, {
             totalSkipped += 1;
             continue;
           }
-          if (pdfBatchLimit && totalSaved + missing.length >= pdfBatchLimit) {
+          if (pdfBatchLimit && totalEnrichmentAttempted + missing.length >= pdfBatchLimit) {
             pdfBatchLimitReached = true;
             break;
           }
           missing.push(item);
         }
-        if (pdfBatchLimit && totalSaved + missing.length >= pdfBatchLimit) {
+        if (pdfBatchLimit && totalEnrichmentAttempted + missing.length >= pdfBatchLimit) {
           pdfBatchLimitReached = true;
         }
         if (missing.length) {
@@ -169,16 +195,19 @@ async function runSync(syncKey, source, apiKey, runId, {
             phase: 'pdf_batch',
             label: 'Analyzing missing PDFs',
             status: 'running',
-            counts: { processed: totalSaved, total: pdfBatchLimit || totalSaved + missing.length },
+            counts: {
+              processed: totalEnrichmentAttempted,
+              total: pdfBatchLimit || totalEnrichmentAttempted + missing.length,
+            },
           });
         }
         let pdfIndex = 0;
-        const savedBeforePage = totalSaved;
+        const attemptedBeforePage = totalEnrichmentAttempted;
         for (const item of missing) {
           pdfIndex += 1;
           const docCounts = {
-            processed: savedBeforePage + pdfIndex,
-            total: pdfBatchLimit || savedBeforePage + missing.length,
+            processed: attemptedBeforePage + pdfIndex,
+            total: pdfBatchLimit || attemptedBeforePage + missing.length,
           };
           await onProgress?.({
             phase: 'pdf_document',
@@ -189,28 +218,41 @@ async function runSync(syncKey, source, apiKey, runId, {
           });
           await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
           pdfAttemptedIds.push(item.doc.id);
-          await analyzeDocumentFile(item.doc, {
-            contentMode,
-            downloadFiles: contentMode === 'pdf_cache' || contentMode === 'pdf_stream',
-            forceDownload: false,
-            recomputeFromCache: false,
-            artifactClient,
-            onProgress: async (event = {}) => onProgress?.({
-              ...event,
-              detail: event.detail || progressDocDetail(item.doc),
-              counts: { ...docCounts, ...(event.counts || {}) },
-            }),
-          });
+          totalEnrichmentAttempted += 1;
+          try {
+            await analyzeDocumentFile(item.doc, {
+              contentMode,
+              downloadFiles: contentMode === 'pdf_cache' || contentMode === 'pdf_stream',
+              forceDownload: false,
+              recomputeFromCache: false,
+              artifactClient,
+              onContentRequest: countContentRequest,
+              onProgress: async (event = {}) => onProgress?.({
+                ...event,
+                detail: event.detail || progressDocDetail(item.doc),
+                counts: { ...docCounts, ...(event.counts || {}) },
+              }),
+            });
+          } catch (error) {
+            totalEnrichmentFailed += 1;
+            throw error;
+          }
           await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
+          const storedAfterAnalysis = await loadStoredFileMetric(item.doc.id);
+          const policySatisfied = hasCachedEnrichmentMetric(storedAfterAnalysis, contentMode);
+          if (policySatisfied) totalEnriched += 1;
+          else totalEnrichmentFailed += 1;
           await onProgress?.({
             phase: 'pdf_document',
-            label: 'Parsed PDF document data',
+            label: policySatisfied ? 'Parsed document data' : 'Document enrichment did not satisfy policy',
             detail: progressDocDetail(item.doc),
-            status: 'completed',
+            status: policySatisfied ? 'completed' : 'failed',
             counts: {
               ...docCounts,
               pages: item.doc.pages || 0,
               words: item.doc.wordCount || 0,
+              enriched: totalEnriched,
+              failed: totalEnrichmentFailed,
             },
           });
         }
@@ -220,8 +262,10 @@ async function runSync(syncKey, source, apiKey, runId, {
             label: 'Missing PDF batch',
             status: 'completed',
             counts: {
-              processed: savedBeforePage + missing.length,
-              total: pdfBatchLimit || savedBeforePage + missing.length,
+              processed: attemptedBeforePage + missing.length,
+              total: pdfBatchLimit || attemptedBeforePage + missing.length,
+              enriched: totalEnriched,
+              failed: totalEnrichmentFailed,
             },
           });
         }
@@ -252,9 +296,25 @@ async function runSync(syncKey, source, apiKey, runId, {
       pdfBatchSize: pdfBatchLimit || null,
       pdfBatchLimitReached,
       pdfAttempted: pdfAttemptedIds.length,
+      totalEnrichmentAttempted,
+      totalEnriched,
+      totalEnrichmentFailed,
+      requestCounts,
       seconds: Math.round((Date.now() - startedAt) / 1000),
     });
-    return { ok: true, totalSeen, totalSaved, totalSkipped, apiTotal, pdfBatchLimitReached, pdfAttemptedIds };
+    return {
+      ok: true,
+      totalSeen,
+      totalSaved,
+      totalSkipped,
+      apiTotal,
+      pdfBatchLimitReached,
+      pdfAttemptedIds,
+      totalEnrichmentAttempted,
+      totalEnriched,
+      totalEnrichmentFailed,
+      requestCounts,
+    };
   } catch (error) {
     await updateSyncRun(runId, {
       status: 'failed',
@@ -273,6 +333,10 @@ async function runSync(syncKey, source, apiKey, runId, {
       apiTotal,
       pdfBatchLimitReached,
       pdfAttemptedIds,
+      totalEnrichmentAttempted,
+      totalEnriched,
+      totalEnrichmentFailed,
+      requestCounts,
       error: error?.message || String(error),
     };
   } finally {

@@ -11,7 +11,7 @@ import { addColumnIfMissing } from '../src/db.js';
 
 const execFileAsync = promisify(execFile);
 
-test('schema migration adds content_mode to existing import_rules conservatively', async () => {
+test('schema migration adds content policy and provenance fields conservatively', async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-content-mode-migration-'));
   const sqlitePath = path.join(tempDir, 'legacy.sqlite');
   const client = createClient({ url: `file:${sqlitePath}` });
@@ -31,6 +31,25 @@ test('schema migration adds content_mode to existing import_rules conservatively
       );
       INSERT INTO import_rules (id, name, created_at, updated_at)
       VALUES ('legacy-rule', 'Legacy rule', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+      CREATE TABLE file_metrics (
+        doc_id TEXT PRIMARY KEY,
+        pdf_path TEXT,
+        download_url TEXT,
+        file_bytes INTEGER,
+        word_count INTEGER,
+        body_word_count INTEGER,
+        full_text_path TEXT,
+        full_text_bytes INTEGER,
+        full_text_source_url TEXT,
+        page_count INTEGER,
+        word_source TEXT,
+        page_source TEXT,
+        status TEXT,
+        error TEXT,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO file_metrics (doc_id, word_count, page_count, status, updated_at)
+      VALUES ('legacy-doc', 1000, 4, 'downloaded', '2026-01-01T00:00:00.000Z');
     `);
   } finally {
     await client.close();
@@ -40,7 +59,8 @@ test('schema migration adds content_mode to existing import_rules conservatively
   const childSource = `
     const db = await import(${JSON.stringify(dbModuleUrl)});
     const rule = await db.getImportRule('legacy-rule');
-    process.stdout.write(JSON.stringify(rule));
+    const metric = await db.loadStoredFileMetric('legacy-doc');
+    process.stdout.write(JSON.stringify({ rule, metric }));
     await db.closeDb();
   `;
   try {
@@ -60,8 +80,11 @@ test('schema migration adds content_mode to existing import_rules conservatively
       childOptions
     );
     const migrated = JSON.parse(stdout);
-    assert.equal(migrated.id, 'legacy-rule');
-    assert.equal(migrated.contentMode, 'metadata_only');
+    assert.equal(migrated.rule.id, 'legacy-rule');
+    assert.equal(migrated.rule.contentMode, 'metadata_only');
+    assert.equal(migrated.metric.content_source, null);
+    assert.equal(Number(migrated.metric.metadata_request_count), 0);
+    assert.equal(Number(migrated.metric.original_pdf_request_count), 0);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

@@ -48,9 +48,6 @@ function contentPolicyRunError(rules, mode) {
   const invalidRule = rules.find((rule) => validateImportRule(rule).errors.length);
   if (invalidRule) return `Import rule "${invalidRule.name || invalidRule.id || 'unknown'}" has an invalid content policy.`;
   if (mode !== 'sync_missing_pdfs') return null;
-  if (rules.some((rule) => rule.contentMode === 'pdf_stream')) {
-    return 'The pdf_stream content mode will be enabled by the zero-retention processing step and cannot run yet.';
-  }
   if (!ALLOW_ORIGINAL_PDF_RETRIEVAL && rules.some((rule) => contentModeRequestsOriginalPdf(rule.contentMode))) {
     return 'Original PDF retrieval is disabled for this deployment. Set ALLOW_ORIGINAL_PDF_RETRIEVAL=1 to run pdf_cache or pdf_stream rules.';
   }
