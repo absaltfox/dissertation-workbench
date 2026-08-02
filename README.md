@@ -90,12 +90,14 @@ Saved import rules declare one content mode:
 
 - `metadata_only`: never retrieves document content.
 - `full_text_only`: retrieves the repository's extracted `TEXT` derivative, never requests the original PDF, and retains only derived results. Existing legacy full-text cache entries may still be reused.
-- `pdf_stream`: reserved for zero-retention original-PDF processing. Rules may be saved with this mode, but enrichment runs are rejected until the streaming implementation is enabled.
+- `pdf_stream`: retrieves the original PDF into bounded, worker-local ephemeral storage, parses it, and removes the temporary directory in a `finally` block. A first-use janitor removes directories orphaned by a prior worker process. It retains derived metrics and provenance but creates no PDF cache entry or artifact; any independently existing cached PDF path or artifact remains unchanged.
 - `pdf_cache`: retrieves and retains the original PDF. This mode runs only when `ALLOW_ORIGINAL_PDF_RETRIEVAL=1`.
 
 The server snapshots the selected rules into the durable job when it starts, so later rule edits cannot change a running job. The deployment-wide original-PDF guard is checked independently of the UI and rule configuration.
 
-Content policies are fail-closed: unknown values are rejected by the API, worker, and parser; a blocked `pdf_cache` request fails instead of silently changing to another retrieval mode. Cached enrichment is also mode-specific, so full-text-derived metrics do not satisfy a later `pdf_cache` request.
+Content policies are fail-closed: unknown values are rejected by the API, worker, and parser; blocked original-PDF requests fail before retrieval. Until the planned per-rule fallback field is implemented, a `pdf_stream` retrieval or parse failure remains a failed streamed-PDF enrichment and never silently produces estimated full-text metrics. Cached enrichment is mode-specific, so full-text-derived metrics do not satisfy a later PDF request. Successful `pdf_stream` results are recognized by their checksum and exact PDF-derived metrics without retaining the source PDF.
+
+Content processing records its source, SHA-256 checksum, source URL, retrieval time, parser version, repository request counts, and retrieved bytes in `file_metrics`. Import-rule job results aggregate metadata, extracted-full-text, and original-PDF requests separately. A streamed PDF still counts as an original-PDF request and must be treated as a download for policy purposes.
 
 Dashboard reads never page Open Collections. If `/api/metrics` receives query parameters that match a stored sync key, it uses that stored subset; otherwise it falls back to the locally stored corpus. `refresh=1` only bypasses the web process's in-memory metrics payload cache. It does not call Open Collections, download PDFs, recompute file metrics, or extract citations/committee data.
 

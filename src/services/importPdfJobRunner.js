@@ -61,7 +61,7 @@ async function startContinuationJob(job, result, progress) {
   const params = job.params || {};
   if (params.mode !== 'sync_missing_pdfs') return null;
   if (!params.autoContinuePdfBatches) return null;
-  if (!result.ok || !result.pdfBatchLimitReached || Number(result.totalEnriched || 0) <= 0) return null;
+  if (!result.ok || !result.pdfBatchLimitReached || Number(result.totalEnrichmentAttempted || 0) <= 0) return null;
 
   const nextParams = {
     ...params,
@@ -272,12 +272,21 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     const perRule = [];
     const pdfBatchSize = readPdfBatchSize(params);
     const attemptedPdfIds = new Set(readDocIdList(params.skipPdfDocIds));
-    const totals = { rulesStarted: 0, totalSeen: 0, totalSaved: 0, totalSkipped: 0, totalEnriched: 0 };
+    const totals = {
+      rulesStarted: 0,
+      totalSeen: 0,
+      totalSaved: 0,
+      totalSkipped: 0,
+      totalEnrichmentAttempted: 0,
+      totalEnriched: 0,
+      totalEnrichmentFailed: 0,
+    };
+    const requestCounts = { metadata: 0, fullText: 0, originalPdf: 0, retrievedBytes: 0 };
     let pdfBatchLimitReached = false;
     for (const rule of rules) {
       const enrichesDocuments = contentModeEnrichesDocuments(rule.contentMode);
       const remainingPdfBatchSize = params.mode === 'sync_missing_pdfs' && enrichesDocuments && pdfBatchSize
-        ? Math.max(0, pdfBatchSize - totals.totalEnriched)
+        ? Math.max(0, pdfBatchSize - totals.totalEnrichmentAttempted)
         : 0;
       if (params.mode === 'sync_missing_pdfs' && enrichesDocuments && pdfBatchSize && remainingPdfBatchSize <= 0) {
         pdfBatchLimitReached = true;
@@ -308,9 +317,13 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       totals.totalSeen += Number(result.totalSeen || 0);
       totals.totalSaved += Number(result.totalSaved || 0);
       totals.totalSkipped += Number(result.totalSkipped || 0);
-      if (params.mode === 'sync_missing_pdfs' && enrichesDocuments) {
-        totals.totalEnriched += Number(result.totalSaved || 0);
-      }
+      requestCounts.metadata += Number(result.requestCounts?.metadata || 0);
+      requestCounts.fullText += Number(result.requestCounts?.fullText || 0);
+      requestCounts.originalPdf += Number(result.requestCounts?.originalPdf || 0);
+      requestCounts.retrievedBytes += Number(result.requestCounts?.retrievedBytes || 0);
+      totals.totalEnrichmentAttempted += Number(result.totalEnrichmentAttempted || 0);
+      totals.totalEnriched += Number(result.totalEnriched || 0);
+      totals.totalEnrichmentFailed += Number(result.totalEnrichmentFailed || 0);
       for (const docId of readDocIdList(result.pdfAttemptedIds)) attemptedPdfIds.add(docId);
       if (result.pdfBatchLimitReached) pdfBatchLimitReached = true;
       perRule.push({
@@ -325,10 +338,21 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         apiTotal: result.apiTotal ?? null,
         pdfBatchLimitReached: Boolean(result.pdfBatchLimitReached),
         pdfAttempted: Array.isArray(result.pdfAttemptedIds) ? result.pdfAttemptedIds.length : 0,
+        totalEnrichmentAttempted: Number(result.totalEnrichmentAttempted || 0),
+        totalEnriched: Number(result.totalEnriched || 0),
+        totalEnrichmentFailed: Number(result.totalEnrichmentFailed || 0),
+        requestCounts: result.requestCounts || {
+          metadata: 0, fullText: 0, originalPdf: 0, retrievedBytes: 0,
+        },
         error: result.error || null,
       });
       await log(job.id, `Rule result: ${result.ok ? 'success' : 'failed'}; ${result.totalSaved || 0} saved.`);
-      if (params.mode === 'sync_missing_pdfs' && enrichesDocuments && pdfBatchSize && totals.totalEnriched >= pdfBatchSize) {
+      if (
+        params.mode === 'sync_missing_pdfs'
+        && enrichesDocuments
+        && pdfBatchSize
+        && totals.totalEnrichmentAttempted >= pdfBatchSize
+      ) {
         pdfBatchLimitReached = true;
         break;
       }
@@ -340,6 +364,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       pdfBatchSize: params.mode === 'sync_missing_pdfs' ? pdfBatchSize : null,
       pdfBatchLimitReached,
       pdfAttemptedIds: Array.from(attemptedPdfIds),
+      requestCounts,
       ...totals,
       rules: perRule,
     };

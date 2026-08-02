@@ -19,8 +19,10 @@ Step 1 establishes the content-policy contract and safety boundary:
 - Implemented: extracted-text selection requires the DSpace `TEXT` bundle or a verified non-`ORIGINAL` `*.pdf.txt` derivative.
 - Implemented: continuations retain the capped enrichment rule and unprocessed rules while removing every completed rule.
 - Implemented: the `content_mode` migration detects the legacy schema explicitly and fails on unexpected migration errors.
-- Pending Phase 2: `pdf_stream` execution. The mode can be saved, but jobs using it are rejected rather than silently caching a PDF.
-- Pending later phases: per-rule fallback, extraction toggles, byte/concurrency/rate controls, cache retention, request accounting, object storage, aggregate analytics, and incremental PatternRank.
+- Implemented in Step 2: `pdf_stream` retrieves into bounded worker-local ephemeral storage, parses from a seekable path, removes the owned temporary directory after success or failure, and reaps directories orphaned by a prior worker process before the first streamed retrieval.
+- Implemented in Step 2: SHA-256 content checksums, retrieval/parser provenance, per-document request accounting, and import-job request totals distinguish metadata, extracted-text, and original-PDF access.
+- Implemented in Step 2: existing global byte and original-PDF rate limits apply to the streaming path; streamed results retain derived metrics but create no PDF artifact or persistent temporary path. An independently existing cached PDF remains unchanged.
+- Pending later steps: per-rule fallback, extraction toggles, per-rule byte/concurrency/rate controls, cache retention, object storage, aggregate analytics, and incremental PatternRank.
 
 ## Goals
 
@@ -66,7 +68,7 @@ Defaults:
 - Existing rules migrate to `metadata_only` unless their prior configuration unambiguously requested PDF analysis.
 - New rules default to `metadata_only`.
 - `full_text_only` never falls through to a PDF, regardless of fallback settings.
-- `pdf_stream` and `pdf_cache` may fall back to full text when configured.
+- `pdf_stream` and `pdf_cache` may fall back to full text only when an explicit snapshotted fallback policy is configured. Until that field is implemented, `pdf_stream` fails the document rather than silently changing the measurement source.
 - A rule cannot override the deployment-wide prohibition on original PDF retrieval.
 
 The admin interface will display the selected mode on every saved rule and replace the generic **Import + Analyze PDFs** action with **Import + Enrich Using Rule Policy**. Before running selected or all rules, the confirmation screen will summarize how many rules use each mode and explicitly warn when any rule will retrieve original PDFs.
@@ -172,6 +174,8 @@ Exit criterion: automated tests prove that `full_text_only` cannot call the orig
 - Add checksums, provenance, rate limits, and request counters.
 
 Exit criterion: a worker restart or parse failure leaves no streamed PDF behind, and the Fly volume does not grow during zero-retention jobs.
+
+Implementation note: Step 2 completes the zero-retention `pdf_stream` boundary and provenance/accounting foundation. Moving `pdf_cache` to object storage remains intentionally separate because the current Fly-volume artifact API is a persistent-cache contract; disguising another local path as object storage would preserve the scaling failure. Production-scale `pdf_cache` must not be enabled for the expanded corpus until a real object-store backend and migration procedure are implemented.
 
 ### Phase 3: Metadata-scale serving
 

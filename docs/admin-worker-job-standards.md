@@ -101,6 +101,14 @@ The Admin Jobs page should show:
 
 Admin actions that start long-running jobs should not block the browser until the work is done. They should return the job id and let the Jobs page display progress.
 
+## Streamed Content Contract
+
+`pdf_stream` source bytes are not worker artifacts. The worker retrieves the original PDF into a uniquely owned operating-system temporary directory, parses the seekable file, and removes the directory in a `finally` block. Before its first streamed retrieval, a process also removes orphaned stream directories whose owner process is no longer running. The temporary streamed PDF must never be uploaded through the artifact API or saved as `file_metrics.pdf_path`; an independently existing cached PDF path or artifact remains unchanged.
+
+Content-enrichment job results include `requestCounts` with separate `metadata`, `fullText`, and `originalPdf` request totals plus `retrievedBytes`. These counters are operational records, not billing semantics: `pdf_stream` increments `originalPdf` even though its source bytes are deleted after parsing.
+
+Enrichment results must also distinguish `totalEnrichmentAttempted`, `totalEnriched`, and `totalEnrichmentFailed`. Batch limits and continuation checkpoints use attempts; success totals include only results that satisfy the snapshotted content policy. A streamed-PDF failure must not be counted as enriched or silently converted to extracted-full-text estimates.
+
 ## PatternRank Concept Rebuild Standard
 
 PatternRank concept extraction must be implemented as a worker-backed job.

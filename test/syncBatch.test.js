@@ -121,6 +121,9 @@ test('sync_missing_pdfs batches missing PDF attempts and reports per-document pr
 
     assert.equal(first.ok, true);
     assert.equal(first.totalSaved, 2);
+    assert.equal(first.totalEnrichmentAttempted, 2);
+    assert.equal(first.totalEnriched, 0);
+    assert.equal(first.totalEnrichmentFailed, 2);
     assert.equal(first.pdfBatchLimitReached, true);
     assert.deepEqual(first.pdfAttemptedIds, ['1.0000001', '1.0000002']);
     assert.equal((await loadStoredFileMetric('1.0000001')).status, 'not_found');
@@ -164,6 +167,68 @@ test('sync_missing_pdfs batches missing PDF attempts and reports per-document pr
     assert.equal(continuation.ok, true);
     assert.equal(continuation.totalSaved, 1);
     assert.equal((await loadStoredFileMetric('1.0000003')).status, 'not_found');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('sync enrichment totals count only policy-satisfying results as enriched', async () => {
+  const originalFetch = globalThis.fetch;
+  const docId = `1.${String(Date.now()).slice(-7)}`;
+  const fullText = `Successful extracted thesis text\n${'education research '.repeat(300)}`;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes('/search/8.5')) {
+      return new Response(JSON.stringify({
+        data: {
+          hits: {
+            total: 1,
+            hits: [{
+              _source: {
+                id: docId,
+                title: 'Successful Enrichment Fixture',
+                author: 'Success Tester',
+                digitalResourceOriginalRecord: 'https://circle.library.ubc.ca/rest/handle/2429/sync-success',
+              },
+            }],
+          },
+        },
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/rest/handle/2429/sync-success')) {
+      return new Response(JSON.stringify({
+        bitstreams: [{
+          id: 401,
+          bundleName: 'TEXT',
+          mimeType: 'text/plain',
+          name: 'sync-success.pdf.txt',
+        }],
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/rest/bitstreams/401/retrieve')) {
+      return new Response(fullText, { headers: { 'content-type': 'text/plain' } });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  try {
+    const result = await runDocumentSync({
+      mode: 'sync_missing_pdfs',
+      baseUrl: 'https://oc-index.test',
+      term: 'degree.raw,Success',
+      source: 'id,title,author,digitalResourceOriginalRecord',
+      pageSize: 100,
+      scanLimit: 100,
+      syncMaxRecords: 100,
+      pdfBatchSize: 1,
+      contentMode: 'full_text_only',
+      downloadFiles: false,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.totalEnrichmentAttempted, 1);
+    assert.equal(result.totalEnriched, 1);
+    assert.equal(result.totalEnrichmentFailed, 0);
+    assert.equal((await loadStoredFileMetric(docId)).content_source, 'extracted_full_text');
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -233,7 +298,9 @@ test('import-rule PDF batches share one job-level cap across selected rules', as
 
     assert.equal(result.ok, true);
     assert.equal(result.totalSaved, 2);
-    assert.equal(result.totalEnriched, 2);
+    assert.equal(result.totalEnrichmentAttempted, 2);
+    assert.equal(result.totalEnriched, 0);
+    assert.equal(result.totalEnrichmentFailed, 2);
     assert.equal(result.pdfBatchLimitReached, true);
     assert.equal(result.rules.length, 1);
     assert.equal(result.rules[0].contentMode, 'full_text_only');
