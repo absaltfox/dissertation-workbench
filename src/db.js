@@ -8,6 +8,7 @@ import { dedupeSupervisorNames, normalizePersonName, stripMiddleInitials, superv
 import { encryptMfaSecret, decryptMfaSecret } from './secretCrypto.js';
 import { jaroWinkler } from './fuzzyMatch.js';
 import { documentThemeTerms } from './nlp.js';
+import { normalizeImportRule } from './importRules.js';
 
 let db;
 let schemaReady;
@@ -262,6 +263,32 @@ async function ensureSchema(client) {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS enrichment_rollouts (
+      rule_id TEXT PRIMARY KEY,
+      rule_revision TEXT,
+      status TEXT NOT NULL,
+      current_phase TEXT,
+      current_job_id INTEGER,
+      sample_job_id INTEGER,
+      control_job_id INTEGER,
+      last_cohort_job_id INTEGER,
+      evaluation_json TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS enrichment_rollout_evidence (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rule_id TEXT NOT NULL,
+      phase TEXT NOT NULL,
+      job_id INTEGER NOT NULL,
+      doc_id TEXT NOT NULL,
+      content_mode TEXT NOT NULL,
+      rule_revision TEXT,
+      outcome_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(job_id, doc_id)
+    );
+
     CREATE TABLE IF NOT EXISTS committee_members (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       doc_id TEXT NOT NULL,
@@ -486,6 +513,8 @@ async function ensureSchema(client) {
   await addColumnIfMissing(client, 'file_metrics', 'original_pdf_request_count', 'INTEGER DEFAULT 0');
   await addColumnIfMissing(client, 'file_metrics', 'retrieved_bytes', 'INTEGER DEFAULT 0');
   await addColumnIfMissing(client, 'import_rules', 'content_mode', "TEXT NOT NULL DEFAULT 'metadata_only'");
+  await addColumnIfMissing(client, 'enrichment_rollouts', 'rule_revision', 'TEXT');
+  await addColumnIfMissing(client, 'enrichment_rollout_evidence', 'rule_revision', 'TEXT');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_sync_key ON documents(sync_key)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree ON documents(degree)');
@@ -498,6 +527,7 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_concept_partition_candidates_phrase ON concept_partition_candidates(phrase, partition_key)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_citation_extraction_status ON citation_extraction_state(status, extracted_at)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_import_rules_updated_at ON import_rules(updated_at)');
+  await client.execute('CREATE INDEX IF NOT EXISTS idx_enrichment_evidence_rule_phase ON enrichment_rollout_evidence(rule_id, phase, job_id)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_username ON password_reset_tokens(username)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_citations_citation_id ON document_citations(citation_id)');
@@ -1915,8 +1945,29 @@ export async function reapStaleAdminJobs(type = null) {
     sql += ' AND type = ?';
     args.push(type);
   }
-  const result = await run(sql, args);
-  return result.changes || 0;
+  const client = await getDb();
+  const results = await client.batch([
+    { sql, args },
+    {
+      sql: `
+        UPDATE enrichment_rollouts
+        SET status = 'blocked', current_phase = NULL, current_job_id = NULL,
+            evaluation_json = json_object(
+              'passed', 0,
+              'phase', current_phase,
+              'interrupted', 1,
+              'error', 'Admin worker timed out or stopped heartbeating.'
+            ),
+            updated_at = ?
+        WHERE current_job_id IN (
+          SELECT id FROM admin_jobs
+          WHERE status = 'timed_out' AND finished_at = ?
+        )
+      `,
+      args: [now, now],
+    },
+  ], 'write');
+  return changes(results[0]);
 }
 
 export async function hasRunningAdminJob(type) {
@@ -2254,6 +2305,20 @@ function importRuleFromRow(row) {
   };
 }
 
+export function importRuleRevision(input) {
+  const rule = normalizeImportRule(input);
+  const canonical = JSON.stringify({
+    degree: rule.degree,
+    program: rule.program,
+    affiliation: rule.affiliation,
+    index: rule.index,
+    query: rule.query,
+    source: rule.source,
+    contentMode: rule.contentMode,
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
 export async function listImportRules() {
   const rows = await all(`
     SELECT id, name, degree, program, affiliation, requested_index, query, source, content_mode, created_at, updated_at
@@ -2275,9 +2340,10 @@ export async function getImportRule(id) {
 export async function saveImportRule(rule) {
   const now = new Date().toISOString();
   const id = rule.id || crypto.randomUUID();
-  const existing = await get('SELECT created_at FROM import_rules WHERE id = ?', [id]);
-  const createdAt = existing?.created_at || now;
-  await run(`
+  const existing = await getImportRule(id);
+  const createdAt = existing?.createdAt || now;
+  const normalized = normalizeImportRule({ ...rule, id });
+  const statements = [{ sql: `
     INSERT INTO import_rules (
       id, name, degree, program, affiliation, requested_index, query, source, content_mode, created_at, updated_at
     )
@@ -2292,25 +2358,190 @@ export async function saveImportRule(rule) {
       source = excluded.source,
       content_mode = excluded.content_mode,
       updated_at = excluded.updated_at
-  `, [
+  `, args: [
     id,
-    rule.name,
-    rule.degree || null,
-    rule.program || null,
-    rule.affiliation || null,
-    rule.index || null,
-    rule.query || null,
-    rule.source || null,
-    rule.contentMode || 'metadata_only',
+    normalized.name,
+    normalized.degree || null,
+    normalized.program || null,
+    normalized.affiliation || null,
+    normalized.index || null,
+    normalized.query || null,
+    normalized.source || null,
+    normalized.contentMode,
     createdAt,
     now,
-  ]);
+  ] }];
+  if (existing && importRuleRevision(existing) !== importRuleRevision(normalized)) {
+    statements.push({ sql: `
+      UPDATE enrichment_rollouts
+      SET status = 'invalidated', current_phase = NULL, current_job_id = NULL,
+          rule_revision = ?, evaluation_json = ?, updated_at = ?
+      WHERE rule_id = ?
+    `, args: [
+      importRuleRevision(normalized),
+      JSON.stringify({ passed: false, reason: 'import_rule_changed' }),
+      now,
+      id,
+    ] });
+  }
+  const client = await getDb();
+  await client.batch(statements, 'write');
   return getImportRule(id);
 }
 
 export async function deleteImportRule(id) {
-  const result = await run('DELETE FROM import_rules WHERE id = ?', [id]);
-  return result.changes > 0;
+  const existing = await getImportRule(id);
+  if (!existing) return false;
+  const client = await getDb();
+  await client.batch([
+    { sql: 'DELETE FROM enrichment_rollout_evidence WHERE rule_id = ?', args: [id] },
+    { sql: 'DELETE FROM enrichment_rollouts WHERE rule_id = ?', args: [id] },
+    { sql: 'DELETE FROM import_rules WHERE id = ?', args: [id] },
+  ], 'write');
+  return true;
+}
+
+function enrichmentRolloutFromRow(row) {
+  if (!row) return null;
+  let evaluation = null;
+  try { evaluation = row.evaluation_json ? JSON.parse(row.evaluation_json) : null; } catch { evaluation = null; }
+  return {
+    ruleId: row.rule_id,
+    ruleRevision: row.rule_revision || null,
+    status: row.status,
+    currentPhase: row.current_phase || null,
+    currentJobId: row.current_job_id == null ? null : Number(row.current_job_id),
+    sampleJobId: row.sample_job_id == null ? null : Number(row.sample_job_id),
+    controlJobId: row.control_job_id == null ? null : Number(row.control_job_id),
+    lastCohortJobId: row.last_cohort_job_id == null ? null : Number(row.last_cohort_job_id),
+    evaluation,
+    updatedAt: row.updated_at,
+  };
+}
+
+export async function getEnrichmentRollout(ruleId) {
+  return enrichmentRolloutFromRow(await get(`
+    SELECT rule_id, rule_revision, status, current_phase, current_job_id, sample_job_id,
+           control_job_id, last_cohort_job_id, evaluation_json, updated_at
+    FROM enrichment_rollouts
+    WHERE rule_id = ?
+  `, [ruleId]));
+}
+
+export async function startEnrichmentRolloutPhase(ruleId, phase, jobId, ruleRevision) {
+  const currentRule = await getImportRule(ruleId);
+  if (!currentRule || importRuleRevision(currentRule) !== ruleRevision) {
+    throw new Error(`Import rule ${ruleId} changed after this rollout job was created.`);
+  }
+  const existing = await getEnrichmentRollout(ruleId);
+  const allowed = (
+    (phase === 'sample' && (!existing || existing.status === 'invalidated' || (existing.status === 'blocked' && existing.evaluation?.phase === 'sample')))
+    || (phase === 'control' && (existing?.status === 'awaiting_control' || (existing?.status === 'blocked' && existing.evaluation?.phase === 'control')))
+    || (phase === 'cohort' && (existing?.status === 'ready_for_cohort' || (existing?.status === 'blocked' && existing.evaluation?.phase === 'cohort')))
+  );
+  if (!allowed) {
+    throw new Error(`The ${phase} phase is not allowed while rollout ${ruleId} is ${existing?.status || 'not started'}.`);
+  }
+  if (existing?.ruleRevision && existing.ruleRevision !== ruleRevision) {
+    throw new Error(`Import rule ${ruleId} changed after its rollout evidence was recorded.`);
+  }
+  const now = new Date().toISOString();
+  await run(`
+    INSERT INTO enrichment_rollouts (
+      rule_id, rule_revision, status, current_phase, current_job_id, updated_at
+    ) VALUES (?, ?, 'running', ?, ?, ?)
+    ON CONFLICT(rule_id) DO UPDATE SET
+      status = 'running',
+      rule_revision = excluded.rule_revision,
+      current_phase = excluded.current_phase,
+      current_job_id = excluded.current_job_id,
+      updated_at = excluded.updated_at
+  `, [ruleId, ruleRevision, phase, jobId, now]);
+  return getEnrichmentRollout(ruleId);
+}
+
+export async function saveEnrichmentRolloutEvidence({ ruleId, ruleRevision, phase, jobId, contentMode, outcomes = [] }) {
+  const now = new Date().toISOString();
+  for (const outcome of outcomes) {
+    await run(`
+      INSERT INTO enrichment_rollout_evidence (
+        rule_id, rule_revision, phase, job_id, doc_id, content_mode, outcome_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(job_id, doc_id) DO UPDATE SET
+        outcome_json = excluded.outcome_json,
+        content_mode = excluded.content_mode,
+        rule_revision = excluded.rule_revision
+    `, [ruleId, ruleRevision, phase, jobId, String(outcome.docId), contentMode, JSON.stringify(outcome), now]);
+  }
+}
+
+export async function listEnrichmentRolloutEvidence({ ruleId, phase = null, jobId = null } = {}) {
+  const clauses = ['rule_id = ?'];
+  const args = [ruleId];
+  if (phase) { clauses.push('phase = ?'); args.push(phase); }
+  if (jobId != null) { clauses.push('job_id = ?'); args.push(jobId); }
+  const rows = await all(`
+    SELECT rule_id, rule_revision, phase, job_id, doc_id, content_mode, outcome_json, created_at
+    FROM enrichment_rollout_evidence
+    WHERE ${clauses.join(' AND ')}
+    ORDER BY id
+  `, args);
+  return rows.map((row) => {
+    let outcome = null;
+    try { outcome = JSON.parse(row.outcome_json); } catch { outcome = null; }
+    return {
+      ruleId: row.rule_id,
+      ruleRevision: row.rule_revision || null,
+      phase: row.phase,
+      jobId: Number(row.job_id),
+      docId: row.doc_id,
+      contentMode: row.content_mode,
+      outcome,
+      createdAt: row.created_at,
+    };
+  });
+}
+
+export async function finishEnrichmentRolloutPhase(ruleId, phase, jobId, evaluation) {
+  const status = evaluation?.passed
+    ? phase === 'sample'
+      ? 'awaiting_control'
+      : phase === 'cohort' && evaluation.exhausted ? 'completed' : 'ready_for_cohort'
+    : 'blocked';
+  const jobColumn = phase === 'sample'
+    ? 'sample_job_id'
+    : phase === 'control' ? 'control_job_id' : 'last_cohort_job_id';
+  const now = new Date().toISOString();
+  await run(`
+    UPDATE enrichment_rollouts
+    SET status = ?, current_phase = NULL, current_job_id = NULL,
+        ${jobColumn} = ?, evaluation_json = ?, updated_at = ?
+    WHERE rule_id = ? AND current_job_id = ?
+  `, [status, jobId, JSON.stringify(evaluation), now, ruleId, jobId]);
+  return getEnrichmentRollout(ruleId);
+}
+
+export async function failEnrichmentRolloutForJob(jobId, error) {
+  const row = await get(`
+    SELECT rule_id, current_phase
+    FROM enrichment_rollouts
+    WHERE current_job_id = ? AND status = 'running'
+  `, [jobId]);
+  if (!row) return null;
+  const evaluation = {
+    passed: false,
+    phase: row.current_phase,
+    interrupted: true,
+    error: error?.message || String(error || 'Worker interrupted'),
+  };
+  const now = new Date().toISOString();
+  await run(`
+    UPDATE enrichment_rollouts
+    SET status = 'blocked', current_phase = NULL, current_job_id = NULL,
+        evaluation_json = ?, updated_at = ?
+    WHERE rule_id = ? AND current_job_id = ?
+  `, [JSON.stringify(evaluation), now, row.rule_id, jobId]);
+  return getEnrichmentRollout(row.rule_id);
 }
 
 // --- Cache integrity ---

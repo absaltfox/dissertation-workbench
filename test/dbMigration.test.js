@@ -100,11 +100,13 @@ test('schema migration adds content policy and provenance fields conservatively'
     const projection = await client.execute("SELECT serving_projection_version FROM documents WHERE doc_id = 'legacy-serving-doc'");
     const committeeProjection = await client.execute("SELECT doc_id, person_key, affiliation, source FROM document_people WHERE source <> 'metadata' ORDER BY doc_id");
     const committeeState = await client.execute("SELECT projection_value FROM serving_projection_state WHERE projection_key = 'committee_people'");
+    const rolloutTables = await client.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('enrichment_rollouts', 'enrichment_rollout_evidence') ORDER BY name");
     process.stdout.write(JSON.stringify({
       rule, metric, people,
       projectionVersion: projection.rows[0]?.serving_projection_version,
       committeeProjection: committeeProjection.rows,
       committeeState: committeeState.rows[0]?.projection_value,
+      rolloutTables: rolloutTables.rows.map((row) => row.name),
     }));
     await db.closeDb();
   `;
@@ -148,6 +150,7 @@ test('schema migration adds content policy and provenance fields conservatively'
       },
     ]);
     assert.equal(migrated.committeeState, 'complete');
+    assert.deepEqual(migrated.rolloutTables, ['enrichment_rollout_evidence', 'enrichment_rollouts']);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

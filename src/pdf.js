@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import {
   PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS,
   PDF_DOWNLOAD_RATE_PER_MIN, GROBID_URL, GROBID_STARTUP_WAIT_MS, GROBID_FLY_API_TOKEN,
-  ALLOW_ORIGINAL_PDF_RETRIEVAL
+  ALLOW_ORIGINAL_PDF_RETRIEVAL, CONTENT_RETRIEVAL_ENABLED
 } from './config.js';
 import {
   loadStoredFileMetric, saveFileMetric, saveDocumentMetadata, saveCommitteeMembers,
@@ -1958,6 +1958,9 @@ export async function analyzeDocumentFile(doc, options) {
   } = options;
   if (!isImportContentMode(contentMode)) {
     throw new Error(`Unsupported content mode: ${contentMode}`);
+  }
+  if (contentMode !== 'metadata_only' && !CONTENT_RETRIEVAL_ENABLED) {
+    throw new Error('Content retrieval is disabled for this deployment.');
   }
   const requestStats = {
     metadataRequests: 0,

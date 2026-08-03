@@ -109,6 +109,8 @@ Content-enrichment job results include `requestCounts` with separate `metadata`,
 
 Enrichment results must also distinguish `totalEnrichmentAttempted`, `totalEnriched`, and `totalEnrichmentFailed`. Batch limits and continuation checkpoints use attempts; success totals include only results that satisfy the snapshotted content policy. A streamed-PDF failure must not be counted as enriched or silently converted to extracted-full-text estimates.
 
+Progressive enrichment jobs additionally persist per-document evidence outside `file_metrics`. Sample, control, and cohort runs are bounded and must pass their recorded policy evaluation before the next phase can start. Control jobs require explicit original-PDF approval, and cohort jobs never auto-continue. See `docs/progressive-enrichment-rollout.md`.
+
 ## PatternRank Concept Rebuild Standard
 
 PatternRank concept extraction must be implemented as a worker-backed job.

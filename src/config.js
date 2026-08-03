@@ -18,6 +18,9 @@ export const DEFAULT_DOWNLOAD_FILES = process.env.DOWNLOAD_FILES !== '0';
 export const ALLOW_ORIGINAL_PDF_RETRIEVAL = /^(1|true|yes)$/i.test(
   process.env.ALLOW_ORIGINAL_PDF_RETRIEVAL || ''
 );
+export const CONTENT_RETRIEVAL_ENABLED = !/^(1|true|yes)$/i.test(
+  process.env.DISABLE_CONTENT_RETRIEVAL || ''
+);
 export const FILE_CONCURRENCY = 2;
 export const PDF_DOWNLOAD_RATE_PER_MIN = Number(process.env.PDF_DOWNLOAD_RATE_PER_MIN || 0); // 0 = unlimited
 export const DATA_DIR = process.env.APP_DATA_DIR || path.join(process.cwd(), 'data');

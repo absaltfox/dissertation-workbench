@@ -1,7 +1,9 @@
 import {
   appendAdminJobLog, finishAdminJob, getDb, listFileMetrics, listImportRules,
   listPendingCitationExtractions, loadCommitteeMembers, loadDocumentMetadata,
-  saveCitationExtractionState, updateAdminJobProgress
+  finishEnrichmentRolloutPhase, getEnrichmentRollout, listEnrichmentRolloutEvidence,
+  saveCitationExtractionState, saveEnrichmentRolloutEvidence, startEnrichmentRolloutPhase,
+  updateAdminJobProgress
 } from '../db.js';
 import fs from 'node:fs/promises';
 import {
@@ -12,6 +14,9 @@ import {
   contentModeEnrichesDocuments, importRuleToSyncOptions, validateImportRule
 } from '../importRules.js';
 import { IMPORT_PDF_BATCH_SIZE } from '../config.js';
+import {
+  ENRICHMENT_ROLLOUT_PHASES, evaluateEnrichmentRun
+} from './enrichmentRollout.js';
 
 async function log(jobId, message) {
   await appendAdminJobLog(jobId, `[${new Date().toISOString()}] ${message}\n`);
@@ -296,7 +301,16 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       if (errors.length) throw new Error(`Invalid import rule: ${errors.join(' ')}`);
     }
 
+    const rollout = params.rollout || null;
+    if (rollout) {
+      if (!ENRICHMENT_ROLLOUT_PHASES.has(rollout.phase) || rules.length !== 1) {
+        throw new Error('Progressive enrichment jobs require one rule and a valid rollout phase.');
+      }
+      await startEnrichmentRolloutPhase(rules[0].id, rollout.phase, job.id, rollout.ruleRevision);
+    }
+
     await log(job.id, `Starting import rules sync (${params.mode}, ${params.scope}).`);
+    const rolloutStartedAt = Date.now();
     await progress({ phase: 'import_rules', label: 'Running import rules', status: 'running' });
     const apiKey = await getConfiguredApiKey();
     const perRule = [];
@@ -311,6 +325,8 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       totalEnriched: 0,
       totalEnrichmentFailed: 0,
     };
+    const enrichmentOutcomes = [];
+    let heapGrowthBytes = 0;
     const requestCounts = { metadata: 0, fullText: 0, originalPdf: 0, retrievedBytes: 0 };
     let pdfBatchLimitReached = false;
     for (const rule of rules) {
@@ -342,6 +358,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         }),
         pdfBatchSize: params.mode === 'sync_missing_pdfs' && enrichesDocuments ? remainingPdfBatchSize : 0,
         skipPdfDocIds: Array.from(attemptedPdfIds),
+        enrichmentDocIds: rollout?.phase === 'control' ? rollout.documentIds : [],
       });
       totals.rulesStarted += 1;
       totals.totalSeen += Number(result.totalSeen || 0);
@@ -354,6 +371,8 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       totals.totalEnrichmentAttempted += Number(result.totalEnrichmentAttempted || 0);
       totals.totalEnriched += Number(result.totalEnriched || 0);
       totals.totalEnrichmentFailed += Number(result.totalEnrichmentFailed || 0);
+      enrichmentOutcomes.push(...(Array.isArray(result.enrichmentOutcomes) ? result.enrichmentOutcomes : []));
+      heapGrowthBytes = Math.max(heapGrowthBytes, Number(result.heapGrowthBytes || 0));
       for (const docId of readDocIdList(result.pdfAttemptedIds)) attemptedPdfIds.add(docId);
       if (result.pdfBatchLimitReached) pdfBatchLimitReached = true;
       perRule.push({
@@ -374,6 +393,8 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         requestCounts: result.requestCounts || {
           metadata: 0, fullText: 0, originalPdf: 0, retrievedBytes: 0,
         },
+        heapGrowthBytes: Number(result.heapGrowthBytes || 0),
+        enrichmentExhausted: Boolean(result.enrichmentExhausted),
         error: result.error || null,
       });
       await log(job.id, `Rule result: ${result.ok ? 'success' : 'failed'}; ${result.totalSaved || 0} saved.`);
@@ -383,7 +404,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         && pdfBatchSize
         && totals.totalEnrichmentAttempted >= pdfBatchSize
       ) {
-        pdfBatchLimitReached = true;
+        if (!rollout || !result.enrichmentExhausted) pdfBatchLimitReached = true;
         break;
       }
     }
@@ -398,6 +419,37 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       ...totals,
       rules: perRule,
     };
+    if (rollout) {
+      const rule = rules[0];
+      await saveEnrichmentRolloutEvidence({
+        ruleId: rule.id,
+        ruleRevision: rollout.ruleRevision,
+        phase: rollout.phase,
+        jobId: job.id,
+        contentMode: rule.contentMode,
+        outcomes: enrichmentOutcomes,
+      });
+      const rolloutState = await getEnrichmentRollout(rule.id);
+      const controlEvidence = rollout.phase === 'control' && rolloutState?.sampleJobId
+        ? await listEnrichmentRolloutEvidence({ ruleId: rule.id, jobId: rolloutState.sampleJobId })
+        : [];
+      const evaluation = evaluateEnrichmentRun({
+        phase: rollout.phase,
+        targetSize: rollout.targetSize,
+        outcomes: enrichmentOutcomes,
+        controlOutcomes: controlEvidence.map((entry) => entry.outcome).filter(Boolean),
+        requestCounts,
+        durationMs: Date.now() - rolloutStartedAt,
+        heapGrowthBytes,
+        exhausted: perRule.length === 1 && Boolean(perRule[0].enrichmentExhausted),
+      });
+      if (rollout.phase === 'sample' && Number(requestCounts.originalPdf || 0) > 0) {
+        await log(job.id, `ALERT: protected full-text sample made ${requestCounts.originalPdf} original PDF request(s); rollout blocked.`);
+      }
+      result.rollout = await finishEnrichmentRolloutPhase(rule.id, rollout.phase, job.id, evaluation);
+      result.rolloutEvaluation = evaluation;
+      if (!evaluation.passed) result.ok = false;
+    }
     const continuation = await startContinuationJob(job, result, progress);
     if (continuation?.jobId) result.nextJobId = continuation.jobId;
     if (continuation?.error) result.continuationError = continuation.error;

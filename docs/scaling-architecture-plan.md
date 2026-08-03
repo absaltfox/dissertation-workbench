@@ -209,11 +209,14 @@ Exit criterion met by integration tests: an unchanged second run is a no-op, and
 
 ### Phase 5: Progressive enrichment
 
-- Process a 100-document `full_text_only` quality sample.
-- Compare derivative results against PDF-derived results for a small approved control set.
-- Expand by degree/faculty cohorts while monitoring error rate, memory, throughput, repository request rate, and data quality.
+- Implemented: each content-processing rule starts with a bounded 100-document `full_text_only` quality sample.
+- Implemented: an explicitly approved 10-document streamed-PDF control compares durable derivative and PDF evidence for the same leading documents.
+- Implemented: degree/faculty rules expand one bounded cohort at a time; error rate, heap growth, throughput, repository request counts/bytes, and word-count agreement are evaluated before another cohort is allowed.
+- Implemented: approvals are bound to a canonical import-rule revision, and PDF controls use an exact allowlist drawn from the passed sample evidence.
+- Implemented: authoritative scan exhaustion permits a final partial cohort to complete the rollout, and stale-worker reaping makes interrupted phases retryable.
+- Implemented: failed gates block later phases, original-PDF requests in a protected sample create a job-log alert, and `DISABLE_CONTENT_RETRIEVAL=1` stops enrichment without stopping metadata imports.
 
-Exit criterion: each expanded cohort meets quality and operational thresholds before the next cohort is scheduled.
+Exit criterion met by policy and integration tests: a cohort must pass its recorded quality and operational thresholds before another cohort can be started. Production results still require operator review between cohorts. Operational details are in `docs/progressive-enrichment-rollout.md`.
 
 ## Required Tests and Operational Controls
 
@@ -231,3 +234,5 @@ Exit criterion: each expanded cohort meets quality and operational thresholds be
 Import rules are the correct place to declare content-processing intent. The rule selects metadata-only, full-text-only, streamed-PDF, or cached-PDF behaviour; the job snapshots and enforces that policy; and the parser records exactly what source produced each metric. A global safety guard remains authoritative so a rule cannot accidentally violate the no-original-download requirement.
 
 Step 4 decision: concept and citation work is driven by durable enrichment state, not import side effects. Automatic concept shards form one disjoint partition family; custom shards fail closed outside the global merge. Citation extraction is allowed to read cached artifacts but cannot retrieve repository content or implicitly start external resolution. These boundaries are enduring contracts for later schedulers and import-rule extraction toggles.
+
+Step 5 decision: rollout evidence is append-only and separate from the mutable serving metric. Expansion authorization belongs to a per-rule state machine, and no successful job automatically authorizes or schedules the next cohort. PDF controls require both deployment capability and explicit per-run approval. These contracts keep quality comparisons auditable and contain operational failures to one rule and cohort.
