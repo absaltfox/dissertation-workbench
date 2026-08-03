@@ -26,7 +26,7 @@ export function isAdminJobRunning(type) {
   return runningAdminJobs.has(type);
 }
 
-export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCatalogueLookups } = {}) {
+export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCatalogueLookups, scope = null } = {}) {
   const controller = new AbortController();
   const id = Number(jobId);
   const runnerId = `web:${process.pid}`;
@@ -96,6 +96,7 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
     });
     return runLookup({
       pageSize: limit,
+      scope,
       signal: controller.signal,
       onProgress: writeProgress,
     });

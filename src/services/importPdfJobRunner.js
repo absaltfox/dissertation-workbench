@@ -1,7 +1,9 @@
 import {
   appendAdminJobLog, finishAdminJob, getDb, listFileMetrics, listImportRules,
-  loadCommitteeMembers, loadDocumentMetadata, updateAdminJobProgress
+  listPendingCitationExtractions, loadCommitteeMembers, loadDocumentMetadata,
+  saveCitationExtractionState, updateAdminJobProgress
 } from '../db.js';
+import fs from 'node:fs/promises';
 import {
   analyzeDocumentFile, analyzePdfAtPath, deleteCachedPdf, extractAndSaveParsedData
 } from '../pdf.js';
@@ -214,6 +216,34 @@ async function analyzePdfEntry(entry, artifactClient, {
   }
 }
 
+const CITATION_PARSER_VERSION = 'citation-v2';
+
+async function loadCitationSource(entry, artifactClient, progress, counts = null) {
+  if (entry.pdf_path) {
+    const analysis = await analyzePdfEntry(entry, artifactClient, {
+      keepPdfPath: true,
+      progress,
+      counts,
+      label: 'Parsing cached PDF text for citations',
+    });
+    return analysis ? {
+      fullText: analysis.fullText || '',
+      pdfPath: analysis.pdfPath || null,
+      cleanup: analysis.cleanup || null,
+    } : null;
+  }
+  if (!entry.full_text_path) return null;
+  if (artifactClient) {
+    const artifact = await artifactClient.downloadFullText(entry.doc_id);
+    return artifact?.fullText ? { fullText: artifact.fullText, pdfPath: null, cleanup: null } : null;
+  }
+  return {
+    fullText: await fs.readFile(entry.full_text_path, 'utf8'),
+    pdfPath: null,
+    cleanup: null,
+  };
+}
+
 export async function runImportPdfAdminJob(job, { artifactClient = null, clearMetricsCache = null } = {}) {
   const params = job.params || {};
   const progress = createProgressReporter(job.id);
@@ -402,6 +432,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       recomputeFromCache: false,
       artifactClient,
       onProgress: progress,
+      extractCitations: false,
     });
     const result = {
       ok: true,
@@ -493,6 +524,13 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     try {
       if (!analysis?.fullText) {
         const error = 'Cached PDF text extraction returned no text.';
+        await saveCitationExtractionState(docId, {
+          contentChecksum: entry.content_checksum || entry.updated_at || null,
+          parserVersion: CITATION_PARSER_VERSION,
+          status: 'failed',
+          citationCount: 0,
+          error,
+        });
         const result = {
           ok: false,
           docId,
@@ -520,7 +558,23 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         onProgress: progress,
         extractCommittee: false,
         extractCitations: true,
+        strictCitationErrors: true,
       });
+      await saveCitationExtractionState(docId, {
+        contentChecksum: entry.content_checksum || entry.updated_at || null,
+        parserVersion: CITATION_PARSER_VERSION,
+        status: 'completed',
+        citationCount: doc.citationCount || 0,
+      });
+    } catch (error) {
+      await saveCitationExtractionState(docId, {
+        contentChecksum: entry.content_checksum || entry.updated_at || null,
+        parserVersion: CITATION_PARSER_VERSION,
+        status: 'failed',
+        citationCount: 0,
+        error: error?.message || String(error),
+      });
+      throw error;
     } finally {
       await analysis?.cleanup?.();
     }
@@ -596,56 +650,110 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
   }
 
   if (job.type === 'reparse_citations') {
-    await log(job.id, 'Starting cached PDF citation re-extraction.');
-    await progress({ phase: 'reparse_citations', label: 'Re-extracting cached PDF citations', status: 'running' });
-    const entries = (await listFileMetrics()).filter((entry) => entry.pdf_path);
+    await log(job.id, 'Starting incremental citation extraction without catalogue resolution.');
+    await progress({ phase: 'citation_extraction', label: 'Extracting pending citations', status: 'running' });
+    const maxDocuments = Math.max(1, Math.min(5000, Number(params.maxDocuments) || 1000));
+    const pageSize = Math.min(maxDocuments, Math.max(1, Math.min(250, Number(params.pageSize) || 50)));
+    const scope = params.scope || {};
     let processed = 0;
     let totalCitations = 0;
-    for (const entry of entries) {
-      try {
-        await progress({
-          phase: 'reparse_citations',
-          label: 'Re-extracting cached PDF citations',
-          detail: entry.doc_id,
-          status: 'running',
-          counts: { processed, total: entries.length, citations: totalCitations },
-        });
-        const analysis = await analyzePdfEntry(entry, artifactClient, {
-          keepPdfPath: true,
-          progress,
-          counts: { processed, total: entries.length, citations: totalCitations },
-          label: 'Parsing cached PDF text for citations',
-        });
+    let failed = 0;
+    let cursor = '';
+    let reachedLimit = false;
+    while (processed + failed < maxDocuments) {
+      const entries = await listPendingCitationExtractions({
+        limit: Math.min(pageSize, maxDocuments - processed - failed),
+        afterDocId: cursor,
+        syncKey: scope.syncKey || null,
+        filters: scope.filters || scope,
+        parserVersion: CITATION_PARSER_VERSION,
+      });
+      if (!entries.length) break;
+      for (const entry of entries) {
+        cursor = entry.doc_id;
+        let source = null;
         try {
-          if (!analysis?.fullText) continue;
+          await progress({
+            phase: 'citation_extraction',
+            label: 'Extracting pending citations',
+            detail: entry.doc_id,
+            status: 'running',
+            counts: { processed, failed, citations: totalCitations, cursor, maxDocuments },
+          });
+          source = await loadCitationSource(entry, artifactClient, progress, {
+            processed, failed, citations: totalCitations, maxDocuments,
+          });
+          if (!source?.fullText) throw new Error('Cached content returned no text for citation extraction.');
           const doc = await loadDocumentMetadata(entry.doc_id) || { id: entry.doc_id, supervisors: [] };
-          await extractAndSaveParsedData(doc, analysis.fullText, analysis.pdfPath, {
+          await extractAndSaveParsedData(doc, source.fullText, source.pdfPath, {
             onProgress: progress,
             extractCommittee: false,
             extractCitations: true,
+            strictCitationErrors: true,
           });
           processed += 1;
           if (doc.citationCount) totalCitations += Number(doc.citationCount);
+          await saveCitationExtractionState(entry.doc_id, {
+            contentChecksum: entry.content_checksum,
+            parserVersion: CITATION_PARSER_VERSION,
+            status: 'completed',
+            citationCount: doc.citationCount || 0,
+          });
+        } catch (error) {
+          failed += 1;
+          await saveCitationExtractionState(entry.doc_id, {
+            contentChecksum: entry.content_checksum,
+            parserVersion: CITATION_PARSER_VERSION,
+            status: 'failed',
+            citationCount: 0,
+            error: error?.message || String(error),
+          });
+          await log(job.id, `Citation extraction failed for ${entry.doc_id}: ${error?.message || String(error)}`);
         } finally {
-          await analysis?.cleanup?.();
+          await source?.cleanup?.();
         }
-      } catch (error) {
-        await log(job.id, `Citation re-extraction failed for ${entry.doc_id}: ${error?.message || String(error)}`);
       }
+      await progress({
+        phase: 'citation_extraction',
+        label: 'Extracting pending citations',
+        status: 'running',
+        detail: `Checkpointed through ${cursor}`,
+        counts: { processed, failed, citations: totalCitations, cursor, maxDocuments },
+      });
     }
-    const result = { ok: true, processed, citations: totalCitations };
+    if (processed + failed >= maxDocuments) {
+      const remaining = await listPendingCitationExtractions({
+        limit: 1,
+        afterDocId: cursor,
+        syncKey: scope.syncKey || null,
+        filters: scope.filters || scope,
+        parserVersion: CITATION_PARSER_VERSION,
+      });
+      reachedLimit = remaining.length > 0;
+    }
+    const result = {
+      ok: failed === 0,
+      processed,
+      failed,
+      citations: totalCitations,
+      parserVersion: CITATION_PARSER_VERSION,
+      cursor: cursor || null,
+      batchLimitReached: reachedLimit,
+      resolutionQueued: false,
+    };
     clearMetricsCache?.();
     await finishAdminJob(job.id, {
-      status: 'completed',
+      status: failed ? 'failed' : 'completed',
       result,
+      error: failed ? `${failed} document(s) failed citation extraction.` : null,
       finishedAt: new Date().toISOString(),
     });
-    await log(job.id, `Citation re-extraction finished: ${processed} processed.`);
+    await log(job.id, `Citation extraction finished: ${processed} processed, ${failed} failed. Catalogue resolution was not started.`);
     await progress({
-      phase: 'reparse_citations',
-      label: 'Cached PDF citation re-extraction',
-      status: 'completed',
-      counts: { processed, total: entries.length, citations: totalCitations },
+      phase: 'citation_extraction',
+      label: 'Citation extraction',
+      status: failed ? 'failed' : 'completed',
+      counts: { processed, failed, citations: totalCitations, cursor, batchLimitReached: reachedLimit },
     });
     return result;
   }

@@ -1091,7 +1091,7 @@ async function loadConceptPipelineStatus() {
 async function handleRebuildConcepts() {
   if (!rebuildConceptsBtn) return;
   rebuildConceptsBtn.disabled = true;
-  rebuildConceptsBtn.textContent = 'Rebuilding...';
+  rebuildConceptsBtn.textContent = 'Processing...';
   try {
     const res = await fetch('/api/admin/concepts/rebuild', { method: 'POST', headers: csrfHeaders() });
     const data = await res.json();
@@ -1100,15 +1100,15 @@ async function handleRebuildConcepts() {
       return;
     }
     setStatus(data.alreadyRunning
-      ? `Concept rebuild is already running as job ${data.jobId}.`
-      : `Concept rebuild started as job ${data.jobId}.`);
+      ? `A concept partition is already processing as job ${data.jobId}.`
+      : `The next changed concept partition started as job ${data.jobId}.`);
     await loadJobs();
     await loadConceptPipelineStatus();
   } catch {
     alert('Connection error');
   } finally {
     rebuildConceptsBtn.disabled = false;
-    rebuildConceptsBtn.textContent = 'Rebuild Concept Dictionary';
+    rebuildConceptsBtn.textContent = 'Process Next Concept Partition';
   }
 }
 
@@ -1925,16 +1925,18 @@ async function handleReparseCitations() {
     const res = await fetch('/api/admin/reparse-citations', { method: 'POST', headers: csrfHeaders() });
     const data = await res.json();
     if (!res.ok) {
-      alert(data.error || 'Citation re-extraction failed');
+      alert(data.error || 'Citation extraction failed');
       return;
     }
-    setStatus(data.alreadyRunning ? 'A citation re-extraction worker is already running.' : 'Citation re-extraction worker started.');
+    setStatus(data.alreadyRunning
+      ? 'A cached-content citation extraction worker is already running.'
+      : 'Cached-content citation extraction started; catalogue resolution will remain separate.');
     await loadJobs();
   } catch {
     alert('Connection error');
   } finally {
     reparseCitationsBtn.disabled = false;
-    reparseCitationsBtn.textContent = 'Re-extract Citations';
+    reparseCitationsBtn.textContent = 'Extract Pending Citations';
   }
 }
 
