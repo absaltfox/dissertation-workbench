@@ -779,24 +779,55 @@ async function fetchJsonWithTimeout(url, { onContentRequest = null } = {}) {
   }
 }
 
-async function fetchTextWithTimeout(url, { onContentRequest = null } = {}) {
+async function readResponseBufferWithLimit(res, maxBytes, onContentRequest, source) {
+  const chunks = [];
+  let receivedBytes = 0;
+  if (res.body && typeof res.body[Symbol.asyncIterator] === 'function') {
+    for await (const rawChunk of res.body) {
+      const chunk = Buffer.from(rawChunk);
+      chunks.push(chunk);
+      receivedBytes += chunk.length;
+      if (receivedBytes > maxBytes) {
+        await onContentRequest?.({ source, request: false, bytes: receivedBytes });
+        return null;
+      }
+    }
+  } else {
+    // Compatibility for test and older fetch implementations without a
+    // stream body. Production fetch responses take the bounded path above.
+    const bytes = typeof res.arrayBuffer === 'function'
+      ? Buffer.from(await res.arrayBuffer())
+      : Buffer.from(await res.text(), 'utf8');
+    chunks.push(bytes);
+    receivedBytes = bytes.length;
+  }
+  await onContentRequest?.({ source, request: false, bytes: receivedBytes });
+  if (receivedBytes > maxBytes) return null;
+  return Buffer.concat(chunks, receivedBytes);
+}
+
+async function fetchTextWithTimeout(url, { onContentRequest = null, maxBytes = MAX_DOWNLOAD_BYTES } = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
   try {
     await onContentRequest?.({ source: 'full_text', request: true, bytes: 0 });
     const res = await safeFetchDownloadUrl(String(url), { signal: controller.signal }, downloadSafetyOptions);
     if (!res.ok) return null;
+    const contentLength = Number(res.headers.get('content-length') || 0);
+    if (contentLength > maxBytes) {
+      await res.body?.cancel?.();
+      return null;
+    }
     const contentType = res.headers.get('content-type') || '';
     if (!contentType.includes('text/plain') && !contentType.includes('text/')) return null;
-    const body = await res.text();
-    await onContentRequest?.({ source: 'full_text', request: false, bytes: Buffer.byteLength(body, 'utf8') });
-    return body;
+    const bytes = await readResponseBufferWithLimit(res, maxBytes, onContentRequest, 'full_text');
+    return bytes?.toString('utf8') || null;
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function fetchBytesWithTimeout(url, { onContentRequest = null } = {}) {
+async function fetchBytesWithTimeout(url, { onContentRequest = null, maxBytes = MAX_DOWNLOAD_BYTES } = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
   try {
@@ -804,14 +835,14 @@ async function fetchBytesWithTimeout(url, { onContentRequest = null } = {}) {
     const res = await safeFetchDownloadUrl(String(url), { signal: controller.signal }, downloadSafetyOptions);
     if (!res.ok) return null;
     const contentLength = Number(res.headers.get('content-length') || 0);
-    if (contentLength > MAX_DOWNLOAD_BYTES) {
+    if (contentLength > maxBytes) {
       logger.warn('Download skipped: file too large', { url: url.toString(), bytes: contentLength });
+      await res.body?.cancel?.();
       return null;
     }
     const contentType = res.headers.get('content-type') || '';
-    const bytes = Buffer.from(await res.arrayBuffer());
-    await onContentRequest?.({ source: 'original_pdf', request: false, bytes: bytes.length });
-    if (bytes.length > MAX_DOWNLOAD_BYTES) return null;
+    const bytes = await readResponseBufferWithLimit(res, maxBytes, onContentRequest, 'original_pdf');
+    if (!bytes) return null;
     return {
       bytes,
       contentType,
@@ -858,7 +889,8 @@ function chooseDspacePdfBitstream(bitstreams) {
 }
 
 export async function fetchFullTextForDocument(doc, stored = null, {
-  artifactClient = null, persistFullText = true, onContentRequest = null
+  artifactClient = null, persistFullText = true, onContentRequest = null,
+  maxBytes = MAX_DOWNLOAD_BYTES
 } = {}) {
   const cached = await readCachedFullText(doc, stored, artifactClient);
   if (cached) return cached;
@@ -874,7 +906,7 @@ export async function fetchFullTextForDocument(doc, stored = null, {
     if (!id) return null;
 
     const retrieveUrl = dspaceRestUrl(`/rest/bitstreams/${id}/retrieve`);
-    const fullText = await fetchTextWithTimeout(retrieveUrl, { onContentRequest });
+    const fullText = await fetchTextWithTimeout(retrieveUrl, { onContentRequest, maxBytes });
     if (!fullText || fullText.length <= 1000) return null;
     const cachedText = persistFullText
       ? await writeCachedFullText(doc, fullText, retrieveUrl.toString(), artifactClient)
@@ -899,7 +931,9 @@ export async function fetchFullTextForDocument(doc, stored = null, {
   }
 }
 
-export async function fetchPdfForDocument(doc, { onContentRequest = null } = {}) {
+export async function fetchPdfForDocument(doc, {
+  onContentRequest = null, maxBytes = MAX_DOWNLOAD_BYTES
+} = {}) {
   const originalPdfAllowed = downloadSafetyOptions.allowOriginalPdfRetrieval
     ?? ALLOW_ORIGINAL_PDF_RETRIEVAL;
   if (!originalPdfAllowed) {
@@ -913,7 +947,7 @@ export async function fetchPdfForDocument(doc, { onContentRequest = null } = {})
     if (!id) return null;
 
     const retrieveUrl = dspaceRestUrl(`/rest/bitstreams/${id}/retrieve`);
-    const result = await fetchBytesWithTimeout(retrieveUrl, { onContentRequest });
+    const result = await fetchBytesWithTimeout(retrieveUrl, { onContentRequest, maxBytes });
     if (!result?.bytes?.length) return null;
 
     const looksLikePdf = result.bytes.subarray(0, 5).toString('latin1') === '%PDF-';
@@ -1185,10 +1219,10 @@ async function analyzeDocumentFullText(doc, fullText, {
 async function analyzeDocumentFullTextFallback(doc, stored, {
   status = 'full_text', error = null, artifactClient = null, onProgress = null,
   extractCommittee = true, extractCitations = true, persistFullText = true,
-  onContentRequest = null, requestStats = null
+  onContentRequest = null, requestStats = null, maxContentBytes = MAX_DOWNLOAD_BYTES
 } = {}) {
   const result = await fetchFullTextForDocument(doc, stored, {
-    artifactClient, persistFullText, onContentRequest
+    artifactClient, persistFullText, onContentRequest, maxBytes: maxContentBytes
   });
   if (!result?.fullText) return false;
   return analyzeDocumentFullText(doc, result.fullText, {
@@ -1954,8 +1988,12 @@ export async function analyzeDocumentFile(doc, options) {
   const {
     downloadFiles, forceDownload, recomputeFromCache, artifactClient = null, onProgress = null,
     extractCommittee = true, extractCitations = false, onContentRequest = null,
-    contentMode = downloadFiles ? 'pdf_cache' : 'full_text_only'
+    contentMode = downloadFiles ? 'pdf_cache' : 'full_text_only',
+    // Import rules always pass an explicit snapshot. The null case preserves
+    // historical behaviour for direct/manual callers during the migration.
+    contentFallback = null, maxContentBytes = MAX_DOWNLOAD_BYTES
   } = options;
+  const fallback = contentFallback || (contentMode === 'pdf_cache' ? 'full_text' : 'legacy');
   if (!isImportContentMode(contentMode)) {
     throw new Error(`Unsupported content mode: ${contentMode}`);
   }
@@ -2003,8 +2041,9 @@ export async function analyzeDocumentFile(doc, options) {
       persistFullText: false,
       onContentRequest: trackContentRequest,
       requestStats,
+      maxContentBytes,
     })) return;
-    doc.downloadStatus = 'not_found';
+    doc.downloadStatus = fallback === 'metadata_only' ? 'metadata_fallback' : 'not_found';
     doc.downloadError = 'No extracted full-text derivative is available.';
     await saveFileMetric(doc.id, {
       status: doc.downloadStatus,
@@ -2021,6 +2060,7 @@ export async function analyzeDocumentFile(doc, options) {
       ...storedProvenanceFields(stored),
       ...requestMetricFields(requestStats),
     });
+    if (fallback === 'fail_document' || fallback === 'full_text') throw new Error(doc.downloadError);
     return;
   }
 
@@ -2030,6 +2070,7 @@ export async function analyzeDocumentFile(doc, options) {
     await onProgress?.({ phase: 'pdf_download', label: 'Streaming PDF from cIRcle', status: 'running' });
     const streamed = await fetchPdfToTempForDocument(doc, {
       onContentRequest: trackContentRequest,
+      maxBytes: maxContentBytes,
     });
     if (streamed?.policyBlocked) {
       throw new Error('Original PDF retrieval is disabled by deployment policy.');
@@ -2103,9 +2144,15 @@ export async function analyzeDocumentFile(doc, options) {
       }
     }
 
-    doc.downloadStatus = streamed?.blocked
-      ? 'blocked'
-      : doc.downloadError ? 'stream_failed' : 'not_found';
+    if (fallback === 'full_text' && await analyzeDocumentFullTextFallback(doc, stored, {
+      status: 'full_text_fallback',
+      error: null,
+      artifactClient, onProgress, extractCommittee, extractCitations,
+      persistFullText: false, onContentRequest: trackContentRequest, requestStats, maxContentBytes,
+    })) return;
+    doc.downloadStatus = fallback === 'metadata_only'
+      ? 'metadata_fallback'
+      : streamed?.blocked ? 'blocked' : doc.downloadError ? 'stream_failed' : 'not_found';
     if (!doc.downloadError) doc.downloadError = 'No streamable PDF could be resolved for this record.';
     await saveFileMetric(doc.id, {
       status: doc.downloadStatus,
@@ -2122,6 +2169,7 @@ export async function analyzeDocumentFile(doc, options) {
       ...storedProvenanceFields(stored),
       ...requestMetricFields(requestStats),
     });
+    if (fallback === 'fail_document') throw new Error(doc.downloadError);
     return;
   }
 
@@ -2273,7 +2321,10 @@ export async function analyzeDocumentFile(doc, options) {
   logger.info('Downloading PDF from cIRcle REST bitstreams', { docId: doc.id });
   await onProgress?.({ phase: 'pdf_download', label: 'Downloading PDF from cIRcle', status: 'running' });
 
-  const resolved = await fetchPdfForDocument(doc, { onContentRequest: trackContentRequest });
+  const resolved = await fetchPdfForDocument(doc, {
+    onContentRequest: trackContentRequest,
+    maxBytes: maxContentBytes,
+  });
   if (resolved?.policyBlocked) {
     throw new Error('Original PDF retrieval is disabled by deployment policy.');
   } else if (resolved?.blocked) {
@@ -2373,22 +2424,27 @@ export async function analyzeDocumentFile(doc, options) {
     }
   }
 
-  await onProgress?.({ phase: 'full_text', label: 'Falling back to cIRcle full text', status: 'running' });
-  if (await analyzeDocumentFullTextFallback(doc, stored, {
+  if (fallback === 'full_text') await onProgress?.({
+    phase: 'full_text', label: 'Falling back to cIRcle full text', status: 'running'
+  });
+  if (fallback === 'full_text' && await analyzeDocumentFullTextFallback(doc, stored, {
     status: 'full_text_fallback',
-    error: doc.downloadError || 'No downloadable PDF could be resolved for this record.',
+    error: null,
     artifactClient,
     onProgress,
     extractCommittee,
     extractCitations,
     onContentRequest: trackContentRequest,
     requestStats,
+    maxContentBytes,
   })) {
     await onProgress?.({ phase: 'full_text', label: 'Full-text fallback analysis', status: 'completed' });
     return;
   }
 
-  doc.downloadStatus = resolved?.blocked ? 'blocked' : 'not_found';
+  doc.downloadStatus = fallback === 'metadata_only'
+    ? 'metadata_fallback'
+    : resolved?.blocked ? 'blocked' : 'not_found';
   if (!doc.downloadError) doc.downloadError = 'No downloadable PDF could be resolved for this record.';
 
   await saveFileMetric(doc.id, {
@@ -2406,6 +2462,7 @@ export async function analyzeDocumentFile(doc, options) {
     ...storedProvenanceFields(stored),
     ...requestMetricFields(requestStats),
   });
+  if (fallback === 'fail_document') throw new Error(doc.downloadError);
 }
 
 export async function enrichDocumentsWithFileAnalysis(documents, options) {

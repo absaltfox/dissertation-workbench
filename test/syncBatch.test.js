@@ -13,7 +13,9 @@ let loadStoredFileMetric;
 let runDocumentSync;
 let runImportPdfAdminJob;
 let saveImportRule;
+let reserveImportRuleRequestSlot;
 let rulesForContinuation;
+let setDownloadSafetyOptions;
 
 function searchPayload() {
   return {
@@ -45,9 +47,11 @@ test.before(async () => {
     ensureStorage,
     getAdminJob,
     loadStoredFileMetric,
+    reserveImportRuleRequestSlot,
     saveImportRule,
   } = await import('../src/db.js'));
   ({ runDocumentSync } = await import('../src/sync.js'));
+  ({ _setDownloadSafetyOptionsForTests: setDownloadSafetyOptions } = await import('../src/pdf.js'));
   ({ runImportPdfAdminJob } = await import('../src/services/importPdfJobRunner.js'));
   ({ rulesForContinuation } = await import('../src/services/importPdfJobRunner.js'));
   await ensureStorage();
@@ -66,6 +70,19 @@ test('continuations retain only the capped enrichment rule and rules not yet pro
     { ruleId: 'text-capped', pdfBatchLimitReached: true },
   ]);
   assert.deepEqual(continued.map((rule) => rule.id), ['text-capped', 'metadata-pending']);
+});
+
+test('durable per-rule request reservations are atomic across workers', async () => {
+  const rule = await saveImportRule({
+    id: `rate-reservation-${Date.now()}`,
+    name: 'Rate reservation fixture',
+  });
+  const reservations = await Promise.all([
+    reserveImportRuleRequestSlot(rule.id, 2, { nowMs: 10_000, windowMs: 60_000 }),
+    reserveImportRuleRequestSlot(rule.id, 2, { nowMs: 10_000, windowMs: 60_000 }),
+    reserveImportRuleRequestSlot(rule.id, 2, { nowMs: 10_000, windowMs: 60_000 }),
+  ]);
+  assert.deepEqual(reservations.sort((left, right) => left - right), [0, 0, 60_000]);
 });
 
 test('worker rejects invalid snapshotted content policies before network access', async () => {
@@ -271,6 +288,58 @@ test('sync enrichment totals count only policy-satisfying results as enriched', 
     assert.equal(result.totalEnrichmentFailed, 0);
     assert.equal((await loadStoredFileMetric(docId)).content_source, 'extracted_full_text');
   } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('explicit PDF full-text fallback counts as successful enrichment', async () => {
+  const originalFetch = globalThis.fetch;
+  const docId = `1.${String(Date.now()).slice(-7)}9`;
+  const fullText = `Fallback extracted thesis text\n${'education systems research '.repeat(300)}`;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes('/search/8.5')) {
+      return new Response(JSON.stringify({
+        data: { hits: { total: 1, hits: [{ _source: {
+          id: docId,
+          title: 'PDF Fallback Success Fixture',
+          author: 'Fallback Tester',
+          digitalResourceOriginalRecord: 'https://circle.library.ubc.ca/rest/handle/2429/pdf-fallback-success',
+        } }] } },
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/rest/handle/2429/pdf-fallback-success')) {
+      return new Response(JSON.stringify({
+        bitstreams: [{ id: 451, bundleName: 'TEXT', mimeType: 'text/plain', name: 'fallback.pdf.txt' }],
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/rest/bitstreams/451/retrieve')) {
+      return new Response(fullText, { headers: { 'content-type': 'text/plain' } });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  setDownloadSafetyOptions({ allowOriginalPdfRetrieval: true });
+  try {
+    const result = await runDocumentSync({
+      mode: 'sync_missing_pdfs',
+      baseUrl: 'https://oc-index.test',
+      term: 'degree.raw,PDF Fallback',
+      source: 'id,title,author,digitalResourceOriginalRecord',
+      pageSize: 100,
+      scanLimit: 100,
+      syncMaxRecords: 100,
+      pdfBatchSize: 1,
+      contentMode: 'pdf_stream',
+      contentFallback: 'full_text',
+      downloadFiles: true,
+    });
+    const stored = await loadStoredFileMetric(docId);
+    assert.equal(result.totalEnriched, 1);
+    assert.equal(result.totalEnrichmentFailed, 0);
+    assert.equal(stored.status, 'full_text_fallback');
+    assert.equal(stored.error, null);
+  } finally {
+    setDownloadSafetyOptions(null);
     globalThis.fetch = originalFetch;
   }
 });

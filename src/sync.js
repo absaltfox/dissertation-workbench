@@ -5,7 +5,8 @@ import {
 import { fetchPage, extractHits, resolveIndexName } from './api.js';
 import {
   createSyncRun, documentExists, getDocumentCacheStats, getLatestSyncRun,
-  loadStoredFileMetric, saveDocumentMetadata, saveDocumentMetadataBatch, updateSyncRun
+  loadStoredFileMetric, reserveImportRuleRequestSlot, saveDocumentMetadata,
+  saveDocumentMetadataBatch, saveFileMetric, updateSyncRun
 } from './db.js';
 import {
   buildDocumentSyncKey, buildMetricsSourceOptions, ensureSourceFields, normalizeRecord
@@ -62,7 +63,10 @@ function sourceUpdatedAt(raw) {
 export const filterSyncItemsForMode = (items, mode, existsFn = documentExists) =>
   filterSyncItemsForModeWithExists(items, mode, existsFn);
 
-export function hasCachedEnrichmentMetric(stored, contentMode) {
+export function hasCachedEnrichmentMetric(stored, contentMode, contentFallback = null) {
+  if (contentFallback === 'full_text' && stored?.word_source === 'dspace_full_text') {
+    return Number(stored.word_count) > 0 && Number(stored.page_count) > 0;
+  }
   if (contentMode === 'pdf_cache') return Boolean(stored?.pdf_path);
   if (contentMode === 'pdf_stream') {
     return (
@@ -86,9 +90,81 @@ function progressDocDetail(doc = {}) {
   return [doc.title, doc.id].filter(Boolean).join(' · ') || 'Untitled document';
 }
 
+export function createRequestRateLimiter(requestsPerMinute, {
+  windowMs = 60_000,
+  now = () => Date.now(),
+  wait = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+  loadTimestamps = async () => [],
+  saveTimestamps = async () => {},
+  reserveSlot = null,
+} = {}) {
+  const limit = Math.max(0, Number(requestsPerMinute) || 0);
+  const timestamps = [];
+  let tail = Promise.resolve();
+  let loaded = false;
+  return async function acquire() {
+    if (!limit) return;
+    let release;
+    const previous = tail;
+    tail = new Promise((resolve) => { release = resolve; });
+    await previous;
+    try {
+      if (reserveSlot) {
+        while (true) {
+          const waitMs = await reserveSlot(now());
+          if (!waitMs) return;
+          await wait(waitMs);
+        }
+      }
+      if (!loaded) {
+        timestamps.push(...await loadTimestamps());
+        timestamps.sort((left, right) => left - right);
+        loaded = true;
+      }
+      while (timestamps.length && timestamps[0] <= now() - windowMs) timestamps.shift();
+      if (timestamps.length >= limit) {
+        const waitMs = timestamps[0] + windowMs - now();
+        if (waitMs > 0) await wait(waitMs);
+        while (timestamps.length && timestamps[0] <= now() - windowMs) timestamps.shift();
+      }
+      timestamps.push(now());
+      await saveTimestamps(timestamps);
+    } finally {
+      release();
+    }
+  };
+}
+
+export async function mapWithConcurrency(items, concurrency, callback) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(items.length, Math.max(1, Number(concurrency) || 1)) },
+    async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        try {
+          results[index] = { value: await callback(items[index], index) };
+        } catch (error) {
+          results[index] = { error };
+        }
+      }
+    }
+  );
+  await Promise.all(workers);
+  return results;
+}
+
 async function runSync(syncKey, source, apiKey, runId, {
   mode = 'import_all',
+  importRuleId = '',
   contentMode = DEFAULT_IMPORT_CONTENT_MODE,
+  contentFallback = null,
+  extractCommittee = true,
+  maxContentBytes = 200 * 1024 * 1024,
+  contentConcurrency = 1,
+  contentRateLimit = 0,
   artifactClient = null,
   onProgress = null,
   pdfBatchSize = 0,
@@ -115,7 +191,13 @@ async function runSync(syncKey, source, apiKey, runId, {
     originalPdf: 0,
     retrievedBytes: 0,
   };
-  const countContentRequest = (event = {}) => {
+  const acquireRuleRequestSlot = createRequestRateLimiter(contentRateLimit, {
+    reserveSlot: importRuleId
+      ? (nowMs) => reserveImportRuleRequestSlot(importRuleId, contentRateLimit, { nowMs })
+      : null,
+  });
+  const countContentRequest = async (event = {}) => {
+    if (event.request) await acquireRuleRequestSlot();
     if (event.request && event.source === 'metadata') requestCounts.metadata += 1;
     if (event.request && event.source === 'full_text') requestCounts.fullText += 1;
     if (event.request && event.source === 'original_pdf') requestCounts.originalPdf += 1;
@@ -194,7 +276,7 @@ async function runSync(syncKey, source, apiKey, runId, {
             continue;
           }
           const stored = await loadStoredFileMetric(item.doc.id);
-          if (!requiredEnrichmentIds.size && hasCachedEnrichmentMetric(stored, contentMode)) {
+          if (!requiredEnrichmentIds.size && hasCachedEnrichmentMetric(stored, contentMode, contentFallback)) {
             totalSkipped += 1;
             continue;
           }
@@ -215,12 +297,10 @@ async function runSync(syncKey, source, apiKey, runId, {
             },
           });
         }
-        let pdfIndex = 0;
         const attemptedBeforePage = totalEnrichmentAttempted;
-        for (const item of missing) {
-          pdfIndex += 1;
+        const processingResults = await mapWithConcurrency(missing, contentConcurrency, async (item, index) => {
           const docCounts = {
-            processed: attemptedBeforePage + pdfIndex,
+            processed: attemptedBeforePage + index + 1,
             total: pdfBatchLimit || attemptedBeforePage + missing.length,
           };
           await onProgress?.({
@@ -236,10 +316,13 @@ async function runSync(syncKey, source, apiKey, runId, {
           try {
             await analyzeDocumentFile(item.doc, {
               contentMode,
+              contentFallback,
+              maxContentBytes,
               downloadFiles: contentMode === 'pdf_cache' || contentMode === 'pdf_stream',
               forceDownload: false,
               recomputeFromCache: false,
               artifactClient,
+              extractCommittee,
               extractCitations: false,
               onContentRequest: countContentRequest,
               onProgress: async (event = {}) => {
@@ -259,11 +342,18 @@ async function runSync(syncKey, source, apiKey, runId, {
               contentMode,
               error: error?.message || String(error),
             });
-            throw error;
+            const storedFailure = await loadStoredFileMetric(item.doc.id);
+            if (!storedFailure) {
+              await saveFileMetric(item.doc.id, {
+                status: 'not_found',
+                error: error?.message || String(error),
+              });
+            }
+            return;
           }
           await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
           const storedAfterAnalysis = await loadStoredFileMetric(item.doc.id);
-          const policySatisfied = hasCachedEnrichmentMetric(storedAfterAnalysis, contentMode);
+          const policySatisfied = hasCachedEnrichmentMetric(storedAfterAnalysis, contentMode, contentFallback);
           if (policySatisfied) totalEnriched += 1;
           else totalEnrichmentFailed += 1;
           peakHeapBytes = Math.max(peakHeapBytes, process.memoryUsage().heapUsed);
@@ -294,7 +384,9 @@ async function runSync(syncKey, source, apiKey, runId, {
               failed: totalEnrichmentFailed,
             },
           });
-        }
+        });
+        const processingError = processingResults.find((result) => result?.error)?.error;
+        if (processingError) throw processingError;
         if (missing.length) {
           await onProgress?.({
             phase: 'pdf_batch',
@@ -408,7 +500,13 @@ export async function startDocumentSync(options = {}) {
   const runId = await createSyncRun(syncKey, source);
   const task = runSync(syncKey, source, built.apiKey, runId, {
     mode,
+    importRuleId: options.importRuleId,
     contentMode: options.contentMode || (options.downloadFiles === false ? 'full_text_only' : 'pdf_cache'),
+    contentFallback: options.contentFallback,
+    extractCommittee: options.extractCommittee !== false,
+    maxContentBytes: options.maxContentBytes,
+    contentConcurrency: options.contentConcurrency,
+    contentRateLimit: options.contentRateLimit,
     artifactClient: options.artifactClient || null,
     onProgress: options.onProgress || null,
     pdfBatchSize: options.pdfBatchSize || 0,
@@ -430,7 +528,13 @@ export async function runDocumentSync(options = {}) {
   const runId = await createSyncRun(syncKey, source);
   const summary = await runSync(syncKey, source, built.apiKey, runId, {
     mode,
+    importRuleId: options.importRuleId,
     contentMode: options.contentMode || (options.downloadFiles === false ? 'full_text_only' : 'pdf_cache'),
+    contentFallback: options.contentFallback,
+    extractCommittee: options.extractCommittee !== false,
+    maxContentBytes: options.maxContentBytes,
+    contentConcurrency: options.contentConcurrency,
+    contentRateLimit: options.contentRateLimit,
     artifactClient: options.artifactClient || null,
     onProgress: options.onProgress || null,
     pdfBatchSize: options.pdfBatchSize || 0,

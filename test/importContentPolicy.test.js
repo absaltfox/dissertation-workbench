@@ -21,6 +21,7 @@ test('content policy satisfaction is mode-specific', () => {
   };
   assert.equal(hasCachedEnrichmentMetric(fullTextMetric, 'full_text_only'), true);
   assert.equal(hasCachedEnrichmentMetric(fullTextMetric, 'pdf_cache'), false);
+  assert.equal(hasCachedEnrichmentMetric(fullTextMetric, 'pdf_cache', 'full_text'), true);
   assert.equal(hasCachedEnrichmentMetric({ pdf_path: '/cache/doc.pdf' }, 'pdf_cache'), true);
   assert.equal(hasCachedEnrichmentMetric({
     content_source: 'streamed_pdf',
@@ -84,15 +85,30 @@ test('pdf_cache fails closed when original retrieval is disabled', async () => {
   }
 });
 
-test('import-rule content modes persist through the database contract', async () => {
+test('import-rule content policy persists through the database contract', async () => {
   const id = `content-rule-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   try {
     await saveImportRule({
       id,
       name: 'Streamed document rule',
       contentMode: 'pdf_stream',
+      contentFallback: 'full_text',
+      extractCitations: true,
+      extractCommittee: false,
+      runConcepts: false,
+      maxContentBytes: 12_000_000,
+      contentConcurrency: 3,
+      contentRateLimit: 24,
     });
-    assert.equal((await getImportRule(id)).contentMode, 'pdf_stream');
+    const stored = await getImportRule(id);
+    assert.equal(stored.contentMode, 'pdf_stream');
+    assert.equal(stored.contentFallback, 'full_text');
+    assert.equal(stored.extractCitations, true);
+    assert.equal(stored.extractCommittee, false);
+    assert.equal(stored.runConcepts, false);
+    assert.equal(stored.maxContentBytes, 12_000_000);
+    assert.equal(stored.contentConcurrency, 3);
+    assert.equal(stored.contentRateLimit, 24);
   } finally {
     await deleteImportRule(id);
   }
@@ -143,6 +159,113 @@ test('full_text_only analyzes the TEXT derivative without retrieving or retainin
     assert.equal(stored.pdf_path, null);
     assert.equal(requested.some((url) => url.includes('/rest/bitstreams/11/retrieve')), false);
     assert.equal(requested.some((url) => url.includes('/rest/bitstreams/12/retrieve')), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('PDF policies apply only the explicitly snapshotted fallback', async () => {
+  const originalFetch = globalThis.fetch;
+  const requested = [];
+  const fullText = `Fallback dissertation text\n${'governance education research '.repeat(250)}`;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    requested.push(url);
+    if (url.includes('/rest/handle/2429/fallback-')) {
+      return new Response(JSON.stringify({
+        id: 501,
+        bitstreams: [{
+          id: 502,
+          bundleName: 'TEXT',
+          mimeType: 'text/plain',
+          name: 'fallback.pdf.txt',
+        }],
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/rest/bitstreams/502/retrieve')) {
+      return new Response(fullText, { headers: { 'content-type': 'text/plain' } });
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  _setDownloadSafetyOptionsForTests({ allowOriginalPdfRetrieval: true });
+  try {
+    for (const contentMode of ['pdf_stream', 'pdf_cache']) {
+      const fullTextDoc = {
+        id: `${contentMode}-fallback-full-text-${Date.now()}`,
+        originalRecordUrl: `https://circle.library.ubc.ca/rest/handle/2429/fallback-${contentMode}-full-text`,
+      };
+      await analyzeDocumentFile(fullTextDoc, {
+        contentMode,
+        contentFallback: 'full_text',
+        downloadFiles: true,
+        extractCommittee: false,
+        extractCitations: false,
+      });
+      assert.equal(fullTextDoc.downloadStatus, 'full_text_fallback');
+      assert.equal((await loadStoredFileMetric(fullTextDoc.id)).error, null);
+
+      const requestsBeforeMetadataFallback = requested.length;
+      const metadataDoc = {
+        id: `${contentMode}-fallback-metadata-${Date.now()}`,
+        originalRecordUrl: `https://circle.library.ubc.ca/rest/handle/2429/fallback-${contentMode}-metadata`,
+      };
+      await analyzeDocumentFile(metadataDoc, {
+        contentMode,
+        contentFallback: 'metadata_only',
+        downloadFiles: true,
+        extractCommittee: false,
+        extractCitations: false,
+      });
+      assert.equal(metadataDoc.downloadStatus, 'metadata_fallback');
+      assert.equal(requested.slice(requestsBeforeMetadataFallback).some((url) => url.includes('/rest/bitstreams/502/retrieve')), false);
+
+      await assert.rejects(analyzeDocumentFile({
+        id: `${contentMode}-fallback-fail-${Date.now()}`,
+        originalRecordUrl: `https://circle.library.ubc.ca/rest/handle/2429/fallback-${contentMode}-fail`,
+      }, {
+        contentMode,
+        contentFallback: 'fail_document',
+        downloadFiles: true,
+        extractCommittee: false,
+        extractCitations: false,
+      }), contentMode === 'pdf_stream' ? /No streamable PDF/ : /No downloadable PDF/);
+    }
+  } finally {
+    _setDownloadSafetyOptionsForTests(null);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('full-text byte ceilings stop an unbounded response before parsing', async () => {
+  const originalFetch = globalThis.fetch;
+  const docId = `full-text-cap-${Date.now()}`;
+  const oversizedText = 'oversized content '.repeat(500);
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes('/rest/handle/2429/full-text-cap')) {
+      return new Response(JSON.stringify({
+        bitstreams: [{ id: 612, bundleName: 'TEXT', mimeType: 'text/plain', name: 'cap.pdf.txt' }],
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/rest/bitstreams/612/retrieve')) {
+      return new Response(oversizedText, { headers: { 'content-type': 'text/plain' } });
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+  try {
+    await assert.rejects(analyzeDocumentFile({
+      id: docId,
+      originalRecordUrl: 'https://circle.library.ubc.ca/rest/handle/2429/full-text-cap',
+    }, {
+      contentMode: 'full_text_only',
+      contentFallback: 'fail_document',
+      maxContentBytes: 1024,
+      extractCommittee: false,
+      extractCitations: false,
+    }), /No extracted full-text derivative/);
+    const stored = await loadStoredFileMetric(docId);
+    assert.equal(stored.word_count, null);
+    assert.equal(Number(stored.retrieved_bytes) > 1024, true);
   } finally {
     globalThis.fetch = originalFetch;
   }
