@@ -259,8 +259,22 @@ async function ensureSchema(client) {
       query TEXT,
       source TEXT,
       content_mode TEXT NOT NULL DEFAULT 'metadata_only',
+      content_fallback TEXT NOT NULL DEFAULT 'fail_document',
+      extract_citations INTEGER NOT NULL DEFAULT 0,
+      extract_committee INTEGER NOT NULL DEFAULT 1,
+      run_concepts INTEGER NOT NULL DEFAULT 1,
+      max_content_bytes INTEGER NOT NULL DEFAULT 209715200,
+      content_concurrency INTEGER NOT NULL DEFAULT 1,
+      content_rate_limit INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS import_rule_request_limits (
+      rule_id TEXT PRIMARY KEY,
+      timestamps_json TEXT NOT NULL DEFAULT '[]',
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (rule_id) REFERENCES import_rules(id) ON DELETE CASCADE
     );
 
     CREATE TABLE IF NOT EXISTS enrichment_rollouts (
@@ -513,6 +527,13 @@ async function ensureSchema(client) {
   await addColumnIfMissing(client, 'file_metrics', 'original_pdf_request_count', 'INTEGER DEFAULT 0');
   await addColumnIfMissing(client, 'file_metrics', 'retrieved_bytes', 'INTEGER DEFAULT 0');
   await addColumnIfMissing(client, 'import_rules', 'content_mode', "TEXT NOT NULL DEFAULT 'metadata_only'");
+  await addColumnIfMissing(client, 'import_rules', 'content_fallback', "TEXT NOT NULL DEFAULT 'fail_document'");
+  await addColumnIfMissing(client, 'import_rules', 'extract_citations', 'INTEGER NOT NULL DEFAULT 0');
+  await addColumnIfMissing(client, 'import_rules', 'extract_committee', 'INTEGER NOT NULL DEFAULT 1');
+  await addColumnIfMissing(client, 'import_rules', 'run_concepts', 'INTEGER NOT NULL DEFAULT 1');
+  await addColumnIfMissing(client, 'import_rules', 'max_content_bytes', 'INTEGER NOT NULL DEFAULT 209715200');
+  await addColumnIfMissing(client, 'import_rules', 'content_concurrency', 'INTEGER NOT NULL DEFAULT 1');
+  await addColumnIfMissing(client, 'import_rules', 'content_rate_limit', 'INTEGER NOT NULL DEFAULT 0');
   await addColumnIfMissing(client, 'enrichment_rollouts', 'rule_revision', 'TEXT');
   await addColumnIfMissing(client, 'enrichment_rollout_evidence', 'rule_revision', 'TEXT');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_sync_key ON documents(sync_key)');
@@ -2300,6 +2321,13 @@ function importRuleFromRow(row) {
     query: row.query || '',
     source: row.source || '',
     contentMode: row.content_mode || 'metadata_only',
+    contentFallback: row.content_fallback || 'fail_document',
+    extractCitations: Boolean(row.extract_citations),
+    extractCommittee: row.extract_committee == null ? true : Boolean(row.extract_committee),
+    runConcepts: row.run_concepts == null ? true : Boolean(row.run_concepts),
+    maxContentBytes: Number(row.max_content_bytes || 209715200),
+    contentConcurrency: Number(row.content_concurrency || 1),
+    contentRateLimit: Number(row.content_rate_limit || 0),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -2315,13 +2343,22 @@ export function importRuleRevision(input) {
     query: rule.query,
     source: rule.source,
     contentMode: rule.contentMode,
+    contentFallback: rule.contentFallback,
+    extractCitations: rule.extractCitations,
+    extractCommittee: rule.extractCommittee,
+    runConcepts: rule.runConcepts,
+    maxContentBytes: rule.maxContentBytes,
+    contentConcurrency: rule.contentConcurrency,
+    contentRateLimit: rule.contentRateLimit,
   });
   return crypto.createHash('sha256').update(canonical).digest('hex');
 }
 
 export async function listImportRules() {
   const rows = await all(`
-    SELECT id, name, degree, program, affiliation, requested_index, query, source, content_mode, created_at, updated_at
+    SELECT id, name, degree, program, affiliation, requested_index, query, source, content_mode,
+           content_fallback, extract_citations, extract_committee, run_concepts,
+           max_content_bytes, content_concurrency, content_rate_limit, created_at, updated_at
     FROM import_rules
     ORDER BY updated_at DESC, name
   `);
@@ -2330,7 +2367,9 @@ export async function listImportRules() {
 
 export async function getImportRule(id) {
   const row = await get(`
-    SELECT id, name, degree, program, affiliation, requested_index, query, source, content_mode, created_at, updated_at
+    SELECT id, name, degree, program, affiliation, requested_index, query, source, content_mode,
+           content_fallback, extract_citations, extract_committee, run_concepts,
+           max_content_bytes, content_concurrency, content_rate_limit, created_at, updated_at
     FROM import_rules
     WHERE id = ?
   `, [id]);
@@ -2345,9 +2384,11 @@ export async function saveImportRule(rule) {
   const normalized = normalizeImportRule({ ...rule, id });
   const statements = [{ sql: `
     INSERT INTO import_rules (
-      id, name, degree, program, affiliation, requested_index, query, source, content_mode, created_at, updated_at
+      id, name, degree, program, affiliation, requested_index, query, source, content_mode,
+      content_fallback, extract_citations, extract_committee, run_concepts,
+      max_content_bytes, content_concurrency, content_rate_limit, created_at, updated_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       name = excluded.name,
       degree = excluded.degree,
@@ -2357,6 +2398,13 @@ export async function saveImportRule(rule) {
       query = excluded.query,
       source = excluded.source,
       content_mode = excluded.content_mode,
+      content_fallback = excluded.content_fallback,
+      extract_citations = excluded.extract_citations,
+      extract_committee = excluded.extract_committee,
+      run_concepts = excluded.run_concepts,
+      max_content_bytes = excluded.max_content_bytes,
+      content_concurrency = excluded.content_concurrency,
+      content_rate_limit = excluded.content_rate_limit,
       updated_at = excluded.updated_at
   `, args: [
     id,
@@ -2368,6 +2416,13 @@ export async function saveImportRule(rule) {
     normalized.query || null,
     normalized.source || null,
     normalized.contentMode,
+    normalized.contentFallback,
+    normalized.extractCitations ? 1 : 0,
+    normalized.extractCommittee ? 1 : 0,
+    normalized.runConcepts ? 1 : 0,
+    normalized.maxContentBytes,
+    normalized.contentConcurrency,
+    normalized.contentRateLimit,
     createdAt,
     now,
   ] }];
@@ -2394,11 +2449,53 @@ export async function deleteImportRule(id) {
   if (!existing) return false;
   const client = await getDb();
   await client.batch([
+    { sql: 'DELETE FROM import_rule_request_limits WHERE rule_id = ?', args: [id] },
     { sql: 'DELETE FROM enrichment_rollout_evidence WHERE rule_id = ?', args: [id] },
     { sql: 'DELETE FROM enrichment_rollouts WHERE rule_id = ?', args: [id] },
     { sql: 'DELETE FROM import_rules WHERE id = ?', args: [id] },
   ], 'write');
   return true;
+}
+
+export async function reserveImportRuleRequestSlot(ruleId, limit, {
+  nowMs = Date.now(), windowMs = 60_000,
+} = {}) {
+  if (!ruleId || !Number.isFinite(Number(limit)) || Number(limit) <= 0) return 0;
+  const boundedLimit = Math.max(1, Math.min(600, Math.floor(Number(limit))));
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const row = await get(
+      'SELECT timestamps_json FROM import_rule_request_limits WHERE rule_id = ?',
+      [ruleId]
+    );
+    let timestamps = [];
+    try {
+      const parsed = JSON.parse(row?.timestamps_json || '[]');
+      if (Array.isArray(parsed)) timestamps = parsed;
+    } catch { /* replace malformed limiter state */ }
+    timestamps = timestamps
+      .map(Number)
+      .filter((value) => Number.isFinite(value) && value > nowMs - windowMs)
+      .sort((left, right) => left - right);
+    if (timestamps.length >= boundedLimit) {
+      return Math.max(1, timestamps[0] + windowMs - nowMs);
+    }
+    const nextJson = JSON.stringify([...timestamps, nowMs].slice(-600));
+    let result;
+    if (row) {
+      result = await run(`
+        UPDATE import_rule_request_limits
+        SET timestamps_json = ?, updated_at = ?
+        WHERE rule_id = ? AND timestamps_json = ?
+      `, [nextJson, new Date(nowMs).toISOString(), ruleId, row.timestamps_json]);
+    } else {
+      result = await run(`
+        INSERT OR IGNORE INTO import_rule_request_limits (rule_id, timestamps_json, updated_at)
+        VALUES (?, ?, ?)
+      `, [ruleId, nextJson, new Date(nowMs).toISOString()]);
+    }
+    if (result.changes === 1) return 0;
+  }
+  throw new Error(`Could not reserve content-request quota for import rule ${ruleId}.`);
 }
 
 function enrichmentRolloutFromRow(row) {

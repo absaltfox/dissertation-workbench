@@ -32,6 +32,13 @@ function cleanImportRequest(input = {}) {
     query: input.query,
     source: input.source || DEFAULT_SOURCE,
     contentMode: input.contentMode ?? input.content_mode,
+    contentFallback: input.contentFallback ?? input.content_fallback,
+    extractCitations: input.extractCitations ?? input.extract_citations,
+    extractCommittee: input.extractCommittee ?? input.extract_committee,
+    runConcepts: input.runConcepts ?? input.run_concepts,
+    maxContentBytes: input.maxContentBytes ?? input.max_content_bytes,
+    contentConcurrency: input.contentConcurrency ?? input.content_concurrency,
+    contentRateLimit: input.contentRateLimit ?? input.content_rate_limit,
   });
 }
 
@@ -331,7 +338,11 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
       const contentMode = requestedPhase === 'sample'
         ? 'full_text_only'
         : requestedPhase === 'control' ? 'pdf_stream' : rule.contentMode;
-      jobRules = [{ ...rule, contentMode }];
+      jobRules = [{
+        ...rule,
+        contentMode,
+        contentFallback: requestedPhase === 'control' ? 'fail_document' : rule.contentFallback,
+      }];
       let documentIds = [];
       if (requestedPhase === 'control') {
         const sampleEvidence = await listEnrichmentRolloutEvidence({ ruleId: rule.id, jobId: state.sampleJobId });

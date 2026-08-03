@@ -1,6 +1,6 @@
 # Corpus Scaling and Content Processing Plan
 
-Status: In implementation (Phases 1–4 complete; later controls remain)
+Status: In implementation (Phases 1–6 complete; storage lifecycle and projection work remain)
 Scope: Scale PatternRank and document analytics from the current Education corpus to all UBC dissertation and thesis degree types.
 
 ## Implementation Status
@@ -27,7 +27,8 @@ Step 1 establishes the content-policy contract and safety boundary:
 - Implemented in Step 3: the scale harness passes at 1,000, 5,000, 10,000, and 56,000 synthetic metadata records; all measured queries remain below 250 ms locally at 56,000 records and retained heap stays below 4 MB.
 - Implemented in Step 4: PatternRank selects one bounded degree/year partition, checkpoints content-versioned document candidates and embeddings, reuses phrase embeddings, writes versioned shard artifacts, and merges only globally enabled non-overlapping shards.
 - Implemented in Step 4: metadata/content imports do not extract citations inline; bounded citation extraction reads only cached content and records parser/content checkpoints, while scoped catalogue resolution remains a separate explicitly started job.
-- Pending later steps: per-rule fallback, extraction toggles, per-rule byte/concurrency/rate controls, cache retention, object storage, and incremental topic projections.
+- Implemented in Step 6: import rules persist and snapshot explicit fallback, committee/citation/concept intent, maximum bytes, bounded concurrency, and repository content-request rate controls. Retrieval fallback, committee extraction, byte limits, concurrency, and rate limits are enforced by the import worker. Citation extraction remains an asynchronous content-versioned job, and citation/concept intent is reserved for downstream orchestration rather than executing those expensive stages inline.
+- Pending later steps: downstream citation/concept eligibility projection, cache retention, object storage, and incremental topic projections.
 
 ## Goals
 
@@ -73,7 +74,7 @@ Defaults:
 - Existing rules migrate to `metadata_only` unless their prior configuration unambiguously requested PDF analysis.
 - New rules default to `metadata_only`.
 - `full_text_only` never falls through to a PDF, regardless of fallback settings.
-- `pdf_stream` and `pdf_cache` may fall back to full text only when an explicit snapshotted fallback policy is configured. Until that field is implemented, `pdf_stream` fails the document rather than silently changing the measurement source.
+- `pdf_stream` and `pdf_cache` may fall back to full text only when an explicit snapshotted fallback policy is configured. The PDF control cohort always overrides fallback to `fail_document` so comparison evidence cannot silently change measurement source.
 - A rule cannot override the deployment-wide prohibition on original PDF retrieval.
 
 The admin interface will display the selected mode on every saved rule and replace the generic **Import + Analyze PDFs** action with **Import + Enrich Using Rule Policy**. Before running selected or all rules, the confirmation screen will summarize how many rules use each mode and explicitly warn when any rule will retrieve original PDFs.
@@ -217,6 +218,17 @@ Exit criterion met by integration tests: an unchanged second run is a no-op, and
 - Implemented: failed gates block later phases, original-PDF requests in a protected sample create a job-log alert, and `DISABLE_CONTENT_RETRIEVAL=1` stops enrichment without stopping metadata imports.
 
 Exit criterion met by policy and integration tests: a cohort must pass its recorded quality and operational thresholds before another cohort can be started. Production results still require operator review between cohorts. Operational details are in `docs/progressive-enrichment-rollout.md`.
+
+### Phase 6: Per-rule content controls
+
+- Implemented: the complete rule policy is validated, persisted, returned by the API, editable in Admin, included in the canonical rule revision, and snapshotted into worker jobs and continuations.
+- Implemented: `metadata_only`, `full_text`, and `fail_document` fallbacks are explicit. `full_text_only` never requests a PDF, and PDF control runs fail closed regardless of the saved rule fallback.
+- Implemented: both extracted full text and PDF retrieval obey the per-document byte ceiling, which cannot exceed the deployment-wide 200 MiB safety maximum.
+- Implemented: document parsing uses bounded per-rule concurrency, while an atomic, durable sliding-window limiter covers repository metadata-resolution, full-text, and original-PDF content requests across worker continuations. Deployment-wide original-PDF policy and rate limits remain authoritative upper bounds.
+- Implemented: committee extraction follows the snapshotted rule toggle. Citation and PatternRank toggles are persisted intent for their separate bounded pipelines; imports never run those expensive corpus stages inline.
+- Implemented: one document failure is durably recorded and does not cancel other in-flight documents. Progressive rollout gates still block expansion when the resulting error rate or quality evidence fails.
+
+Exit criterion met by contract, migration, fallback, concurrency, rate-limit, and batching tests. Operator guidance and field semantics are in `docs/import-rule-content-controls.md`.
 
 ## Required Tests and Operational Controls
 

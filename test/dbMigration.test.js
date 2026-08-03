@@ -101,12 +101,14 @@ test('schema migration adds content policy and provenance fields conservatively'
     const committeeProjection = await client.execute("SELECT doc_id, person_key, affiliation, source FROM document_people WHERE source <> 'metadata' ORDER BY doc_id");
     const committeeState = await client.execute("SELECT projection_value FROM serving_projection_state WHERE projection_key = 'committee_people'");
     const rolloutTables = await client.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('enrichment_rollouts', 'enrichment_rollout_evidence') ORDER BY name");
+    const limiterTable = await client.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'import_rule_request_limits'");
     process.stdout.write(JSON.stringify({
       rule, metric, people,
       projectionVersion: projection.rows[0]?.serving_projection_version,
       committeeProjection: committeeProjection.rows,
       committeeState: committeeState.rows[0]?.projection_value,
       rolloutTables: rolloutTables.rows.map((row) => row.name),
+      limiterTable: limiterTable.rows.map((row) => row.name),
     }));
     await db.closeDb();
   `;
@@ -129,6 +131,13 @@ test('schema migration adds content policy and provenance fields conservatively'
     const migrated = JSON.parse(stdout.trim().split('\n').at(-1));
     assert.equal(migrated.rule.id, 'legacy-rule');
     assert.equal(migrated.rule.contentMode, 'metadata_only');
+    assert.equal(migrated.rule.contentFallback, 'fail_document');
+    assert.equal(migrated.rule.extractCitations, false);
+    assert.equal(migrated.rule.extractCommittee, true);
+    assert.equal(migrated.rule.runConcepts, true);
+    assert.equal(migrated.rule.maxContentBytes, 209715200);
+    assert.equal(migrated.rule.contentConcurrency, 1);
+    assert.equal(migrated.rule.contentRateLimit, 0);
     assert.equal(migrated.metric.content_source, null);
     assert.equal(Number(migrated.metric.metadata_request_count), 0);
     assert.equal(Number(migrated.metric.original_pdf_request_count), 0);
@@ -151,6 +160,7 @@ test('schema migration adds content policy and provenance fields conservatively'
     ]);
     assert.equal(migrated.committeeState, 'complete');
     assert.deepEqual(migrated.rolloutTables, ['enrichment_rollout_evidence', 'enrichment_rollouts']);
+    assert.deepEqual(migrated.limiterTable, ['import_rule_request_limits']);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

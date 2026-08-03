@@ -40,6 +40,13 @@ const {
   importRunScopeEl,
   importSourceEl,
   importContentModeEl,
+  importContentFallbackEl,
+  importExtractCitationsEl,
+  importExtractCommitteeEl,
+  importRunConceptsEl,
+  importMaxContentBytesEl,
+  importContentConcurrencyEl,
+  importContentRateLimitEl,
   jobsStatusCardsEl,
   jobsTableEl,
   loginError,
@@ -641,7 +648,14 @@ function getImportRuleFormData() {
     index: importIndexEl?.value.trim() || '',
     query: importQueryEl?.value.trim() || '',
     source: importSourceEl?.value.trim() || document.getElementById('s-source')?.value.trim() || '',
-    contentMode: importContentModeEl?.value || 'metadata_only'
+    contentMode: importContentModeEl?.value || 'metadata_only',
+    contentFallback: importContentFallbackEl?.value || 'fail_document',
+    extractCitations: Boolean(importExtractCitationsEl?.checked),
+    extractCommittee: importExtractCommitteeEl?.checked !== false,
+    runConcepts: importRunConceptsEl?.checked !== false,
+    maxContentBytes: Number(importMaxContentBytesEl?.value || 209715200),
+    contentConcurrency: Number(importContentConcurrencyEl?.value || 1),
+    contentRateLimit: Number(importContentRateLimitEl?.value || 0)
   };
 }
 
@@ -680,6 +694,8 @@ function summarizeImportRule(rule) {
     rule.affiliation ? `Affiliation: ${rule.affiliation}` : ''
   ].filter(Boolean);
   parts.push(`Content: ${importContentModeLabel(rule.contentMode)}`);
+  parts.push(`Fallback: ${(rule.contentFallback || 'fail_document').replaceAll('_', ' ')}`);
+  parts.push(`Concurrency: ${rule.contentConcurrency || 1}`);
   if (rule.rollout?.status) parts.push(`Rollout: ${rule.rollout.status.replaceAll('_', ' ')}`);
   return parts.join(' · ');
 }
@@ -728,6 +744,13 @@ function setImportRuleForm(rule = {}) {
   importQueryEl.value = rule.query ?? document.getElementById('s-query')?.value ?? '';
   importSourceEl.value = rule.source || document.getElementById('s-source')?.value || '';
   importContentModeEl.value = rule.contentMode || 'metadata_only';
+  importContentFallbackEl.value = rule.contentFallback || 'fail_document';
+  importExtractCitationsEl.checked = Boolean(rule.extractCitations);
+  importExtractCommitteeEl.checked = rule.extractCommittee !== false;
+  importRunConceptsEl.checked = rule.runConcepts !== false;
+  importMaxContentBytesEl.value = rule.maxContentBytes || 209715200;
+  importContentConcurrencyEl.value = rule.contentConcurrency || 1;
+  importContentRateLimitEl.value = rule.contentRateLimit || 0;
   deleteImportRuleBtn.hidden = !rule.id;
   importRulePreviewEl.innerHTML = '';
   updateImportGeneratedTerm();
