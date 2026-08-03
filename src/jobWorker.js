@@ -1,6 +1,6 @@
 import {
   appendAdminJobLog, claimAdminJob, closeDb, ensureStorage, finishAdminJob, getAdminJob,
-  heartbeatAdminJob, updateAdminJob
+  failEnrichmentRolloutForJob, heartbeatAdminJob, updateAdminJob
 } from './db.js';
 import { ADMIN_WORKER_TIMEOUT_MS } from './config.js';
 import { createWorkerArtifactClientFromEnv } from './workerArtifacts.js';
@@ -14,6 +14,7 @@ async function finishFailure(error, status = 'failed') {
   if (!jobId || finished) return;
   finished = true;
   const message = error?.message || String(error);
+  await failEnrichmentRolloutForJob(jobId, error);
   await appendAdminJobLog(jobId, `Worker ${status}: ${message}\n`);
   const now = new Date().toISOString();
   await finishAdminJob(jobId, {

@@ -167,6 +167,47 @@ test('sync_missing_pdfs batches missing PDF attempts and reports per-document pr
     assert.equal(continuation.ok, true);
     assert.equal(continuation.totalSaved, 1);
     assert.equal((await loadStoredFileMetric('1.0000003')).status, 'not_found');
+
+    const controlled = await runDocumentSync({
+      mode: 'sync_missing_pdfs',
+      baseUrl: 'https://oc-index.test',
+      term: 'degree.raw,Doctor of Philosophy - PhD',
+      source: 'id,title,author',
+      pageSize: 100,
+      scanLimit: 100,
+      syncMaxRecords: 100,
+      pdfBatchSize: 1,
+      enrichmentDocIds: ['1.0000002'],
+      downloadFiles: true,
+    });
+    assert.deepEqual(controlled.pdfAttemptedIds, ['1.0000002']);
+    assert.equal(controlled.totalEnrichmentAttempted, 1);
+    assert.equal(controlled.enrichmentExhausted, true);
+
+    globalThis.fetch = async (url) => {
+      if (String(url).includes('/search/8.5')) {
+        const payload = searchPayload();
+        payload.data.hits.total = 100;
+        return new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    };
+    const scanLimited = await runDocumentSync({
+      mode: 'sync_missing_pdfs',
+      baseUrl: 'https://oc-index.test',
+      term: 'degree.raw,Doctor of Philosophy - PhD',
+      source: 'id,title,author',
+      pageSize: 100,
+      scanLimit: 3,
+      syncMaxRecords: 3,
+      pdfBatchSize: 1,
+      enrichmentDocIds: ['1.0000001'],
+      downloadFiles: true,
+    });
+    assert.equal(scanLimited.enrichmentExhausted, false);
   } finally {
     globalThis.fetch = originalFetch;
   }

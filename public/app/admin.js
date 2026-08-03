@@ -680,6 +680,7 @@ function summarizeImportRule(rule) {
     rule.affiliation ? `Affiliation: ${rule.affiliation}` : ''
   ].filter(Boolean);
   parts.push(`Content: ${importContentModeLabel(rule.contentMode)}`);
+  if (rule.rollout?.status) parts.push(`Rollout: ${rule.rollout.status.replaceAll('_', ' ')}`);
   return parts.join(' · ');
 }
 
@@ -868,6 +869,23 @@ async function handleRunImportRules(mode, button) {
     sync_missing_pdfs: 'Import and enrich using rule policy'
   };
   const selectedRules = state.importRules.filter((rule) => ruleIds.includes(rule.id));
+  const enrichingRules = selectedRules.filter((rule) => rule.contentMode !== 'metadata_only');
+  let rolloutPhase = null;
+  if (mode === 'sync_missing_pdfs' && enrichingRules.length) {
+    if (selectedRules.length !== 1) {
+      alert('Progressive enrichment runs one rule at a time so each cohort has an independent quality gate.');
+      return;
+    }
+    const rolloutState = selectedRules[0].rollout;
+    if (!rolloutState || rolloutState.status === 'invalidated') rolloutPhase = 'sample';
+    else if (rolloutState.status === 'awaiting_control') rolloutPhase = 'control';
+    else if (rolloutState.status === 'ready_for_cohort') rolloutPhase = 'cohort';
+    else if (rolloutState.status === 'blocked') rolloutPhase = rolloutState.evaluation?.phase;
+    if (!rolloutPhase) {
+      alert(`This rollout cannot start while it is ${rolloutState?.status || 'in an unknown state'}.`);
+      return;
+    }
+  }
   const policyCounts = selectedRules.reduce((counts, rule) => {
     const label = importContentModeLabel(rule.contentMode);
     counts[label] = (counts[label] || 0) + 1;
@@ -876,11 +894,14 @@ async function handleRunImportRules(mode, button) {
   const policySummary = mode === 'sync_missing_pdfs'
     ? `\n\nContent policies:\n${Object.entries(policyCounts).map(([label, count]) => `- ${label}: ${count}`).join('\n')}`
     : '';
-  const originalPdfWarning = mode === 'sync_missing_pdfs'
-    && selectedRules.some((rule) => ['pdf_stream', 'pdf_cache'].includes(rule.contentMode))
-    ? '\n\nWarning: at least one selected rule requests original PDFs.'
+  const rolloutSummary = rolloutPhase
+    ? `\n\nProgressive enrichment phase: ${rolloutPhase}`
     : '';
-  if (!confirm(`${labels[mode]} for ${importScopeLabel()}?${policySummary}${originalPdfWarning}`)) return;
+  const originalPdfWarning = mode === 'sync_missing_pdfs'
+    && (rolloutPhase === 'control' || selectedRules.some((rule) => ['pdf_stream', 'pdf_cache'].includes(rule.contentMode)))
+    ? '\n\nWarning: this phase requests original PDFs. Confirming explicitly approves retrieval for this bounded run.'
+    : '';
+  if (!confirm(`${labels[mode]} for ${importScopeLabel()}?${policySummary}${rolloutSummary}${originalPdfWarning}`)) return;
 
   button.disabled = true;
   const originalHtml = button.innerHTML;
@@ -893,6 +914,8 @@ async function handleRunImportRules(mode, button) {
         mode,
         scope,
         ruleIds,
+        rolloutPhase,
+        approveOriginalPdfControl: rolloutPhase === 'control',
         maxRecords: document.getElementById('s-maxRecords')?.value || '9999',
         pageSize: document.getElementById('s-pageSize')?.value || '20',
         scanLimit: document.getElementById('s-scanLimit')?.value || '50000'

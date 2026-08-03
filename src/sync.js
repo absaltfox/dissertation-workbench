@@ -93,6 +93,7 @@ async function runSync(syncKey, source, apiKey, runId, {
   onProgress = null,
   pdfBatchSize = 0,
   skipPdfDocIds = [],
+  enrichmentDocIds = [],
 } = {}) {
   const startedAt = Date.now();
   let totalSeen = 0;
@@ -103,7 +104,11 @@ async function runSync(syncKey, source, apiKey, runId, {
   let totalEnrichmentFailed = 0;
   let apiTotal = null;
   let pdfBatchLimitReached = false;
+  let upstreamExhausted = false;
   const pdfAttemptedIds = [];
+  const enrichmentOutcomes = [];
+  const startingHeapBytes = process.memoryUsage().heapUsed;
+  let peakHeapBytes = startingHeapBytes;
   const requestCounts = {
     metadata: 0,
     fullText: 0,
@@ -120,6 +125,11 @@ async function runSync(syncKey, source, apiKey, runId, {
   };
   const skippedPdfIds = new Set(
     (Array.isArray(skipPdfDocIds) ? skipPdfDocIds : [])
+      .map((id) => String(id || '').trim())
+      .filter(Boolean)
+  );
+  const requiredEnrichmentIds = new Set(
+    (Array.isArray(enrichmentDocIds) ? enrichmentDocIds : [])
       .map((id) => String(id || '').trim())
       .filter(Boolean)
   );
@@ -152,7 +162,10 @@ async function runSync(syncKey, source, apiKey, runId, {
       });
       const docs = extractHits(payload);
       if (apiTotal === null) apiTotal = payload?.data?.hits?.total ?? null;
-      if (!docs.length) break;
+      if (!docs.length) {
+        upstreamExhausted = true;
+        break;
+      }
 
       const batch = docs.slice(0, Math.max(0, source.maxRecords - totalSeen)).map((raw) => {
         const normalized = normalizeRecord(raw);
@@ -172,12 +185,16 @@ async function runSync(syncKey, source, apiKey, runId, {
       if (enrichmentRequested) {
         const missing = [];
         for (const item of filtered.items) {
+          if (requiredEnrichmentIds.size && !requiredEnrichmentIds.has(String(item.doc.id))) {
+            totalSkipped += 1;
+            continue;
+          }
           if (skippedPdfIds.has(String(item.doc.id))) {
             totalSkipped += 1;
             continue;
           }
           const stored = await loadStoredFileMetric(item.doc.id);
-          if (hasCachedEnrichmentMetric(stored, contentMode)) {
+          if (!requiredEnrichmentIds.size && hasCachedEnrichmentMetric(stored, contentMode)) {
             totalSkipped += 1;
             continue;
           }
@@ -186,9 +203,6 @@ async function runSync(syncKey, source, apiKey, runId, {
             break;
           }
           missing.push(item);
-        }
-        if (pdfBatchLimit && totalEnrichmentAttempted + missing.length >= pdfBatchLimit) {
-          pdfBatchLimitReached = true;
         }
         if (missing.length) {
           await onProgress?.({
@@ -228,14 +242,23 @@ async function runSync(syncKey, source, apiKey, runId, {
               artifactClient,
               extractCitations: false,
               onContentRequest: countContentRequest,
-              onProgress: async (event = {}) => onProgress?.({
-                ...event,
-                detail: event.detail || progressDocDetail(item.doc),
-                counts: { ...docCounts, ...(event.counts || {}) },
-              }),
+              onProgress: async (event = {}) => {
+                peakHeapBytes = Math.max(peakHeapBytes, process.memoryUsage().heapUsed);
+                return onProgress?.({
+                  ...event,
+                  detail: event.detail || progressDocDetail(item.doc),
+                  counts: { ...docCounts, ...(event.counts || {}) },
+                });
+              },
             });
           } catch (error) {
+            peakHeapBytes = Math.max(peakHeapBytes, process.memoryUsage().heapUsed);
             totalEnrichmentFailed += 1;
+            enrichmentOutcomes.push({
+              docId: item.doc.id,
+              contentMode,
+              error: error?.message || String(error),
+            });
             throw error;
           }
           await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
@@ -243,6 +266,21 @@ async function runSync(syncKey, source, apiKey, runId, {
           const policySatisfied = hasCachedEnrichmentMetric(storedAfterAnalysis, contentMode);
           if (policySatisfied) totalEnriched += 1;
           else totalEnrichmentFailed += 1;
+          peakHeapBytes = Math.max(peakHeapBytes, process.memoryUsage().heapUsed);
+          enrichmentOutcomes.push({
+            docId: item.doc.id,
+            contentMode,
+            status: storedAfterAnalysis?.status || null,
+            error: storedAfterAnalysis?.error || null,
+            contentSource: storedAfterAnalysis?.content_source || null,
+            wordSource: storedAfterAnalysis?.word_source || null,
+            pageSource: storedAfterAnalysis?.page_source || null,
+            wordCount: Number(storedAfterAnalysis?.word_count || 0),
+            bodyWordCount: Number(storedAfterAnalysis?.body_word_count || 0),
+            pageCount: Number(storedAfterAnalysis?.page_count || 0),
+            parserVersion: storedAfterAnalysis?.parser_version || null,
+            contentChecksum: storedAfterAnalysis?.content_checksum || null,
+          });
           await onProgress?.({
             phase: 'pdf_document',
             label: policySatisfied ? 'Parsed document data' : 'Document enrichment did not satisfy policy',
@@ -276,9 +314,13 @@ async function runSync(syncKey, source, apiKey, runId, {
       }
       await updateSyncRun(runId, { totalSeen, totalSaved, apiTotal });
 
+      if (apiTotal !== null && totalSeen >= apiTotal) {
+        upstreamExhausted = true;
+        break;
+      }
       if (totalSeen >= source.maxRecords) break;
-      if (apiTotal !== null && totalSeen >= Math.min(apiTotal, source.maxRecords)) break;
       if (pdfBatchLimitReached) break;
+      if (requiredEnrichmentIds.size && pdfAttemptedIds.length >= requiredEnrichmentIds.size) break;
     }
 
     await updateSyncRun(runId, {
@@ -296,10 +338,12 @@ async function runSync(syncKey, source, apiKey, runId, {
       totalSkipped,
       pdfBatchSize: pdfBatchLimit || null,
       pdfBatchLimitReached,
+      enrichmentExhausted: mode === 'sync_missing_pdfs' && !pdfBatchLimitReached && upstreamExhausted,
       pdfAttempted: pdfAttemptedIds.length,
       totalEnrichmentAttempted,
       totalEnriched,
       totalEnrichmentFailed,
+      heapGrowthBytes: Math.max(0, peakHeapBytes - startingHeapBytes),
       requestCounts,
       seconds: Math.round((Date.now() - startedAt) / 1000),
     });
@@ -310,10 +354,13 @@ async function runSync(syncKey, source, apiKey, runId, {
       totalSkipped,
       apiTotal,
       pdfBatchLimitReached,
+      enrichmentExhausted: mode === 'sync_missing_pdfs' && !pdfBatchLimitReached && upstreamExhausted,
       pdfAttemptedIds,
       totalEnrichmentAttempted,
       totalEnriched,
       totalEnrichmentFailed,
+      enrichmentOutcomes,
+      heapGrowthBytes: Math.max(0, peakHeapBytes - startingHeapBytes),
       requestCounts,
     };
   } catch (error) {
@@ -337,6 +384,8 @@ async function runSync(syncKey, source, apiKey, runId, {
       totalEnrichmentAttempted,
       totalEnriched,
       totalEnrichmentFailed,
+      enrichmentOutcomes,
+      heapGrowthBytes: Math.max(0, peakHeapBytes - startingHeapBytes),
       requestCounts,
       error: error?.message || String(error),
     };
@@ -364,6 +413,7 @@ export async function startDocumentSync(options = {}) {
     onProgress: options.onProgress || null,
     pdfBatchSize: options.pdfBatchSize || 0,
     skipPdfDocIds: options.skipPdfDocIds || [],
+    enrichmentDocIds: options.enrichmentDocIds || [],
   });
   runningSyncs.set(syncKey, task);
   return { started: true, syncKey, runId, status: await getDocumentSyncStatus(syncKey) };
@@ -385,6 +435,7 @@ export async function runDocumentSync(options = {}) {
     onProgress: options.onProgress || null,
     pdfBatchSize: options.pdfBatchSize || 0,
     skipPdfDocIds: options.skipPdfDocIds || [],
+    enrichmentDocIds: options.enrichmentDocIds || [],
   });
   return { syncKey, runId, mode, ...summary, status: await getDocumentSyncStatus(syncKey) };
 }
