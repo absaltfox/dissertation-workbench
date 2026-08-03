@@ -199,12 +199,12 @@ All `/api/admin/*` endpoints require an authenticated admin session. `POST`, `PU
 | `POST` | `/api/admin/import-rules/sync` | Runs one import rule immediately and clears the metrics cache. |
 | `POST` | `/api/admin/import-rules/run` | Starts a background import-rules job for selected or all rules; returns `202`. |
 | `GET` | `/api/admin/jobs` | Returns recent admin jobs, sync runs, catalogue stats, topic status, and concept status. |
-| `POST` | `/api/admin/jobs/catalogue-lookup` | Starts a background Z39.50 lookup job, or returns a dry-run preview. |
+| `POST` | `/api/admin/jobs/catalogue-lookup` | Starts a bounded background Z39.50 lookup job, or returns a dry-run preview; accepts optional corpus scope fields. |
 | `POST` | `/api/admin/jobs/bertopic` | Starts a background BERTopic rebuild job. |
 | `GET` | `/api/admin/documents/sync/status` | Returns global or query-specific document sync status. |
 | `POST` | `/api/admin/documents/sync` | Starts document sync for request body/query options and clears metrics cache. |
 | `GET` | `/api/admin/concepts/status` | Returns concept pipeline status. |
-| `POST` | `/api/admin/concepts/rebuild` | Rebuilds the concept dictionary; returns `409` if a rebuild cannot start. |
+| `POST` | `/api/admin/concepts/rebuild` | Processes the next changed PatternRank partition, or an explicit scoped partition from the request body. |
 | `GET` | `/api/admin/catalogue-lookup/stats` | Returns stored catalogue lookup statistics. |
 | `POST` | `/api/admin/catalogue-lookup` | Runs pending catalogue lookups synchronously, or previews with `dryRun=1`. |
 | `GET` | `/api/admin/cache` | Lists cached file-metric entries. |
@@ -212,7 +212,8 @@ All `/api/admin/*` endpoints require an authenticated admin session. `POST`, `PU
 | `POST` | `/api/admin/cache/refresh` | Clears only the in-memory metrics cache. |
 | `POST` | `/api/admin/cache/:docId/refresh` | Redownloads/reanalyzes one document and clears metrics cache. |
 | `DELETE` | `/api/admin/cache/:docId` | Deletes cached PDF and file metrics for one document. |
-| `POST` | `/api/admin/reparse-all` | Re-extracts committee/citation data from cached PDFs and reruns catalogue lookups. |
+| `POST` | `/api/admin/reparse-all` | Re-extracts non-citation document data from cached PDFs. |
+| `POST` | `/api/admin/reparse-citations` | Extracts citations incrementally from cached PDFs/full text; accepts job limits and corpus scope and never starts catalogue resolution. |
 | `POST` | `/api/admin/reparse-committee` | Re-extracts committee data for cached PDFs missing committee records. |
 | `GET` | `/api/admin/runs` | Returns recent import/sync runs. |
 
@@ -268,6 +269,10 @@ Worker-specific settings:
 - `CATALOGUE_LOOKUP_ON_START`: default `1`.
 - `CATALOGUE_LOOKUP_PAGE_SIZE`: default `200`.
 - `CATALOGUE_LOOKUP_BATCH_SIZE`: default `1`; each `yaz-client` session handles one citation so slow OCR-derived queries fail independently instead of timing out a whole batch.
+- `CONCEPT_PARTITION_MAX_DOCUMENTS`: maximum documents loaded by one PatternRank shard, default `5000`.
+- `CONCEPT_CHECKPOINT_BATCH_SIZE`: changed-document checkpoint batch, default `50`.
+- `CONCEPT_MIN_DOCUMENT_FREQUENCY`: pre-embedding phrase frequency gate, default/minimum `2`.
+- `CONCEPT_PARTITION_MAX_CONCEPTS` and `CONCEPT_GLOBAL_MAX_CONCEPTS`: shard/global artifact bounds, default `5000` and `50000`.
 - `YAZ_CLIENT_TIMEOUT_MS`: single-lookup timeout, default `15000`.
 - `YAZ_CLIENT_BATCH_BASE_TIMEOUT_MS`: batch lookup base timeout, default `30000`.
 - `YAZ_CLIENT_BATCH_ITEM_TIMEOUT_MS`: additional timeout per item in a batch, default `2000`.
@@ -356,8 +361,9 @@ In production, startup validates secret configuration. The API-key encryption ke
 - Security response headers are enabled by default.
 - Public `downloadFiles`, `refresh`, and `recomputeFromCache` are restricted by default in production but allowed in local development.
 - PDFs are cached locally and are only redownloaded when force refresh is used.
-- Citation extraction uses GROBID first, then AnyStyle, then regex fallback.
-- Pending citation catalogue lookups use Z39.50 through `yaz-client`.
+- Citation extraction uses GROBID first, then AnyStyle, then regex fallback. Bulk extraction reads only existing cached artifacts and records content/parser checkpoints; metadata imports do not extract citations inline.
+- Pending citation catalogue lookups use Z39.50 through `yaz-client` as a separate, explicitly started, optionally scoped job.
+- PatternRank rebuilds are partitioned and incremental. Automatic degree/year shards form the global dictionary; explicit scopes remain isolated to prevent overlap. See `docs/incremental-patternrank-citations.md`.
 - BERTopic reads cached document abstracts from the database, uses `allenai/specter2_base`, and writes topic assignments back to the database.
 - Per-document attributes, PDF metrics, sync runs, citations, catalogue lookups, admin jobs, users, and run-level metric snapshots are persisted through libSQL: local SQLite by default, or Turso when `TURSO_DATABASE_URL` is set.
 - Metric run snapshots (`metric_runs`) are recorded only when an admin forces `refresh=1`; the table keeps the latest 100 runs.

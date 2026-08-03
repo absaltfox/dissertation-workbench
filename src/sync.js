@@ -226,6 +226,7 @@ async function runSync(syncKey, source, apiKey, runId, {
               forceDownload: false,
               recomputeFromCache: false,
               artifactClient,
+              extractCitations: false,
               onContentRequest: countContentRequest,
               onProgress: async (event = {}) => onProgress?.({
                 ...event,

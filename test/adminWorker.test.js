@@ -18,6 +18,7 @@ let runThemeRecomputeAdminJob;
 let runCatalogueLookupJob;
 let runPendingCatalogueLookups;
 let analyzeDocumentFile;
+let extractAndSaveParsedData;
 let appendAdminJobLog;
 let claimAdminJob;
 let clearAllCitations;
@@ -37,9 +38,12 @@ let listTopicLabelReviews;
 let loadCatalogueLookup;
 let loadStoredFileMetric;
 let listPendingLookups;
+let listPendingCitationExtractions;
+let countPendingLookups;
 let publishPassingTopicLabels;
 let saveDocumentMetadata;
 let saveCitations;
+let saveCitationExtractionState;
 let saveFileMetric;
 let selectTopicLabelCandidate;
 let updateTopicManualLabel;
@@ -99,7 +103,7 @@ test.before(async () => {
   ({ WorkerArtifactClient } = await import('../src/workerArtifacts.js'));
   ({ runImportPdfAdminJob } = await import('../src/services/importPdfJobRunner.js'));
   ({ runThemeRecomputeAdminJob } = await import('../src/services/themeJobRunner.js'));
-  ({ analyzeDocumentFile } = await import('../src/pdf.js'));
+  ({ analyzeDocumentFile, extractAndSaveParsedData } = await import('../src/pdf.js'));
   const { _setDownloadSafetyOptionsForTests } = await import('../src/pdf.js');
   _setDownloadSafetyOptionsForTests({ resolveHost: async () => [{ address: '142.103.96.1' }] });
   ({
@@ -121,9 +125,12 @@ test.before(async () => {
     loadCatalogueLookup,
     loadStoredFileMetric,
     listPendingLookups,
+    listPendingCitationExtractions,
+    countPendingLookups,
     publishPassingTopicLabels,
     saveDocumentMetadata,
     saveCitations,
+    saveCitationExtractionState,
     saveFileMetric,
     selectTopicLabelCandidate,
     updateTopicManualLabel,
@@ -450,6 +457,242 @@ test('transient YAZ failures are not saved as completed catalogue lookups', asyn
 
   assert.deepEqual(stats, { processed: 1, found: 0, notFound: 0, skipped: 0, failed: 1 });
   assert.equal(await loadCatalogueLookup(pending.id), null);
+});
+
+test('citation extraction checkpoints are content-versioned and scope-aware', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const selectedId = `citation-scope-selected-${suffix}`;
+  const excludedId = `citation-scope-excluded-${suffix}`;
+  const degree = `Citation Scope ${suffix}`;
+  await saveDocumentMetadata({
+    id: selectedId,
+    title: 'Selected Citation Extraction Fixture',
+    author: 'Worker Tester',
+    degree,
+    supervisors: [],
+  }, { syncKey: `citation-sync-${suffix}` });
+  await saveDocumentMetadata({
+    id: excludedId,
+    title: 'Excluded Citation Extraction Fixture',
+    author: 'Worker Tester',
+    degree: `Other ${suffix}`,
+    supervisors: [],
+  });
+  await saveFileMetric(selectedId, {
+    status: 'full_text',
+    fullTextPath: `/cached/${selectedId}.txt`,
+    contentChecksum: 'citation-checksum-v1',
+  });
+  await saveFileMetric(excludedId, {
+    status: 'full_text',
+    fullTextPath: `/cached/${excludedId}.txt`,
+    contentChecksum: 'excluded-checksum-v1',
+  });
+
+  let pending = await listPendingCitationExtractions({
+    limit: 10,
+    filters: { degree },
+    parserVersion: 'citation-test-v1',
+  });
+  assert.deepEqual(pending.map((row) => row.doc_id), [selectedId]);
+
+  await saveCitationExtractionState(selectedId, {
+    contentChecksum: 'citation-checksum-v1',
+    parserVersion: 'citation-test-v1',
+    status: 'completed',
+    citationCount: 3,
+  });
+  pending = await listPendingCitationExtractions({
+    limit: 10,
+    filters: { degree },
+    parserVersion: 'citation-test-v1',
+  });
+  assert.equal(pending.length, 0);
+
+  await saveFileMetric(selectedId, {
+    status: 'full_text',
+    fullTextPath: `/cached/${selectedId}.txt`,
+    contentChecksum: 'citation-checksum-v2',
+  });
+  pending = await listPendingCitationExtractions({
+    limit: 10,
+    filters: { degree },
+    parserVersion: 'citation-test-v1',
+  });
+  assert.deepEqual(pending.map((row) => row.doc_id), [selectedId]);
+
+  await saveCitations(selectedId, [{
+    text: `Selected citation ${suffix}`,
+    author: 'Selected',
+    title: `Selected scoped work ${suffix}`,
+    year: '2024',
+  }], (text) => `selected-${text}`);
+  await saveCitations(excludedId, [{
+    text: `Excluded citation ${suffix}`,
+    author: 'Excluded',
+    title: `Excluded scoped work ${suffix}`,
+    year: '2023',
+  }], (text) => `excluded-${text}`);
+  const scopedLookups = await listPendingLookups({ limit: 10, filters: { degree } });
+  assert.deepEqual(scopedLookups.map((row) => row.citation_text), [`Selected citation ${suffix}`]);
+  assert.equal(await countPendingLookups({ filters: { degree } }), 1);
+});
+
+test('strict citation extraction propagates failures instead of creating a completed checkpoint', async () => {
+  const docId = `strict-citation-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  await assert.rejects(
+    extractAndSaveParsedData({ id: docId, supervisors: [] }, 'References\nA citation entry.', null, {
+      extractCommittee: false,
+      extractCitations: true,
+      strictCitationErrors: true,
+      onProgress: async (event) => {
+        if (event.phase === 'citation_extraction' && event.status === 'completed') {
+          throw new Error('simulated citation persistence failure');
+        }
+      },
+    }),
+    /simulated citation persistence failure/
+  );
+});
+
+test('incremental PatternRank reuses checkpoints and rebuilds changed documents only', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const degree = `PatternRank Fixture ${suffix}`;
+  const baseDocument = {
+    author: 'Worker Tester',
+    degree,
+    year: 2025,
+    abstract: 'Community learning leadership supports community learning leadership across schools.',
+    subjects: ['community learning leadership'],
+    supervisors: [],
+  };
+  await saveDocumentMetadata({ ...baseDocument, id: `patternrank-a-${suffix}`, title: 'Community Learning Leadership A' });
+  await saveDocumentMetadata({ ...baseDocument, id: `patternrank-b-${suffix}`, title: 'Community Learning Leadership B' });
+
+  async function runPatternRank() {
+    const jobId = await createAdminJob({
+      type: 'concept_rebuild',
+      label: 'PatternRank Incremental Test',
+      params: { scope: { degree }, method: 'patternrank_incremental' },
+      runnerType: 'local',
+    });
+    await execFileAsync('python3', ['scripts/build-concepts.py'], {
+      cwd: path.resolve('.'),
+      env: {
+        ...process.env,
+        ADMIN_JOB_ID: String(jobId),
+        NODE_ENV: 'test',
+        CONCEPT_EMBEDDING_BACKEND: 'deterministic_test',
+        CONCEPT_PATTERNRANK_MIN_SCORE: '-1',
+      },
+    });
+    return getAdminJob(jobId);
+  }
+
+  const first = await runPatternRank();
+  assert.equal(first.status, 'completed');
+  assert.equal(first.result.documentsChanged, 2);
+  assert.equal(first.result.documentsReused, 0);
+  assert.equal(first.result.partitionVersion, 1);
+  assert.match(first.result.partition, /^custom-/);
+
+  const second = await runPatternRank();
+  assert.equal(second.status, 'completed');
+  assert.equal(second.result.noChanges, true);
+
+  await (await getDb()).execute({
+    sql: "UPDATE concept_partitions SET status = 'running' WHERE partition_key = ?",
+    args: [first.result.partition],
+  });
+  const resumed = await runPatternRank();
+  assert.equal(resumed.status, 'completed');
+  assert.equal(resumed.result.documentsChanged, 0);
+  assert.equal(resumed.result.documentsReused, 2);
+  assert.equal(resumed.result.partitionVersion, 2);
+
+  await saveDocumentMetadata({
+    ...baseDocument,
+    id: `patternrank-a-${suffix}`,
+    title: 'Community Learning Leadership A Revised',
+  });
+  const third = await runPatternRank();
+  assert.equal(third.status, 'completed');
+  assert.equal(third.result.documentsChanged, 1);
+  assert.equal(third.result.documentsReused, 1);
+  assert.equal(third.result.partitionVersion, 3);
+});
+
+test('automatic PatternRank publishes only a complete generation and reconciles retired shards', async () => {
+  const autoDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-auto-'));
+  const sqlitePath = path.join(autoDir, 'metrics.sqlite');
+  const latestPath = path.join(autoDir, 'concepts', 'latest.json');
+  const setup = `
+import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, degree TEXT, year INTEGER, updated_at TEXT NOT NULL)")
+for year in (2024, 2025):
+    doc = {"id": f"auto-{year}", "title": "Community Learning Leadership", "abstract": "Community learning leadership supports schools.", "subjects": ["community learning leadership"], "degree": "Auto Degree", "year": year}
+    db.execute("INSERT INTO documents VALUES (?, ?, ?, ?, ?)", (doc["id"], json.dumps(doc), doc["degree"], year, "2026-01-01T00:00:00+00:00"))
+db.commit()
+`;
+  await execFileAsync('python3', ['-c', setup, sqlitePath]);
+  const env = {
+    ...process.env,
+    SQLITE_PATH: sqlitePath,
+    APP_DATA_DIR: autoDir,
+    TURSO_DATABASE_URL: '',
+    ADMIN_JOB_ID: '',
+    NODE_ENV: 'test',
+    CONCEPT_EMBEDDING_BACKEND: 'deterministic_test',
+    CONCEPT_PATTERNRANK_MIN_SCORE: '-1',
+  };
+  const run = () => execFileAsync('python3', ['scripts/build-concepts.py'], { cwd: path.resolve('.'), env });
+
+  await run();
+  await assert.rejects(fs.access(latestPath));
+  await run();
+  await assert.rejects(fs.access(latestPath));
+  const conceptsPath = path.join(autoDir, 'concepts');
+  await fs.writeFile(conceptsPath, 'block publication', 'utf8');
+  let publicationFailed = false;
+  for (let attempt = 0; attempt < 5 && !publicationFailed; attempt += 1) {
+    try { await run(); } catch { publicationFailed = true; }
+  }
+  assert.equal(publicationFailed, true);
+  await fs.unlink(conceptsPath);
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    await run();
+    try { await fs.access(latestPath); break; } catch { /* next invalidated shard */ }
+  }
+  let artifact = JSON.parse(await fs.readFile(latestPath, 'utf8'));
+  assert.equal(artifact.source.documents, 2);
+  assert.equal(artifact.source.partitions.every((partition) => partition.key.startsWith('auto-')), true);
+  assert.equal(artifact.concepts.some((concept) => concept.canonical === 'community learning leadership'), true);
+
+  await fs.unlink(latestPath);
+  await execFileAsync('python3', ['-c', 'import sqlite3, sys; db=sqlite3.connect(sys.argv[1]); db.execute("DELETE FROM concept_publication_state"); db.commit()', sqlitePath]);
+  await run();
+  artifact = JSON.parse(await fs.readFile(latestPath, 'utf8'));
+  assert.equal(artifact.source.documents, 2);
+
+  await execFileAsync('python3', ['-c', 'import sqlite3, sys; db=sqlite3.connect(sys.argv[1]); db.execute("DELETE FROM documents WHERE year = 2024"); db.commit()', sqlitePath]);
+  await run();
+  artifact = JSON.parse(await fs.readFile(latestPath, 'utf8'));
+  assert.equal(artifact.source.documents, 1);
+  assert.equal(artifact.concepts.some((concept) => concept.canonical === 'community learning leadership'), false);
+
+  await execFileAsync('python3', ['-c', 'import sqlite3, sys; db=sqlite3.connect(sys.argv[1]); db.execute("DELETE FROM documents"); db.commit()', sqlitePath]);
+  const invalidDataRoot = path.join(autoDir, 'invalid-data-root');
+  await fs.writeFile(invalidDataRoot, 'not a directory', 'utf8');
+  await assert.rejects(execFileAsync('python3', ['scripts/build-concepts.py'], {
+    cwd: path.resolve('.'),
+    env: { ...env, APP_DATA_DIR: invalidDataRoot },
+  }));
+  await run();
+  artifact = JSON.parse(await fs.readFile(latestPath, 'utf8'));
+  assert.equal(artifact.source.documents, 0);
 });
 
 test('one-shot job worker claims unsupported jobs and marks them failed', async () => {

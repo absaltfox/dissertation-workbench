@@ -1,6 +1,6 @@
 # Corpus Scaling and Content Processing Plan
 
-Status: Proposed
+Status: In implementation (Phases 1–4 complete; later controls remain)
 Scope: Scale PatternRank and document analytics from the current Education corpus to all UBC dissertation and thesis degree types.
 
 ## Implementation Status
@@ -25,7 +25,9 @@ Step 1 establishes the content-policy contract and safety boundary:
 - Implemented in Step 3: bootstrap, document, citation, people, person-detail, related-document, large-corpus analytics, and topic-visualization reads use bounded database queries; the legacy composition endpoint is capped by `maxRecords`.
 - Implemented in Step 3: normalized people relationships are maintained as a versioned serving projection, including transactional committee updates and cursor-checkpointed legacy backfill.
 - Implemented in Step 3: the scale harness passes at 1,000, 5,000, 10,000, and 56,000 synthetic metadata records; all measured queries remain below 250 ms locally at 56,000 records and retained heap stays below 4 MB.
-- Pending later steps: per-rule fallback, extraction toggles, per-rule byte/concurrency/rate controls, cache retention, object storage, and incremental PatternRank.
+- Implemented in Step 4: PatternRank selects one bounded degree/year partition, checkpoints content-versioned document candidates and embeddings, reuses phrase embeddings, writes versioned shard artifacts, and merges only globally enabled non-overlapping shards.
+- Implemented in Step 4: metadata/content imports do not extract citations inline; bounded citation extraction reads only cached content and records parser/content checkpoints, while scoped catalogue resolution remains a separate explicitly started job.
+- Pending later steps: per-rule fallback, extraction toggles, per-rule byte/concurrency/rate controls, cache retention, object storage, and incremental topic projections.
 
 ## Goals
 
@@ -194,12 +196,16 @@ Exit criterion met in the local synthetic harness: retained heap growth stays be
 
 ### Phase 4: Incremental PatternRank and citations
 
-- Implement partitioned, checkpointed PatternRank.
-- Persist candidates and embeddings.
-- Separate citation extraction from citation resolution.
-- Add corpus-level scheduling and prioritization.
+- Implemented: automatic PatternRank scheduling selects changed, non-overlapping degree/exact-year partitions and every partition has a tested 5,000-document default boundary.
+- Implemented: candidates, document embeddings, phrase embeddings, per-document content/model checksums, partition checkpoints, and versioned shard artifacts persist in libSQL.
+- Implemented: partition candidate-frequency contributions are persisted so corpus-wide minimum document frequency is applied before phrase embedding; threshold crossings invalidate only affected prior shards.
+- Implemented: never-run cohorts are preferred, then configured priority and oldest completion order determine the next changed partition.
+- Implemented: explicit scopes are isolated from the global merge, preventing accidental double counting by overlapping shards.
+- Implemented: the current global artifact remains active until every enabled shard in the next generation is ready; failed uploads retry and removed cohorts trigger re-ranking before atomic republication.
+- Implemented: citation extraction is a bounded, content/parser-versioned cached-artifact job; imports no longer extract citations inline.
+- Implemented: catalogue resolution is a separate scoped job that prioritizes citations reused by more documents and retains existing batching/rate limits.
 
-Exit criterion: adding or changing one cohort does not require rebuilding the complete corpus.
+Exit criterion met by integration tests: an unchanged second run is a no-op, and changing one document in a cohort recomputes that document while reusing the other stored document state. Operational details and scheduling constraints are in `docs/incremental-patternrank-citations.md`.
 
 ### Phase 5: Progressive enrichment
 
@@ -223,3 +229,5 @@ Exit criterion: each expanded cohort meets quality and operational thresholds be
 ## Decision Summary
 
 Import rules are the correct place to declare content-processing intent. The rule selects metadata-only, full-text-only, streamed-PDF, or cached-PDF behaviour; the job snapshots and enforces that policy; and the parser records exactly what source produced each metric. A global safety guard remains authoritative so a rule cannot accidentally violate the no-original-download requirement.
+
+Step 4 decision: concept and citation work is driven by durable enrichment state, not import side effects. Automatic concept shards form one disjoint partition family; custom shards fail closed outside the global merge. Citation extraction is allowed to read cached artifacts but cannot retrieve repository content or implicitly start external resolution. These boundaries are enduring contracts for later schedulers and import-rule extraction toggles.

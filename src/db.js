@@ -373,6 +373,73 @@ async function ensureSchema(client) {
       embedding   TEXT NOT NULL,
       created_at  TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS concept_partitions (
+      partition_key        TEXT PRIMARY KEY,
+      scope_json           TEXT NOT NULL,
+      priority             INTEGER NOT NULL DEFAULT 0,
+      enabled              INTEGER NOT NULL DEFAULT 1,
+      status               TEXT NOT NULL DEFAULT 'pending',
+      source_document_count INTEGER NOT NULL DEFAULT 0,
+      source_updated_at    TEXT,
+      checkpoint_json      TEXT,
+      artifact_version     INTEGER NOT NULL DEFAULT 0,
+      last_started_at      TEXT,
+      last_completed_at    TEXT,
+      error                TEXT,
+      updated_at           TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS concept_document_state (
+      partition_key   TEXT NOT NULL,
+      doc_id          TEXT NOT NULL,
+      content_checksum TEXT NOT NULL,
+      candidates_json TEXT NOT NULL,
+      embedding_json  TEXT NOT NULL,
+      model_name      TEXT NOT NULL,
+      processed_at    TEXT NOT NULL,
+      PRIMARY KEY (partition_key, doc_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS concept_phrase_embeddings (
+      model_name     TEXT NOT NULL,
+      phrase         TEXT NOT NULL,
+      embedding_json TEXT NOT NULL,
+      updated_at     TEXT NOT NULL,
+      PRIMARY KEY (model_name, phrase)
+    );
+
+    CREATE TABLE IF NOT EXISTS concept_partition_artifacts (
+      partition_key TEXT NOT NULL,
+      version       INTEGER NOT NULL,
+      artifact_json TEXT NOT NULL,
+      document_count INTEGER NOT NULL,
+      created_at    TEXT NOT NULL,
+      PRIMARY KEY (partition_key, version)
+    );
+
+    CREATE TABLE IF NOT EXISTS concept_partition_candidates (
+      partition_key      TEXT NOT NULL,
+      phrase             TEXT NOT NULL,
+      document_frequency INTEGER NOT NULL,
+      PRIMARY KEY (partition_key, phrase)
+    );
+
+    CREATE TABLE IF NOT EXISTS concept_publication_state (
+      id                  INTEGER PRIMARY KEY,
+      published_signature TEXT,
+      published_at        TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS citation_extraction_state (
+      doc_id           TEXT PRIMARY KEY,
+      content_checksum TEXT,
+      parser_version   TEXT NOT NULL,
+      status           TEXT NOT NULL,
+      citation_count   INTEGER NOT NULL DEFAULT 0,
+      error            TEXT,
+      extracted_at     TEXT NOT NULL
+    );
   `);
 
   await tryExec(client, 'ALTER TABLE catalogue_lookups ADD COLUMN bib_id TEXT');
@@ -425,6 +492,11 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_program ON documents(program)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_people_key ON document_people(person_key)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_people_role ON document_people(role)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_concept_partitions_priority ON concept_partitions(enabled, priority DESC, updated_at)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_concept_document_state_doc ON concept_document_state(doc_id)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_concept_partition_artifacts_latest ON concept_partition_artifacts(partition_key, version DESC)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_concept_partition_candidates_phrase ON concept_partition_candidates(phrase, partition_key)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_citation_extraction_status ON citation_extraction_state(status, extracted_at)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_import_rules_updated_at ON import_rules(updated_at)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_username ON password_reset_tokens(username)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)');
@@ -2708,6 +2780,61 @@ export async function getCitationStats() {
   `);
 }
 
+export async function listPendingCitationExtractions({
+  limit = 100, afterDocId = '', syncKey = null, filters: requestedFilters = {},
+  parserVersion = 'citation-v1',
+} = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  return all(`
+    SELECT d.doc_id, d.metadata_json,
+           fm.pdf_path, fm.full_text_path,
+           COALESCE(fm.content_checksum, fm.updated_at, '') AS content_checksum,
+           fm.content_source, fm.parser_version
+    FROM documents d
+    JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN citation_extraction_state ces ON ces.doc_id = d.doc_id
+    ${filters.where}
+    ${qualifier} d.doc_id > ?
+      AND (fm.pdf_path IS NOT NULL OR fm.full_text_path IS NOT NULL)
+      AND (
+        ces.doc_id IS NULL
+        OR ces.status <> 'completed'
+        OR ces.parser_version <> ?
+        OR COALESCE(ces.content_checksum, '') <> COALESCE(fm.content_checksum, fm.updated_at, '')
+      )
+    ORDER BY d.doc_id
+    LIMIT ?
+  `, [
+    ...filters.args,
+    String(afterDocId || ''),
+    String(parserVersion || 'citation-v1'),
+    Math.max(1, Math.min(1000, Number(limit) || 100)),
+  ]);
+}
+
+export async function saveCitationExtractionState(docId, {
+  contentChecksum = null, parserVersion = 'citation-v1', status = 'completed',
+  citationCount = 0, error = null,
+} = {}) {
+  const now = new Date().toISOString();
+  await run(`
+    INSERT INTO citation_extraction_state (
+      doc_id, content_checksum, parser_version, status, citation_count, error, extracted_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(doc_id) DO UPDATE SET
+      content_checksum = excluded.content_checksum,
+      parser_version = excluded.parser_version,
+      status = excluded.status,
+      citation_count = excluded.citation_count,
+      error = excluded.error,
+      extracted_at = excluded.extracted_at
+  `, [
+    docId, contentChecksum || null, parserVersion || 'citation-v1', status,
+    Math.max(0, Number(citationCount) || 0), error || null, now,
+  ]);
+}
+
 // --- Catalogue lookup functions ---
 
 export async function saveCatalogueLookup(citationId, { hits, queryAuthor, queryTitle, bibId }) {
@@ -2784,7 +2911,35 @@ export async function getTopicBuildStatus() {
   };
 }
 
-export async function listPendingLookups(limit = 100) {
+function pendingLookupOptions(limitOrOptions = 100) {
+  if (limitOrOptions && typeof limitOrOptions === 'object') {
+    return {
+      limit: Math.max(1, Math.min(1000, Number(limitOrOptions.limit) || 100)),
+      syncKey: limitOrOptions.syncKey || null,
+      filters: limitOrOptions.filters || {},
+    };
+  }
+  return { limit: Math.max(1, Math.min(1000, Number(limitOrOptions) || 100)), syncKey: null, filters: {} };
+}
+
+function pendingLookupScope({ syncKey = null, filters: requestedFilters = {} } = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  if (!filters.where) return { sql: '', args: [] };
+  return {
+    sql: `AND EXISTS (
+      SELECT 1
+      FROM document_citations scoped_dc
+      JOIN documents d ON d.doc_id = scoped_dc.doc_id
+      WHERE scoped_dc.citation_id = c.id
+        AND ${filters.where.replace(/^WHERE\s+/, '')}
+    )`,
+    args: filters.args,
+  };
+}
+
+export async function listPendingLookups(limitOrOptions = 100) {
+  const options = pendingLookupOptions(limitOrOptions);
+  const scope = pendingLookupScope(options);
   return all(`
     SELECT c.id, c.citation_text, c.author, c.title, c.year, c.source
     FROM (
@@ -2800,24 +2955,28 @@ export async function listPendingLookups(limit = 100) {
         SELECT 1 FROM catalogue_lookups cl WHERE cl.citation_id = c.id
       )
     ) c
+    WHERE 1 = 1 ${scope.sql}
+    ORDER BY (
+      SELECT COUNT(*) FROM document_citations priority_dc WHERE priority_dc.citation_id = c.id
+    ) DESC, c.id ASC
     LIMIT ?
-  `, [limit]);
+  `, [...scope.args, options.limit]);
 }
 
-export async function countPendingLookups() {
+export async function countPendingLookups(options = {}) {
+  const scope = pendingLookupScope(pendingLookupOptions({ ...options, limit: 1 }));
   const row = await get(`
-    SELECT
-      (
-        (SELECT COUNT(*) FROM citations)
-        - (SELECT COUNT(*) FROM catalogue_lookups)
-        + (
-          SELECT COUNT(*)
-          FROM catalogue_lookups
-          WHERE hits IS NULL
-            AND query_title IS NOT NULL
-        )
-      ) AS total
-  `);
+    SELECT COUNT(*) AS total
+    FROM citations c
+    WHERE (
+      NOT EXISTS (SELECT 1 FROM catalogue_lookups cl WHERE cl.citation_id = c.id)
+      OR EXISTS (
+        SELECT 1 FROM catalogue_lookups cl
+        WHERE cl.citation_id = c.id AND cl.hits IS NULL AND cl.query_title IS NOT NULL
+      )
+    )
+    ${scope.sql}
+  `, scope.args);
   return Number(row?.total || 0);
 }
 

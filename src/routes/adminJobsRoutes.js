@@ -21,6 +21,15 @@ import { cancelAdminWorkerJob, createAndStartAdminWorkerJob } from '../services/
 export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
   const router = Router();
 
+  const citationScope = (body = {}) => ({
+    syncKey: String(body.syncKey || '').trim().slice(0, 2000) || null,
+    filters: {
+      degree: String(body.degree || '').trim().slice(0, 250),
+      program: String(body.program || '').trim().slice(0, 250),
+      affiliation: String(body.affiliation || '').trim().slice(0, 250),
+    },
+  });
+
   router.get('/jobs', asyncHandler(async (_req, res) => {
     const { getDocumentSyncStatus } = await loadSyncModule();
     const [jobs, syncRuns, catalogueStats, topicStatus, documentSyncStatus, conceptStatus] = await Promise.all([
@@ -44,11 +53,12 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
   router.post('/jobs/catalogue-lookup', asyncHandler(async (req, res) => {
     const limit = Math.min(parseNumberParam(req.body?.limit ?? getQueryValue(req, 'limit'), 100), 1000);
     const dryRun = parseBooleanParam(req.body?.dryRun ?? getQueryValue(req, 'dryRun'), false);
+    const scope = citationScope(req.body || {});
 
     if (dryRun) {
       const [pending, totalPending] = await Promise.all([
-        listPendingLookups(limit),
-        countPendingLookups(),
+        listPendingLookups({ limit, ...scope }),
+        countPendingLookups(scope),
       ]);
       res.status(200).json({
         ok: true,
@@ -72,11 +82,11 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
     const jobId = await createAdminJob({
       type: 'catalogue_lookup',
       label: 'Z39.50 Catalogue Lookups',
-      params: { limit, pendingOnly: true },
+      params: { limit, pendingOnly: true, scope },
       timeoutAt: new Date(Date.now() + ADMIN_WORKER_TIMEOUT_MS).toISOString(),
     });
     // Run out-of-band so catalogue lookups do not hold the HTTP connection open.
-    runCatalogueLookupJob(jobId, limit);
+    runCatalogueLookupJob(jobId, limit, { scope });
     res.status(202).json({ ok: true, started: true, jobId });
   }));
 

@@ -1821,7 +1821,8 @@ export function detectDownloadBlockPage(html) {
 }
 
 export async function extractAndSaveParsedData(doc, fullText, pdfPath, {
-  onProgress = null, extractCommittee = true, extractCitations = true
+  onProgress = null, extractCommittee = true, extractCitations = true,
+  strictCitationErrors = false,
 } = {}) {
   if (!fullText) return;
 
@@ -1917,6 +1918,7 @@ export async function extractAndSaveParsedData(doc, fullText, pdfPath, {
       doc.citationCount = (await loadDocumentCitations(doc.id)).length;
     } catch (err) {
       logger.warn('Failed to extract citations from PDF', { docId: doc.id, error: err.message });
+      if (strictCitationErrors) throw err;
     }
   }
 
@@ -1951,7 +1953,7 @@ async function loadStoredParsedData(doc) {
 export async function analyzeDocumentFile(doc, options) {
   const {
     downloadFiles, forceDownload, recomputeFromCache, artifactClient = null, onProgress = null,
-    extractCommittee = true, extractCitations = true, onContentRequest = null,
+    extractCommittee = true, extractCitations = false, onContentRequest = null,
     contentMode = downloadFiles ? 'pdf_cache' : 'full_text_only'
   } = options;
   if (!isImportContentMode(contentMode)) {
