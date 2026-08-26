@@ -7,6 +7,8 @@ import zlib from 'node:zlib';
 import {
   analyzePdfAtPath,
   DEGRADED_WORD_SOURCE,
+  EXTRACTION_TEXT_TOO_LARGE,
+  _setMaxPdfTextBytesForTests,
   detectDownloadBlockPage,
   fetchPdfForDocument,
   fetchFullTextForDocument,
@@ -534,4 +536,52 @@ Jones, A. (2015). Another paper.`;
 
   assert.ok(bodyWords < totalWords, `Expected body word count (${bodyWords}) to be less than total word count (${totalWords})`);
   assert.equal(bodyWords, 25); // Words: "Introduction to the dissertation. This is the body text which has some words in it. These words should be counted towards the body word count." -> 25 words
+});
+
+test('extraction refuses output larger than the configured text ceiling', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf-cap-'));
+  const pdfPath = path.join(dir, 'oversize.pdf');
+  // 40 pages of real text: comfortably over the tiny ceiling set below, while
+  // staying small enough that the fixture itself is cheap to build.
+  await writeLargeFlatePdf(pdfPath, { pages: 40, linesPerPage: 40 });
+
+  const uncapped = await analyzePdfAtPath(pdfPath);
+  assert.equal(uncapped.extractionStatus, 'ok');
+  assert.ok(uncapped.extractedBytes > 4096, 'fixture should exceed the ceiling used below');
+
+  _setMaxPdfTextBytesForTests(4096);
+  try {
+    const capped = await analyzePdfAtPath(pdfPath);
+    assert.equal(capped.extractionStatus, EXTRACTION_TEXT_TOO_LARGE);
+    // The point of the guard is that the string is never built.
+    assert.equal(capped.fullText, null);
+    assert.equal(capped.wordCount, null);
+    assert.equal(capped.bodyWordCount, null);
+    assert.equal(capped.degraded, true);
+    // Page count comes from pdfinfo, not the text, so it survives.
+    assert.equal(capped.pageCount, 40);
+    // The observed size is reported so an operator can see why it was refused.
+    assert.equal(capped.extractedBytes, uncapped.extractedBytes);
+  } finally {
+    _setMaxPdfTextBytesForTests(null);
+  }
+
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test('a refused oversize extraction cannot be recorded as a reliable word count', async () => {
+  const { hasReliableWordCount } = await import('../src/metrics.js');
+  // text_too_large yields no count at all, so applyAnalysisWordCount leaves the
+  // document's existing provenance alone rather than relabelling it.
+  const doc = { wordCount: 42000, wordCountSource: 'dspace_full_text' };
+  const analysis = {
+    wordCount: null, degraded: true, extractionStatus: EXTRACTION_TEXT_TOO_LARGE,
+  };
+  assert.equal(analysis.wordCount, null);
+  assert.equal(hasReliableWordCount(doc), true, 'a real full-text count stays reliable');
+  assert.equal(
+    hasReliableWordCount({ wordCount: 42000, wordCountSource: DEGRADED_WORD_SOURCE }),
+    false,
+    'a degraded count is never reliable'
+  );
 });

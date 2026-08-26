@@ -40,6 +40,12 @@ export const PORT = Number(process.env.PORT || 3000);
 export const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60 * 1000);
 export const WORKBENCH_CACHE_REFRESH_MS = Number(process.env.WORKBENCH_CACHE_REFRESH_MS || 10 * 60 * 1000);
 export const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024; // 200 MB
+// Ceiling on text extracted from one PDF. A text-dense PDF decompresses roughly
+// 10:1, so without this a 200 MB download can force an arbitrarily large string
+// into the heap -- and on Fly os.tmpdir() is tmpfs, so the staging file is RAM
+// too. 20 MB is ~3.3M words; a 1,000-page thesis is nearer 5 MB, so exceeding it
+// means a pathological or hostile file rather than a long dissertation.
+export const MAX_PDF_TEXT_BYTES = Number(process.env.MAX_PDF_TEXT_BYTES || 20 * 1024 * 1024); // 20 MB
 export const DOWNLOAD_TIMEOUT_MS = 30_000; // 30 seconds
 export const TRUST_PROXY = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '');
 export const PDF_ALLOWED_HOSTS = (process.env.PDF_ALLOWED_HOSTS || 'open.library.ubc.ca,oc-index.library.ubc.ca,circle.library.ubc.ca')

@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
-  PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS,
+  PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, MAX_PDF_TEXT_BYTES, DOWNLOAD_TIMEOUT_MS,
   PDF_DOWNLOAD_RATE_PER_MIN, GROBID_URL, GROBID_STARTUP_WAIT_MS, GROBID_FLY_API_TOKEN,
   ALLOW_ORIGINAL_PDF_RETRIEVAL, CONTENT_RETRIEVAL_ENABLED
 } from './config.js';
@@ -26,10 +26,19 @@ import { isImportContentMode } from './importRules.js';
 export const DEGRADED_WORD_SOURCE = 'degraded_pdf_text';
 
 let downloadSafetyOptions = {};
+let maxPdfTextBytes = MAX_PDF_TEXT_BYTES;
 const activePdfStreamDirs = new Set();
 let pdfStreamJanitorPromise = null;
 export function _setDownloadSafetyOptionsForTests(options) {
   downloadSafetyOptions = options || {};
+}
+
+// MAX_PDF_TEXT_BYTES is read from env at import, so exercising the ceiling would
+// otherwise mean either a genuinely 20 MB fixture or an env value that distorts
+// every other test in the file. Overriding it per-test keeps the real byte check
+// on the real code path. Pass null to restore the configured value.
+export function _setMaxPdfTextBytesForTests(bytes) {
+  maxPdfTextBytes = bytes == null ? MAX_PDF_TEXT_BYTES : Number(bytes);
 }
 
 export async function cleanupOrphanedPdfStreamDirs() {
@@ -410,6 +419,11 @@ export async function parseBibliographyWithGrobid(pdfPath, { timeoutMs = 120_000
  * Extract citations from full text using AnyStyle ML parser.
  * Falls back to regex-based parseBibliography() if AnyStyle is unavailable.
  */
+// CSL JSON carries per-reference structure and field names, so it runs larger
+// than the bibliography text it is built from. 2x the extraction cap leaves
+// headroom for a document that is almost entirely references.
+const ANYSTYLE_STDOUT_MAX_BYTES = MAX_PDF_TEXT_BYTES * 2;
+
 export async function parseBibliographyWithAnyStyle(fullText) {
   if (!fullText) return [];
   const bin = await resolveAnyStyleBin();
@@ -418,8 +432,13 @@ export async function parseBibliographyWithAnyStyle(fullText) {
   const tmpFile = path.join(os.tmpdir(), `anystyle-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
   try {
     await fs.writeFile(tmpFile, fullText, 'utf8');
+    // AnyStyle emits CSL JSON, which is structurally larger than the references
+    // it describes. Deriving the ceiling from the extraction cap keeps the two
+    // in step: a flat literal here silently drifts out of range the moment
+    // MAX_PDF_TEXT_BYTES moves, and the overflow degrades to the regex parser
+    // without saying so.
     const { stdout } = await execFileAsync(bin, ['-f', 'csl', '--stdout', 'find', tmpFile], {
-      maxBuffer: 10 * 1024 * 1024
+      maxBuffer: ANYSTYLE_STDOUT_MAX_BYTES
     });
     const records = JSON.parse(stdout);
     const citations = records.map(buildCitationText).filter(Boolean);
@@ -609,9 +628,31 @@ export function extractBodyWordCount(text) {
 //                        there is no word count, and nothing to distrust.
 //   'extraction_failed'- pdftotext was unavailable or errored, or we are serving
 //                        raw-byte-scanner output instead of real extraction.
+//   'text_too_large'   - pdftotext produced more text than MAX_PDF_TEXT_BYTES.
+//                        We refuse to read it rather than truncating: a partial
+//                        read yields a plausible-but-wrong word count and a
+//                        half-parsed bibliography, which is the silent
+//                        corruption this whole extraction path exists to stop.
 const EXTRACTION_OK = 'ok';
 const EXTRACTION_EMPTY_TEXT_LAYER = 'empty_text_layer';
 const EXTRACTION_FAILED = 'extraction_failed';
+export const EXTRACTION_TEXT_TOO_LARGE = 'text_too_large';
+
+// pdftotext writes its text to a file, so stdout is quiet -- but stderr is still
+// a pipe subject to execFile's 1 MB default, and a malformed PDF can emit
+// thousands of "Syntax Error:" lines. Without an explicit bound a broken file
+// can still blow up the call, just from the other stream.
+const PDFTOTEXT_STDERR_MAX_BYTES = 1024 * 1024;
+// err.message embeds the child's entire stderr and is written into a structured
+// log line; keep it to something a log aggregator can hold.
+const EXTRACTION_ERROR_MAX_CHARS = 500;
+
+function briefError(err) {
+  const message = err?.message || String(err);
+  return message.length > EXTRACTION_ERROR_MAX_CHARS
+    ? `${message.slice(0, EXTRACTION_ERROR_MAX_CHARS)}… (${message.length} chars)`
+    : message;
+}
 
 // The raw-byte fallback only sees uncompressed Tj/TJ operators, so for a real
 // (FlateDecode) dissertation it recovers almost nothing. Whenever we serve its
@@ -661,10 +702,31 @@ async function extractPdfText(filePath, bytes = null) {
   // Write to a temp file instead of piping through stdout: a dissertation's text
   // routinely exceeds execFile's 1 MB default maxBuffer, and a truncated pipe
   // rejects with ERR_CHILD_PROCESS_STDIO_MAXBUFFER, silently dropping us into
-  // the near-useless raw-byte fallback. A file keeps the output unbounded.
+  // the near-useless raw-byte fallback. Staging to a file lets us size the
+  // output before committing any of it to the heap.
   const tmpFile = path.join(os.tmpdir(), `pdftotext-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
   try {
-    await execFileAsync('pdftotext', ['-enc', 'UTF-8', filePath, tmpFile]);
+    await execFileAsync('pdftotext', ['-enc', 'UTF-8', filePath, tmpFile], {
+      maxBuffer: PDFTOTEXT_STDERR_MAX_BYTES,
+    });
+    // stat before read. Reading first and checking length afterwards would mean
+    // the allocation we are guarding against has already happened.
+    const { size } = await fs.stat(tmpFile);
+    if (size > maxPdfTextBytes) {
+      logger.warn('pdftotext output exceeds the extraction size limit; refusing to load it', {
+        bytes: size,
+        limit: maxPdfTextBytes,
+      });
+      return {
+        text: null,
+        wordCount: null,
+        bodyWordCount: null,
+        textSource: EXTRACTION_TEXT_TOO_LARGE,
+        extractionStatus: EXTRACTION_TEXT_TOO_LARGE,
+        extractedBytes: size,
+        degraded: true
+      };
+    }
     const text = await fs.readFile(tmpFile, 'utf8');
     if (!text.trim()) {
       return fallbackPdfText(bytes, 'pdftotext_returned_no_text', { pdftotextFailed: false });
@@ -675,10 +737,11 @@ async function extractPdfText(filePath, bytes = null) {
       bodyWordCount: extractBodyWordCount(text),
       textSource: 'pdftotext',
       extractionStatus: EXTRACTION_OK,
+      extractedBytes: size,
       degraded: false
     };
   } catch (err) {
-    return fallbackPdfText(bytes, err?.message || String(err));
+    return fallbackPdfText(bytes, briefError(err));
   } finally {
     await fs.unlink(tmpFile).catch(() => {});
   }
@@ -709,7 +772,7 @@ export async function analyzePdfAtPath(pdfPath, bytes) {
     pageCount = countPdfPagesFromBuffer(fallbackBytes);
   }
   const {
-    text, wordCount, bodyWordCount, textSource, extractionStatus, degraded
+    text, wordCount, bodyWordCount, textSource, extractionStatus, extractedBytes, degraded
   } = await extractPdfText(pdfPath, fallbackBytes);
   return {
     pageCount: pageCount || null,
@@ -719,6 +782,7 @@ export async function analyzePdfAtPath(pdfPath, bytes) {
     fullText: text || null,
     textSource,
     extractionStatus,
+    extractedBytes: extractedBytes ?? null,
     degraded
   };
 }
@@ -988,7 +1052,12 @@ export async function fetchFullTextForDocument(doc, stored = null, {
     if (!id) return null;
 
     const retrieveUrl = dspaceRestUrl(`/rest/bitstreams/${id}/retrieve`);
-    const fullText = await fetchTextWithTimeout(retrieveUrl, { onContentRequest, maxBytes });
+    // The repository's extracted-text derivative lands in the same in-memory
+    // parsers as pdftotext output, so it answers to the same ceiling. maxBytes
+    // here derives from the rule's maxContentBytes, which is sized for PDF
+    // downloads (up to 200 MB) and is far too generous for a text body.
+    const textLimit = Math.min(Number(maxBytes) || maxPdfTextBytes, maxPdfTextBytes);
+    const fullText = await fetchTextWithTimeout(retrieveUrl, { onContentRequest, maxBytes: textLimit });
     if (!fullText || fullText.length <= 1000) return null;
     const cachedText = persistFullText
       ? await writeCachedFullText(doc, fullText, retrieveUrl.toString(), artifactClient)
