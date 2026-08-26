@@ -18,6 +18,11 @@ import { dedupeSupervisorNames } from './supervisors.js';
 import { safeFetchDownloadUrl } from './urlSafety.js';
 import { isImportContentMode } from './importRules.js';
 
+// Recorded as file_metrics.word_source when pdftotext could not produce text
+// and we fell back to scraping raw PDF bytes. Treated as unreliable everywhere
+// word counts are aggregated, so a degraded parse cannot masquerade as a good one.
+export const DEGRADED_WORD_SOURCE = 'degraded_pdf_text';
+
 let downloadSafetyOptions = {};
 const activePdfStreamDirs = new Set();
 let pdfStreamJanitorPromise = null;
@@ -593,30 +598,48 @@ export function extractBodyWordCount(text) {
   return count || null;
 }
 
+// The raw-byte fallback only sees uncompressed Tj/TJ operators, so for a real
+// (FlateDecode) dissertation it recovers almost nothing. Every caller of this
+// path is therefore producing degraded output and must say so.
+function degradedPdfText(bytes, reason) {
+  const text = bytes ? extractPdfTextFallback(bytes) : '';
+  logger.warn('pdftotext extraction degraded, using raw-byte fallback', {
+    reason,
+    chars: text.length
+  });
+  return {
+    text: text || null,
+    wordCount: wordCountFromText(text),
+    bodyWordCount: extractBodyWordCount(text),
+    textSource: text ? 'raw_bytes_fallback' : 'none',
+    degraded: true
+  };
+}
+
 async function extractPdfText(filePath, bytes = null) {
   if (!(await ensurePdftotextAvailability())) {
-    const text = bytes ? extractPdfTextFallback(bytes) : '';
-    const wordCount = wordCountFromText(text);
-    return {
-      text: text || null,
-      wordCount,
-      bodyWordCount: extractBodyWordCount(text)
-    };
+    return degradedPdfText(bytes, 'pdftotext_unavailable');
   }
+  // Write to a temp file instead of piping through stdout: a dissertation's text
+  // routinely exceeds execFile's 1 MB default maxBuffer, and a truncated pipe
+  // rejects with ERR_CHILD_PROCESS_STDIO_MAXBUFFER, silently dropping us into
+  // the near-useless raw-byte fallback. A file keeps the output unbounded.
+  const tmpFile = path.join(os.tmpdir(), `pdftotext-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
   try {
-    const { stdout } = await execFileAsync('pdftotext', ['-enc', 'UTF-8', filePath, '-']);
-    let text = String(stdout || '');
-    if (!text.trim() && bytes) text = extractPdfTextFallback(bytes);
-    const wordCount = wordCountFromText(text);
-    const bodyWordCount = extractBodyWordCount(text);
-    return { text, wordCount: wordCount || null, bodyWordCount };
-  } catch {
-    const text = bytes ? extractPdfTextFallback(bytes) : '';
+    await execFileAsync('pdftotext', ['-enc', 'UTF-8', filePath, tmpFile]);
+    const text = await fs.readFile(tmpFile, 'utf8');
+    if (!text.trim()) return degradedPdfText(bytes, 'pdftotext_returned_no_text');
     return {
-      text: text || null,
-      wordCount: wordCountFromText(text),
-      bodyWordCount: extractBodyWordCount(text)
+      text,
+      wordCount: wordCountFromText(text) || null,
+      bodyWordCount: extractBodyWordCount(text),
+      textSource: 'pdftotext',
+      degraded: false
     };
+  } catch (err) {
+    return degradedPdfText(bytes, err?.message || String(err));
+  } finally {
+    await fs.unlink(tmpFile).catch(() => {});
   }
 }
 
@@ -644,13 +667,15 @@ export async function analyzePdfAtPath(pdfPath, bytes) {
     fallbackBytes ||= await fs.readFile(pdfPath);
     pageCount = countPdfPagesFromBuffer(fallbackBytes);
   }
-  const { text, wordCount, bodyWordCount } = await extractPdfText(pdfPath, fallbackBytes);
+  const { text, wordCount, bodyWordCount, textSource, degraded } = await extractPdfText(pdfPath, fallbackBytes);
   return {
     pageCount: pageCount || null,
     wordCount: wordCount || null,
     bodyWordCount: bodyWordCount || null,
     fileBytes: fileSize,
-    fullText: text || null
+    fullText: text || null,
+    textSource,
+    degraded
   };
 }
 
@@ -2096,6 +2121,7 @@ export async function analyzeDocumentFile(doc, options) {
           doc.wordCount = analysis.wordCount;
           doc.wordCountSource = 'streamed_pdf_text';
         }
+        if (analysis.degraded) doc.wordCountSource = DEGRADED_WORD_SOURCE;
         if (analysis.bodyWordCount) doc.bodyWordCount = analysis.bodyWordCount;
         doc.fileBytes = analysis.fileBytes;
         doc.downloadUrl = streamed.downloadUrl;
@@ -2224,6 +2250,7 @@ export async function analyzeDocumentFile(doc, options) {
         doc.wordCount = analysis.wordCount;
         doc.wordCountSource = 'cached_pdf_text';
       }
+      if (analysis.degraded) doc.wordCountSource = DEGRADED_WORD_SOURCE;
       if (analysis.bodyWordCount) {
         doc.bodyWordCount = analysis.bodyWordCount;
       }
@@ -2373,6 +2400,7 @@ export async function analyzeDocumentFile(doc, options) {
         doc.wordCount = analysis.wordCount;
         doc.wordCountSource = 'downloaded_pdf_text';
       }
+      if (analysis.degraded) doc.wordCountSource = DEGRADED_WORD_SOURCE;
       if (analysis.bodyWordCount) {
         doc.bodyWordCount = analysis.bodyWordCount;
       }

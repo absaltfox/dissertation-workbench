@@ -695,6 +695,219 @@ db.commit()
   assert.equal(artifact.source.documents, 0);
 });
 
+// Regression cover for finding N-01: the partitioned rework shipped `variants: []`,
+// `variantToCanonical: {}` and `aliases: 0` hardcoded, so plural forms, token
+// reorderings and morphological head variants each became their own concept and
+// fragmented every document-frequency count downstream.
+test('PatternRank clusters phrase variants and publishes a populated alias map', async () => {
+  const aliasDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-alias-'));
+  const sqlitePath = path.join(aliasDir, 'metrics.sqlite');
+  const latestPath = path.join(aliasDir, 'concepts', 'latest.json');
+  const setup = `
+import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, degree TEXT, year INTEGER, updated_at TEXT NOT NULL)")
+for year in (2024, 2025):
+    doc = {
+        "id": f"alias-{year}",
+        # "learning communities" / "learning community" differ only by plural (R1),
+        # "educational leadership" / "educational leader" only by head form (R2).
+        "title": "Learning Communities and Educational Leadership",
+        "abstract": "Learning community practice supports educational leader growth.",
+        "subjects": ["learning communities"],
+        "degree": "Alias Degree",
+        "year": year,
+    }
+    db.execute("INSERT INTO documents VALUES (?, ?, ?, ?, ?)", (doc["id"], json.dumps(doc), doc["degree"], year, "2026-01-01T00:00:00+00:00"))
+db.commit()
+`;
+  await execFileAsync('python3', ['-c', setup, sqlitePath]);
+  const env = {
+    ...process.env,
+    SQLITE_PATH: sqlitePath,
+    APP_DATA_DIR: aliasDir,
+    TURSO_DATABASE_URL: '',
+    ADMIN_JOB_ID: '',
+    NODE_ENV: 'test',
+    CONCEPT_EMBEDDING_BACKEND: 'deterministic_test',
+    CONCEPT_PATTERNRANK_MIN_SCORE: '-1',
+  };
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    await execFileAsync('python3', ['scripts/build-concepts.py'], { cwd: path.resolve('.'), env });
+    try { await fs.access(latestPath); break; } catch { /* generation still incomplete */ }
+  }
+  const artifact = JSON.parse(await fs.readFile(latestPath, 'utf8'));
+
+  // The alias map is genuinely populated, not the hardcoded empty object.
+  assert.ok(Object.keys(artifact.variantToCanonical).length > 0);
+  assert.equal(artifact.stats.aliases, Object.keys(artifact.variantToCanonical).length);
+  assert.ok(artifact.concepts.some((concept) => concept.variants.length > 0));
+
+  // R1: plural form folds into the singular canonical.
+  assert.equal(artifact.variantToCanonical['learning communities'], 'learning community');
+  // R2: morphologically related head folds into the stronger head form.
+  assert.equal(artifact.variantToCanonical['educational leader'], 'educational leadership');
+
+  // The point of the fix: both shards' documents land on one concept instead of
+  // being split across a singular and a plural entry with half the docFreq each.
+  const community = artifact.concepts.find((concept) => concept.canonical === 'learning community');
+  assert.ok(community);
+  assert.equal(community.docFreq, 2);
+  assert.ok(community.variants.includes('learning communities'));
+  assert.equal(artifact.concepts.some((concept) => concept.canonical === 'learning communities'), false);
+
+  // concepts[].variants, variantToCanonical and stats.aliases must agree exactly, and
+  // no surviving canonical may also be a variant key — src/metrics.js resolves
+  // variantMap before canonicalSet, so such a phrase would lose its own entry.
+  const projected = {};
+  for (const concept of artifact.concepts) {
+    for (const variant of concept.variants) projected[variant] = concept.canonical;
+  }
+  assert.deepEqual(projected, artifact.variantToCanonical);
+  const canonicals = new Set(artifact.concepts.map((concept) => concept.canonical));
+  for (const [variant, canonical] of Object.entries(artifact.variantToCanonical)) {
+    assert.ok(canonicals.has(canonical));
+    assert.equal(canonicals.has(variant), false);
+  }
+});
+
+test('PatternRank merge resolves cross-shard variant collisions deterministically', async () => {
+  const mergeDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-merge-'));
+  const harnessPath = path.join(mergeDir, 'merge_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+client = bc.SqliteClientWrapper(sys.argv[2])
+bc.ensure_incremental_schema(client)
+for shard in json.loads(sys.argv[3]):
+    documents = shard["artifact"]["stats"]["documents"]
+    client.execute(
+        "INSERT OR REPLACE INTO concept_partitions (partition_key, scope_json, priority, enabled,"
+        " status, source_document_count, artifact_version, updated_at)"
+        " VALUES (?, '{}', ?, 1, 'complete', ?, 1, '2026-01-01T00:00:00+00:00')",
+        [shard["key"], shard["priority"], documents],
+    )
+    client.execute(
+        "INSERT OR REPLACE INTO concept_partition_artifacts (partition_key, version, artifact_json,"
+        " document_count, created_at) VALUES (?, 1, ?, ?, '2026-01-01T00:00:00+00:00')",
+        [shard["key"], json.dumps(shard["artifact"]), documents],
+    )
+merged = bc.merge_partition_artifacts(client)
+print(json.dumps({
+    "concepts": [[c["canonical"], c["variants"], c["docFreq"]] for c in merged["concepts"]],
+    "variantToCanonical": merged["variantToCanonical"],
+    "aliases": merged["stats"]["aliases"],
+}, sort_keys=True))
+`, 'utf8');
+
+  const shard = (key, canonical, variants, docFreq, score) => ({
+    key,
+    artifact: {
+      stats: { documents: 10 },
+      partition: { key },
+      concepts: [{ canonical, variants, docFreq, patternRankScore: score }],
+    },
+  });
+  // The collision: "student engagements" is a variant of "student engagement" in one
+  // shard but a canonical in its own right in another, and "student engaging" is
+  // claimed by two different canonicals in two more shards.
+  const shards = [
+    shard('p-alpha', 'student engagement', ['student engagements'], 6, 0.9),
+    shard('p-beta', 'student engagements', ['student engaging'], 4, 0.7),
+    shard('p-gamma', 'learner engagement', ['student engaging'], 3, 0.5),
+  ];
+
+  const runMerge = async (priorities) => {
+    const dbPath = path.join(mergeDir, `merge-${priorities.join('-')}.sqlite`);
+    const payload = shards.map((entry, index) => ({ ...entry, priority: priorities[index] }));
+    const { stdout } = await execFileAsync(
+      'python3',
+      [harnessPath, path.resolve('scripts/build-concepts.py'), dbPath, JSON.stringify(payload)],
+      { cwd: path.resolve('.') },
+    );
+    return JSON.parse(stdout);
+  };
+
+  // Every shard ordering must produce byte-identical output: the merge resolves each
+  // connected component of (variant -> canonical) edges as a whole and elects the
+  // winner by summed docFreq, then score, then phrase - never last-write-wins.
+  const baseline = await runMerge([3, 2, 1]);
+  for (const priorities of [[1, 2, 3], [2, 3, 1], [1, 1, 1], [3, 1, 2]]) {
+    assert.deepEqual(await runMerge(priorities), baseline);
+  }
+
+  // The four colliding phrases collapse into a single concept whose docFreq is the
+  // sum across the disjoint shards (6 + 4 + 3), not three fragmented entries.
+  assert.deepEqual(baseline.concepts, [[
+    'student engagement',
+    ['learner engagement', 'student engagements', 'student engaging'],
+    13,
+  ]]);
+  assert.deepEqual(baseline.variantToCanonical, {
+    'learner engagement': 'student engagement',
+    'student engagements': 'student engagement',
+    'student engaging': 'student engagement',
+  });
+  assert.equal(baseline.aliases, 3);
+});
+
+test('PatternRank refuses to publish an artifact whose alias map disagrees with stats', async () => {
+  const guardDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-guard-'));
+  const guardPath = path.join(guardDir, 'guard.py');
+  await fs.writeFile(guardPath, `
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+def expect_failure(artifact, label):
+    try:
+        bc.assert_alias_invariants(artifact, "test")
+    except ValueError as error:
+        print(label + ": " + str(error))
+        return
+    raise SystemExit("expected " + label + " to be rejected")
+
+# The exact shape the regression shipped: real variants, empty map, aliases hardcoded 0.
+expect_failure({
+    "stats": {"aliases": 0},
+    "concepts": [{"canonical": "learning community", "variants": ["learning communities"]}],
+    "variantToCanonical": {},
+}, "empty-map")
+expect_failure({
+    "stats": {"aliases": 5},
+    "concepts": [{"canonical": "learning community", "variants": ["learning communities"]}],
+    "variantToCanonical": {"learning communities": "learning community"},
+}, "miscounted")
+expect_failure({
+    "stats": {"aliases": 1},
+    "concepts": [
+        {"canonical": "learning community", "variants": ["learning communities"]},
+        {"canonical": "learning communities", "variants": []},
+    ],
+    "variantToCanonical": {"learning communities": "learning community"},
+}, "canonical-also-variant")
+bc.assert_alias_invariants({
+    "stats": {"aliases": 1},
+    "concepts": [{"canonical": "learning community", "variants": ["learning communities"]}],
+    "variantToCanonical": {"learning communities": "learning community"},
+}, "test")
+print("consistent artifact accepted")
+`, 'utf8');
+  const { stdout } = await execFileAsync(
+    'python3',
+    [guardPath, path.resolve('scripts/build-concepts.py')],
+    { cwd: path.resolve('.') },
+  );
+  // aliases=0 matches an empty map, so this shape is caught by the projection check.
+  assert.match(stdout, /empty-map: .*does not match concepts\[\]\.variants \(1 projected vs 0 mapped\)/);
+  assert.match(stdout, /miscounted: .*stats\.aliases=5 disagrees/);
+  assert.match(stdout, /canonical-also-variant: .*both a canonical and a variant key/);
+  assert.match(stdout, /consistent artifact accepted/);
+});
+
 test('one-shot job worker claims unsupported jobs and marks them failed', async () => {
   await ensureStorage();
   const token = `worker-token-${Date.now()}`;

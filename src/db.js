@@ -1186,7 +1186,7 @@ export async function getDocumentServingAnalytics({ syncKey = null, filters: req
   const filters = documentServingFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
   const activeWords = 'COALESCE(fm.body_word_count, fm.word_count)';
-  const reliableWords = `${activeWords} >= 1000 AND COALESCE(fm.word_source, '') <> 'metadata_text'`;
+  const reliableWords = `${activeWords} >= 1000 AND COALESCE(fm.word_source, '') NOT IN ('metadata_text', 'degraded_pdf_text')`;
   const reliablePages = `fm.page_count >= 10 AND COALESCE(fm.page_source, '') NOT IN ('estimated_from_metadata_words', 'estimated_from_full_text_words')`;
 
   const [overall, yearCounts, wordRows, pageRows, themes, concepts, methodologies] = await Promise.all([
@@ -2123,6 +2123,7 @@ export async function getFileMetricsStats() {
            SUM(CASE WHEN file_bytes IS NOT NULL THEN file_bytes ELSE 0 END) AS total_bytes,
            SUM(CASE WHEN status = 'downloaded' OR status = 'redownloaded' OR status = 'cached' OR status = 'recomputed_from_cache' THEN 1 ELSE 0 END) AS with_pdf,
            SUM(CASE WHEN word_source = 'dspace_full_text' THEN 1 ELSE 0 END) AS with_full_text,
+           SUM(CASE WHEN word_source = 'degraded_pdf_text' THEN 1 ELSE 0 END) AS degraded_text,
            SUM(CASE WHEN status = 'not_found' OR status = 'cache_miss' OR status = 'blocked' THEN 1 ELSE 0 END) AS failed,
            MIN(updated_at) AS oldest,
            MAX(updated_at) AS newest
@@ -3657,6 +3658,7 @@ export async function logCacheStats() {
     totalBytes: stats.total_bytes,
     withPdf: stats.with_pdf,
     failed: stats.failed,
+    degradedText: stats.degraded_text,
     oldest: stats.oldest,
     newest: stats.newest,
   });

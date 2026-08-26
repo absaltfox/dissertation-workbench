@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import {
   analyzePdfAtPath,
+  DEGRADED_WORD_SOURCE,
   detectDownloadBlockPage,
   fetchPdfForDocument,
   fetchFullTextForDocument,
@@ -36,6 +38,63 @@ async function writeOnePagePdfWithExtraPageToken(filePath) {
   }
   body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
   await fs.writeFile(filePath, body, 'binary');
+}
+
+// Writes a multi-page PDF whose content streams are FlateDecode-compressed, so
+// the raw-byte Tj/TJ fallback can recover nothing and only pdftotext can read it.
+// Sized so the extracted text is comfortably over execFile's 1 MB stdout limit.
+const LARGE_PDF_MARKER = 'FINAL-LINE-MARKER-OK';
+
+async function writeLargeFlatePdf(filePath, { pages = 400, linesPerPage = 40 } = {}) {
+  const filler = 'lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod '.repeat(2);
+  const contentStreams = [];
+  for (let p = 0; p < pages; p += 1) {
+    const lines = [];
+    for (let i = 0; i < linesPerPage; i += 1) {
+      // Keep the marker line short so it stays inside the MediaBox: pdftotext
+      // clips glyphs drawn past the page edge, and the filler runs well past it.
+      const isLast = p === pages - 1 && i === linesPerPage - 1;
+      const body = isLast ? LARGE_PDF_MARKER : filler;
+      lines.push(`(page${p} line${i} ${body}) Tj 0 -16 Td`);
+    }
+    const stream = `BT /F1 9 Tf 20 770 Td ${lines.join(' ')} ET`;
+    contentStreams.push(zlib.deflateSync(Buffer.from(stream, 'latin1')));
+  }
+
+  // Object layout: 1 catalog, 2 pages, 3 font, 4.. page objects, then content streams.
+  const firstPage = 4;
+  const firstContent = firstPage + pages;
+  const total = firstContent + pages - 1;
+  const objects = [];
+  objects[1] = Buffer.from('<< /Type /Catalog /Pages 2 0 R >>');
+  const kids = Array.from({ length: pages }, (_, p) => `${firstPage + p} 0 R`);
+  objects[2] = Buffer.from(`<< /Type /Pages /Kids [${kids.join(' ')}] /Count ${pages} >>`);
+  objects[3] = Buffer.from('<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
+  for (let p = 0; p < pages; p += 1) {
+    objects[firstPage + p] = Buffer.from(
+      `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${firstContent + p} 0 R >>`
+    );
+    objects[firstContent + p] = Buffer.concat([
+      Buffer.from(`<< /Length ${contentStreams[p].length} /Filter /FlateDecode >>\nstream\n`),
+      contentStreams[p],
+      Buffer.from('\nendstream'),
+    ]);
+  }
+
+  const chunks = [Buffer.from('%PDF-1.4\n')];
+  const offsets = [];
+  let offset = chunks[0].length;
+  for (let i = 1; i <= total; i += 1) {
+    const buf = Buffer.concat([Buffer.from(`${i} 0 obj\n`), objects[i], Buffer.from('\nendobj\n')]);
+    offsets[i] = offset;
+    offset += buf.length;
+    chunks.push(buf);
+  }
+  let xref = `xref\n0 ${total + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i <= total; i += 1) xref += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+  xref += `trailer\n<< /Size ${total + 1} /Root 1 0 R >>\nstartxref\n${offset}\n%%EOF\n`;
+  chunks.push(Buffer.from(xref));
+  await fs.writeFile(filePath, Buffer.concat(chunks));
 }
 
 test('detectDownloadBlockPage identifies UBC/F5 security block HTML', () => {
@@ -189,9 +248,87 @@ test('analyzePdfAtPath prefers pdfinfo page count over raw page-token scan', asy
     await writeOnePagePdfWithExtraPageToken(pdfPath);
     const result = await analyzePdfAtPath(pdfPath);
     assert.equal(result.pageCount, 1);
+    assert.equal(result.textSource, 'pdftotext');
+    assert.equal(result.degraded, false);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
+});
+
+// Regression guard for H-01: pdftotext output used to be piped through
+// execFile's 1 MB default maxBuffer, so any dissertation longer than ~150k words
+// blew up with ERR_CHILD_PROCESS_STDIO_MAXBUFFER and silently degraded to the
+// raw-byte fallback -- which recovers nothing from FlateDecode streams.
+test('analyzePdfAtPath extracts text larger than the 1 MB stdout buffer intact', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf-large-text-'));
+  const pdfPath = path.join(dir, 'large.pdf');
+  try {
+    await writeLargeFlatePdf(pdfPath);
+    const result = await analyzePdfAtPath(pdfPath);
+
+    assert.equal(result.degraded, false);
+    assert.equal(result.textSource, 'pdftotext');
+    assert.equal(result.pageCount, 400);
+    assert.ok(
+      result.fullText.length > 1024 * 1024,
+      `expected >1 MB of extracted text, got ${result.fullText.length}`
+    );
+    // Both ends present => the stream was not truncated at any buffer boundary.
+    assert.ok(result.fullText.includes('page0 line0'));
+    assert.ok(result.fullText.includes(LARGE_PDF_MARKER));
+    assert.ok(result.fullText.includes('page399 line39'));
+    assert.ok(result.wordCount > 150_000, `expected a large word count, got ${result.wordCount}`);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('analyzePdfAtPath flags raw-byte fallback extraction as degraded', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf-degraded-'));
+  const pdfPath = path.join(dir, 'broken.pdf');
+  try {
+    // Not a readable PDF (no xref/trailer) so pdftotext exits non-zero, but it
+    // still carries an uncompressed Tj operator the byte scanner can find.
+    const bytes = Buffer.from('not really a pdf\nBT (Hidden fallback words here) Tj ET\n', 'latin1');
+    await fs.writeFile(pdfPath, bytes);
+    const result = await analyzePdfAtPath(pdfPath, bytes);
+
+    assert.equal(result.degraded, true);
+    assert.equal(result.textSource, 'raw_bytes_fallback');
+    assert.ok(result.fullText.includes('Hidden fallback words here'));
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('analyzePdfAtPath reports degraded extraction with no recoverable text', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf-degraded-empty-'));
+  const pdfPath = path.join(dir, 'broken.pdf');
+  try {
+    const bytes = Buffer.from('not really a pdf and no text operators at all\n', 'latin1');
+    await fs.writeFile(pdfPath, bytes);
+    const result = await analyzePdfAtPath(pdfPath, bytes);
+
+    assert.equal(result.degraded, true);
+    assert.equal(result.textSource, 'none');
+    assert.equal(result.fullText, null);
+    assert.equal(result.wordCount, null);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('DEGRADED_WORD_SOURCE is treated as an unreliable word-count source', async () => {
+  const { hasReliableWordCount } = await import('../src/metrics.js');
+  assert.equal(DEGRADED_WORD_SOURCE, 'degraded_pdf_text');
+  assert.equal(
+    hasReliableWordCount({ wordCount: 200_000, wordCountSource: DEGRADED_WORD_SOURCE }),
+    false
+  );
+  assert.equal(
+    hasReliableWordCount({ wordCount: 200_000, wordCountSource: 'downloaded_pdf_text' }),
+    true
+  );
 });
 
 test('parseAcknowledgements extracts supervisors, co-supervisors, and committee members', () => {

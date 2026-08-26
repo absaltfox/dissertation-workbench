@@ -32,6 +32,21 @@ CHECKPOINT_BATCH_SIZE = max(10, int(os.environ.get("CONCEPT_CHECKPOINT_BATCH_SIZ
 MAX_PARTITION_DOCUMENTS = max(100, int(os.environ.get("CONCEPT_PARTITION_MAX_DOCUMENTS", "5000")))
 MAX_PARTITION_CONCEPTS = max(100, int(os.environ.get("CONCEPT_PARTITION_MAX_CONCEPTS", "5000")))
 MAX_GLOBAL_CONCEPTS = max(MAX_PARTITION_CONCEPTS, int(os.environ.get("CONCEPT_GLOBAL_MAX_CONCEPTS", "50000")))
+# A 2-gram is only folded into a containing 3-gram when the pair is well attested;
+# otherwise a single stray extension would swallow an independent concept.
+VARIANT_EXTENSION_MIN_DOCUMENT_FREQUENCY = max(
+    2, int(os.environ.get("CONCEPT_VARIANT_EXTENSION_MIN_DF", "3"))
+)
+# Hard ceiling on head-prefix comparisons inside one blocking bucket. Blocking already
+# keeps clustering linear in practice; this guarantees it even for adversarial inputs.
+MAX_BUCKET_COMPARISONS = max(1000, int(os.environ.get("CONCEPT_MAX_BUCKET_COMPARISONS", "50000")))
+
+# Heads that read as the subject of a concept rather than an incidental noun; used only
+# to break ties when choosing which member of a variant cluster becomes the canonical.
+PREFERRED_CANONICAL_HEADS = {
+    "education", "learning", "policy", "leadership", "students", "student",
+    "research", "health", "curriculum", "assessment",
+}
 
 STOP_WORDS = {
     "about", "after", "again", "against", "among", "also", "been", "before",
@@ -333,6 +348,221 @@ def cosine(a, b):
     if not denom:
         return 0.0
     return sum(x * y for x, y in zip(a, b)) / denom
+
+
+def stem_for_similarity(token):
+    """Strip common English plural suffixes for comparison only.
+
+    Mirrors ``stemForSim`` in src/conceptsPipeline.js so the Python worker and the
+    JavaScript pipeline cluster the same phrases the same way.
+    """
+    if len(token) > 5 and token.endswith("ies"):
+        return token[:-3] + "y"
+    if len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return token
+
+
+def phrase_stems(phrase):
+    return tuple(stem_for_similarity(token) for token in phrase.split())
+
+
+class DisjointSet:
+    """Union-find with path compression; deterministic and order independent."""
+
+    def __init__(self):
+        self.parent = {}
+
+    def add(self, item):
+        self.parent.setdefault(item, item)
+
+    def find(self, item):
+        root = item
+        while self.parent[root] != root:
+            root = self.parent[root]
+        while self.parent[item] != root:
+            self.parent[item], item = root, self.parent[item]
+        return root
+
+    def union(self, left, right):
+        self.add(left)
+        self.add(right)
+        left_root = self.find(left)
+        right_root = self.find(right)
+        if left_root == right_root:
+            return
+        # Attach the lexicographically larger root to the smaller one so the forest
+        # shape — and therefore every downstream iteration order — is reproducible.
+        if left_root > right_root:
+            left_root, right_root = right_root, left_root
+        self.parent[right_root] = left_root
+
+    def components(self):
+        grouped = {}
+        for item in self.parent:
+            grouped.setdefault(self.find(item), []).append(item)
+        return [sorted(members) for _, members in sorted(grouped.items())]
+
+
+def cluster_phrases(phrases, document_frequency):
+    """Group near-duplicate phrases into variant clusters.
+
+    Blocking, not all-pairs. Candidate phrases are 2-3 distinct tokens (enforced by
+    ``valid_label_expression``), which bounds the reachable Jaccard values and lets
+    every clustering rule be expressed as an exact bucket lookup:
+
+      R1 equivalence  - identical stemmed token *sets*. Catches plural forms
+                        ("learning community" / "learning communities") and token
+                        reorderings ("policy education" / "education policy").
+                        Bucket key: frozenset of stemmed tokens.
+      R2 head form    - same token count, identical stemmed modifiers in order, and
+                        one head stem is a proper prefix of the other (both >= 5
+                        characters). Catches "educational leader" / "educational
+                        leadership". Bucket key: the stemmed modifier tuple.
+      R3 extension    - a 2-gram whose stems are the first two stems of a 3-gram,
+                        when the pair is attested by at least
+                        VARIANT_EXTENSION_MIN_DOCUMENT_FREQUENCY documents. Catches
+                        "online learning" / "online learning environments".
+                        Bucket key: the 2-gram's stem pair.
+
+    Each rule is O(1) lookup or an output-sensitive scan, so total work is linear in
+    the phrase count plus the number of variant pairs actually found. Returns a list
+    of clusters (lists of phrases), each sorted, in deterministic order.
+    """
+    forest = DisjointSet()
+    for phrase in phrases:
+        forest.add(phrase)
+
+    equivalence_buckets = {}
+    modifier_buckets = {}
+    bigram_stems = {}
+    trigrams = []
+    for phrase in sorted(phrases):
+        stems = phrase_stems(phrase)
+        if not stems:
+            continue
+        equivalence_buckets.setdefault(frozenset(stems), []).append(phrase)
+        if len(stems) >= 2:
+            modifier_buckets.setdefault(stems[:-1], {}).setdefault(stems[-1], []).append(phrase)
+        if len(stems) == 2:
+            bigram_stems.setdefault(stems, []).append(phrase)
+        elif len(stems) == 3:
+            trigrams.append((phrase, stems))
+
+    # R1: every phrase in a bucket shares the same stemmed token set.
+    for members in equivalence_buckets.values():
+        for other in members[1:]:
+            forest.union(members[0], other)
+
+    # R2: inside one modifier bucket, sort the head stems. If head A is a prefix of
+    # head B then every string between them also carries that prefix, so the matches
+    # for A form a contiguous run and the forward scan can stop at the first miss.
+    for heads in modifier_buckets.values():
+        ordered = sorted(heads)
+        comparisons = 0
+        for index, head in enumerate(ordered):
+            if len(head) < 5:
+                continue
+            for other in ordered[index + 1:]:
+                comparisons += 1
+                if comparisons > MAX_BUCKET_COMPARISONS:
+                    break
+                if not other.startswith(head):
+                    break
+                forest.union(heads[head][0], heads[other][0])
+            if comparisons > MAX_BUCKET_COMPARISONS:
+                break
+
+    # R3: a 3-gram extends a 2-gram when the 2-gram's stems are its leading stems.
+    for phrase, stems in trigrams:
+        for shorter in bigram_stems.get(stems[:2], []):
+            attested = max(document_frequency.get(phrase, 0), document_frequency.get(shorter, 0))
+            if attested >= VARIANT_EXTENSION_MIN_DOCUMENT_FREQUENCY:
+                forest.union(shorter, phrase)
+
+    return forest.components()
+
+
+def pick_canonical(cluster, document_frequency):
+    """Choose the cluster member that represents it. Ported from pickCanonical()."""
+    def sort_key(phrase):
+        tokens = phrase.split()
+        head_bonus = 2 if tokens and tokens[-1] in PREFERRED_CANONICAL_HEADS else 0
+        length_score = 1 if len(tokens) == 2 else 0
+        score = (document_frequency.get(phrase, 0) * 100) + (head_bonus * 10) + length_score
+        # Ties fall back to the shorter phrase, then lexicographic order, so the
+        # winner never depends on iteration order.
+        return (-score, len(phrase), phrase)
+
+    return min(cluster, key=sort_key)
+
+
+def build_variant_map(concepts):
+    """Project concepts[].variants into the flat map the JS consumer resolves through.
+
+    Built from the *final* concept list so no variant can point at a canonical that
+    was dropped by a max-concept cut-off, and so no surviving canonical also appears
+    as a variant key. That second property matters: src/metrics.js resolves with
+    ``variantMap[term] || (canonicalSet.has(term) ? term : null)``, so a canonical
+    that leaked into the map would be silently redirected away from its own entry.
+    """
+    canonicals = {concept["canonical"] for concept in concepts}
+    variant_to_canonical = {}
+    for concept in concepts:
+        canonical = concept["canonical"]
+        kept = []
+        for variant in concept.get("variants") or []:
+            if variant == canonical or variant in canonicals:
+                continue
+            if variant in variant_to_canonical:
+                # Deterministic: the lexicographically smaller canonical keeps the variant.
+                if variant_to_canonical[variant] <= canonical:
+                    continue
+            variant_to_canonical[variant] = canonical
+            kept.append(variant)
+        concept["variants"] = sorted(kept)
+    # A variant may have lost its owner to the tie-break above; drop it from that
+    # concept so concepts[].variants and the map stay in exact agreement.
+    for concept in concepts:
+        concept["variants"] = sorted(
+            variant for variant in concept["variants"]
+            if variant_to_canonical.get(variant) == concept["canonical"]
+        )
+    return variant_to_canonical
+
+
+def assert_alias_invariants(artifact, context):
+    """Fail loudly if the alias map, the concept variants and stats.aliases disagree.
+
+    This is the guard against silently shipping an empty map again: the three
+    representations of the same clustering are cross-checked before publication.
+    """
+    variant_to_canonical = artifact.get("variantToCanonical")
+    if not isinstance(variant_to_canonical, dict):
+        raise ValueError(f"{context}: variantToCanonical must be an object.")
+    reported = artifact.get("stats", {}).get("aliases")
+    if reported != len(variant_to_canonical):
+        raise ValueError(
+            f"{context}: stats.aliases={reported} disagrees with "
+            f"{len(variant_to_canonical)} variantToCanonical entries."
+        )
+    concepts = artifact.get("concepts", [])
+    canonicals = {concept["canonical"] for concept in concepts}
+    projected = {}
+    for concept in concepts:
+        for variant in concept.get("variants") or []:
+            projected[variant] = concept["canonical"]
+    if projected != variant_to_canonical:
+        raise ValueError(
+            f"{context}: variantToCanonical does not match concepts[].variants "
+            f"({len(projected)} projected vs {len(variant_to_canonical)} mapped)."
+        )
+    for variant, canonical in variant_to_canonical.items():
+        if canonical not in canonicals:
+            raise ValueError(f"{context}: variant '{variant}' maps to missing canonical '{canonical}'.")
+        if variant in canonicals:
+            raise ValueError(f"{context}: '{variant}' is both a canonical and a variant key.")
+    return artifact
 
 
 def artifact_base_url():
@@ -918,8 +1148,10 @@ def merge_partition_artifacts(client):
            ORDER BY cp.priority DESC, cp.partition_key"""
     ).rows
     total_docs = 0
-    merged = {}
+    shard_doc_freq = {}
+    shard_score = {}
     partitions = []
+    relations = DisjointSet()
     for row in rows:
         artifact = json.loads(row["artifact_json"])
         total_docs += int(artifact.get("stats", {}).get("documents", 0))
@@ -928,35 +1160,59 @@ def merge_partition_artifacts(client):
             canonical = concept.get("canonical")
             if not canonical:
                 continue
-            target = merged.setdefault(canonical, {
-                "canonical": canonical, "variants": set(), "docFreq": 0,
-                "patternRankScore": 0.0, "source": "patternrank_partition_merge",
-            })
-            target["docFreq"] += int(concept.get("docFreq", 0))
-            target["patternRankScore"] = max(target["patternRankScore"], float(concept.get("patternRankScore", 0)))
-            target["variants"].update(concept.get("variants", []))
+            # Shards cover disjoint document sets, so per-shard frequencies simply add.
+            shard_doc_freq[canonical] = shard_doc_freq.get(canonical, 0) + int(concept.get("docFreq", 0))
+            shard_score[canonical] = max(shard_score.get(canonical, 0.0), float(concept.get("patternRankScore", 0)))
+            relations.add(canonical)
+            for variant in concept.get("variants", []) or []:
+                relations.union(variant, canonical)
+
+    # Cross-shard collision rule. Shard A may call a phrase a variant of X while shard
+    # B calls the same phrase a variant of Y, or promotes it to a canonical of its own.
+    # Last-write-wins would make the merged dictionary depend on partition iteration
+    # order, so instead every (variant, canonical) pair is treated as an undirected
+    # "these are the same concept" edge and the connected component is resolved as a
+    # whole. Two canonicals that share a variant genuinely are near-duplicates, so
+    # collapsing them is the correct reading of the evidence, not a lossy tie-break.
+    # Within a component the winner is the phrase with the highest summed document
+    # frequency, then the highest PatternRank score, then the lexicographically
+    # smallest phrase - a total order over data that is identical no matter which
+    # shard was merged first.
     concepts = []
-    for target in merged.values():
-        target["variants"] = sorted(target["variants"])
-        target["idf"] = math.log((total_docs + 1) / (target["docFreq"] + 1)) if total_docs else 0
-        target["patternRankScore"] = round(target["patternRankScore"], 4)
-        concepts.append(target)
+    for members in relations.components():
+        attested = [phrase for phrase in members if phrase in shard_doc_freq]
+        if not attested:
+            continue
+        canonical = min(
+            attested,
+            key=lambda phrase: (-shard_doc_freq.get(phrase, 0), -shard_score.get(phrase, 0.0), phrase),
+        )
+        doc_freq = sum(shard_doc_freq.get(phrase, 0) for phrase in members)
+        concepts.append({
+            "canonical": canonical,
+            "variants": sorted(phrase for phrase in members if phrase != canonical),
+            "docFreq": doc_freq,
+            "idf": math.log((total_docs + 1) / (doc_freq + 1)) if total_docs else 0,
+            "patternRankScore": round(max((shard_score.get(phrase, 0.0) for phrase in members), default=0.0), 4),
+            "source": "patternrank_partition_merge",
+        })
     concepts.sort(key=lambda concept: (-concept["docFreq"], -concept["patternRankScore"], concept["canonical"]))
     concepts = concepts[:MAX_GLOBAL_CONCEPTS]
+    variant_to_canonical = build_variant_map(concepts)
     generated_at = utc_now()
-    return {
+    return assert_alias_invariants({
         "version": 3,
         "generatedAt": generated_at,
         "source": {"documents": total_docs, "method": "patternrank_incremental", "model": MODEL_NAME, "partitions": partitions},
         "stats": {
             "candidatePhrases": len(concepts), "qualityFilteredPhrases": len(concepts),
             "concepts": len(concepts), "singleDocConcepts": sum(1 for concept in concepts if concept["docFreq"] == 1),
-            "aliases": 0, "patternRankRejected": 0, "documents": total_docs, "failed": 0,
+            "aliases": len(variant_to_canonical), "patternRankRejected": 0, "documents": total_docs, "failed": 0,
             "partitions": len(partitions),
         },
         "concepts": concepts,
-        "variantToCanonical": {},
-    }
+        "variantToCanonical": variant_to_canonical,
+    }, "merged concept artifact")
 
 
 def main():
@@ -1002,6 +1258,7 @@ def main():
                 "documents": merged_artifact["stats"]["documents"],
                 "partitions": readiness["total"], "partitionsPending": 0,
                 "mergedConcepts": len(merged_artifact["concepts"]),
+                "mergedAliases": merged_artifact["stats"]["aliases"],
                 "globalPublished": True, "publicationOnly": True,
                 "warnings": selected.get("warnings") or [],
                 "method": "patternrank_incremental",
@@ -1148,27 +1405,43 @@ def main():
         for idx, phrases_for_doc in enumerate(accepted_by_doc):
             for phrase in phrases_for_doc:
                 accepted_docs.setdefault(phrase, set()).add(idx)
+        # Cluster variants inside this partition only. The phrase set is bounded by the
+        # partition's own accepted candidates, so the work never scales with the corpus.
+        phrase_document_frequency = {phrase: len(ids) for phrase, ids in accepted_docs.items()}
+        clusters = cluster_phrases(set(accepted_docs), phrase_document_frequency)
         concepts = []
-        for phrase, ids in accepted_docs.items():
+        for cluster in clusters:
+            canonical = pick_canonical(cluster, phrase_document_frequency)
+            # Merge the document sets rather than the counts: a document mentioning both
+            # a variant and its canonical must only be counted once.
+            cluster_docs = set()
+            for phrase in cluster:
+                cluster_docs |= accepted_docs.get(phrase, set())
             concepts.append({
-                "canonical": phrase, "variants": [], "docFreq": len(ids),
-                "idf": math.log((len(docs) + 1) / (len(ids) + 1)),
-                "patternRankScore": round(float(phrase_scores.get(phrase, 0)), 4),
+                "canonical": canonical,
+                "variants": sorted(phrase for phrase in cluster if phrase != canonical),
+                "docFreq": len(cluster_docs),
+                "idf": math.log((len(docs) + 1) / (len(cluster_docs) + 1)),
+                "patternRankScore": round(float(max(phrase_scores.get(phrase, 0) for phrase in cluster)), 4),
                 "source": "patternrank_partition",
             })
         concepts.sort(key=lambda concept: (-concept["docFreq"], -concept["patternRankScore"], concept["canonical"]))
         concepts = concepts[:MAX_PARTITION_CONCEPTS]
+        variant_to_canonical = build_variant_map(concepts)
         artifact = {
             "version": 3, "generatedAt": utc_now(),
             "source": {"documents": len(docs), "method": "patternrank_incremental", "model": MODEL_NAME, "scope": scope},
             "stats": {
                 "candidatePhrases": len(phrase_docs), "qualityFilteredPhrases": len(accepted_docs),
-                "concepts": len(concepts), "singleDocConcepts": 0, "aliases": 0,
+                "concepts": len(concepts),
+                "singleDocConcepts": sum(1 for concept in concepts if concept["docFreq"] == 1),
+                "aliases": len(variant_to_canonical),
                 "patternRankRejected": rejected_rank, "documentFrequencyRejected": rejected_gate,
                 "documents": len(docs), "documentsChanged": len(changed_docs), "documentsReused": reused, "failed": failures,
             },
-            "concepts": concepts, "variantToCanonical": {},
+            "concepts": concepts, "variantToCanonical": variant_to_canonical,
         }
+        assert_alias_invariants(artifact, f"partition {key} concept artifact")
         version = save_partition_artifact(client, key, scope, artifact)
         readiness = global_partition_readiness(client)
         merged_artifact = None
@@ -1209,7 +1482,9 @@ def main():
             "candidates": len(phrase_docs), "accepted": len(accepted_docs), "rejected": rejected_rank + rejected_gate,
             "concepts": len(concepts),
             "mergedConcepts": len(merged_artifact["concepts"]) if merged_artifact else None,
-            "globalPublished": should_publish, "partitionsPending": readiness["pending"], "aliases": 0,
+            "globalPublished": should_publish, "partitionsPending": readiness["pending"],
+            "aliases": len(variant_to_canonical),
+            "mergedAliases": merged_artifact["stats"]["aliases"] if merged_artifact else None,
             "failed": failures, "method": "patternrank_incremental", "model": MODEL_NAME,
         }
         reporter.report("complete", "Complete", status="completed", detail=f"Completed {key} version {version}.", counts=result)
