@@ -313,6 +313,75 @@ test('cached full-text recomputation replaces stale PDF provenance', async () =>
   }
 });
 
+// Valid single-page PDF whose only content is a filled rectangle: no text
+// operators at all, i.e. what a scanned / image-only dissertation looks like.
+async function writeScannedImageOnlyPdf(filePath) {
+  const stream = 'q 0.6 g 72 72 468 648 re f Q';
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>',
+    `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+  ];
+  let body = '%PDF-1.4\n';
+  const offsets = [0];
+  for (let i = 0; i < objects.length; i += 1) {
+    offsets.push(Buffer.byteLength(body));
+    body += `${i + 1} 0 obj\n${objects[i]}\nendobj\n`;
+  }
+  const xrefOffset = Buffer.byteLength(body);
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i < offsets.length; i += 1) {
+    body += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+  }
+  body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  await fs.writeFile(filePath, body, 'binary');
+}
+
+// The cache_reanalyze_doc job hands analyzeDocumentFile a doc that already
+// carries an accurate dspace_full_text word count. Reanalyzing an image-only
+// cached PDF produces no word count of its own, so it must leave both the count
+// and its provenance alone -- restamping it degraded_pdf_text would drop an
+// accurate number out of every reliable-word aggregate.
+test('recomputing an image-only cached PDF keeps the existing word count and its provenance', async () => {
+  const docId = `image-only-recompute-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const tempDir = await fs.mkdtemp(`${os.tmpdir()}/oc-image-only-test-`);
+  const pdfPath = `${tempDir}/scanned.pdf`;
+  await writeScannedImageOnlyPdf(pdfPath);
+
+  try {
+    await saveFileMetric(docId, {
+      status: 'cached',
+      pdfPath,
+      wordCount: 82_314,
+      wordSource: 'dspace_full_text',
+      pageCount: 240,
+      pageSource: 'estimated_from_full_text_words',
+      parserVersion: 'pdf-v1',
+    });
+
+    const doc = { id: docId, wordCount: 82_314, wordCountSource: 'dspace_full_text' };
+    await analyzeDocumentFile(doc, {
+      contentMode: 'pdf_cache',
+      downloadFiles: false,
+      forceDownload: false,
+      recomputeFromCache: true,
+      extractCommittee: false,
+      extractCitations: false,
+    });
+
+    assert.equal(doc.downloadStatus, 'recomputed_from_cache');
+    assert.equal(doc.wordCount, 82_314);
+    assert.equal(doc.wordCountSource, 'dspace_full_text');
+
+    const stored = await loadStoredFileMetric(docId);
+    assert.equal(Number(stored.word_count), 82_314);
+    assert.equal(stored.word_source, 'dspace_full_text');
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 async function listPdfStreamTempDirs() {
   return new Set((await fs.readdir(os.tmpdir())).filter((name) => name.startsWith('oc-pdf-stream-')));
 }

@@ -426,8 +426,10 @@ def cluster_phrases(phrases, document_frequency):
                         Bucket key: the 2-gram's stem pair.
 
     Each rule is O(1) lookup or an output-sensitive scan, so total work is linear in
-    the phrase count plus the number of variant pairs actually found. Returns a list
-    of clusters (lists of phrases), each sorted, in deterministic order.
+    the phrase count plus the number of variant pairs actually found. Returns
+    ``(clusters, telemetry)``: the clusters (lists of phrases), each sorted, in
+    deterministic order, and a dict recording how much of R2 the comparison budget
+    cut short.
     """
     forest = DisjointSet()
     for phrase in phrases:
@@ -457,20 +459,35 @@ def cluster_phrases(phrases, document_frequency):
     # R2: inside one modifier bucket, sort the head stems. If head A is a prefix of
     # head B then every string between them also carries that prefix, so the matches
     # for A form a contiguous run and the forward scan can stop at the first miss.
+    # MAX_BUCKET_COMPARISONS is a safety valve against a pathological bucket, but
+    # tripping it discards legitimate merges: the current head is abandoned mid-run
+    # and so is every head after it. Because ``ordered`` is sorted, the casualties
+    # are always the lexicographically later heads, which makes the loss structural
+    # rather than random and lets clustering drift between incremental rebuilds.
+    # Count it so an operator can see clustering was truncated and raise the budget.
+    truncated_buckets = 0
+    truncated_heads = 0
     for heads in modifier_buckets.values():
         ordered = sorted(heads)
         comparisons = 0
         for index, head in enumerate(ordered):
             if len(head) < 5:
                 continue
-            for other in ordered[index + 1:]:
+            # Walk by position. ``ordered[index + 1:]`` copied the whole bucket tail
+            # for every head before comparing anything -- work the comparison budget
+            # cannot see, so it cannot bound it either (60k phrases in one bucket
+            # with no prefix relations spent ~15s purely copying).
+            for offset in range(index + 1, len(ordered)):
                 comparisons += 1
                 if comparisons > MAX_BUCKET_COMPARISONS:
                     break
+                other = ordered[offset]
                 if not other.startswith(head):
                     break
                 forest.union(heads[head][0], heads[other][0])
             if comparisons > MAX_BUCKET_COMPARISONS:
+                truncated_buckets += 1
+                truncated_heads += len(ordered) - index
                 break
 
     # R3: a 3-gram extends a 2-gram when the 2-gram's stems are its leading stems.
@@ -480,7 +497,11 @@ def cluster_phrases(phrases, document_frequency):
             if attested >= VARIANT_EXTENSION_MIN_DOCUMENT_FREQUENCY:
                 forest.union(shorter, phrase)
 
-    return forest.components()
+    return forest.components(), {
+        "truncatedBuckets": truncated_buckets,
+        "truncatedHeads": truncated_heads,
+        "comparisonBudget": MAX_BUCKET_COMPARISONS,
+    }
 
 
 def pick_canonical(cluster, document_frequency):
@@ -562,6 +583,31 @@ def assert_alias_invariants(artifact, context):
             raise ValueError(f"{context}: variant '{variant}' maps to missing canonical '{canonical}'.")
         if variant in canonicals:
             raise ValueError(f"{context}: '{variant}' is both a canonical and a variant key.")
+    return artifact
+
+
+def assert_document_frequency_invariants(artifact, context):
+    """Fail loudly if any concept claims more documents than the corpus holds.
+
+    docFreq is a count of distinct documents, so it can never exceed the document
+    total, and idf = log((N + 1) / (df + 1)) can therefore never be negative. A
+    negative idf is not merely odd: src/metrics.js multiplies it by the mention
+    count, so the concept scores below the assignment gate and disappears from
+    document assignment entirely. Catch it here rather than in the dashboard.
+    """
+    total_docs = int(artifact.get("stats", {}).get("documents", 0) or 0)
+    for concept in artifact.get("concepts", []):
+        doc_freq = int(concept.get("docFreq", 0) or 0)
+        idf = float(concept.get("idf", 0) or 0)
+        if doc_freq > total_docs:
+            raise ValueError(
+                f"{context}: concept '{concept.get('canonical')}' claims docFreq={doc_freq} "
+                f"across only {total_docs} documents."
+            )
+        if idf < 0:
+            raise ValueError(
+                f"{context}: concept '{concept.get('canonical')}' has negative idf={idf}."
+            )
     return artifact
 
 
@@ -1139,6 +1185,37 @@ def save_partition_artifact(client, key, scope, artifact):
     return version
 
 
+def merged_component_doc_freq(members, shards, total_docs):
+    """Distinct documents mentioning any phrase in a merged component.
+
+    Summing per-shard docFreq is wrong. Shards are disjoint in *documents*, but a
+    merged component routinely contains two phrases that both came from the same
+    shard -- that is precisely what the merge does, gluing together canonicals a
+    shard deliberately kept apart. A document mentioning both is then counted
+    twice, docFreq climbs past the corpus size, and idf goes negative.
+
+    So union within each shard and only then add across shards. A shard artifact
+    carries docIndexes (its concept's own document indexes, local to that shard),
+    which makes the within-shard union exact. Artifacts written before that field
+    existed fall back to an upper bound clamped to the shard's own document count,
+    which is what keeps docFreq <= total_docs and idf >= 0.
+    """
+    total = 0
+    for shard in shards:
+        present = [phrase for phrase in members if phrase in shard["docFreq"]]
+        if not present:
+            continue
+        indexed = [shard["docIndexes"][phrase] for phrase in present if phrase in shard["docIndexes"]]
+        if len(indexed) == len(present):
+            total += len(set().union(*indexed))
+            continue
+        total += min(
+            sum(shard["docFreq"][phrase] for phrase in present),
+            shard["documents"],
+        )
+    return min(total, total_docs)
+
+
 def merge_partition_artifacts(client):
     rows = client.execute(
         """SELECT cpa.artifact_json
@@ -1148,24 +1225,42 @@ def merge_partition_artifacts(client):
            ORDER BY cp.priority DESC, cp.partition_key"""
     ).rows
     total_docs = 0
+    truncated_buckets = 0
+    truncated_heads = 0
     shard_doc_freq = {}
     shard_score = {}
+    shards = []
     partitions = []
     relations = DisjointSet()
     for row in rows:
         artifact = json.loads(row["artifact_json"])
-        total_docs += int(artifact.get("stats", {}).get("documents", 0))
+        stats = artifact.get("stats", {})
+        documents = int(stats.get("documents", 0))
+        total_docs += documents
+        # Carry each shard's R2 truncation forward: the merged dictionary is where an
+        # operator looks, and under-clustering in any shard shows up there.
+        truncated_buckets += int(stats.get("clusterTruncatedBuckets", 0) or 0)
+        truncated_heads += int(stats.get("clusterTruncatedHeads", 0) or 0)
         partitions.append(artifact.get("partition", {}))
+        shard = {"documents": documents, "docFreq": {}, "docIndexes": {}}
         for concept in artifact.get("concepts", []):
             canonical = concept.get("canonical")
             if not canonical:
                 continue
-            # Shards cover disjoint document sets, so per-shard frequencies simply add.
-            shard_doc_freq[canonical] = shard_doc_freq.get(canonical, 0) + int(concept.get("docFreq", 0))
+            doc_freq = int(concept.get("docFreq", 0))
+            shard["docFreq"][canonical] = doc_freq
+            indexes = concept.get("docIndexes")
+            if isinstance(indexes, list):
+                shard["docIndexes"][canonical] = {int(index) for index in indexes}
+            # A canonical appears at most once per shard, so summing this key across
+            # shards - which really are document-disjoint - is sound. Only the
+            # component-level roll-up below has to union instead of add.
+            shard_doc_freq[canonical] = shard_doc_freq.get(canonical, 0) + doc_freq
             shard_score[canonical] = max(shard_score.get(canonical, 0.0), float(concept.get("patternRankScore", 0)))
             relations.add(canonical)
             for variant in concept.get("variants", []) or []:
                 relations.union(variant, canonical)
+        shards.append(shard)
 
     # Cross-shard collision rule. Shard A may call a phrase a variant of X while shard
     # B calls the same phrase a variant of Y, or promotes it to a canonical of its own.
@@ -1187,12 +1282,15 @@ def merge_partition_artifacts(client):
             attested,
             key=lambda phrase: (-shard_doc_freq.get(phrase, 0), -shard_score.get(phrase, 0.0), phrase),
         )
-        doc_freq = sum(shard_doc_freq.get(phrase, 0) for phrase in members)
+        doc_freq = merged_component_doc_freq(members, shards, total_docs)
         concepts.append({
             "canonical": canonical,
             "variants": sorted(phrase for phrase in members if phrase != canonical),
             "docFreq": doc_freq,
-            "idf": math.log((total_docs + 1) / (doc_freq + 1)) if total_docs else 0,
+            # doc_freq <= total_docs is guaranteed above, so this is already >= 0;
+            # max() is belt and braces against a future change reintroducing the
+            # negative idf that silently drops concepts at the assignment gate.
+            "idf": max(0.0, math.log((total_docs + 1) / (doc_freq + 1))) if total_docs else 0,
             "patternRankScore": round(max((shard_score.get(phrase, 0.0) for phrase in members), default=0.0), 4),
             "source": "patternrank_partition_merge",
         })
@@ -1200,19 +1298,25 @@ def merge_partition_artifacts(client):
     concepts = concepts[:MAX_GLOBAL_CONCEPTS]
     variant_to_canonical = build_variant_map(concepts)
     generated_at = utc_now()
-    return assert_alias_invariants({
+    merged = {
         "version": 3,
         "generatedAt": generated_at,
         "source": {"documents": total_docs, "method": "patternrank_incremental", "model": MODEL_NAME, "partitions": partitions},
         "stats": {
             "candidatePhrases": len(concepts), "qualityFilteredPhrases": len(concepts),
+            # Now that docFreq is a real distinct-document count, a concept seen in
+            # exactly one document is again exactly the ones this counts. The old
+            # summed docFreq inflated components past 1 and undercounted this.
             "concepts": len(concepts), "singleDocConcepts": sum(1 for concept in concepts if concept["docFreq"] == 1),
             "aliases": len(variant_to_canonical), "patternRankRejected": 0, "documents": total_docs, "failed": 0,
+            "clusterTruncatedBuckets": truncated_buckets, "clusterTruncatedHeads": truncated_heads,
             "partitions": len(partitions),
         },
         "concepts": concepts,
         "variantToCanonical": variant_to_canonical,
-    }, "merged concept artifact")
+    }
+    assert_document_frequency_invariants(merged, "merged concept artifact")
+    return assert_alias_invariants(merged, "merged concept artifact")
 
 
 def main():
@@ -1408,7 +1512,14 @@ def main():
         # Cluster variants inside this partition only. The phrase set is bounded by the
         # partition's own accepted candidates, so the work never scales with the corpus.
         phrase_document_frequency = {phrase: len(ids) for phrase, ids in accepted_docs.items()}
-        clusters = cluster_phrases(set(accepted_docs), phrase_document_frequency)
+        clusters, cluster_truncation = cluster_phrases(set(accepted_docs), phrase_document_frequency)
+        if cluster_truncation["truncatedBuckets"]:
+            reporter.append_log(
+                f"Variant clustering hit the {cluster_truncation['comparisonBudget']}-comparison budget in "
+                f"{cluster_truncation['truncatedBuckets']} modifier bucket(s) of partition {key}, abandoning "
+                f"{cluster_truncation['truncatedHeads']} head form(s). Legitimate variants were left unmerged, "
+                "always the lexicographically later ones. Raise CONCEPT_MAX_BUCKET_COMPARISONS to cluster them.\n"
+            )
         concepts = []
         for cluster in clusters:
             canonical = pick_canonical(cluster, phrase_document_frequency)
@@ -1421,6 +1532,13 @@ def main():
                 "canonical": canonical,
                 "variants": sorted(phrase for phrase in cluster if phrase != canonical),
                 "docFreq": len(cluster_docs),
+                # Document indexes local to this partition. The merge needs them to
+                # union document sets across a component whose phrases came from the
+                # same shard; counts alone cannot be unioned and double count. Total
+                # size is bounded by TOP_CANDIDATES_PER_DOC * len(docs) indexes across
+                # the whole artifact, because that is how many (phrase, document)
+                # pairs the ranking stage can accept.
+                "docIndexes": sorted(cluster_docs),
                 "idf": math.log((len(docs) + 1) / (len(cluster_docs) + 1)),
                 "patternRankScore": round(float(max(phrase_scores.get(phrase, 0) for phrase in cluster)), 4),
                 "source": "patternrank_partition",
@@ -1437,11 +1555,17 @@ def main():
                 "singleDocConcepts": sum(1 for concept in concepts if concept["docFreq"] == 1),
                 "aliases": len(variant_to_canonical),
                 "patternRankRejected": rejected_rank, "documentFrequencyRejected": rejected_gate,
+                # Non-zero means MAX_BUCKET_COMPARISONS stopped R2 early and this
+                # partition is under-clustered: legitimate variants were left as
+                # separate concepts, always the lexicographically later head forms.
+                "clusterTruncatedBuckets": cluster_truncation["truncatedBuckets"],
+                "clusterTruncatedHeads": cluster_truncation["truncatedHeads"],
                 "documents": len(docs), "documentsChanged": len(changed_docs), "documentsReused": reused, "failed": failures,
             },
             "concepts": concepts, "variantToCanonical": variant_to_canonical,
         }
         assert_alias_invariants(artifact, f"partition {key} concept artifact")
+        assert_document_frequency_invariants(artifact, f"partition {key} concept artifact")
         version = save_partition_artifact(client, key, scope, artifact)
         readiness = global_partition_readiness(client)
         merged_artifact = None

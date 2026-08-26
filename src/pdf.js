@@ -21,6 +21,8 @@ import { isImportContentMode } from './importRules.js';
 // Recorded as file_metrics.word_source when pdftotext could not produce text
 // and we fell back to scraping raw PDF bytes. Treated as unreliable everywhere
 // word counts are aggregated, so a degraded parse cannot masquerade as a good one.
+// It describes a count the degraded parse itself produced -- a PDF that simply
+// has no text layer produces no count and keeps whatever provenance it had.
 export const DEGRADED_WORD_SOURCE = 'degraded_pdf_text';
 
 let downloadSafetyOptions = {};
@@ -598,27 +600,63 @@ export function extractBodyWordCount(text) {
   return count || null;
 }
 
+// How an extraction attempt ended. These are two genuinely different outcomes and
+// only the last one is degraded:
+//   'ok'               - pdftotext read a text layer; we are using its output.
+//   'empty_text_layer' - pdftotext ran, exited clean, and correctly reported that
+//                        the PDF carries no text at all. That is the right answer
+//                        for a scanned / image-only dissertation, not a failure:
+//                        there is no word count, and nothing to distrust.
+//   'extraction_failed'- pdftotext was unavailable or errored, or we are serving
+//                        raw-byte-scanner output instead of real extraction.
+const EXTRACTION_OK = 'ok';
+const EXTRACTION_EMPTY_TEXT_LAYER = 'empty_text_layer';
+const EXTRACTION_FAILED = 'extraction_failed';
+
 // The raw-byte fallback only sees uncompressed Tj/TJ operators, so for a real
-// (FlateDecode) dissertation it recovers almost nothing. Every caller of this
-// path is therefore producing degraded output and must say so.
-function degradedPdfText(bytes, reason) {
+// (FlateDecode) dissertation it recovers almost nothing. Whenever we serve its
+// output -- or could not extract at all -- the result is degraded and must say
+// so. `pdftotextFailed: false` means pdftotext itself exited clean and simply
+// found nothing, which is a correct result rather than a degraded one.
+function fallbackPdfText(bytes, reason, { pdftotextFailed = true } = {}) {
   const text = bytes ? extractPdfTextFallback(bytes) : '';
-  logger.warn('pdftotext extraction degraded, using raw-byte fallback', {
-    reason,
-    chars: text.length
-  });
+
+  if (!text && !pdftotextFailed) {
+    logger.info('pdftotext found no text layer in PDF', { reason });
+    return {
+      text: null,
+      wordCount: null,
+      bodyWordCount: null,
+      textSource: EXTRACTION_EMPTY_TEXT_LAYER,
+      extractionStatus: EXTRACTION_EMPTY_TEXT_LAYER,
+      degraded: false
+    };
+  }
+
+  // Say what actually happened: with no bytes in hand the raw-byte scanner never
+  // ran at all, and claiming otherwise sends operators looking for output that
+  // was never produced.
+  logger.warn(
+    text
+      ? 'pdftotext extraction degraded, using raw-byte fallback'
+      : bytes
+        ? 'pdftotext extraction failed and the raw-byte fallback recovered no text'
+        : 'pdftotext extraction failed and no bytes were available for the raw-byte fallback',
+    { reason, chars: text.length }
+  );
   return {
     text: text || null,
     wordCount: wordCountFromText(text),
     bodyWordCount: extractBodyWordCount(text),
     textSource: text ? 'raw_bytes_fallback' : 'none',
+    extractionStatus: EXTRACTION_FAILED,
     degraded: true
   };
 }
 
 async function extractPdfText(filePath, bytes = null) {
   if (!(await ensurePdftotextAvailability())) {
-    return degradedPdfText(bytes, 'pdftotext_unavailable');
+    return fallbackPdfText(bytes, 'pdftotext_unavailable');
   }
   // Write to a temp file instead of piping through stdout: a dissertation's text
   // routinely exceeds execFile's 1 MB default maxBuffer, and a truncated pipe
@@ -628,16 +666,19 @@ async function extractPdfText(filePath, bytes = null) {
   try {
     await execFileAsync('pdftotext', ['-enc', 'UTF-8', filePath, tmpFile]);
     const text = await fs.readFile(tmpFile, 'utf8');
-    if (!text.trim()) return degradedPdfText(bytes, 'pdftotext_returned_no_text');
+    if (!text.trim()) {
+      return fallbackPdfText(bytes, 'pdftotext_returned_no_text', { pdftotextFailed: false });
+    }
     return {
       text,
       wordCount: wordCountFromText(text) || null,
       bodyWordCount: extractBodyWordCount(text),
       textSource: 'pdftotext',
+      extractionStatus: EXTRACTION_OK,
       degraded: false
     };
   } catch (err) {
-    return degradedPdfText(bytes, err?.message || String(err));
+    return fallbackPdfText(bytes, err?.message || String(err));
   } finally {
     await fs.unlink(tmpFile).catch(() => {});
   }
@@ -667,7 +708,9 @@ export async function analyzePdfAtPath(pdfPath, bytes) {
     fallbackBytes ||= await fs.readFile(pdfPath);
     pageCount = countPdfPagesFromBuffer(fallbackBytes);
   }
-  const { text, wordCount, bodyWordCount, textSource, degraded } = await extractPdfText(pdfPath, fallbackBytes);
+  const {
+    text, wordCount, bodyWordCount, textSource, extractionStatus, degraded
+  } = await extractPdfText(pdfPath, fallbackBytes);
   return {
     pageCount: pageCount || null,
     wordCount: wordCount || null,
@@ -675,8 +718,22 @@ export async function analyzePdfAtPath(pdfPath, bytes) {
     fileBytes: fileSize,
     fullText: text || null,
     textSource,
+    extractionStatus,
     degraded
   };
+}
+
+// The degraded stamp describes a word count, so it may only ever be applied to a
+// word count this analysis actually produced. Stamping it unconditionally
+// relabels whatever `doc` already carried -- a metadata count, or an accurate
+// `dspace_full_text` count -- and silently drops that number out of every
+// reliable-word aggregate (see reliableWords in db.js, hasReliableWordCount in
+// metrics.js). An image-only PDF yields no count at all, so it must leave the
+// existing provenance untouched.
+function applyAnalysisWordCount(doc, analysis, source) {
+  if (!analysis.wordCount) return;
+  doc.wordCount = analysis.wordCount;
+  doc.wordCountSource = analysis.degraded ? DEGRADED_WORD_SOURCE : source;
 }
 
 function wordCountFromText(text) {
@@ -2117,11 +2174,7 @@ export async function analyzeDocumentFile(doc, options) {
           doc.pages = analysis.pageCount;
           doc.pagesSource = 'streamed_pdf';
         }
-        if (analysis.wordCount) {
-          doc.wordCount = analysis.wordCount;
-          doc.wordCountSource = 'streamed_pdf_text';
-        }
-        if (analysis.degraded) doc.wordCountSource = DEGRADED_WORD_SOURCE;
+        applyAnalysisWordCount(doc, analysis, 'streamed_pdf_text');
         if (analysis.bodyWordCount) doc.bodyWordCount = analysis.bodyWordCount;
         doc.fileBytes = analysis.fileBytes;
         doc.downloadUrl = streamed.downloadUrl;
@@ -2246,11 +2299,7 @@ export async function analyzeDocumentFile(doc, options) {
         doc.pages = analysis.pageCount;
         doc.pagesSource = 'cached_pdf';
       }
-      if (analysis.wordCount) {
-        doc.wordCount = analysis.wordCount;
-        doc.wordCountSource = 'cached_pdf_text';
-      }
-      if (analysis.degraded) doc.wordCountSource = DEGRADED_WORD_SOURCE;
+      applyAnalysisWordCount(doc, analysis, 'cached_pdf_text');
       if (analysis.bodyWordCount) {
         doc.bodyWordCount = analysis.bodyWordCount;
       }
@@ -2396,11 +2445,7 @@ export async function analyzeDocumentFile(doc, options) {
         doc.pages = analysis.pageCount;
         doc.pagesSource = 'downloaded_pdf';
       }
-      if (analysis.wordCount) {
-        doc.wordCount = analysis.wordCount;
-        doc.wordCountSource = 'downloaded_pdf_text';
-      }
-      if (analysis.degraded) doc.wordCountSource = DEGRADED_WORD_SOURCE;
+      applyAnalysisWordCount(doc, analysis, 'downloaded_pdf_text');
       if (analysis.bodyWordCount) {
         doc.bodyWordCount = analysis.bodyWordCount;
       }

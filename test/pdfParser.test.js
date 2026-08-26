@@ -40,6 +40,32 @@ async function writeOnePagePdfWithExtraPageToken(filePath) {
   await fs.writeFile(filePath, body, 'binary');
 }
 
+// Writes a valid single-page PDF whose only content is a filled rectangle: no
+// text operators anywhere, i.e. exactly what a scanned / image-only dissertation
+// looks like to pdftotext. pdftotext reads it fine and exits 0 with no text.
+async function writeScannedImageOnlyPdf(filePath) {
+  const stream = 'q 0.6 g 72 72 468 648 re f Q';
+  const objects = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>',
+    `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+  ];
+  let body = '%PDF-1.4\n';
+  const offsets = [0];
+  for (let i = 0; i < objects.length; i += 1) {
+    offsets.push(Buffer.byteLength(body));
+    body += `${i + 1} 0 obj\n${objects[i]}\nendobj\n`;
+  }
+  const xrefOffset = Buffer.byteLength(body);
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  for (let i = 1; i < offsets.length; i += 1) {
+    body += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+  }
+  body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF\n`;
+  await fs.writeFile(filePath, body, 'binary');
+}
+
 // Writes a multi-page PDF whose content streams are FlateDecode-compressed, so
 // the raw-byte Tj/TJ fallback can recover nothing and only pdftotext can read it.
 // Sized so the extracted text is comfortably over execFile's 1 MB stdout limit.
@@ -313,6 +339,52 @@ test('analyzePdfAtPath reports degraded extraction with no recoverable text', as
     assert.equal(result.textSource, 'none');
     assert.equal(result.fullText, null);
     assert.equal(result.wordCount, null);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+// A scanned / image-only dissertation is a large, systematic population in a
+// cIRcle-style archive, not an edge case. pdftotext succeeding and correctly
+// reporting "no text layer" is an accurate result, so it must not be reported as
+// a degraded parse -- `degraded` is what relabels a word count as untrustworthy.
+test('analyzePdfAtPath reports an image-only PDF as an empty text layer, not degraded', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf-image-only-'));
+  const pdfPath = path.join(dir, 'scanned.pdf');
+  try {
+    await writeScannedImageOnlyPdf(pdfPath);
+    const bytes = await fs.readFile(pdfPath);
+    // Both with and without bytes in hand: having bytes must not tip a clean
+    // "no text layer" answer into the degraded raw-byte path.
+    for (const result of [
+      await analyzePdfAtPath(pdfPath),
+      await analyzePdfAtPath(pdfPath, bytes),
+    ]) {
+      assert.equal(result.pageCount, 1);
+      assert.equal(result.degraded, false);
+      assert.equal(result.extractionStatus, 'empty_text_layer');
+      assert.equal(result.textSource, 'empty_text_layer');
+      assert.equal(result.wordCount, null);
+      assert.equal(result.bodyWordCount, null);
+      assert.equal(result.fullText, null);
+    }
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('a failed extraction is reported as extraction_failed, not an empty text layer', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf-extraction-failed-'));
+  const pdfPath = path.join(dir, 'broken.pdf');
+  try {
+    const bytes = Buffer.from('not really a pdf\nBT (Hidden fallback words here) Tj ET\n', 'latin1');
+    await fs.writeFile(pdfPath, bytes);
+    assert.equal((await analyzePdfAtPath(pdfPath, bytes)).extractionStatus, 'extraction_failed');
+    // Callers that pass no bytes reach the same verdict: pdfinfo also fails on an
+    // unreadable file, so analyzePdfAtPath reads the bytes itself for the page scan.
+    const withoutBytes = await analyzePdfAtPath(pdfPath);
+    assert.equal(withoutBytes.extractionStatus, 'extraction_failed');
+    assert.equal(withoutBytes.degraded, true);
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }

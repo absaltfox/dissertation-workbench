@@ -853,6 +853,182 @@ print(json.dumps({
   assert.equal(baseline.aliases, 3);
 });
 
+// Shards are disjoint in documents, but a merged component routinely contains two
+// phrases that both came from the SAME shard -- that is exactly what the merge
+// does. Summing per-shard docFreq then counts a document that mentions both twice,
+// docFreq climbs past the corpus size, and idf = log((N+1)/(df+1)) goes negative.
+// src/metrics.js takes a negative idf verbatim, so score = count * idf + lengthBonus
+// falls under the >= 1.2 assignment gate and the concept vanishes from every
+// document.
+test('PatternRank merge unions document sets across a component instead of summing counts', async () => {
+  const mergeDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-docfreq-'));
+  const harnessPath = path.join(mergeDir, 'docfreq_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+client = bc.SqliteClientWrapper(sys.argv[2])
+bc.ensure_incremental_schema(client)
+for shard in json.loads(sys.argv[3]):
+    documents = shard["artifact"]["stats"]["documents"]
+    client.execute(
+        "INSERT OR REPLACE INTO concept_partitions (partition_key, scope_json, priority, enabled,"
+        " status, source_document_count, artifact_version, updated_at)"
+        " VALUES (?, '{}', 1, 1, 'complete', ?, 1, '2026-01-01T00:00:00+00:00')",
+        [shard["key"], documents],
+    )
+    client.execute(
+        "INSERT OR REPLACE INTO concept_partition_artifacts (partition_key, version, artifact_json,"
+        " document_count, created_at) VALUES (?, 1, ?, ?, '2026-01-01T00:00:00+00:00')",
+        [shard["key"], json.dumps(shard["artifact"]), documents],
+    )
+merged = bc.merge_partition_artifacts(client)
+print(json.dumps({
+    "documents": merged["stats"]["documents"],
+    "singleDocConcepts": merged["stats"]["singleDocConcepts"],
+    "concepts": [[c["canonical"], c["docFreq"], round(c["idf"], 4)] for c in merged["concepts"]],
+}, sort_keys=True))
+`, 'utf8');
+
+  const range = (start, end) => Array.from({ length: end - start }, (_, i) => start + i);
+  // Three 10-document shards, 30 documents in all. "student leader(ship|s)" is one
+  // concept split across shards; alpha and gamma each attest two of its phrases
+  // from the same shard, which is where the double counting comes from. "solar
+  // kiln"/"solar kilns" are two alpha canonicals joined only because they share the
+  // variant "solar kilning" -- both live in alpha's document 9 and nowhere else, so
+  // the merged concept covers exactly one document.
+  const shards = [
+    {
+      key: 'p-alpha',
+      artifact: {
+        stats: { documents: 10 },
+        partition: { key: 'p-alpha' },
+        concepts: [
+          { canonical: 'student leadership', variants: ['student leader'], docFreq: 10, docIndexes: range(0, 10), patternRankScore: 0.9 },
+          { canonical: 'student leaders', variants: [], docFreq: 10, docIndexes: range(0, 10), patternRankScore: 0.8 },
+          { canonical: 'solar kiln', variants: ['solar kilning'], docFreq: 1, docIndexes: [9], patternRankScore: 0.5 },
+          { canonical: 'solar kilns', variants: ['solar kilning'], docFreq: 1, docIndexes: [9], patternRankScore: 0.4 },
+        ],
+      },
+    },
+    {
+      key: 'p-beta',
+      artifact: {
+        stats: { documents: 10 },
+        partition: { key: 'p-beta' },
+        concepts: [
+          { canonical: 'student leaders', variants: ['student leadership'], docFreq: 6, docIndexes: range(0, 6), patternRankScore: 0.7 },
+        ],
+      },
+    },
+    {
+      key: 'p-gamma',
+      artifact: {
+        stats: { documents: 10 },
+        partition: { key: 'p-gamma' },
+        concepts: [
+          { canonical: 'student leadership', variants: [], docFreq: 4, docIndexes: [0, 1, 2, 3], patternRankScore: 0.6 },
+          { canonical: 'student leaders', variants: [], docFreq: 4, docIndexes: [3, 4, 5, 6], patternRankScore: 0.6 },
+        ],
+      },
+    },
+  ];
+
+  const runMerge = async (payload, name) => {
+    const { stdout } = await execFileAsync(
+      'python3',
+      [harnessPath, path.resolve('scripts/build-concepts.py'), path.join(mergeDir, `${name}.sqlite`), JSON.stringify(payload)],
+      { cwd: path.resolve('.') },
+    );
+    return JSON.parse(stdout);
+  };
+
+  const indexed = await runMerge(shards, 'indexed');
+  assert.equal(indexed.documents, 30);
+  // Summing gave 14 + 20 = 34 for the student-leadership component (docFreq > 30)
+  // and idf = log(31/35) = -0.1214. Unioning per shard gives 10 + 6 + 7 = 23.
+  assert.deepEqual(indexed.concepts, [
+    ['student leaders', 23, Number(Math.log(31 / 24).toFixed(4))],
+    ['solar kiln', 1, Number(Math.log(31 / 2).toFixed(4))],
+  ]);
+  // Summing reported docFreq 2 for a concept that occupies a single document, so
+  // this statistic missed it entirely.
+  assert.equal(indexed.singleDocConcepts, 1);
+
+  // Artifacts written before docIndexes existed still have to satisfy the
+  // invariants. The merge falls back to an upper bound clamped to each shard's own
+  // document count: 10 + 6 + min(4 + 4, 10) = 24 here, and 2 for the solar concept.
+  const legacy = await runMerge(
+    shards.map((shard) => ({
+      ...shard,
+      artifact: {
+        ...shard.artifact,
+        concepts: shard.artifact.concepts.map(({ docIndexes, ...rest }) => rest),
+      },
+    })),
+    'legacy',
+  );
+  assert.deepEqual(legacy.concepts, [
+    ['student leaders', 24, Number(Math.log(31 / 25).toFixed(4))],
+    ['solar kiln', 2, Number(Math.log(31 / 3).toFixed(4))],
+  ]);
+
+  for (const merged of [indexed, legacy]) {
+    for (const [canonical, docFreq, idf] of merged.concepts) {
+      assert.ok(docFreq <= merged.documents, `${canonical} docFreq ${docFreq} > ${merged.documents}`);
+      assert.ok(idf >= 0, `${canonical} idf ${idf} is negative`);
+    }
+  }
+});
+
+// MAX_BUCKET_COMPARISONS used to abandon head forms with no log, no counter and
+// nothing in stats. Because the bucket is sorted, the casualties are always the
+// lexicographically later heads, so the loss is structural and clustering drifts
+// between incremental rebuilds. It still truncates - it is a safety valve - but it
+// now says so.
+test('variant clustering reports when the comparison budget truncates a bucket', async () => {
+  const clusterDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-cluster-'));
+  const harnessPath = path.join(clusterDir, 'cluster_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+def run(phrases):
+    clusters, telemetry = bc.cluster_phrases(set(phrases), {phrase: 3 for phrase in phrases})
+    return {
+        "scholarCluster": sorted(next(sorted(c) for c in clusters if "educational scholar" in c)),
+        "telemetry": telemetry,
+    }
+
+# "educational scholar" / "educational scholarship" is an R2-only merge: the stems
+# differ, so R1 cannot catch it. The noise is one long prefix run in the same
+# modifier bucket that exhausts the budget before the scan reaches "scholar".
+pair = ["educational scholar", "educational scholarship"]
+noise = ["educational leader" + ("s" * i) for i in range(80)]
+print(json.dumps({"clean": run(pair), "truncated": run(pair + noise)}, sort_keys=True))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync(
+    'python3',
+    [harnessPath, path.resolve('scripts/build-concepts.py')],
+    { cwd: path.resolve('.'), env: { ...process.env, CONCEPT_MAX_BUCKET_COMPARISONS: '1000' } },
+  );
+  const { clean, truncated } = JSON.parse(stdout);
+
+  assert.deepEqual(clean.scholarCluster, ['educational scholar', 'educational scholarship']);
+  assert.equal(clean.telemetry.truncatedBuckets, 0);
+  assert.equal(clean.telemetry.truncatedHeads, 0);
+
+  // Same pair, same rule, now silently unmerged -- except it is no longer silent.
+  assert.deepEqual(truncated.scholarCluster, ['educational scholar']);
+  assert.equal(truncated.telemetry.truncatedBuckets, 1);
+  assert.ok(truncated.telemetry.truncatedHeads > 0);
+  assert.equal(truncated.telemetry.comparisonBudget, 1000);
+});
+
 test('PatternRank refuses to publish an artifact whose alias map disagrees with stats', async () => {
   const guardDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-guard-'));
   const guardPath = path.join(guardDir, 'guard.py');
