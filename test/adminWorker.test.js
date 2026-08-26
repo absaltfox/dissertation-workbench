@@ -1652,3 +1652,55 @@ test('appendAdminJobLog trims to the tail limit atomically', async () => {
   assert.equal(job.log.length, 40);
   assert.equal(job.log, 'x'.repeat(40));
 });
+
+// A 2-gram that many distinct 3-grams extend is a hub topic, not a sliding-window
+// fragment of any one of them. Absorbing all of them replaces every specific
+// concept with the generic parent, which is the opposite of a discovery aid.
+test('variant clustering leaves hub extensions distinct and reports withholding them', async () => {
+  const clusterDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-fanin-'));
+  const harnessPath = path.join(clusterDir, 'fanin_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+def run(phrases):
+    clusters, telemetry = bc.cluster_phrases(set(phrases), {phrase: 5 for phrase in phrases})
+    return {
+        "hubCluster": sorted(next(sorted(c) for c in clusters if "student engagement" in c)),
+        "telemetry": telemetry,
+        "clusters": len(clusters),
+    }
+
+hub = "student engagement"
+# Two extensions: plausibly fragments, so they fold in.
+few = [hub, hub + " practice", hub + " practices"]
+# Seven distinct research topics: the hub must not swallow them.
+many = [hub] + [hub + " " + w for w in
+                ["practice", "outcome", "theory", "barrier", "survey", "policy", "gap"]]
+print(json.dumps({"few": run(few), "many": run(many)}, sort_keys=True))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync(
+    'python3',
+    [harnessPath, path.resolve('scripts/build-concepts.py')],
+    { cwd: path.resolve('.'), env: { ...process.env, CONCEPT_VARIANT_EXTENSION_MAX_FAN_IN: '2' } },
+  );
+  const { few, many } = JSON.parse(stdout);
+
+  // Within the limit, the extension rule still does its job.
+  assert.deepEqual(few.hubCluster, [
+    'student engagement', 'student engagement practice', 'student engagement practices',
+  ]);
+  assert.equal(few.telemetry.extensionHubsSkipped, 0);
+  assert.equal(few.telemetry.extensionEdgesSkipped, 0);
+
+  // Over the limit, the hub keeps only itself and every extension survives as its
+  // own concept -- all of them, not an alphabetically-chosen subset.
+  assert.deepEqual(many.hubCluster, ['student engagement']);
+  assert.equal(many.clusters, 8);
+  assert.equal(many.telemetry.extensionHubsSkipped, 1);
+  assert.equal(many.telemetry.extensionEdgesSkipped, 7);
+  assert.equal(many.telemetry.extensionFanInLimit, 2);
+});

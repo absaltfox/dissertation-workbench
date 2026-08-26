@@ -37,6 +37,17 @@ MAX_GLOBAL_CONCEPTS = max(MAX_PARTITION_CONCEPTS, int(os.environ.get("CONCEPT_GL
 VARIANT_EXTENSION_MIN_DOCUMENT_FREQUENCY = max(
     2, int(os.environ.get("CONCEPT_VARIANT_EXTENSION_MIN_DF", "3"))
 )
+# How many 3-grams one 2-gram may absorb. The extension rule exists to reabsorb
+# sliding-window fragments ("critical literacy" / "critical literacy practices"),
+# and a phrase with one or two extensions is plausibly exactly that. A phrase with
+# a dozen is not a fragment at all -- it is a hub topic whose extensions are
+# distinct research areas, and folding them in replaces every specific concept
+# with the generic parent, which is the opposite of a discovery aid. Above the
+# limit the whole fan-in is left alone rather than an arbitrary subset absorbed:
+# picking k of n equally-good extensions would decide by sort order, not evidence.
+MAX_VARIANT_EXTENSION_FAN_IN = max(
+    1, int(os.environ.get("CONCEPT_VARIANT_EXTENSION_MAX_FAN_IN", "2"))
+)
 # Hard ceiling on head-prefix comparisons inside one blocking bucket. Blocking already
 # keeps clustering linear in practice; this guarantees it even for adversarial inputs.
 MAX_BUCKET_COMPARISONS = max(1000, int(os.environ.get("CONCEPT_MAX_BUCKET_COMPARISONS", "50000")))
@@ -491,16 +502,34 @@ def cluster_phrases(phrases, document_frequency):
                 break
 
     # R3: a 3-gram extends a 2-gram when the 2-gram's stems are its leading stems.
+    # Collect the eligible edges before applying any of them: the fan-in decision
+    # needs to see a 2-gram's whole extension set, and unioning as we go would
+    # merge the first arrivals before we know how many there are.
+    extensions = {}
     for phrase, stems in trigrams:
         for shorter in bigram_stems.get(stems[:2], []):
             attested = max(document_frequency.get(phrase, 0), document_frequency.get(shorter, 0))
             if attested >= VARIANT_EXTENSION_MIN_DOCUMENT_FREQUENCY:
-                forest.union(shorter, phrase)
+                extensions.setdefault(shorter, []).append(phrase)
+
+    extension_hubs_skipped = 0
+    extension_edges_skipped = 0
+    for shorter in sorted(extensions):
+        absorbed = extensions[shorter]
+        if len(absorbed) > MAX_VARIANT_EXTENSION_FAN_IN:
+            extension_hubs_skipped += 1
+            extension_edges_skipped += len(absorbed)
+            continue
+        for phrase in absorbed:
+            forest.union(shorter, phrase)
 
     return forest.components(), {
         "truncatedBuckets": truncated_buckets,
         "truncatedHeads": truncated_heads,
         "comparisonBudget": MAX_BUCKET_COMPARISONS,
+        "extensionHubsSkipped": extension_hubs_skipped,
+        "extensionEdgesSkipped": extension_edges_skipped,
+        "extensionFanInLimit": MAX_VARIANT_EXTENSION_FAN_IN,
     }
 
 
@@ -1227,6 +1256,8 @@ def merge_partition_artifacts(client):
     total_docs = 0
     truncated_buckets = 0
     truncated_heads = 0
+    extension_hubs_skipped = 0
+    extension_edges_skipped = 0
     shard_doc_freq = {}
     shard_score = {}
     shards = []
@@ -1241,6 +1272,8 @@ def merge_partition_artifacts(client):
         # operator looks, and under-clustering in any shard shows up there.
         truncated_buckets += int(stats.get("clusterTruncatedBuckets", 0) or 0)
         truncated_heads += int(stats.get("clusterTruncatedHeads", 0) or 0)
+        extension_hubs_skipped += int(stats.get("clusterExtensionHubsSkipped", 0) or 0)
+        extension_edges_skipped += int(stats.get("clusterExtensionEdgesSkipped", 0) or 0)
         partitions.append(artifact.get("partition", {}))
         shard = {"documents": documents, "docFreq": {}, "docIndexes": {}}
         for concept in artifact.get("concepts", []):
@@ -1310,6 +1343,8 @@ def merge_partition_artifacts(client):
             "concepts": len(concepts), "singleDocConcepts": sum(1 for concept in concepts if concept["docFreq"] == 1),
             "aliases": len(variant_to_canonical), "patternRankRejected": 0, "documents": total_docs, "failed": 0,
             "clusterTruncatedBuckets": truncated_buckets, "clusterTruncatedHeads": truncated_heads,
+            "clusterExtensionHubsSkipped": extension_hubs_skipped,
+            "clusterExtensionEdgesSkipped": extension_edges_skipped,
             "partitions": len(partitions),
         },
         "concepts": concepts,
@@ -1520,6 +1555,14 @@ def main():
                 f"{cluster_truncation['truncatedHeads']} head form(s). Legitimate variants were left unmerged, "
                 "always the lexicographically later ones. Raise CONCEPT_MAX_BUCKET_COMPARISONS to cluster them.\n"
             )
+        if cluster_truncation["extensionHubsSkipped"]:
+            reporter.append_log(
+                f"{cluster_truncation['extensionHubsSkipped']} phrase(s) in partition {key} had more than "
+                f"{cluster_truncation['extensionFanInLimit']} longer forms extending them, so "
+                f"{cluster_truncation['extensionEdgesSkipped']} extension(s) were kept as distinct concepts "
+                "rather than folded into the shorter phrase. These are hub topics, not sliding-window "
+                "fragments. Raise CONCEPT_VARIANT_EXTENSION_MAX_FAN_IN to merge them anyway.\n"
+            )
         concepts = []
         for cluster in clusters:
             canonical = pick_canonical(cluster, phrase_document_frequency)
@@ -1560,6 +1603,10 @@ def main():
                 # separate concepts, always the lexicographically later head forms.
                 "clusterTruncatedBuckets": cluster_truncation["truncatedBuckets"],
                 "clusterTruncatedHeads": cluster_truncation["truncatedHeads"],
+                # Extension merges withheld because the shorter phrase is a hub with
+                # many distinct longer forms, not a fragment of any one of them.
+                "clusterExtensionHubsSkipped": cluster_truncation["extensionHubsSkipped"],
+                "clusterExtensionEdgesSkipped": cluster_truncation["extensionEdgesSkipped"],
                 "documents": len(docs), "documentsChanged": len(changed_docs), "documentsReused": reused, "failed": failures,
             },
             "concepts": concepts, "variantToCanonical": variant_to_canonical,
