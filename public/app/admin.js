@@ -1255,6 +1255,8 @@ function formatJobCounts(counts = {}) {
   if (counts.fuzzyMatches != null) parts.push(`${formatNum(counts.fuzzyMatches)} fuzzy`);
   if (counts.exactMatches != null) parts.push(`${formatNum(counts.exactMatches)} exact`);
   if (counts.newCitations != null) parts.push(`${formatNum(counts.newCitations)} new`);
+  if (counts.truncatedBuckets) parts.push(`${formatNum(counts.truncatedBuckets)} truncated buckets`);
+  if (counts.truncationBlockedMerges) parts.push(`${formatNum(counts.truncationBlockedMerges)} merges blocked by truncation`);
   if (counts.withCommittee != null) parts.push(`${formatNum(counts.withCommittee)} with committee`);
   if (counts.pages != null) parts.push(`${formatNum(counts.pages)} pages`);
   if (counts.words != null) parts.push(`${formatNum(counts.words)} words`);

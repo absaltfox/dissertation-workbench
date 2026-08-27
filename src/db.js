@@ -3021,10 +3021,12 @@ function citationTextPrefix(value) {
 }
 
 const FUZZY_CITATION_THRESHOLD = 0.94;
-// Per-bucket cap on fuzzy candidates. The year buckets grow with the corpus, so
+// Per-bucket cap on fuzzy candidates. The buckets grow with the corpus, so
 // without a cap the per-document cost would still scale with total citations.
-// Below the cap the candidate set is exactly the old in-memory bucket.
-const FUZZY_CANDIDATE_LIMIT = 400;
+// Below the cap the candidate set is exactly the old in-memory bucket; at the
+// cap the bucket is *unknown*, not empty, and findFuzzyMatch refuses to merge
+// rather than guess from a truncated read. See the note above findFuzzyMatch.
+const FUZZY_CANDIDATE_LIMIT = 2000;
 const CITATION_MATCH_KEY_VERSION = 1;
 const CITATION_BACKFILL_BATCH = 500;
 const CITATION_CANDIDATE_COLUMNS = 'id, citation_hash, citation_text, match_year';
@@ -3108,6 +3110,12 @@ async function loadCitationIdsByHash(hashes) {
 // Reads one or more capped candidate buckets in a single round trip and returns
 // them keyed by bucket, each in ascending id order — the order the in-memory
 // index produced, because it was filled by a rowid-ordered table scan.
+//
+// `saturated` names the buckets that came back exactly full. Those reads were
+// cut off by the LIMIT, so rows past the cut were never compared and the bucket
+// has to be treated as unknown rather than as the whole bucket. Callers must
+// not silently take the best of a truncated read: that is how a cap turns into
+// a merge the old matcher would never have made.
 async function loadCandidateBuckets(arms) {
   const sql = arms.map((arm) => `SELECT * FROM (
       SELECT ${arm.bucket} AS bucket, ${CITATION_CANDIDATE_COLUMNS} FROM citations
@@ -3116,8 +3124,12 @@ async function loadCandidateBuckets(arms) {
   const rows = await all(sql, arms.flatMap((arm) => arm.args));
   const byBucket = new Map(arms.map((arm) => [arm.bucket, []]));
   for (const row of rows) byBucket.get(Number(row.bucket))?.push(prepareCitationForMatching(row));
-  for (const bucket of byBucket.values()) bucket.sort((a, b) => a.id - b.id);
-  return byBucket;
+  const saturated = new Set();
+  for (const [bucket, candidates] of byBucket) {
+    if (candidates.length >= FUZZY_CANDIDATE_LIMIT) saturated.add(bucket);
+    candidates.sort((a, b) => a.id - b.id);
+  }
+  return { byBucket, saturated };
 }
 
 const characterCountScratch = new Int32Array(256);
@@ -3171,9 +3183,9 @@ function bestInBucket(candidates, incoming, counts) {
 }
 
 // SQL replacement for the old in-memory fuzzyMatchCandidates plus the scan that
-// followed it. The buckets are the same ones the in-memory index held — the ±1
-// year window and the 3-character prefix bucket — and the winner is still the
-// first bucket, in the order y-1, y, y+1, undated-prefix, to attain the highest
+// followed it. The buckets are the ones the in-memory index held — the ±1 year
+// window and the 3-character prefix bucket — and the winner is still the first
+// bucket, in the order y-1, y, y+1, undated-prefix, to attain the highest
 // similarity, so the ±1 window still *blocks* a same-year merge when an adjacent
 // year scores higher.
 //
@@ -3183,49 +3195,125 @@ function bestInBucket(candidates, incoming, counts) {
 // acceptable candidate has cleared the threshold — when none does, the old code
 // rejected regardless of what those buckets held.
 //
-// Deliberate difference: the old code fell back to comparing against every
+// Deliberate difference 1: the old code fell back to comparing against every
 // citation in the corpus when a bucket came back empty. That fallback is the
 // unbounded path B-01 exists to remove, so an empty bucket now simply yields no
 // fuzzy match.
-async function findFuzzyMatch(text, itemYear) {
+//
+// Deliberate difference 2: the dated arms are blocked on the incoming citation's
+// 3-character prefix as well as on its year. The old matcher compared a dated
+// incoming against *every* same-year and adjacent-year citation, which is a
+// bucket that grows without bound as the corpus grows. Under a fixed cap that
+// bucket can only be read partially, and a partially read *adjacent-year* bucket
+// is actively dangerous: it drops the ±1 blocker and merges two distinct
+// editions into one row. Prefix blocking is what makes each bucket inherently
+// small — one year, one 3-character prefix — so the read is complete and the
+// blocker is always there. Three things justify narrowing rather than
+// truncating:
+//   * Winkler's prefix bonus already favours same-prefix candidates. A candidate
+//     agreeing on the first four characters gains up to 0.4 * (1 - jaro); one
+//     that differs inside the first three gains at most 0.2 * (1 - jaro). To
+//     outscore a same-prefix candidate that already clears 0.94 it needs a
+//     materially higher raw Jaro, which for citation strings means the texts
+//     diverge almost only at the very start.
+//   * The undated half of the matcher was prefix-blocked in the old code too, so
+//     this makes the dated half consistent with a gate the design already relied
+//     on rather than inventing a new one.
+//   * The alternative is unbounded reads or truncated ones. Truncation is what
+//     produced the wrong merges; unbounded reads are the cost regression the
+//     rewrite exists to remove.
+// It applies symmetrically to the accepting and the vetoing arms, so the veto is
+// never weakened relative to what can be accepted: within the prefix-blocked
+// candidate set the decision is bit-for-bit the old one. A citation shorter than
+// the prefix window has no prefix to block on and falls back to the plain year
+// arms.
+//
+// Deliberate difference 3: a bucket that comes back saturated (see
+// loadCandidateBuckets) refuses the merge instead of taking the best of what it
+// read. Every merge this matcher makes is therefore one the old matcher would
+// also have made from the same candidate set; the cap can cost a merge, but it
+// can no longer invent one. Saturation is reported to the caller so it is
+// visible rather than silent.
+async function findFuzzyMatch(text, itemYear, telemetry = null) {
   const year = citationMatchYear(itemYear) ?? citationMatchYear(text);
   const prefix = citationTextPrefix(text);
   const incoming = text.toLowerCase();
   const counts = characterCounts(incoming);
+  const refuse = () => {
+    telemetry?.truncationBlockedMerge();
+    return null;
+  };
 
   if (year == null) {
     if (!prefix) return null;
     // ORDER BY match_year, id follows idx_citations_match_prefix, so the cap is an
     // ordered index range scan; loadCandidateBuckets restores the id ordering.
-    const buckets = await loadCandidateBuckets([
+    const undated = await loadCandidateBuckets([
       { bucket: 0, where: 'match_prefix = ?', order: 'match_year, id', args: [prefix] },
     ]);
-    const { best, maxSim } = bestInBucket(buckets.get(0), incoming, counts);
+    if (undated.saturated.has(0)) telemetry?.truncatedBucket('undated-prefix', null, prefix);
+    const { best, maxSim } = bestInBucket(undated.byBucket.get(0), incoming, counts);
     // An incoming citation with no year is compatible with every candidate.
-    return best && maxSim >= FUZZY_CITATION_THRESHOLD ? { row: best, similarity: maxSim } : null;
+    if (!best || maxSim < FUZZY_CITATION_THRESHOLD) return null;
+    return undated.saturated.size ? refuse() : { row: best, similarity: maxSim };
   }
 
-  const acceptableArms = [{ bucket: 1, where: 'match_year = ?', args: [year] }];
+  const yearArm = (bucket, bucketYear) => (prefix
+    ? { bucket, where: 'match_prefix = ? AND match_year = ?', args: [prefix, bucketYear] }
+    : { bucket, where: 'match_year = ?', args: [bucketYear] });
+
+  const acceptableArms = [yearArm(1, year)];
   if (prefix) {
     acceptableArms.push({ bucket: 3, where: 'match_prefix = ? AND match_year IS NULL', args: [prefix] });
   }
   const acceptable = await loadCandidateBuckets(acceptableArms);
-  const sameYear = bestInBucket(acceptable.get(1), incoming, counts);
-  const undated = prefix ? bestInBucket(acceptable.get(3), incoming, counts) : { best: null, maxSim: 0 };
+  if (acceptable.saturated.has(1)) telemetry?.truncatedBucket('same-year', year, prefix);
+  if (acceptable.saturated.has(3)) telemetry?.truncatedBucket('undated-prefix', null, prefix);
+  const sameYear = bestInBucket(acceptable.byBucket.get(1), incoming, counts);
+  const undated = prefix ? bestInBucket(acceptable.byBucket.get(3), incoming, counts) : { best: null, maxSim: 0 };
   if (Math.max(sameYear.maxSim, undated.maxSim) < FUZZY_CITATION_THRESHOLD) return null;
+  // A truncated accepting arm may hide the candidate the old matcher would have
+  // picked, so the merge target is not knowable: refuse rather than pick another.
+  if (acceptable.saturated.size) return refuse();
 
-  const adjacent = await loadCandidateBuckets([
-    { bucket: 0, where: 'match_year = ?', args: [year - 1] },
-    { bucket: 2, where: 'match_year = ?', args: [year + 1] },
-  ]);
-  const before = bestInBucket(adjacent.get(0), incoming, counts);
-  const after = bestInBucket(adjacent.get(2), incoming, counts);
+  const adjacent = await loadCandidateBuckets([yearArm(0, year - 1), yearArm(2, year + 1)]);
+  if (adjacent.saturated.has(0)) telemetry?.truncatedBucket('year-before', year - 1, prefix);
+  if (adjacent.saturated.has(2)) telemetry?.truncatedBucket('year-after', year + 1, prefix);
+  // A truncated veto arm cannot prove no adjacent-year work outscores the
+  // accepted candidate, which is exactly the case that conflates two editions.
+  if (adjacent.saturated.size) return refuse();
+  const before = bestInBucket(adjacent.byBucket.get(0), incoming, counts);
+  const after = bestInBucket(adjacent.byBucket.get(2), incoming, counts);
 
   const overall = Math.max(before.maxSim, sameYear.maxSim, after.maxSim, undated.maxSim);
   if (before.maxSim === overall) return null;
   if (sameYear.maxSim === overall) return { row: sameYear.best, similarity: overall };
   if (after.maxSim === overall) return null;
   return { row: undated.best, similarity: overall };
+}
+
+// Saturation reporter for one saveCitations call. Every saturated bucket read is
+// counted; the warning is emitted once per bucket so a document whose year is
+// oversubscribed logs a line, not a hundred.
+function citationMatchTelemetry(counts) {
+  const warned = new Set();
+  return {
+    truncatedBucket(bucket, year, prefix) {
+      counts.truncatedBuckets += 1;
+      const key = `${bucket}|${year ?? ''}|${prefix ?? ''}`;
+      if (warned.has(key)) return;
+      warned.add(key);
+      logger.warn('Citation fuzzy-match bucket hit the candidate cap; rows beyond it were not compared', {
+        bucket,
+        year: year ?? null,
+        prefix: prefix ?? null,
+        limit: FUZZY_CANDIDATE_LIMIT,
+      });
+    },
+    truncationBlockedMerge() {
+      counts.truncationBlockedMerges += 1;
+    },
+  };
 }
 
 function citationFields(item) {
@@ -3297,7 +3385,13 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
     exactMatches: 0,
     fuzzyMatches: 0,
     newCitations: 0,
+    // Candidate buckets that came back at FUZZY_CANDIDATE_LIMIT, and merges
+    // refused because of one. Both stay 0 on a corpus the cap never binds on, so
+    // a non-zero value is the signal that matching is running on partial reads.
+    truncatedBuckets: 0,
+    truncationBlockedMerges: 0,
   };
+  const telemetry = citationMatchTelemetry(counts);
   await onProgress?.({
     phase: 'citation_matching',
     label: 'Matching citations',
@@ -3310,7 +3404,7 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
     let matchedBy = matchedId ? 'exact' : null;
 
     if (!matchedId) {
-      const fuzzy = await findFuzzyMatch(item.text, item.year);
+      const fuzzy = await findFuzzyMatch(item.text, item.year, telemetry);
       if (fuzzy) {
         matchedId = fuzzy.row.id;
         matchedBy = 'fuzzy';

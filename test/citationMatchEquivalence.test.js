@@ -182,6 +182,44 @@ function hashFn(text) {
   return crypto.createHash('sha1').update(normalized).digest('hex');
 }
 
+// Texts for the phase-2 fixtures below. Each group is an adjacent-year pair of
+// near-identical works plus a probe whose year field and text disagree, which is
+// what forces the matcher past the phase-1 short circuit and into the +/-1 veto.
+const OKONKWO_1991 = 'Okonkwo, R. (1991). Comparative study of estuarine nutrient loading. Northern Books.';
+const OKONKWO_1992 = 'Okonkwo, R. (1992). Comparative study of estuarine nutrient loading. Northern Books.';
+// 0.9928 against the 1991 row (clears the threshold, so phase 2 is reached) and
+// 0.9976 against the 1992 row, so the y+1 bucket wins and vetoes.
+const OKONKWO_PROBE = 'Okonkwo, R. (1992). Comparative study of estuarine nutrient loading. Northern Books';
+
+const RAVINDRAN_1990 = 'Ravindran, S. (1990). Sediment budgets of the lower delta. Academic Press.';
+const RAVINDRAN_1991 = 'Ravindran, S. (1991). Sediment budgets of the lower delta. Academic Press.';
+// 0.9919 against the 1991 row, 0.9973 against the 1990 row: the y-1 bucket vetoes.
+const RAVINDRAN_PROBE = 'Ravindran, S. (1990). Sediment budgets of the lower delta. Academic Press';
+
+// An exact tie between the y-1 and the same-year bucket. Both candidates are the
+// probe with one adjacent pair of characters transposed, so their Jaro-Winkler
+// scores against it are bit-identical (0.99767). The tie-break order decides:
+// y-1 is consulted first, so the merge is vetoed. Reorder it and the probe
+// merges into the 2001 row instead.
+const NAKAMURA_PROBE = 'Nakamura, T. (2001). Tidal marsh accretion rates in the outer bay. Scholarly Editions.';
+const NAKAMURA_2000 = 'Nakamura, T. (2001). Tidal marhs accretion rates in the outer bay. Scholarly Editions.';
+const NAKAMURA_2001 = 'Nakamura, T. (2001). Tidal marsh accretion rates in the oute rbay. Scholarly Editions.';
+
+// Two candidates in the *same* year bucket that also tie exactly (0.96471), far
+// enough apart from each other (0.92941) that seeding them does not merge them.
+// The winner must be the lower id, i.e. the bucket must be scanned in ascending
+// id order and the first of a tie kept.
+const SANDOVAL_PROBE = 'Sandoval, P. (2007). Wetland qqqqqqqqqqqq indices for the northern reach of the estuary and its gradients. Academic Press, qqqqqqqqqqqq.';
+const SANDOVAL_FIRST = SANDOVAL_PROBE.replace('qqqqqqqqqqqq', 'zzzzzzzzzzzz');
+const SANDOVAL_SECOND = SANDOVAL_PROBE.replace(/qqqqqqqqqqqq(?=[^q]*$)/, 'zzzzzzzzzzzz');
+
+// The window is +/-1, not +/-2. The probe merges into the 2001 row it scores
+// 0.9602 against; the 1999 row it scores 0.9976 against is two years away and
+// must stay invisible. Widen the window and the 1999 row vetoes the merge.
+const PEMBERTON_1999 = 'Pemberton, L. (1999). Glacial till stratigraphy of the upper basin. University Press.';
+const PEMBERTON_2001 = 'Pemberton, L. (2001). Glacial till stratigraphy of the upper basins. University Press!';
+const PEMBERTON_PROBE = 'Pemberton, L. (1999). Glacial till stratigraphy of the upper basin. University Press';
+
 const FIXTURES = [
   {
     id: 'equiv-doc-1',
