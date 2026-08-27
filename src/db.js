@@ -555,10 +555,12 @@ async function ensureSchema(client) {
   await addColumnIfMissing(client, 'citations', 'match_key_version', 'INTEGER NOT NULL DEFAULT 0');
   await tryExec(client, 'CREATE TABLE IF NOT EXISTS enrichment_attempts (doc_id TEXT PRIMARY KEY, attempted_at TEXT NOT NULL)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_sync_key ON documents(sync_key)');
-  // listDocumentsPendingEnrichment walks one rule's corpus in doc_id order from a
-  // cursor, so the enrichment queue is an ordered range scan rather than a filter
-  // over every document the rule has ever imported.
-  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_sync_key_doc_id ON documents(sync_key, doc_id)');
+  // Deliberately NOT an index on documents(sync_key, doc_id). It would serve the
+  // enrichment queue's ordered scan, but it also makes the filtered_people CTE in
+  // queryPeoplePage look cheap enough to inline and re-evaluate once per matched
+  // person: 5,100 documents took that query from 70 ms to 126 s. The queue drives
+  // off the doc_id primary key instead - see listDocumentsPendingEnrichment.
+  await tryExec(client, 'DROP INDEX IF EXISTS idx_documents_sync_key_doc_id');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree ON documents(degree)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_program ON documents(program)');
@@ -2206,6 +2208,12 @@ export function enrichmentPolicySatisfiedSql(contentMode, contentFallback = null
 // The enrichment work queue. Replaces re-scanning Open Collections from record 0
 // on every batch: outstanding documents are found locally, in doc_id order from a
 // cursor, so batch N costs the same as batch 1 no matter how much is already done.
+//
+// `+d.sync_key` is deliberate. It makes the sync-key term unusable as an index
+// lookup, which forces the walk onto the doc_id primary key: the cursor becomes an
+// ordered range scan and ORDER BY needs no sort. Left to itself the planner takes
+// idx_documents_sync_key and then sorts the rule's whole corpus for every batch,
+// which is precisely the per-batch cost this queue exists to remove.
 export async function listDocumentsPendingEnrichment({
   syncKey = null,
   contentMode = null,
@@ -2217,7 +2225,7 @@ export async function listDocumentsPendingEnrichment({
   const args = [];
   const where = [];
   if (syncKey) {
-    where.push('d.sync_key = ?');
+    where.push('+d.sync_key = ?');
     args.push(syncKey);
   }
   const cursor = String(afterDocId || '');

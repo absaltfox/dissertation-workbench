@@ -168,6 +168,8 @@ test('sync_missing_pdfs batches missing PDF attempts and reports per-document pr
     assert.equal(second.totalSaved, 2);
     assert.equal(await loadStoredFileMetric('1.0000003'), null);
 
+    // A continuation carries the chain's start instant, not a list of doc ids: the
+    // documents the chain already attempted are excluded by enrichment_attempts.
     const continuation = await runDocumentSync({
       mode: 'sync_missing_pdfs',
       baseUrl: 'https://oc-index.test',
@@ -177,12 +179,14 @@ test('sync_missing_pdfs batches missing PDF attempts and reports per-document pr
       scanLimit: 100,
       syncMaxRecords: 100,
       pdfBatchSize: 2,
-      skipPdfDocIds: first.pdfAttemptedIds,
+      enrichmentAttemptedBefore: first.enrichmentAttemptedBefore,
+      enrichmentCursor: first.enrichmentCursor,
       downloadFiles: true,
     });
 
     assert.equal(continuation.ok, true);
     assert.equal(continuation.totalSaved, 1);
+    assert.deepEqual(continuation.pdfAttemptedIds, ['1.0000003']);
     assert.equal((await loadStoredFileMetric('1.0000003')).status, 'not_found');
 
     const controlled = await runDocumentSync({

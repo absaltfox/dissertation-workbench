@@ -83,6 +83,8 @@ async function startContinuationJob(job, result, progress) {
       || new Date().toISOString(),
     enrichmentCursors: result.enrichmentCursors || {},
   };
+  // A chain started before this change may still be carrying the old id list in its
+  // params; drop it rather than copying it forward one more hop.
   delete nextParams.skipPdfDocIds;
   await progress?.({
     phase: 'continuation',
@@ -322,7 +324,10 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     const apiKey = await getConfiguredApiKey();
     const perRule = [];
     const pdfBatchSize = readPdfBatchSize(params);
-    const attemptedPdfIds = new Set(readDocIdList(params.skipPdfDocIds));
+    // Only this job's attempts. What earlier batches in the chain already took is
+    // durable state in enrichment_attempts, so this set stays bounded by the batch
+    // size instead of accumulating every doc id the chain has ever touched.
+    const attemptedPdfIds = new Set();
     // One instant for the whole job (and, via continuation params, for the whole
     // batch chain): documents attempted at or after it are already this chain's work.
     const enrichmentAttemptedBefore = String(params.enrichmentAttemptedBefore || new Date().toISOString());
@@ -370,7 +375,6 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
           detail: event.detail || `Syncing ${rule.name}`,
         }),
         pdfBatchSize: params.mode === 'sync_missing_pdfs' && enrichesDocuments ? remainingPdfBatchSize : 0,
-        skipPdfDocIds: Array.from(attemptedPdfIds),
         enrichmentDocIds: rollout?.phase === 'control' ? rollout.documentIds : [],
         enrichmentAttemptedBefore,
         enrichmentCursor: enrichmentCursors[rule.id] || '',

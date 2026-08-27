@@ -174,7 +174,6 @@ async function runSync(syncKey, source, apiKey, runId, {
   artifactClient = null,
   onProgress = null,
   pdfBatchSize = 0,
-  skipPdfDocIds = [],
   enrichmentDocIds = [],
   enrichmentAttemptedBefore = null,
   enrichmentCursor = '',
@@ -213,11 +212,6 @@ async function runSync(syncKey, source, apiKey, runId, {
       requestCounts.retrievedBytes += Math.max(0, Number(event.bytes));
     }
   };
-  const skippedPdfIds = new Set(
-    (Array.isArray(skipPdfDocIds) ? skipPdfDocIds : [])
-      .map((id) => String(id || '').trim())
-      .filter(Boolean)
-  );
   const requiredEnrichmentIds = new Set(
     (Array.isArray(enrichmentDocIds) ? enrichmentDocIds : [])
       .map((id) => String(id || '').trim())
@@ -234,8 +228,10 @@ async function runSync(syncKey, source, apiKey, runId, {
   const attemptedBefore = String(enrichmentAttemptedBefore || new Date(startedAt).toISOString());
   let queueCursor = String(enrichmentCursor || '');
 
-  const attemptedInChain = (stored, attemptedAt) => Boolean(
-    !requiredEnrichmentIds.size && attemptedAt && String(attemptedAt) >= attemptedBefore && stored
+  // Same rule the enrichment queue applies in SQL, so the upstream scan and the
+  // local queue agree on what this batch chain has already taken responsibility for.
+  const attemptedInChain = (attemptedAt) => Boolean(
+    !requiredEnrichmentIds.size && attemptedAt && String(attemptedAt) >= attemptedBefore
   );
 
   async function runEnrichmentBatch(missing) {
@@ -381,14 +377,11 @@ async function runSync(syncKey, source, apiKey, runId, {
       if (!candidates.length) return false;
       queueCursor = candidates[candidates.length - 1].docId;
       totalSeen += candidates.length;
-      const missing = candidates
-        .filter((candidate) => !skippedPdfIds.has(candidate.docId))
-        .map((candidate) => ({
-          doc: candidate.metadata && candidate.metadata.id ? candidate.metadata : { id: candidate.docId },
-          syncKey,
-          source: null,
-        }));
-      totalSkipped += candidates.length - missing.length;
+      const missing = candidates.map((candidate) => ({
+        doc: candidate.metadata && candidate.metadata.id ? candidate.metadata : { id: candidate.docId },
+        syncKey,
+        source: null,
+      }));
       await runEnrichmentBatch(missing);
       totalSaved += missing.length;
       await updateSyncRun(runId, { totalSeen, totalSaved, apiTotal });
@@ -443,9 +436,15 @@ async function runSync(syncKey, source, apiKey, runId, {
   }
 
   try {
+    // H-03: enrichment takes its work from the local queue and returns here, without
+    // resolving an index or fetching a single Open Collections page. The scan below
+    // is reached only when there is nothing outstanding locally - a corpus that has
+    // never had its metadata synced, or one the queue has drained - so that the scan
+    // can still discover documents the database has not seen yet.
+    //
     // The Phase 5 PDF control ships an explicit document allowlist and must keep
-    // taking precedence over any database-driven selection, so it stays on the
-    // upstream scan path untouched.
+    // taking precedence over any database-driven selection, so it skips the queue
+    // and stays on the upstream scan path untouched.
     if (enrichmentRequested && !requiredEnrichmentIds.size && await drainLocalEnrichmentQueue(runId)) {
       return await finishSync();
     }
@@ -512,16 +511,12 @@ async function runSync(syncKey, source, apiKey, runId, {
             totalSkipped += 1;
             continue;
           }
-          if (skippedPdfIds.has(docId)) {
-            totalSkipped += 1;
-            continue;
-          }
           const stored = storedByDocId.get(docId) || null;
           if (!requiredEnrichmentIds.size && hasCachedEnrichmentMetric(stored, contentMode, contentFallback)) {
             totalSkipped += 1;
             continue;
           }
-          if (attemptedInChain(stored, attemptedByDocId.get(docId))) {
+          if (attemptedInChain(attemptedByDocId.get(docId))) {
             totalSkipped += 1;
             continue;
           }
@@ -605,7 +600,6 @@ export async function startDocumentSync(options = {}) {
     artifactClient: options.artifactClient || null,
     onProgress: options.onProgress || null,
     pdfBatchSize: options.pdfBatchSize || 0,
-    skipPdfDocIds: options.skipPdfDocIds || [],
     enrichmentDocIds: options.enrichmentDocIds || [],
     enrichmentAttemptedBefore: options.enrichmentAttemptedBefore || null,
     enrichmentCursor: options.enrichmentCursor || '',
@@ -635,7 +629,6 @@ export async function runDocumentSync(options = {}) {
     artifactClient: options.artifactClient || null,
     onProgress: options.onProgress || null,
     pdfBatchSize: options.pdfBatchSize || 0,
-    skipPdfDocIds: options.skipPdfDocIds || [],
     enrichmentDocIds: options.enrichmentDocIds || [],
     enrichmentAttemptedBefore: options.enrichmentAttemptedBefore || null,
     enrichmentCursor: options.enrichmentCursor || '',
