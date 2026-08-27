@@ -160,6 +160,15 @@ async function ensureSchema(client) {
       updated_at TEXT NOT NULL
     );
 
+    -- Durable enrichment progress (H-03). Kept out of file_metrics on purpose:
+    -- a marker row in file_metrics would count towards the cache statistics and
+    -- would suppress the 'not_found' failure record that saveFileMetric only
+    -- writes when no metric row exists yet.
+    CREATE TABLE IF NOT EXISTS enrichment_attempts (
+      doc_id TEXT PRIMARY KEY,
+      attempted_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS document_people (
       doc_id TEXT NOT NULL,
       person_key TEXT NOT NULL,
@@ -544,7 +553,12 @@ async function ensureSchema(client) {
   await addColumnIfMissing(client, 'citations', 'match_year', 'INTEGER');
   await addColumnIfMissing(client, 'citations', 'match_prefix', 'TEXT');
   await addColumnIfMissing(client, 'citations', 'match_key_version', 'INTEGER NOT NULL DEFAULT 0');
+  await tryExec(client, 'CREATE TABLE IF NOT EXISTS enrichment_attempts (doc_id TEXT PRIMARY KEY, attempted_at TEXT NOT NULL)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_sync_key ON documents(sync_key)');
+  // listDocumentsPendingEnrichment walks one rule's corpus in doc_id order from a
+  // cursor, so the enrichment queue is an ordered range scan rather than a filter
+  // over every document the rule has ever imported.
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_sync_key_doc_id ON documents(sync_key, doc_id)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree ON documents(degree)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_program ON documents(program)');
@@ -867,6 +881,31 @@ export async function documentExists(docId) {
   if (!docId) return false;
   const row = await get('SELECT 1 AS found FROM documents WHERE doc_id = ? LIMIT 1', [docId]);
   return Boolean(row);
+}
+
+const ID_CHUNK_SIZE = 999;
+
+function normalizeDocIdList(docIds) {
+  return Array.from(new Set(
+    (Array.isArray(docIds) ? docIds : [])
+      .map((id) => String(id ?? '').trim())
+      .filter(Boolean)
+  ));
+}
+
+// Batched form of documentExists (H-05). Every statement is a network round trip
+// against Turso, so a page of sync records must cost one SELECT, not one per record.
+export async function documentsExist(docIds = []) {
+  const ids = normalizeDocIdList(docIds);
+  const found = new Set();
+  if (!ids.length) return found;
+  for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = await all(`SELECT doc_id FROM documents WHERE doc_id IN (${placeholders})`, chunk);
+    for (const row of rows) found.add(String(row.doc_id));
+  }
+  return found;
 }
 
 export async function listAllDocumentMetadata() {
@@ -2046,6 +2085,30 @@ export async function loadStoredFileMetric(docId) {
   `, [docId]);
 }
 
+// Batched form of loadStoredFileMetric (H-05): one SELECT per page of sync
+// records instead of one per record. Returns a Map keyed by doc_id.
+export async function loadStoredFileMetrics(docIds = []) {
+  const ids = normalizeDocIdList(docIds);
+  const byDocId = new Map();
+  if (!ids.length) return byDocId;
+  for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = await all(`
+      SELECT doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count,
+             full_text_path, full_text_bytes, full_text_source_url, page_count,
+             word_source, page_source, content_source, content_checksum,
+             content_source_url, content_retrieved_at, parser_version,
+             metadata_request_count, full_text_request_count,
+             original_pdf_request_count, retrieved_bytes, status, error, updated_at
+      FROM file_metrics
+      WHERE doc_id IN (${placeholders})
+    `, chunk);
+    for (const row of rows) byDocId.set(String(row.doc_id), row);
+  }
+  return byDocId;
+}
+
 export async function saveFileMetric(docId, payload) {
   const now = new Date().toISOString();
   await run(`
@@ -2111,6 +2174,112 @@ export async function saveFileMetric(docId, payload) {
 
 export async function deleteFileMetric(docId) {
   await run('DELETE FROM file_metrics WHERE doc_id = ?', [docId]);
+}
+
+// --- Enrichment queue (H-03) ---
+
+// SQL mirror of hasCachedEnrichmentMetric() in src/sync.js. The two must agree or
+// the local enrichment queue and the in-process policy check will disagree about
+// what is still outstanding, so test/enrichmentPolicyEquivalence.test.js asserts
+// they return the same answer for every content mode over a matrix of stored rows.
+// Branch order is deliberate: the full_text fallback wins over the mode rule
+// whenever the stored word source is DSpace full text, exactly as the JS does.
+export function enrichmentPolicySatisfiedSql(contentMode, contentFallback = null, alias = 'fm') {
+  const counted = `COALESCE(${alias}.word_count, 0) > 0 AND COALESCE(${alias}.page_count, 0) > 0`;
+  const fullText = `${alias}.word_source = 'dspace_full_text' AND ${counted}`;
+  let byMode = '0';
+  if (contentMode === 'pdf_cache') {
+    byMode = `${alias}.pdf_path IS NOT NULL AND ${alias}.pdf_path <> ''`;
+  } else if (contentMode === 'pdf_stream') {
+    byMode = `${alias}.content_source = 'streamed_pdf'`
+      + ` AND ${alias}.content_checksum IS NOT NULL AND ${alias}.content_checksum <> ''`
+      + ` AND ${counted}`;
+  } else if (contentMode === 'full_text_only') {
+    byMode = fullText;
+  }
+  const expression = contentFallback === 'full_text'
+    ? `CASE WHEN ${alias}.word_source = 'dspace_full_text' THEN (${counted}) ELSE (${byMode}) END`
+    : `(${byMode})`;
+  return `COALESCE(${expression}, 0)`;
+}
+
+// The enrichment work queue. Replaces re-scanning Open Collections from record 0
+// on every batch: outstanding documents are found locally, in doc_id order from a
+// cursor, so batch N costs the same as batch 1 no matter how much is already done.
+export async function listDocumentsPendingEnrichment({
+  syncKey = null,
+  contentMode = null,
+  contentFallback = null,
+  attemptedBefore = null,
+  afterDocId = '',
+  limit = 50,
+} = {}) {
+  const args = [];
+  const where = [];
+  if (syncKey) {
+    where.push('d.sync_key = ?');
+    args.push(syncKey);
+  }
+  const cursor = String(afterDocId || '');
+  if (cursor) {
+    where.push('d.doc_id > ?');
+    args.push(cursor);
+  }
+  where.push(`${enrichmentPolicySatisfiedSql(contentMode, contentFallback, 'fm')} = 0`);
+  if (attemptedBefore) {
+    where.push('(ea.attempted_at IS NULL OR ea.attempted_at < ?)');
+    args.push(String(attemptedBefore));
+  }
+  args.push(Math.max(1, Number(limit) || 1));
+  const rows = await all(`
+    SELECT d.doc_id, d.metadata_json
+    FROM documents d
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN enrichment_attempts ea ON ea.doc_id = d.doc_id
+    WHERE ${where.join(' AND ')}
+    ORDER BY d.doc_id
+    LIMIT ?
+  `, args);
+  return rows.map((row) => {
+    let metadata = null;
+    try { metadata = row.metadata_json ? JSON.parse(row.metadata_json) : null; } catch { metadata = null; }
+    return { docId: String(row.doc_id), metadata };
+  });
+}
+
+export async function markEnrichmentAttempts(docIds = [], attemptedAt = new Date().toISOString()) {
+  const ids = normalizeDocIdList(docIds);
+  if (!ids.length) return 0;
+  const client = await getDb();
+  const stamp = String(attemptedAt || new Date().toISOString());
+  const chunkSize = 250;
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    await client.batch(ids.slice(i, i + chunkSize).map((docId) => ({
+      sql: `
+        INSERT INTO enrichment_attempts (doc_id, attempted_at)
+        VALUES (?, ?)
+        ON CONFLICT(doc_id) DO UPDATE SET attempted_at = excluded.attempted_at
+      `,
+      args: [docId, stamp],
+    })), 'write');
+  }
+  return ids.length;
+}
+
+export async function loadEnrichmentAttempts(docIds = []) {
+  const ids = normalizeDocIdList(docIds);
+  const byDocId = new Map();
+  if (!ids.length) return byDocId;
+  for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = await all(
+      `SELECT doc_id, attempted_at FROM enrichment_attempts WHERE doc_id IN (${placeholders})`,
+      chunk
+    );
+    for (const row of rows) byDocId.set(String(row.doc_id), row.attempted_at || null);
+  }
+  return byDocId;
 }
 
 export async function listFileMetrics() {

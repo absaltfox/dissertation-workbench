@@ -4,9 +4,10 @@ import {
 } from './config.js';
 import { fetchPage, extractHits, resolveIndexName } from './api.js';
 import {
-  createSyncRun, documentExists, getDocumentCacheStats, getLatestSyncRun,
-  loadStoredFileMetric, reserveImportRuleRequestSlot, saveDocumentMetadata,
-  saveDocumentMetadataBatch, saveFileMetric, updateSyncRun
+  createSyncRun, documentExists, documentsExist, getDocumentCacheStats, getLatestSyncRun,
+  listDocumentsPendingEnrichment, loadEnrichmentAttempts, loadStoredFileMetric,
+  loadStoredFileMetrics, markEnrichmentAttempts, reserveImportRuleRequestSlot,
+  saveDocumentMetadata, saveDocumentMetadataBatch, saveFileMetric, updateSyncRun
 } from './db.js';
 import {
   buildDocumentSyncKey, buildMetricsSourceOptions, ensureSourceFields, normalizeRecord
@@ -60,8 +61,13 @@ function sourceUpdatedAt(raw) {
   return raw?.updated_at || raw?.updatedAt || raw?.date_updated || raw?.dateModified || null;
 }
 
-export const filterSyncItemsForMode = (items, mode, existsFn = documentExists) =>
-  filterSyncItemsForModeWithExists(items, mode, existsFn);
+// Without an injected existence check the batched form is used: one SELECT per
+// page of records rather than one per record (H-05). Callers that inject their own
+// existsFn — tests — keep the per-document seam.
+export const filterSyncItemsForMode = (items, mode, existsFn = null) =>
+  filterSyncItemsForModeWithExists(items, mode, existsFn || documentExists, {
+    existsBatchFn: existsFn ? null : documentsExist,
+  });
 
 export function hasCachedEnrichmentMetric(stored, contentMode, contentFallback = null) {
   if (contentFallback === 'full_text' && stored?.word_source === 'dspace_full_text') {
@@ -170,6 +176,8 @@ async function runSync(syncKey, source, apiKey, runId, {
   pdfBatchSize = 0,
   skipPdfDocIds = [],
   enrichmentDocIds = [],
+  enrichmentAttemptedBefore = null,
+  enrichmentCursor = '',
 } = {}) {
   const startedAt = Date.now();
   let totalSeen = 0;
@@ -218,7 +226,230 @@ async function runSync(syncKey, source, apiKey, runId, {
   const pdfBatchLimit = mode === 'sync_missing_pdfs'
     ? Math.max(0, Number(pdfBatchSize || 0))
     : 0;
+  const enrichmentRequested = mode === 'sync_missing_pdfs' && contentModeEnrichesDocuments(contentMode);
+  // Documents attempted at or after this instant are treated as already handled by
+  // the current batch chain. A continuation job inherits the value the first job in
+  // the chain used, so a chain never re-attempts its own work and the job parameters
+  // stay one timestamp long instead of growing an id list (H-03).
+  const attemptedBefore = String(enrichmentAttemptedBefore || new Date(startedAt).toISOString());
+  let queueCursor = String(enrichmentCursor || '');
+
+  const attemptedInChain = (stored, attemptedAt) => Boolean(
+    !requiredEnrichmentIds.size && attemptedAt && String(attemptedAt) >= attemptedBefore && stored
+  );
+
+  async function runEnrichmentBatch(missing) {
+    if (!missing.length) return;
+    await onProgress?.({
+      phase: 'pdf_batch',
+      label: 'Analyzing missing PDFs',
+      status: 'running',
+      counts: {
+        processed: totalEnrichmentAttempted,
+        total: pdfBatchLimit || totalEnrichmentAttempted + missing.length,
+      },
+    });
+    const attemptedBeforePage = totalEnrichmentAttempted;
+    // Durable progress is recorded before any content request so a crashed batch
+    // does not leave the chain re-reading the same documents forever.
+    await markEnrichmentAttempts(missing.map((item) => item.doc.id), new Date().toISOString());
+    const processingResults = await mapWithConcurrency(missing, contentConcurrency, async (item, index) => {
+      const docCounts = {
+        processed: attemptedBeforePage + index + 1,
+        total: pdfBatchLimit || attemptedBeforePage + missing.length,
+      };
+      await onProgress?.({
+        phase: 'pdf_document',
+        label: 'Parsing PDF document data',
+        detail: progressDocDetail(item.doc),
+        status: 'running',
+        counts: docCounts,
+      });
+      await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
+      pdfAttemptedIds.push(item.doc.id);
+      totalEnrichmentAttempted += 1;
+      try {
+        await analyzeDocumentFile(item.doc, {
+          contentMode,
+          contentFallback,
+          maxContentBytes,
+          downloadFiles: contentMode === 'pdf_cache' || contentMode === 'pdf_stream',
+          forceDownload: false,
+          recomputeFromCache: false,
+          artifactClient,
+          extractCommittee,
+          extractCitations: false,
+          onContentRequest: countContentRequest,
+          onProgress: async (event = {}) => {
+            peakHeapBytes = Math.max(peakHeapBytes, process.memoryUsage().heapUsed);
+            return onProgress?.({
+              ...event,
+              detail: event.detail || progressDocDetail(item.doc),
+              counts: { ...docCounts, ...(event.counts || {}) },
+            });
+          },
+        });
+      } catch (error) {
+        peakHeapBytes = Math.max(peakHeapBytes, process.memoryUsage().heapUsed);
+        totalEnrichmentFailed += 1;
+        enrichmentOutcomes.push({
+          docId: item.doc.id,
+          contentMode,
+          error: error?.message || String(error),
+        });
+        const storedFailure = await loadStoredFileMetric(item.doc.id);
+        if (!storedFailure) {
+          await saveFileMetric(item.doc.id, {
+            status: 'not_found',
+            error: error?.message || String(error),
+          });
+        }
+        return;
+      }
+      await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
+      const storedAfterAnalysis = await loadStoredFileMetric(item.doc.id);
+      const policySatisfied = hasCachedEnrichmentMetric(storedAfterAnalysis, contentMode, contentFallback);
+      if (policySatisfied) totalEnriched += 1;
+      else totalEnrichmentFailed += 1;
+      peakHeapBytes = Math.max(peakHeapBytes, process.memoryUsage().heapUsed);
+      enrichmentOutcomes.push({
+        docId: item.doc.id,
+        contentMode,
+        status: storedAfterAnalysis?.status || null,
+        error: storedAfterAnalysis?.error || null,
+        contentSource: storedAfterAnalysis?.content_source || null,
+        wordSource: storedAfterAnalysis?.word_source || null,
+        pageSource: storedAfterAnalysis?.page_source || null,
+        wordCount: Number(storedAfterAnalysis?.word_count || 0),
+        bodyWordCount: Number(storedAfterAnalysis?.body_word_count || 0),
+        pageCount: Number(storedAfterAnalysis?.page_count || 0),
+        parserVersion: storedAfterAnalysis?.parser_version || null,
+        contentChecksum: storedAfterAnalysis?.content_checksum || null,
+      });
+      await onProgress?.({
+        phase: 'pdf_document',
+        label: policySatisfied ? 'Parsed document data' : 'Document enrichment did not satisfy policy',
+        detail: progressDocDetail(item.doc),
+        status: policySatisfied ? 'completed' : 'failed',
+        counts: {
+          ...docCounts,
+          pages: item.doc.pages || 0,
+          words: item.doc.wordCount || 0,
+          enriched: totalEnriched,
+          failed: totalEnrichmentFailed,
+        },
+      });
+    });
+    const processingError = processingResults.find((result) => result?.error)?.error;
+    if (processingError) throw processingError;
+    await onProgress?.({
+      phase: 'pdf_batch',
+      label: 'Missing PDF batch',
+      status: 'completed',
+      counts: {
+        processed: attemptedBeforePage + missing.length,
+        total: pdfBatchLimit || attemptedBeforePage + missing.length,
+        enriched: totalEnriched,
+        failed: totalEnrichmentFailed,
+      },
+    });
+  }
+
+  // Drains the locally known outstanding documents for this sync key before going
+  // anywhere near Open Collections. Returns true when the batch cap was reached, in
+  // which case the upstream scan is skipped entirely — the whole point of H-03.
+  async function drainLocalEnrichmentQueue(runId) {
+    while (true) {
+      if (pdfBatchLimit && totalEnrichmentAttempted >= pdfBatchLimit) {
+        pdfBatchLimitReached = true;
+        return true;
+      }
+      if (totalSeen >= source.maxRecords) return true;
+      const pageLimit = Math.max(1, Math.min(
+        source.pageSize,
+        source.maxRecords - totalSeen,
+        pdfBatchLimit ? pdfBatchLimit - totalEnrichmentAttempted : source.pageSize
+      ));
+      const candidates = await listDocumentsPendingEnrichment({
+        syncKey,
+        contentMode,
+        contentFallback,
+        attemptedBefore,
+        afterDocId: queueCursor,
+        limit: pageLimit,
+      });
+      if (!candidates.length) return false;
+      queueCursor = candidates[candidates.length - 1].docId;
+      totalSeen += candidates.length;
+      const missing = candidates
+        .filter((candidate) => !skippedPdfIds.has(candidate.docId))
+        .map((candidate) => ({
+          doc: candidate.metadata && candidate.metadata.id ? candidate.metadata : { id: candidate.docId },
+          syncKey,
+          source: null,
+        }));
+      totalSkipped += candidates.length - missing.length;
+      await runEnrichmentBatch(missing);
+      totalSaved += missing.length;
+      await updateSyncRun(runId, { totalSeen, totalSaved, apiTotal });
+      if (candidates.length < pageLimit) return false;
+    }
+  }
+
+  async function finishSync() {
+    await updateSyncRun(runId, {
+      status: 'completed',
+      totalSeen,
+      totalSaved,
+      apiTotal,
+      finishedAt: new Date().toISOString(),
+    });
+    const enrichmentExhausted = mode === 'sync_missing_pdfs' && !pdfBatchLimitReached && upstreamExhausted;
+    logger.info('Open Collections sync completed', {
+      syncKey,
+      mode,
+      totalSeen,
+      totalSaved,
+      totalSkipped,
+      pdfBatchSize: pdfBatchLimit || null,
+      pdfBatchLimitReached,
+      enrichmentExhausted,
+      pdfAttempted: pdfAttemptedIds.length,
+      totalEnrichmentAttempted,
+      totalEnriched,
+      totalEnrichmentFailed,
+      heapGrowthBytes: Math.max(0, peakHeapBytes - startingHeapBytes),
+      requestCounts,
+      seconds: Math.round((Date.now() - startedAt) / 1000),
+    });
+    return {
+      ok: true,
+      totalSeen,
+      totalSaved,
+      totalSkipped,
+      apiTotal,
+      pdfBatchLimitReached,
+      enrichmentExhausted,
+      pdfAttemptedIds,
+      totalEnrichmentAttempted,
+      totalEnriched,
+      totalEnrichmentFailed,
+      enrichmentOutcomes,
+      enrichmentAttemptedBefore: attemptedBefore,
+      enrichmentCursor: queueCursor,
+      heapGrowthBytes: Math.max(0, peakHeapBytes - startingHeapBytes),
+      requestCounts,
+    };
+  }
+
   try {
+    // The Phase 5 PDF control ships an explicit document allowlist and must keep
+    // taking precedence over any database-driven selection, so it stays on the
+    // upstream scan path untouched.
+    if (enrichmentRequested && !requiredEnrichmentIds.size && await drainLocalEnrichmentQueue(runId)) {
+      return await finishSync();
+    }
+
     const index = source.requestedIndex
       ? await resolveIndexName(source.baseUrl, source.requestedIndex, apiKey)
       : null;
@@ -261,22 +492,36 @@ async function runSync(syncKey, source, apiKey, runId, {
         };
       });
       totalSeen += batch.length;
-      const enrichmentRequested = mode === 'sync_missing_pdfs' && contentModeEnrichesDocuments(contentMode);
       const filtered = await filterSyncItemsForMode(batch, enrichmentRequested ? mode : 'import_all');
       totalSkipped += filtered.skipped;
       if (enrichmentRequested) {
+        // One batched read of the stored metrics and the attempt log for the whole
+        // page replaces one loadStoredFileMetric round trip per record (H-05). The
+        // control allowlist ignores both, so it does not pay for them at all.
+        const pageIds = filtered.items.map((item) => String(item.doc.id));
+        const storedByDocId = requiredEnrichmentIds.size
+          ? new Map()
+          : await loadStoredFileMetrics(pageIds);
+        const attemptedByDocId = requiredEnrichmentIds.size
+          ? new Map()
+          : await loadEnrichmentAttempts(pageIds);
         const missing = [];
         for (const item of filtered.items) {
-          if (requiredEnrichmentIds.size && !requiredEnrichmentIds.has(String(item.doc.id))) {
+          const docId = String(item.doc.id);
+          if (requiredEnrichmentIds.size && !requiredEnrichmentIds.has(docId)) {
             totalSkipped += 1;
             continue;
           }
-          if (skippedPdfIds.has(String(item.doc.id))) {
+          if (skippedPdfIds.has(docId)) {
             totalSkipped += 1;
             continue;
           }
-          const stored = await loadStoredFileMetric(item.doc.id);
+          const stored = storedByDocId.get(docId) || null;
           if (!requiredEnrichmentIds.size && hasCachedEnrichmentMetric(stored, contentMode, contentFallback)) {
+            totalSkipped += 1;
+            continue;
+          }
+          if (attemptedInChain(stored, attemptedByDocId.get(docId))) {
             totalSkipped += 1;
             continue;
           }
@@ -286,120 +531,7 @@ async function runSync(syncKey, source, apiKey, runId, {
           }
           missing.push(item);
         }
-        if (missing.length) {
-          await onProgress?.({
-            phase: 'pdf_batch',
-            label: 'Analyzing missing PDFs',
-            status: 'running',
-            counts: {
-              processed: totalEnrichmentAttempted,
-              total: pdfBatchLimit || totalEnrichmentAttempted + missing.length,
-            },
-          });
-        }
-        const attemptedBeforePage = totalEnrichmentAttempted;
-        const processingResults = await mapWithConcurrency(missing, contentConcurrency, async (item, index) => {
-          const docCounts = {
-            processed: attemptedBeforePage + index + 1,
-            total: pdfBatchLimit || attemptedBeforePage + missing.length,
-          };
-          await onProgress?.({
-            phase: 'pdf_document',
-            label: 'Parsing PDF document data',
-            detail: progressDocDetail(item.doc),
-            status: 'running',
-            counts: docCounts,
-          });
-          await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
-          pdfAttemptedIds.push(item.doc.id);
-          totalEnrichmentAttempted += 1;
-          try {
-            await analyzeDocumentFile(item.doc, {
-              contentMode,
-              contentFallback,
-              maxContentBytes,
-              downloadFiles: contentMode === 'pdf_cache' || contentMode === 'pdf_stream',
-              forceDownload: false,
-              recomputeFromCache: false,
-              artifactClient,
-              extractCommittee,
-              extractCitations: false,
-              onContentRequest: countContentRequest,
-              onProgress: async (event = {}) => {
-                peakHeapBytes = Math.max(peakHeapBytes, process.memoryUsage().heapUsed);
-                return onProgress?.({
-                  ...event,
-                  detail: event.detail || progressDocDetail(item.doc),
-                  counts: { ...docCounts, ...(event.counts || {}) },
-                });
-              },
-            });
-          } catch (error) {
-            peakHeapBytes = Math.max(peakHeapBytes, process.memoryUsage().heapUsed);
-            totalEnrichmentFailed += 1;
-            enrichmentOutcomes.push({
-              docId: item.doc.id,
-              contentMode,
-              error: error?.message || String(error),
-            });
-            const storedFailure = await loadStoredFileMetric(item.doc.id);
-            if (!storedFailure) {
-              await saveFileMetric(item.doc.id, {
-                status: 'not_found',
-                error: error?.message || String(error),
-              });
-            }
-            return;
-          }
-          await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
-          const storedAfterAnalysis = await loadStoredFileMetric(item.doc.id);
-          const policySatisfied = hasCachedEnrichmentMetric(storedAfterAnalysis, contentMode, contentFallback);
-          if (policySatisfied) totalEnriched += 1;
-          else totalEnrichmentFailed += 1;
-          peakHeapBytes = Math.max(peakHeapBytes, process.memoryUsage().heapUsed);
-          enrichmentOutcomes.push({
-            docId: item.doc.id,
-            contentMode,
-            status: storedAfterAnalysis?.status || null,
-            error: storedAfterAnalysis?.error || null,
-            contentSource: storedAfterAnalysis?.content_source || null,
-            wordSource: storedAfterAnalysis?.word_source || null,
-            pageSource: storedAfterAnalysis?.page_source || null,
-            wordCount: Number(storedAfterAnalysis?.word_count || 0),
-            bodyWordCount: Number(storedAfterAnalysis?.body_word_count || 0),
-            pageCount: Number(storedAfterAnalysis?.page_count || 0),
-            parserVersion: storedAfterAnalysis?.parser_version || null,
-            contentChecksum: storedAfterAnalysis?.content_checksum || null,
-          });
-          await onProgress?.({
-            phase: 'pdf_document',
-            label: policySatisfied ? 'Parsed document data' : 'Document enrichment did not satisfy policy',
-            detail: progressDocDetail(item.doc),
-            status: policySatisfied ? 'completed' : 'failed',
-            counts: {
-              ...docCounts,
-              pages: item.doc.pages || 0,
-              words: item.doc.wordCount || 0,
-              enriched: totalEnriched,
-              failed: totalEnrichmentFailed,
-            },
-          });
-        });
-        const processingError = processingResults.find((result) => result?.error)?.error;
-        if (processingError) throw processingError;
-        if (missing.length) {
-          await onProgress?.({
-            phase: 'pdf_batch',
-            label: 'Missing PDF batch',
-            status: 'completed',
-            counts: {
-              processed: attemptedBeforePage + missing.length,
-              total: pdfBatchLimit || attemptedBeforePage + missing.length,
-              enriched: totalEnriched,
-              failed: totalEnrichmentFailed,
-            },
-          });
-        }
+        await runEnrichmentBatch(missing);
         totalSaved += missing.length;
       } else {
         totalSaved += await saveDocumentMetadataBatch(filtered.items);
@@ -415,46 +547,7 @@ async function runSync(syncKey, source, apiKey, runId, {
       if (requiredEnrichmentIds.size && pdfAttemptedIds.length >= requiredEnrichmentIds.size) break;
     }
 
-    await updateSyncRun(runId, {
-      status: 'completed',
-      totalSeen,
-      totalSaved,
-      apiTotal,
-      finishedAt: new Date().toISOString(),
-    });
-    logger.info('Open Collections sync completed', {
-      syncKey,
-      mode,
-      totalSeen,
-      totalSaved,
-      totalSkipped,
-      pdfBatchSize: pdfBatchLimit || null,
-      pdfBatchLimitReached,
-      enrichmentExhausted: mode === 'sync_missing_pdfs' && !pdfBatchLimitReached && upstreamExhausted,
-      pdfAttempted: pdfAttemptedIds.length,
-      totalEnrichmentAttempted,
-      totalEnriched,
-      totalEnrichmentFailed,
-      heapGrowthBytes: Math.max(0, peakHeapBytes - startingHeapBytes),
-      requestCounts,
-      seconds: Math.round((Date.now() - startedAt) / 1000),
-    });
-    return {
-      ok: true,
-      totalSeen,
-      totalSaved,
-      totalSkipped,
-      apiTotal,
-      pdfBatchLimitReached,
-      enrichmentExhausted: mode === 'sync_missing_pdfs' && !pdfBatchLimitReached && upstreamExhausted,
-      pdfAttemptedIds,
-      totalEnrichmentAttempted,
-      totalEnriched,
-      totalEnrichmentFailed,
-      enrichmentOutcomes,
-      heapGrowthBytes: Math.max(0, peakHeapBytes - startingHeapBytes),
-      requestCounts,
-    };
+    return await finishSync();
   } catch (error) {
     await updateSyncRun(runId, {
       status: 'failed',
@@ -477,6 +570,8 @@ async function runSync(syncKey, source, apiKey, runId, {
       totalEnriched,
       totalEnrichmentFailed,
       enrichmentOutcomes,
+      enrichmentAttemptedBefore: attemptedBefore,
+      enrichmentCursor: queueCursor,
       heapGrowthBytes: Math.max(0, peakHeapBytes - startingHeapBytes),
       requestCounts,
       error: error?.message || String(error),
@@ -512,6 +607,8 @@ export async function startDocumentSync(options = {}) {
     pdfBatchSize: options.pdfBatchSize || 0,
     skipPdfDocIds: options.skipPdfDocIds || [],
     enrichmentDocIds: options.enrichmentDocIds || [],
+    enrichmentAttemptedBefore: options.enrichmentAttemptedBefore || null,
+    enrichmentCursor: options.enrichmentCursor || '',
   });
   runningSyncs.set(syncKey, task);
   return { started: true, syncKey, runId, status: await getDocumentSyncStatus(syncKey) };
@@ -540,6 +637,8 @@ export async function runDocumentSync(options = {}) {
     pdfBatchSize: options.pdfBatchSize || 0,
     skipPdfDocIds: options.skipPdfDocIds || [],
     enrichmentDocIds: options.enrichmentDocIds || [],
+    enrichmentAttemptedBefore: options.enrichmentAttemptedBefore || null,
+    enrichmentCursor: options.enrichmentCursor || '',
   });
   return { syncKey, runId, mode, ...summary, status: await getDocumentSyncStatus(syncKey) };
 }

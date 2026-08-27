@@ -70,13 +70,20 @@ async function startContinuationJob(job, result, progress) {
   if (!params.autoContinuePdfBatches) return null;
   if (!result.ok || !result.pdfBatchLimitReached || Number(result.totalEnrichmentAttempted || 0) <= 0) return null;
 
+  // Progress is carried as durable state, not as job parameters: one chain-start
+  // timestamp plus one cursor per rule, so params_json stays the same size at batch
+  // 1000 as at batch 1 instead of accumulating every attempted doc id (H-03).
   const nextParams = {
     ...params,
     rules: rulesForContinuation(params.rules, result.rules),
     continuationOf: params.continuationOf || job.id,
     previousJobId: job.id,
-    skipPdfDocIds: result.pdfAttemptedIds || [],
+    enrichmentAttemptedBefore: result.enrichmentAttemptedBefore
+      || params.enrichmentAttemptedBefore
+      || new Date().toISOString(),
+    enrichmentCursors: result.enrichmentCursors || {},
   };
+  delete nextParams.skipPdfDocIds;
   await progress?.({
     phase: 'continuation',
     label: 'Scheduling next PDF batch',
@@ -316,6 +323,12 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     const perRule = [];
     const pdfBatchSize = readPdfBatchSize(params);
     const attemptedPdfIds = new Set(readDocIdList(params.skipPdfDocIds));
+    // One instant for the whole job (and, via continuation params, for the whole
+    // batch chain): documents attempted at or after it are already this chain's work.
+    const enrichmentAttemptedBefore = String(params.enrichmentAttemptedBefore || new Date().toISOString());
+    const enrichmentCursors = {
+      ...(params.enrichmentCursors && typeof params.enrichmentCursors === 'object' ? params.enrichmentCursors : {}),
+    };
     const totals = {
       rulesStarted: 0,
       totalSeen: 0,
@@ -359,7 +372,10 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         pdfBatchSize: params.mode === 'sync_missing_pdfs' && enrichesDocuments ? remainingPdfBatchSize : 0,
         skipPdfDocIds: Array.from(attemptedPdfIds),
         enrichmentDocIds: rollout?.phase === 'control' ? rollout.documentIds : [],
+        enrichmentAttemptedBefore,
+        enrichmentCursor: enrichmentCursors[rule.id] || '',
       });
+      if (result.enrichmentCursor) enrichmentCursors[rule.id] = result.enrichmentCursor;
       totals.rulesStarted += 1;
       totals.totalSeen += Number(result.totalSeen || 0);
       totals.totalSaved += Number(result.totalSaved || 0);
@@ -416,6 +432,8 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       pdfBatchLimitReached,
       pdfAttemptedIds: Array.from(attemptedPdfIds),
       requestCounts,
+      enrichmentAttemptedBefore,
+      enrichmentCursors,
       ...totals,
       rules: perRule,
     };
