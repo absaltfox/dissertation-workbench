@@ -45,7 +45,14 @@ export const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024; // 200 MB
 // into the heap -- and on Fly os.tmpdir() is tmpfs, so the staging file is RAM
 // too. 20 MB is ~3.3M words; a 1,000-page thesis is nearer 5 MB, so exceeding it
 // means a pathological or hostile file rather than a long dissertation.
-export const MAX_PDF_TEXT_BYTES = Number(process.env.MAX_PDF_TEXT_BYTES || 20 * 1024 * 1024); // 20 MB
+export const DEFAULT_MAX_PDF_TEXT_BYTES = 20 * 1024 * 1024; // 20 MB
+// Parsed defensively: a safety ceiling that silently becomes NaN on a typo
+// ("20mb") fails open -- `size > NaN` is false, so the guard disappears while
+// still looking configured.
+export const MAX_PDF_TEXT_BYTES = (() => {
+  const parsed = Number(process.env.MAX_PDF_TEXT_BYTES);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_PDF_TEXT_BYTES;
+})();
 export const DOWNLOAD_TIMEOUT_MS = 30_000; // 30 seconds
 export const TRUST_PROXY = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '');
 export const PDF_ALLOWED_HOSTS = (process.env.PDF_ALLOWED_HOSTS || 'open.library.ubc.ca,oc-index.library.ubc.ca,circle.library.ubc.ca')

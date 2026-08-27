@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
-  PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, MAX_PDF_TEXT_BYTES, DOWNLOAD_TIMEOUT_MS,
+  PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, FILE_CONCURRENCY, MAX_DOWNLOAD_BYTES, MAX_PDF_TEXT_BYTES, DEFAULT_MAX_PDF_TEXT_BYTES, DOWNLOAD_TIMEOUT_MS,
   PDF_DOWNLOAD_RATE_PER_MIN, GROBID_URL, GROBID_STARTUP_WAIT_MS, GROBID_FLY_API_TOKEN,
   ALLOW_ORIGINAL_PDF_RETRIEVAL, CONTENT_RETRIEVAL_ENABLED
 } from './config.js';
@@ -26,7 +26,12 @@ import { isImportContentMode } from './importRules.js';
 export const DEGRADED_WORD_SOURCE = 'degraded_pdf_text';
 
 let downloadSafetyOptions = {};
-let maxPdfTextBytes = MAX_PDF_TEXT_BYTES;
+// A ceiling that fails open is worse than no ceiling, because it looks configured.
+function resolveTextCeiling(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+let maxPdfTextBytes = resolveTextCeiling(MAX_PDF_TEXT_BYTES, DEFAULT_MAX_PDF_TEXT_BYTES);
 const activePdfStreamDirs = new Set();
 let pdfStreamJanitorPromise = null;
 export function _setDownloadSafetyOptionsForTests(options) {
@@ -37,8 +42,15 @@ export function _setDownloadSafetyOptionsForTests(options) {
 // otherwise mean either a genuinely 20 MB fixture or an env value that distorts
 // every other test in the file. Overriding it per-test keeps the real byte check
 // on the real code path. Pass null to restore the configured value.
+export const _testing = {
+  get extractionError() { return extractionError; },
+  get persistedWordCount() { return persistedWordCount; },
+};
+
 export function _setMaxPdfTextBytesForTests(bytes) {
-  maxPdfTextBytes = bytes == null ? MAX_PDF_TEXT_BYTES : Number(bytes);
+  maxPdfTextBytes = bytes == null
+    ? resolveTextCeiling(MAX_PDF_TEXT_BYTES, DEFAULT_MAX_PDF_TEXT_BYTES)
+    : Number(bytes);
 }
 
 export async function cleanupOrphanedPdfStreamDirs() {
@@ -640,9 +652,11 @@ export const EXTRACTION_TEXT_TOO_LARGE = 'text_too_large';
 
 // pdftotext writes its text to a file, so stdout is quiet -- but stderr is still
 // a pipe subject to execFile's 1 MB default, and a malformed PDF can emit
-// thousands of "Syntax Error:" lines. Without an explicit bound a broken file
-// can still blow up the call, just from the other stream.
-const PDFTOTEXT_STDERR_MAX_BYTES = 1024 * 1024;
+// thousands of "Syntax Error:" lines. Overflowing it aborts the child and drops a
+// perfectly extractable thesis into the raw-byte fallback: the #13 data loss, on
+// the sibling stream. This must be ABOVE the 1 MB default to buy anything -- with
+// stdout going to a file, the headroom costs nothing.
+const PDFTOTEXT_STDERR_MAX_BYTES = 8 * 1024 * 1024;
 // err.message embeds the child's entire stderr and is written into a structured
 // log line; keep it to something a log aggregator can hold.
 const EXTRACTION_ERROR_MAX_CHARS = 500;
@@ -714,6 +728,7 @@ async function extractPdfText(filePath, bytes = null) {
     const { size } = await fs.stat(tmpFile);
     if (size > maxPdfTextBytes) {
       logger.warn('pdftotext output exceeds the extraction size limit; refusing to load it', {
+        path: filePath,
         bytes: size,
         limit: maxPdfTextBytes,
       });
@@ -794,6 +809,23 @@ export async function analyzePdfAtPath(pdfPath, bytes) {
 // reliable-word aggregate (see reliableWords in db.js, hasReliableWordCount in
 // metrics.js). An image-only PDF yields no count at all, so it must leave the
 // existing provenance untouched.
+// A size refusal produced no text, so it must not be written as a clean success.
+// Recording it in `error` makes the population queryable -- otherwise the row is
+// byte-identical to a scanned PDF with no text layer, and an operator who later
+// raises the ceiling has no way to find the documents worth reprocessing.
+function extractionError(analysis) {
+  if (analysis?.extractionStatus !== EXTRACTION_TEXT_TOO_LARGE) return null;
+  return `Extracted text exceeded the ${maxPdfTextBytes}-byte limit `
+    + `(${analysis.extractedBytes ?? 'unknown'} bytes); text was not loaded.`;
+}
+
+// Never let an analysis that produced no count erase one already on the row. The
+// sibling failure branches already fall back to the stored value; these did not,
+// so a size refusal silently nulled a good dspace_full_text count.
+function persistedWordCount(doc, stored) {
+  return doc.wordCount ?? stored?.word_count ?? null;
+}
+
 function applyAnalysisWordCount(doc, analysis, source) {
   if (!analysis.wordCount) return;
   doc.wordCount = analysis.wordCount;
@@ -2252,11 +2284,11 @@ export async function analyzeDocumentFile(doc, options) {
 
         await saveFileMetric(doc.id, {
           status: doc.downloadStatus,
-          error: null,
+          error: extractionError(analysis),
           pdfPath: stored?.pdf_path || null,
           downloadUrl: streamed.downloadUrl,
           fileBytes: analysis.fileBytes,
-          wordCount: doc.wordCount,
+          wordCount: persistedWordCount(doc, stored),
           bodyWordCount: doc.bodyWordCount,
           ...storedFullTextFields(stored),
           pageCount: doc.pages,
@@ -2379,11 +2411,11 @@ export async function analyzeDocumentFile(doc, options) {
 
       await saveFileMetric(doc.id, {
         status: 'recomputed_from_cache',
-        error: null,
+        error: extractionError(analysis),
         pdfPath: stored.pdf_path,
         downloadUrl: stored.download_url,
         fileBytes: analysis.fileBytes,
-        wordCount: doc.wordCount,
+        wordCount: persistedWordCount(doc, stored),
         bodyWordCount: doc.bodyWordCount,
         ...storedFullTextFields(stored),
         pageCount: doc.pages,
@@ -2526,11 +2558,11 @@ export async function analyzeDocumentFile(doc, options) {
 
       await saveFileMetric(doc.id, {
         status: doc.downloadStatus,
-        error: null,
+        error: extractionError(analysis),
         pdfPath: durablePdfPath,
         downloadUrl: resolved.downloadUrl,
         fileBytes: analysis.fileBytes,
-        wordCount: doc.wordCount,
+        wordCount: persistedWordCount(doc, stored),
         bodyWordCount: doc.bodyWordCount,
         ...storedFullTextFields(stored),
         pageCount: doc.pages,

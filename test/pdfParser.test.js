@@ -569,19 +569,42 @@ test('extraction refuses output larger than the configured text ceiling', async 
   await fs.rm(dir, { recursive: true, force: true });
 });
 
-test('a refused oversize extraction cannot be recorded as a reliable word count', async () => {
-  const { hasReliableWordCount } = await import('../src/metrics.js');
-  // text_too_large yields no count at all, so applyAnalysisWordCount leaves the
-  // document's existing provenance alone rather than relabelling it.
-  const doc = { wordCount: 42000, wordCountSource: 'dspace_full_text' };
-  const analysis = {
-    wordCount: null, degraded: true, extractionStatus: EXTRACTION_TEXT_TOO_LARGE,
-  };
-  assert.equal(analysis.wordCount, null);
-  assert.equal(hasReliableWordCount(doc), true, 'a real full-text count stays reliable');
-  assert.equal(
-    hasReliableWordCount({ wordCount: 42000, wordCountSource: DEGRADED_WORD_SOURCE }),
-    false,
-    'a degraded count is never reliable'
-  );
+
+// The previous version of this test built an object by hand and asserted a property
+// it had just assigned, so it passed with the entire fix reverted. It was also the
+// test that should have caught the refusal being written as a clean success.
+test('an oversize refusal is recorded as an error and never erases a stored word count', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'pdf-refusal-'));
+  const pdfPath = path.join(dir, 'oversize.pdf');
+  await writeLargeFlatePdf(pdfPath, { pages: 40, linesPerPage: 40 });
+
+  _setMaxPdfTextBytesForTests(4096);
+  try {
+    const analysis = await analyzePdfAtPath(pdfPath);
+    assert.equal(analysis.extractionStatus, EXTRACTION_TEXT_TOO_LARGE);
+
+    // What the refusal contributes to the persisted row.
+    const { _testing } = await import('../src/pdf.js');
+    const stored = { word_count: 42000, word_source: 'dspace_full_text' };
+    const doc = {};
+
+    const error = _testing.extractionError(analysis);
+    assert.ok(error, 'a size refusal must not persist error: null');
+    assert.match(error, /exceeded/i);
+    assert.ok(error.includes(String(analysis.extractedBytes)), 'error should name the observed size');
+
+    // A clean extraction contributes no error, so ordinary rows stay untouched.
+    assert.equal(_testing.extractionError({ extractionStatus: 'ok' }), null);
+
+    // The stored count survives an analysis that produced none.
+    assert.equal(_testing.persistedWordCount(doc, stored), 42000);
+    // A fresh count still wins.
+    assert.equal(_testing.persistedWordCount({ wordCount: 123 }, stored), 123);
+    // Nothing anywhere stays null rather than becoming undefined.
+    assert.equal(_testing.persistedWordCount({}, null), null);
+  } finally {
+    _setMaxPdfTextBytesForTests(null);
+  }
+
+  await fs.rm(dir, { recursive: true, force: true });
 });

@@ -512,11 +512,26 @@ def cluster_phrases(phrases, document_frequency):
             if attested >= VARIANT_EXTENSION_MIN_DOCUMENT_FREQUENCY:
                 extensions.setdefault(shorter, []).append(phrase)
 
+    # Fan-in is measured in distinct concepts, not surface forms. extract_candidates
+    # is a raw sliding window with no plural normalisation, so a real corpus yields
+    # "critical literacy practice" AND "critical literacy practices" as separate
+    # candidates -- which R1 has already merged into one component by this point.
+    # Counting surface forms would score that as two extensions and make a limit of
+    # two mean "at most one distinct extension", withholding exactly the fragment
+    # merges this rule exists to make. Roots are snapshotted before the apply loop
+    # so an earlier union cannot lower a later hub's count and make the outcome
+    # depend on the (deterministic, but arbitrary) iteration order.
+    roots_before = {phrase: forest.find(phrase) for phrase in extensions}
+    for absorbed in extensions.values():
+        for phrase in absorbed:
+            roots_before.setdefault(phrase, forest.find(phrase))
+
     extension_hubs_skipped = 0
     extension_edges_skipped = 0
     for shorter in sorted(extensions):
         absorbed = extensions[shorter]
-        if len(absorbed) > MAX_VARIANT_EXTENSION_FAN_IN:
+        distinct = {roots_before[phrase] for phrase in absorbed} - {roots_before[shorter]}
+        if len(distinct) > MAX_VARIANT_EXTENSION_FAN_IN:
             extension_hubs_skipped += 1
             extension_edges_skipped += len(absorbed)
             continue
