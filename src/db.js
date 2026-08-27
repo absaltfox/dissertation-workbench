@@ -536,6 +536,14 @@ async function ensureSchema(client) {
   await addColumnIfMissing(client, 'import_rules', 'content_rate_limit', 'INTEGER NOT NULL DEFAULT 0');
   await addColumnIfMissing(client, 'enrichment_rollouts', 'rule_revision', 'TEXT');
   await addColumnIfMissing(client, 'enrichment_rollout_evidence', 'rule_revision', 'TEXT');
+  // Citation match keys (M-06 / B-01). `year` is free text and the match year is a
+  // regex extraction from it, so an index on the raw column cannot serve the fuzzy
+  // candidate query. These columns persist exactly what citationMatchYear() and
+  // citationTextPrefix() derive, so the buckets that used to be built in memory
+  // become indexed range scans.
+  await addColumnIfMissing(client, 'citations', 'match_year', 'INTEGER');
+  await addColumnIfMissing(client, 'citations', 'match_prefix', 'TEXT');
+  await addColumnIfMissing(client, 'citations', 'match_key_version', 'INTEGER NOT NULL DEFAULT 0');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_sync_key ON documents(sync_key)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree ON documents(degree)');
@@ -554,6 +562,22 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_citations_citation_id ON document_citations(citation_id)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_citations_citation_doc ON document_citations(citation_id, doc_id)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_catalogue_lookups_hits_query_title ON catalogue_lookups(hits, query_title)');
+  // Fuzzy candidate buckets for saveCitations: the trailing `id` keeps each bucket
+  // in insertion order so the capped read is an ordered index range scan.
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_citations_match_year ON citations(match_year, id)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_citations_match_prefix ON citations(match_prefix, match_year, id)');
+  // Partial index over rows still awaiting match-key backfill. It carries the
+  // columns the backfill reads so the probe is a covering scan, and it empties
+  // itself as the backfill runs — once the corpus is done the probe reads nothing.
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_citations_match_pending ON citations(id, citation_text, year) WHERE match_key_version = 0');
+  // checkCacheIntegrity reads only these two columns, so a partial covering index
+  // turns its full table scan into an index scan over cached PDFs alone.
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_file_metrics_pdf_path ON file_metrics(doc_id, pdf_path) WHERE pdf_path IS NOT NULL');
+  // scope_where() in build-concepts.py filters every automatic partition by
+  // degree plus a year range on each PatternRank run.
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree_year ON documents(degree, year)');
+
+  await backfillCitationMatchKeys(client);
 
   const cleaned = await cleanupCommitteeArtifacts(client);
   if (cleaned > 0) logger.info(`Cleaned up ${cleaned} committee artefact rows`);
@@ -2819,87 +2843,276 @@ function citationTextPrefix(value) {
   return prefix.length === 3 ? prefix : null;
 }
 
+const FUZZY_CITATION_THRESHOLD = 0.94;
+// Per-bucket cap on fuzzy candidates. The year buckets grow with the corpus, so
+// without a cap the per-document cost would still scale with total citations.
+// Below the cap the candidate set is exactly the old in-memory bucket.
+const FUZZY_CANDIDATE_LIMIT = 400;
+const CITATION_MATCH_KEY_VERSION = 1;
+const CITATION_BACKFILL_BATCH = 500;
+const CITATION_CANDIDATE_COLUMNS = 'id, citation_hash, citation_text, match_year';
+
+function citationMatchKeys(citationText, yearValue) {
+  return {
+    matchYear: citationMatchYear(yearValue),
+    matchPrefix: citationTextPrefix(citationText),
+  };
+}
+
 function prepareCitationForMatching(row) {
   return {
-    ...row,
+    id: Number(row.id),
+    citation_hash: row.citation_hash,
+    citation_text: row.citation_text,
     matchText: String(row.citation_text || '').toLowerCase(),
-    matchYear: citationMatchYear(row.year),
-    matchPrefix: citationTextPrefix(row.citation_text),
+    matchYear: row.match_year == null ? null : Number(row.match_year),
   };
 }
 
-function pushBucket(map, key, row) {
-  if (key == null) return;
-  const existing = map.get(key);
-  if (existing) {
-    existing.push(row);
-  } else {
-    map.set(key, [row]);
-  }
-}
-
-function buildCitationMatchIndex(rows) {
-  const index = {
-    all: rows,
-    byHash: new Map(rows.map((row) => [row.citation_hash, row])),
-    byYear: new Map(),
-    withoutYear: [],
-    byPrefix: new Map(),
-  };
-  for (const row of rows) {
-    if (row.matchYear == null) {
-      index.withoutYear.push(row);
-    } else {
-      pushBucket(index.byYear, row.matchYear, row);
+// One-time migration for citations written before match_year/match_prefix existed.
+// Every statement is bounded to CITATION_BACKFILL_BATCH rows, and the probe is a
+// covering read of idx_citations_match_pending, which empties itself as the
+// backfill progresses — so on an already-migrated corpus this costs one scan of
+// an empty index rather than a pass over the table.
+export async function backfillCitationMatchKeys(dbInstance = null) {
+  const client = dbInstance || await getDb();
+  let total = 0;
+  let previousFirstId = null;
+  for (;;) {
+    let result;
+    try {
+      result = await client.execute({
+        sql: 'SELECT id, citation_text, year FROM citations WHERE match_key_version = 0 LIMIT ?',
+        args: [CITATION_BACKFILL_BATCH],
+      });
+    } catch {
+      // An older database without the match-key columns: nothing to backfill.
+      return total;
     }
-    pushBucket(index.byPrefix, row.matchPrefix, row);
+    if (!result.rows.length) break;
+    const firstId = Number(result.rows[0].id);
+    // Each batch takes its rows out of the pending set, so the next pass sees new
+    // ones. Seeing the same row twice means the writes are not landing; stop
+    // rather than spin.
+    if (firstId === previousFirstId) {
+      logger.warn('Citation match-key backfill made no progress; stopping', { citationId: firstId });
+      break;
+    }
+    previousFirstId = firstId;
+    const statements = result.rows.map((row) => {
+      const keys = citationMatchKeys(row.citation_text, row.year);
+      return {
+        sql: 'UPDATE citations SET match_year = ?, match_prefix = ?, match_key_version = ? WHERE id = ?',
+        args: [keys.matchYear, keys.matchPrefix, CITATION_MATCH_KEY_VERSION, Number(row.id)],
+      };
+    });
+    await client.batch(statements, 'write');
+    total += result.rows.length;
   }
-  return index;
+  if (total > 0) logger.info(`Backfilled citation match keys for ${total} citations`);
+  return total;
 }
 
-function addCitationToMatchIndex(index, row) {
-  index.all.push(row);
-  index.byHash.set(row.citation_hash, row);
-  if (row.matchYear == null) {
-    index.withoutYear.push(row);
-  } else {
-    pushBucket(index.byYear, row.matchYear, row);
+// Exact matching is a unique-index lookup, so the whole document's hashes are
+// resolved in one round trip instead of materialising the citations table.
+async function loadCitationIdsByHash(hashes) {
+  const idByHash = new Map();
+  const unique = Array.from(new Set(hashes.filter(Boolean)));
+  const chunkSize = 999;
+  for (let i = 0; i < unique.length; i += chunkSize) {
+    const chunk = unique.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = await all(`SELECT id, citation_hash FROM citations WHERE citation_hash IN (${placeholders})`, chunk);
+    for (const row of rows) idByHash.set(String(row.citation_hash), Number(row.id));
   }
-  pushBucket(index.byPrefix, row.matchPrefix, row);
+  return idByHash;
 }
 
-function fuzzyMatchCandidates(index, text, itemYear) {
+// Reads one or more capped candidate buckets in a single round trip and returns
+// them keyed by bucket, each in ascending id order — the order the in-memory
+// index produced, because it was filled by a rowid-ordered table scan.
+async function loadCandidateBuckets(arms) {
+  const sql = arms.map((arm) => `SELECT * FROM (
+      SELECT ${arm.bucket} AS bucket, ${CITATION_CANDIDATE_COLUMNS} FROM citations
+      WHERE ${arm.where} ORDER BY ${arm.order || 'id'} LIMIT ${FUZZY_CANDIDATE_LIMIT}
+    )`).join(' UNION ALL ');
+  const rows = await all(sql, arms.flatMap((arm) => arm.args));
+  const byBucket = new Map(arms.map((arm) => [arm.bucket, []]));
+  for (const row of rows) byBucket.get(Number(row.bucket))?.push(prepareCitationForMatching(row));
+  for (const bucket of byBucket.values()) bucket.sort((a, b) => a.id - b.id);
+  return byBucket;
+}
+
+const characterCountScratch = new Int32Array(256);
+
+function characterCounts(text) {
+  const counts = new Int32Array(256);
+  for (let i = 0; i < text.length; i += 1) counts[text.charCodeAt(i) & 0xff] += 1;
+  return counts;
+}
+
+// Upper bound on jaroWinkler(incoming, candidate), used to skip candidates that
+// provably cannot clear FUZZY_CITATION_THRESHOLD.
+//
+// Jaro's match count can never exceed the size of the character multiset the two
+// strings share, and its transposition term is at most 1, so
+// jaro <= (m/len1 + m/len2 + 1) / 3. Winkler adds at most 4 * 0.1 * (1 - jaro),
+// so jaroWinkler <= 0.6 * jaro + 0.4. Skipping a candidate the bound puts below
+// the threshold cannot change saveCitations' answer: such a candidate is below
+// the threshold in truth as well, so it can neither be accepted nor be the
+// highest-scoring candidate whenever any candidate clears the threshold.
+function jaroWinklerUpperBound(counts, incomingLength, candidateText) {
+  const remaining = characterCountScratch;
+  remaining.set(counts);
+  let matches = 0;
+  for (let i = 0; i < candidateText.length; i += 1) {
+    const code = candidateText.charCodeAt(i) & 0xff;
+    if (remaining[code] > 0) {
+      remaining[code] -= 1;
+      matches += 1;
+    }
+  }
+  if (!matches || !incomingLength || !candidateText.length) return 0;
+  const jaro = ((matches / incomingLength) + (matches / candidateText.length) + 1) / 3;
+  return (0.6 * jaro) + 0.4;
+}
+
+// Highest-scoring candidate in one bucket, keeping the first of any tie exactly
+// as the old `sim > maxSim` loop did.
+function bestInBucket(candidates, incoming, counts) {
+  let best = null;
+  let maxSim = 0;
+  for (const candidate of candidates) {
+    if (jaroWinklerUpperBound(counts, incoming.length, candidate.matchText) < FUZZY_CITATION_THRESHOLD) continue;
+    const sim = jaroWinkler(incoming, candidate.matchText);
+    if (sim > maxSim) {
+      maxSim = sim;
+      best = candidate;
+    }
+  }
+  return { best, maxSim };
+}
+
+// SQL replacement for the old in-memory fuzzyMatchCandidates plus the scan that
+// followed it. The buckets are the same ones the in-memory index held — the ±1
+// year window and the 3-character prefix bucket — and the winner is still the
+// first bucket, in the order y-1, y, y+1, undated-prefix, to attain the highest
+// similarity, so the ±1 window still *blocks* a same-year merge when an adjacent
+// year scores higher.
+//
+// Only the y and undated-prefix buckets can produce an accepted match: a
+// candidate whose year is non-null and different always fails
+// fuzzyYearsCompatible. So the adjacent-year buckets are read only once an
+// acceptable candidate has cleared the threshold — when none does, the old code
+// rejected regardless of what those buckets held.
+//
+// Deliberate difference: the old code fell back to comparing against every
+// citation in the corpus when a bucket came back empty. That fallback is the
+// unbounded path B-01 exists to remove, so an empty bucket now simply yields no
+// fuzzy match.
+async function findFuzzyMatch(text, itemYear) {
   const year = citationMatchYear(itemYear) ?? citationMatchYear(text);
   const prefix = citationTextPrefix(text);
-  if (year != null) {
-    const candidates = [];
-    for (let candidateYear = year - 1; candidateYear <= year + 1; candidateYear += 1) {
-      candidates.push(...(index.byYear.get(candidateYear) || []));
-    }
-    if (prefix) {
-      candidates.push(...(index.byPrefix.get(prefix) || []).filter((row) => row.matchYear == null));
-    }
-    return candidates.length ? candidates : index.all;
+  const incoming = text.toLowerCase();
+  const counts = characterCounts(incoming);
+
+  if (year == null) {
+    if (!prefix) return null;
+    // ORDER BY match_year, id follows idx_citations_match_prefix, so the cap is an
+    // ordered index range scan; loadCandidateBuckets restores the id ordering.
+    const buckets = await loadCandidateBuckets([
+      { bucket: 0, where: 'match_prefix = ?', order: 'match_year, id', args: [prefix] },
+    ]);
+    const { best, maxSim } = bestInBucket(buckets.get(0), incoming, counts);
+    // An incoming citation with no year is compatible with every candidate.
+    return best && maxSim >= FUZZY_CITATION_THRESHOLD ? { row: best, similarity: maxSim } : null;
   }
 
-  if (!prefix) return index.all;
-  const candidates = index.byPrefix.get(prefix) || [];
-  return candidates.length ? candidates : index.all;
+  const acceptableArms = [{ bucket: 1, where: 'match_year = ?', args: [year] }];
+  if (prefix) {
+    acceptableArms.push({ bucket: 3, where: 'match_prefix = ? AND match_year IS NULL', args: [prefix] });
+  }
+  const acceptable = await loadCandidateBuckets(acceptableArms);
+  const sameYear = bestInBucket(acceptable.get(1), incoming, counts);
+  const undated = prefix ? bestInBucket(acceptable.get(3), incoming, counts) : { best: null, maxSim: 0 };
+  if (Math.max(sameYear.maxSim, undated.maxSim) < FUZZY_CITATION_THRESHOLD) return null;
+
+  const adjacent = await loadCandidateBuckets([
+    { bucket: 0, where: 'match_year = ?', args: [year - 1] },
+    { bucket: 2, where: 'match_year = ?', args: [year + 1] },
+  ]);
+  const before = bestInBucket(adjacent.get(0), incoming, counts);
+  const after = bestInBucket(adjacent.get(2), incoming, counts);
+
+  const overall = Math.max(before.maxSim, sameYear.maxSim, after.maxSim, undated.maxSim);
+  if (before.maxSim === overall) return null;
+  if (sameYear.maxSim === overall) return { row: sameYear.best, similarity: overall };
+  if (after.maxSim === overall) return null;
+  return { row: undated.best, similarity: overall };
 }
 
-const FUZZY_CITATION_THRESHOLD = 0.94;
+function citationFields(item) {
+  const text = typeof item === 'string' ? item : item.text;
+  return {
+    text,
+    author: (typeof item === 'string' ? null : item.author) || null,
+    title: (typeof item === 'string' ? null : item.title) || null,
+    year: (typeof item === 'string' ? null : item.year) || null,
+    source: (typeof item === 'string' ? null : item.source) || null,
+  };
+}
 
-function fuzzyYearsCompatible(a, b) {
-  return a == null || b == null || a === b;
+// Inserts (or reuses) a citation row and returns its id, keeping the persisted
+// match keys in step with whatever text/year the row ended up carrying.
+async function upsertCitation(fields, hash, now) {
+  const keys = citationMatchKeys(fields.text, fields.year);
+  await run(`
+    INSERT INTO citations (
+      citation_hash, citation_text, author, title, year, source, created_at,
+      match_year, match_prefix, match_key_version
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(citation_hash) DO UPDATE SET
+      author = COALESCE(excluded.author, citations.author),
+      title = COALESCE(excluded.title, citations.title),
+      year = COALESCE(excluded.year, citations.year),
+      source = COALESCE(excluded.source, citations.source)
+  `, [
+    hash, fields.text, fields.author, fields.title, fields.year, fields.source, now,
+    keys.matchYear, keys.matchPrefix, CITATION_MATCH_KEY_VERSION,
+  ]);
+  const row = await get(`
+    SELECT id, citation_text, year, match_year, match_prefix, match_key_version
+    FROM citations WHERE citation_hash = ?
+  `, [hash]);
+  if (!row) return null;
+  const stored = citationMatchKeys(row.citation_text, row.year);
+  const storedYear = row.match_year == null ? null : Number(row.match_year);
+  if (
+    Number(row.match_key_version) !== CITATION_MATCH_KEY_VERSION
+    || storedYear !== stored.matchYear
+    || (row.match_prefix ?? null) !== stored.matchPrefix
+  ) {
+    await run(
+      'UPDATE citations SET match_year = ?, match_prefix = ?, match_key_version = ? WHERE id = ?',
+      [stored.matchYear, stored.matchPrefix, CITATION_MATCH_KEY_VERSION, Number(row.id)]
+    );
+  }
+  return Number(row.id);
 }
 
 export async function saveCitations(docId, citations, hashFn, { onProgress = null } = {}) {
   const now = new Date().toISOString();
-  
-  // Fetch once, then bucket in memory so fuzzy matching avoids scanning every citation.
-  const existingCitations = (await all('SELECT id, citation_hash, citation_text, author, title, year FROM citations'))
-    .map(prepareCitationForMatching);
-  const matchIndex = buildCitationMatchIndex(existingCitations);
+
+  const items = citations.map((item) => {
+    const fields = citationFields(item);
+    return { ...fields, hash: hashFn(fields.text) };
+  });
+  // Exact matches come from one indexed lookup over this document's hashes only.
+  // Rows created inside the loop are added here, exactly as the old in-memory
+  // hash map grew during the loop.
+  const idByHash = await loadCitationIdsByHash(items.map((item) => item.hash));
+
   const linkedIds = [];
   const counts = {
     processed: 0,
@@ -2915,53 +3128,19 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
     counts,
   });
 
-  for (const item of citations) {
-    const text = typeof item === 'string' ? item : item.text;
-    const hash = hashFn(text);
-    
-    let matchedId = null;
-    let matchedHash = hash;
-    let matchedBy = null;
+  for (const item of items) {
+    let matchedId = idByHash.get(item.hash) ?? null;
+    let matchedBy = matchedId ? 'exact' : null;
 
-    // 1. Exact match check
-    if (matchIndex.byHash.has(hash)) {
-      matchedId = matchIndex.byHash.get(hash).id;
-      matchedHash = hash;
-      matchedBy = 'exact';
-    } else {
-      // 2. Fuzzy match check
-      const candidates = fuzzyMatchCandidates(
-        matchIndex,
-        text,
-        typeof item === 'string' ? null : item.year
-      );
-
-      let bestMatch = null;
-      let maxSim = 0;
-
-      const incomingMatchText = text.toLowerCase();
-      for (const candidate of candidates) {
-        const sim = jaroWinkler(incomingMatchText, candidate.matchText);
-        if (sim > maxSim) {
-          maxSim = sim;
-          bestMatch = candidate;
-        }
-      }
-
-      const incomingYear = citationMatchYear(typeof item === 'string' ? null : item.year)
-        ?? citationMatchYear(text);
-      if (
-        bestMatch
-        && maxSim >= FUZZY_CITATION_THRESHOLD
-        && fuzzyYearsCompatible(incomingYear, bestMatch.matchYear)
-      ) {
-        matchedId = bestMatch.id;
-        matchedHash = bestMatch.citation_hash;
+    if (!matchedId) {
+      const fuzzy = await findFuzzyMatch(item.text, item.year);
+      if (fuzzy) {
+        matchedId = fuzzy.row.id;
         matchedBy = 'fuzzy';
         logger.info('Fuzzy matched citation', {
-          incoming: text.slice(0, 50),
-          matched: bestMatch.citation_text.slice(0, 50),
-          similarity: maxSim
+          incoming: item.text.slice(0, 50),
+          matched: fuzzy.row.citation_text.slice(0, 50),
+          similarity: fuzzy.similarity
         });
       }
     }
@@ -2977,31 +3156,15 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
       linkedIds.push(matchedId);
     } else {
       counts.newCitations += 1;
-      await run(`
-        INSERT INTO citations (citation_hash, citation_text, author, title, year, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(citation_hash) DO UPDATE SET
-          author = COALESCE(excluded.author, citations.author),
-          title = COALESCE(excluded.title, citations.title),
-          year = COALESCE(excluded.year, citations.year),
-          source = COALESCE(excluded.source, citations.source)
-      `, [
-        hash, text,
-        (typeof item === 'string' ? null : item.author) || null,
-        (typeof item === 'string' ? null : item.title) || null,
-        (typeof item === 'string' ? null : item.year) || null,
-        (typeof item === 'string' ? null : item.source) || null,
-        now
-      ]);
-      const row = await get('SELECT id, citation_hash, citation_text, author, title, year FROM citations WHERE citation_hash = ?', [hash]);
-      if (row) {
-        addCitationToMatchIndex(matchIndex, prepareCitationForMatching(row));
+      const citationId = await upsertCitation(item, item.hash, now);
+      if (citationId) {
+        idByHash.set(item.hash, citationId);
         await run(`
           INSERT INTO document_citations (doc_id, citation_id, updated_at)
           VALUES (?, ?, ?)
           ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
-        `, [docId, row.id, now]);
-        linkedIds.push(row.id);
+        `, [docId, citationId, now]);
+        linkedIds.push(citationId);
       }
     }
     counts.processed += 1;
@@ -3091,8 +3254,64 @@ export async function replaceDocumentCitationLinks(docId, keepCitationIds = []) 
     const placeholders = chunk.map(() => '?').join(', ');
     await run(`DELETE FROM document_citations WHERE doc_id = ? AND citation_id IN (${placeholders})`, [docId, ...chunk]);
   }
-  await exec('DELETE FROM catalogue_lookups WHERE citation_id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
-  await exec('DELETE FROM citations WHERE id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
+  await collectOrphanedCitations(stale);
+}
+
+// Scoped orphan collection (B-02). Only the citations this document just unlinked
+// are considered, so re-extracting one document can never delete a citation — or
+// the Z39.50 result attached to it — that belongs to another document, and cannot
+// destroy a citation another process has inserted but not yet linked. This
+// replaces the two global `NOT IN` anti-joins that used to run once per document.
+export async function collectOrphanedCitations(citationIds = []) {
+  const ids = Array.from(new Set(
+    (citationIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
+  ));
+  if (!ids.length) return 0;
+  let removed = 0;
+  const chunkSize = 900;
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(', ');
+    await run(`
+      DELETE FROM catalogue_lookups
+      WHERE citation_id IN (${placeholders})
+        AND NOT EXISTS (
+          SELECT 1 FROM document_citations dc WHERE dc.citation_id = catalogue_lookups.citation_id
+        )
+    `, chunk);
+    const result = await run(`
+      DELETE FROM citations
+      WHERE id IN (${placeholders})
+        AND NOT EXISTS (
+          SELECT 1 FROM document_citations dc WHERE dc.citation_id = citations.id
+        )
+    `, chunk);
+    removed += result.changes;
+  }
+  return removed;
+}
+
+// Corpus-wide reconciliation for citations orphaned outside the re-extraction path
+// (interrupted jobs, direct link deletions). Deliberately exported for scheduled
+// maintenance only — calling this per document is the B-02 defect. Keyset-paginated
+// so every statement stays bounded regardless of corpus size.
+export async function sweepOrphanedCitations({ batchSize = 500 } = {}) {
+  const limit = Math.max(1, Math.min(5000, Number(batchSize) || 500));
+  let cursor = 0;
+  let removed = 0;
+  for (;;) {
+    const rows = await all(`
+      SELECT c.id FROM citations c
+      WHERE c.id > ?
+        AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.citation_id = c.id)
+      ORDER BY c.id
+      LIMIT ?
+    `, [cursor, limit]);
+    if (!rows.length) break;
+    cursor = Number(rows[rows.length - 1].id);
+    removed += await collectOrphanedCitations(rows.map((row) => Number(row.id)));
+  }
+  return removed;
 }
 
 export async function clearAllCitations() {
