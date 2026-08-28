@@ -47,8 +47,37 @@ const EARLY_WINDOW = DOC_COUNT >= 2000 ? [100, 1000] : [Math.floor(DOC_COUNT * 0
 const LATE_WINDOW = DOC_COUNT >= 2000
   ? [Math.max(0, DOC_COUNT - 1000), DOC_COUNT]
   : [Math.floor(DOC_COUNT * 0.7), DOC_COUNT];
-const FLAT_FACTOR = 2; // late window may cost up to 2x early window...
-const FLAT_SLACK_STATEMENTS = 3; // ...plus this much slack on tiny statement counts
+// Two different bounds for two different metrics, deliberately:
+//
+// SQL statement count is the PRIMARY gate. It counts real work items (see
+// installStatementCounter above) issued against an in-process libsql/SQLite
+// connection with no network, so run-to-run variance is near-zero -- the
+// smoke run behind these constants showed a single-sample wobble of one
+// statement (14 -> 15) across 300 documents/batches, nothing more. A tight
+// factor is therefore both safe (won't flake on legitimate noise) and
+// necessary (a loose factor is exactly the gap the independent review
+// flagged: the previous 2x+slack bound would happily pass a 30-90% per-doc
+// regression, since almost nothing short of an O(n) blowup doubles a
+// statement count). 1.15x + a small absolute cushion (for tiny counts, e.g.
+// enrichment's ~14 statements/batch, where +1 statement is a bigger relative
+// jump than the same +1 would be against citations' ~56) is chosen to sit
+// comfortably above the observed single-statement wobble while sitting
+// comfortably below a 30% regression -- see docs/phase-a-gate-results.md for
+// the injected-regression evidence this margin was checked against.
+const FLAT_FACTOR_STATEMENTS = 1.15;
+const FLAT_SLACK_STATEMENTS = 1; // absolute cushion on tiny statement counts
+
+// Wall-clock is a SECONDARY, informational signal only, kept at the original
+// loose 2x+slack bound. Wall-clock in this sandbox is subject to real
+// run-to-run CPU/scheduler jitter unrelated to the harness or the code under
+// test (observed directly during this hardening pass and by the independent
+// reviewer) -- a single GC pause or noisy-neighbor scheduling tick can move
+// a wall-clock sample by 2-5x with zero change in actual SQL work done.
+// Gating hard on wall-clock at statement-count tightness would make this
+// gate flake on sandbox noise instead of signaling a real regression, so
+// wall-clock is not used for the running-max/p99 spike check either --
+// only mean/p95 window comparison, same as before this hardening pass.
+const FLAT_FACTOR_WALL = 2;
 const FLAT_SLACK_MS = 5; // ...plus this much slack on tiny wall-clock values
 
 if (!global.gc) {
@@ -91,16 +120,31 @@ const client = await db.getDb();
 // Wraps BOTH client.execute and client.batch exactly once; per-operation cost
 // is read as a delta against this running counter, so no per-document
 // rebinding overhead pollutes the timings being measured.
+//
+// `count` is the SQL-STATEMENT-count metric (the primary flatness signal --
+// see FLAT_FACTOR_STATEMENTS below): a single client.execute() is 1
+// statement, but a single client.batch(array) call bundles `array.length`
+// statements into one round trip, and counting it as "1" the way an earlier
+// draft of this harness did is exactly the "blind to intra-call cost" gap
+// Phase 2 already had to fix once (a batch could grow from 5 statements to
+// 500 across the run and this counter would report no change at all).
+// `roundTrips` is kept alongside as a secondary, informational count of
+// actual client.execute/client.batch calls -- useful for eyeballing network
+// round-trip volume -- but it is NOT what the pass/fail verdict gates on.
 function installStatementCounter(target) {
   const originalExecute = target.execute.bind(target);
   const originalBatch = target.batch.bind(target);
-  const state = { count: 0 };
+  const state = { count: 0, roundTrips: 0 };
   target.execute = async (...args) => {
     state.count += 1;
+    state.roundTrips += 1;
     return originalExecute(...args);
   };
   target.batch = async (...args) => {
-    state.count += 1;
+    const statements = args[0];
+    const n = Array.isArray(statements) ? statements.length : 1;
+    state.count += n;
+    state.roundTrips += 1;
     return originalBatch(...args);
   };
   state.restore = () => {
@@ -118,12 +162,13 @@ function percentile(sorted, p) {
 
 function summarizeWindow(samples, key) {
   const values = samples.map((s) => s[key]).sort((a, b) => a - b);
-  if (!values.length) return { mean: 0, p50: 0, p95: 0, max: 0, n: 0 };
+  if (!values.length) return { mean: 0, p50: 0, p95: 0, p99: 0, max: 0, n: 0 };
   const mean = values.reduce((a, b) => a + b, 0) / values.length;
   return {
     mean: Math.round(mean * 100) / 100,
     p50: percentile(values, 50),
     p95: percentile(values, 95),
+    p99: percentile(values, 99),
     max: values[values.length - 1],
     n: values.length,
   };
@@ -133,18 +178,35 @@ function windowSlice(samples, [lo, hi]) {
   return samples.filter((s) => s.i >= lo && s.i < hi);
 }
 
-function flatVerdict(early, late, slack) {
-  const bound = early.mean * FLAT_FACTOR + slack;
+// `full` (optional) is the summarizeWindow() stats over the ENTIRE run
+// (every document/batch, not just the early/late windows). When supplied,
+// the verdict also asserts that the full-run running max and p99 stay
+// within the same early-baseline bound as the windowed mean/p95 -- so a
+// spike confined to the untested middle of the run (neither in the early
+// nor late window) still fails the gate, per the review's explicit ask to
+// wire runningMax into `pass` instead of computing it and discarding it.
+function flatVerdict(early, late, slack, factor, full) {
+  const bound = early.mean * factor + slack;
   const meanFlat = late.mean <= bound;
-  const p95Bound = early.p95 * FLAT_FACTOR + slack;
+  const p95Bound = early.p95 * factor + slack;
   const p95Flat = late.p95 <= p95Bound;
-  return {
+  const verdict = {
     pass: meanFlat && p95Flat,
     meanFlat,
     p95Flat,
     bound: Math.round(bound * 100) / 100,
     p95Bound: Math.round(p95Bound * 100) / 100,
   };
+  if (full) {
+    const runningMaxFlat = full.max <= bound;
+    const p99Flat = full.p99 <= bound;
+    verdict.runningMax = full.max;
+    verdict.p99 = full.p99;
+    verdict.runningMaxFlat = runningMaxFlat;
+    verdict.p99Flat = p99Flat;
+    verdict.pass = verdict.pass && runningMaxFlat && p99Flat;
+  }
+  return verdict;
 }
 
 function heapReport(samples, label) {
@@ -167,7 +229,9 @@ function heapReport(samples, label) {
     // "flat-ish": second half of the run doesn't grow heap dramatically more
     // than the first half. A pathological-bucket corpus that blows up memory
     // would show secondHalfGrowth >> firstHalfGrowth.
-    accelerating: secondHalfGrowthMB > Math.max(2, firstHalfGrowthMB * FLAT_FACTOR + 5),
+    // Heap, like wall-clock, is a memory-allocator/GC-driven signal rather
+    // than a direct statement count, so it keeps the loose factor too.
+    accelerating: secondHalfGrowthMB > Math.max(2, firstHalfGrowthMB * FLAT_FACTOR_WALL + 5),
     samples: samples.length,
   };
 }
@@ -446,7 +510,8 @@ try {
     satisfiedPerPending: SATISFIED_PER_PENDING,
     earlyWindow: EARLY_WINDOW,
     lateWindow: LATE_WINDOW,
-    flatFactor: FLAT_FACTOR,
+    flatFactorStatements: FLAT_FACTOR_STATEMENTS,
+    flatFactorWall: FLAT_FACTOR_WALL,
     exposedGc: Boolean(global.gc),
   }, segments: {} };
 
@@ -455,18 +520,24 @@ try {
     const late = windowSlice(seg.perDoc, LATE_WINDOW);
     const statementsEarly = summarizeWindow(early, 'statements');
     const statementsLate = summarizeWindow(late, 'statements');
+    const statementsFull = summarizeWindow(seg.perDoc, 'statements');
     const wallEarly = summarizeWindow(early, 'wallMs');
     const wallLate = summarizeWindow(late, 'wallMs');
-    const statementsVerdict = flatVerdict(statementsEarly, statementsLate, FLAT_SLACK_STATEMENTS);
-    const wallVerdict = flatVerdict(wallEarly, wallLate, FLAT_SLACK_MS);
-    const runningMaxStatements = Math.max(...seg.perDoc.map((s) => s.statements));
+    // Statement count: PRIMARY gate, tight factor, and also checked against
+    // the full-run running max / p99 (not just the early/late windows) so a
+    // spike in the untested middle of the run fails the gate too.
+    const statementsVerdict = flatVerdict(statementsEarly, statementsLate, FLAT_SLACK_STATEMENTS, FLAT_FACTOR_STATEMENTS, statementsFull);
+    // Wall-clock: SECONDARY signal, loose factor, windowed mean/p95 only --
+    // see the FLAT_FACTOR_WALL comment above for why it is not used to gate
+    // on running max/p99 the way statement count is.
+    const wallVerdict = flatVerdict(wallEarly, wallLate, FLAT_SLACK_MS, FLAT_FACTOR_WALL);
     const runningMaxWallMs = Math.round(Math.max(...seg.perDoc.map((s) => s.wallMs)) * 100) / 100;
     const heap = heapReport(seg.heapSamples, name);
 
     report.segments[name] = {
       totalDocsOrBatches: seg.perDoc.length,
       totalSegmentSeconds: Math.round((seg.totalMs / 1000) * 10) / 10,
-      statements: { early: statementsEarly, late: statementsLate, runningMax: runningMaxStatements, verdict: statementsVerdict },
+      statements: { early: statementsEarly, late: statementsLate, full: statementsFull, verdict: statementsVerdict },
       wallMs: { early: wallEarly, late: wallLate, runningMax: runningMaxWallMs, verdict: wallVerdict },
       heap,
       pass: statementsVerdict.pass && wallVerdict.pass && heap && !heap.accelerating,
