@@ -476,6 +476,216 @@ function generatedCorpus() {
   return documents;
 }
 
+// --- Phase 1 / #11: wire the five phase-2 fixture groups into a real save/match
+// run (defect 2). These groups were declared above and never referenced, so the
+// ±1 veto / tie-break branches they were built to exercise fired zero times.
+//
+// Critical: the production hash normalizeCitation (src/pdf.js) strips periods
+// before hashing, so the three trailing-period-only pairs (OKONKWO_1992/PROBE,
+// RAVINDRAN_1990/PROBE, PEMBERTON_1999/PROBE) hash-collide under it and would
+// resolve via the exact-hash short-circuit, never reaching findFuzzyMatch. This
+// test uses a pass-through hashFn (distinct text -> distinct hash) so the probes
+// actually reach phase-2 fuzzy logic. The file-level `hashFn` above also folds
+// punctuation and MUST NOT be used here for the same reason.
+const passthroughHash = (text) => `fixture|${text}`;
+
+// Each group: the two "established" rows to seed (text + the year field they are
+// stored under), the probe (text + a year field that deliberately disagrees with
+// the year printed in its text, which is what forces the matcher past phase 1),
+// and the outcome its comment documents. `mergeSeed` is the index of the seed the
+// probe must merge into, or null when the probe must land as a new citation.
+const PHASE2_GROUPS = [
+  {
+    name: 'OKONKWO',
+    seeds: [[OKONKWO_1991, '1991'], [OKONKWO_1992, '1992']],
+    probe: [OKONKWO_PROBE, '1991'],
+    // Probe year 1991: the 1991 row is same-year (0.9928), the 1992 row is in the
+    // y+1 bucket (0.9976) and outscores it, so the ±1 veto fires -> new citation.
+    event: 'veto:after',
+    mergeSeed: null,
+  },
+  {
+    name: 'RAVINDRAN',
+    seeds: [[RAVINDRAN_1990, '1990'], [RAVINDRAN_1991, '1991']],
+    probe: [RAVINDRAN_PROBE, '1991'],
+    // Probe year 1991: the 1990 row is in the y-1 bucket (0.9973) and outscores
+    // the same-year 1991 row (0.9919), so the veto fires -> new citation.
+    event: 'veto:before',
+    mergeSeed: null,
+  },
+  {
+    name: 'NAKAMURA',
+    seeds: [[NAKAMURA_2000, '2000'], [NAKAMURA_2001, '2001']],
+    probe: [NAKAMURA_PROBE, '2001'],
+    // Exact tie (0.99767) between the y-1 (2000) and same-year (2001) buckets.
+    // y-1 is consulted first, so the tie-break vetoes -> new citation.
+    event: 'veto:before',
+    mergeSeed: null,
+  },
+  {
+    name: 'SANDOVAL',
+    seeds: [[SANDOVAL_FIRST, '2007'], [SANDOVAL_SECOND, '2007']],
+    probe: [SANDOVAL_PROBE, '2007'],
+    // Both candidates tie exactly (0.96471) in the same 2007 bucket; the bucket is
+    // scanned in ascending id order and the first of a tie kept, so the probe
+    // merges into the lower-id seed.
+    event: 'merge:same-year',
+    mergeSeed: 0,
+  },
+  {
+    name: 'PEMBERTON',
+    seeds: [[PEMBERTON_1999, '1999'], [PEMBERTON_2001, '2001']],
+    probe: [PEMBERTON_PROBE, '2001'],
+    // Probe year 2001: it merges into the 2001 row it scores 0.9602 against; the
+    // 1999 row it scores 0.9976 against is two years away, outside the ±1 window,
+    // so it is invisible and does not veto.
+    event: 'merge:same-year',
+    mergeSeed: 1,
+  },
+];
+
+test('the five phase-2 fixture groups reach the +/-1 veto / tie-break logic and resolve as documented', async () => {
+  const client = await db.getDb();
+
+  const totalCitations = async () =>
+    Number((await db.getCitationStats()).total_citations);
+  const linkedId = async (docId) => {
+    const rows = await client.execute({
+      sql: 'SELECT citation_id FROM document_citations WHERE doc_id = ? ORDER BY citation_id',
+      args: [docId],
+    });
+    return rows.rows.map((row) => Number(row.citation_id));
+  };
+
+  // Every group must be individually shown to reach phase 2 for its own probe,
+  // and the three veto groups must be individually shown to fire the veto — a
+  // per-group check, never ">=1 somewhere across the suite".
+  const reachedPhase2 = {};
+  const firedEvent = {};
+
+  for (const group of PHASE2_GROUPS) {
+    // The trailing-period-only pairs must have distinct pass-through hashes here
+    // (they collide under normalizeCitation); pin that so the seam can't rot.
+    for (const [text] of group.seeds) {
+      assert.notEqual(
+        passthroughHash(text),
+        passthroughHash(group.probe[0]),
+        `${group.name}: seed and probe hash-collide even under the pass-through hash`
+      );
+    }
+
+    const seedIds = [];
+    for (let i = 0; i < group.seeds.length; i += 1) {
+      const [text, year] = group.seeds[i];
+      const docId = `phase2-${group.name}-seed-${i}`;
+      const ids = await db.saveCitations(docId, [{ text, year }], passthroughHash);
+      seedIds.push(ids[0]);
+    }
+    // Seeds are distinct works; they must not have merged into one another.
+    assert.equal(
+      new Set(seedIds).size,
+      group.seeds.length,
+      `${group.name}: seed rows merged into each other before the probe ran`
+    );
+
+    const before = await totalCitations();
+    const events = [];
+    const probeDoc = `phase2-${group.name}-probe`;
+    const probeIds = await db.saveCitations(
+      probeDoc,
+      [{ text: group.probe[0], year: group.probe[1] }],
+      passthroughHash,
+      { matchObserver: (event) => events.push(event) }
+    );
+    const after = await totalCitations();
+
+    reachedPhase2[group.name] = events.includes('phase2:adjacent');
+    firedEvent[group.name] = events;
+
+    // (1) Phase-2 reach, proven per group. Without the pass-through hash the
+    // trailing-period probes short-circuit here and this is false.
+    assert.ok(
+      reachedPhase2[group.name],
+      `${group.name}: probe did not reach phase-2 fuzzy logic (events: ${JSON.stringify(events)})`
+    );
+    // (2) The specific decision branch its comment documents fired.
+    assert.ok(
+      events.includes(group.event),
+      `${group.name}: expected branch ${group.event}, got ${JSON.stringify(events)}`
+    );
+
+    // (3) The database outcome the comment documents.
+    if (group.mergeSeed == null) {
+      assert.equal(after, before + 1, `${group.name}: probe should have created a new citation`);
+      assert.ok(
+        !seedIds.includes(probeIds[0]),
+        `${group.name}: probe merged into a seed instead of landing as new`
+      );
+    } else {
+      assert.equal(after, before, `${group.name}: probe should have merged, not created a new row`);
+      assert.equal(
+        probeIds[0],
+        seedIds[group.mergeSeed],
+        `${group.name}: probe merged into the wrong seed`
+      );
+    }
+  }
+
+  // Per-group phase-2 reach, asserted as a set so a regression that silently
+  // short-circuits one group cannot hide behind the others.
+  assert.deepEqual(
+    reachedPhase2,
+    { OKONKWO: true, RAVINDRAN: true, NAKAMURA: true, SANDOVAL: true, PEMBERTON: true },
+    'not every fixture group reached phase-2 fuzzy logic'
+  );
+  // The three groups whose comment says the ±1 veto fires must each show it.
+  for (const name of ['OKONKWO', 'RAVINDRAN', 'NAKAMURA']) {
+    assert.ok(
+      firedEvent[name].some((event) => event.startsWith('veto:')),
+      `${name}: the +/-1 veto branch never fired`
+    );
+  }
+});
+
+// --- Phase 1 / #11 (1d): pin the prefix-narrowing trade-off ---
+//
+// "Deliberate difference 2" narrows the dated arms on the incoming citation's
+// 3-character prefix as well as its year. Two otherwise-identical, same-year
+// citations that differ only in their first three characters (e.g. an OCR-misread
+// initial letter) therefore fall into different prefix buckets and are NOT
+// compared, so the second lands as a new citation rather than merging. This is a
+// genuine behaviour change from the pre-Phase-A matcher; pin it so the accepted
+// trade-off is locked by a test rather than left implicit.
+test('prefix narrowing keeps two same-year citations that differ only in their first 3 chars apart', async () => {
+  const base = 'nnnn, Q. (2011). Distinctive monograph on the prefix-narrowing trade-off. Solitary Press.';
+  // Differ only in the first three characters ("nnn" vs "mmm"): same year, same
+  // everything else. Under the old whole-year-bucket matcher these would merge;
+  // under prefix narrowing they must not.
+  const seedText = base;
+  const ocrText = `mmm${base.slice(3)}`;
+  const uniqueHash = (text) => `prefixpin|${text}`;
+
+  const before = Number((await db.getCitationStats()).total_citations);
+  const seedIds = await db.saveCitations('prefix-pin-seed', [{ text: seedText, year: '2011' }], uniqueHash);
+  const events = [];
+  const ocrIds = await db.saveCitations(
+    'prefix-pin-ocr',
+    [{ text: ocrText, year: '2011' }],
+    uniqueHash,
+    { matchObserver: (event) => events.push(event) }
+  );
+  const after = Number((await db.getCitationStats()).total_citations);
+
+  assert.equal(after, before + 2, 'prefix narrowing no longer keeps different-prefix citations apart');
+  assert.notEqual(ocrIds[0], seedIds[0], 'the different-prefix citation merged despite prefix narrowing');
+  // The candidate bucket for the OCR row never contained the seed, so no
+  // acceptable candidate cleared the threshold and phase 2 was never reached.
+  assert.ok(
+    !events.includes('phase2:adjacent'),
+    'a different-prefix citation reached phase 2, so it was not prefix-narrowed'
+  );
+});
+
 test('equivalence holds across a dense generated corpus', async () => {
   const corpus = generatedCorpus();
   const generatedHash = (text) => hashFn(`gen|${text}`);

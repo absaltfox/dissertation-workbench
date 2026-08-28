@@ -3026,7 +3026,23 @@ const FUZZY_CITATION_THRESHOLD = 0.94;
 // Below the cap the candidate set is exactly the old in-memory bucket; at the
 // cap the bucket is *unknown*, not empty, and findFuzzyMatch refuses to merge
 // rather than guess from a truncated read. See the note above findFuzzyMatch.
-const FUZZY_CANDIDATE_LIMIT = 2000;
+//
+// Design decision (Phase 1 / #11): keep the cap + (prefix, year) bucket
+// narrowing + refuse-on-saturation rather than eliminating the cap. A "provably
+// never truncates" alternative (no cap / exhaustive pagination) reintroduces the
+// unbounded per-document cost this rewrite exists to remove. Refuse-on-saturation
+// is a *safety* property, not just telemetry: by construction it can only turn a
+// would-be merge into a new citation (a lost merge), never invent a merge or drop
+// a veto the old algorithm would not also have dropped from the same complete
+// candidate set. The prefix-narrowing trade-off and both saturation sub-cases are
+// pinned by tests (test/citationMatchEquivalence.test.js,
+// test/citationFuzzySaturation.test.js).
+//
+// The cap is a hardcoded 2000 in production; the env override exists only so a
+// test can force saturation cheaply (seed a handful of rows against a limit of a
+// few) instead of materialising 2000 real rows. Mirrors the
+// CONCEPT_MAX_BUCKET_COMPARISONS precedent (scripts/build-concepts.py).
+const FUZZY_CANDIDATE_LIMIT = Number(process.env.CITATION_FUZZY_CANDIDATE_LIMIT) || 2000;
 const CITATION_MATCH_KEY_VERSION = 1;
 const CITATION_BACKFILL_BATCH = 500;
 const CITATION_CANDIDATE_COLUMNS = 'id, citation_hash, citation_text, match_year';
@@ -3276,6 +3292,9 @@ async function findFuzzyMatch(text, itemYear, telemetry = null) {
   // picked, so the merge target is not knowable: refuse rather than pick another.
   if (acceptable.saturated.size) return refuse();
 
+  // Phase 2: an acceptable candidate cleared the threshold, so the ±1 adjacent
+  // year buckets are now read to see whether a higher-scoring neighbour vetoes it.
+  telemetry?.observe?.('phase2:adjacent', { year, prefix });
   const adjacent = await loadCandidateBuckets([yearArm(0, year - 1), yearArm(2, year + 1)]);
   if (adjacent.saturated.has(0)) telemetry?.truncatedBucket('year-before', year - 1, prefix);
   if (adjacent.saturated.has(2)) telemetry?.truncatedBucket('year-after', year + 1, prefix);
@@ -3286,18 +3305,28 @@ async function findFuzzyMatch(text, itemYear, telemetry = null) {
   const after = bestInBucket(adjacent.byBucket.get(2), incoming, counts);
 
   const overall = Math.max(before.maxSim, sameYear.maxSim, after.maxSim, undated.maxSim);
-  if (before.maxSim === overall) return null;
-  if (sameYear.maxSim === overall) return { row: sameYear.best, similarity: overall };
-  if (after.maxSim === overall) return null;
+  if (before.maxSim === overall) { telemetry?.observe?.('veto:before', { year, prefix }); return null; }
+  if (sameYear.maxSim === overall) { telemetry?.observe?.('merge:same-year', { year, prefix }); return { row: sameYear.best, similarity: overall }; }
+  if (after.maxSim === overall) { telemetry?.observe?.('veto:after', { year, prefix }); return null; }
   return { row: undated.best, similarity: overall };
 }
 
 // Saturation reporter for one saveCitations call. Every saturated bucket read is
 // counted; the warning is emitted once per bucket so a document whose year is
 // oversubscribed logs a line, not a hundred.
-function citationMatchTelemetry(counts) {
+// `observe` is a behaviour-neutral, test-only reach probe. In production no
+// observer is passed, so it is a no-op; a test can pass one through
+// saveCitations({ matchObserver }) to prove which decision branch a probe
+// reached (phase 2 was entered, the ±1 veto fired, etc.) rather than only
+// asserting the final row count. It exists because the operational counters
+// (truncatedBuckets / truncationBlockedMerges) fire only on saturation and say
+// nothing about the ordinary veto/merge path.
+function citationMatchTelemetry(counts, observer = null) {
   const warned = new Set();
   return {
+    observe(event, detail) {
+      observer?.(event, detail);
+    },
     truncatedBucket(bucket, year, prefix) {
       counts.truncatedBuckets += 1;
       const key = `${bucket}|${year ?? ''}|${prefix ?? ''}`;
@@ -3366,7 +3395,7 @@ async function upsertCitation(fields, hash, now) {
   return Number(row.id);
 }
 
-export async function saveCitations(docId, citations, hashFn, { onProgress = null } = {}) {
+export async function saveCitations(docId, citations, hashFn, { onProgress = null, matchObserver = null } = {}) {
   const now = new Date().toISOString();
 
   const items = citations.map((item) => {
@@ -3391,7 +3420,7 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
     truncatedBuckets: 0,
     truncationBlockedMerges: 0,
   };
-  const telemetry = citationMatchTelemetry(counts);
+  const telemetry = citationMatchTelemetry(counts, matchObserver);
   await onProgress?.({
     phase: 'citation_matching',
     label: 'Matching citations',
