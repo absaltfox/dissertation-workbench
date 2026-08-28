@@ -64,7 +64,11 @@ function readDocIdList(value) {
     : [];
 }
 
-async function startContinuationJob(job, result, progress) {
+// `createContinuationJob` is a test seam only: production always takes the
+// default (a real admin worker job, which spawns a runner process), while tests
+// inject a stub so driving many continuations stays a fast, in-process check of
+// the params_json-stays-constant property (#16) without starting real workers.
+export async function startContinuationJob(job, result, progress, { createContinuationJob = null } = {}) {
   const params = job.params || {};
   if (params.mode !== 'sync_missing_pdfs') return null;
   if (!params.autoContinuePdfBatches) return null;
@@ -94,8 +98,11 @@ async function startContinuationJob(job, result, progress) {
   });
 
   try {
-    const { createAndStartAdminWorkerJob } = await import('./adminWorker.js');
-    const next = await createAndStartAdminWorkerJob({
+    const createJob = createContinuationJob || (async (payload) => {
+      const { createAndStartAdminWorkerJob } = await import('./adminWorker.js');
+      return createAndStartAdminWorkerJob(payload);
+    });
+    const next = await createJob({
       type: 'import_rules_sync',
       label: 'Import Rules Sync (PDF batch)',
       params: nextParams,
