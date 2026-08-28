@@ -228,6 +228,83 @@ test('a citation orphaned outside this document survives a re-extraction', async
   assert.equal(Number(gone.rows[0].n), 0);
 });
 
+// --- B-02 (#12): re-extraction cost is flat as the corpus grows ---
+
+test('re-extraction cost does not grow with corpus size or document position', async () => {
+  const db = await import('../src/db.js');
+  const client = await db.getDb();
+  const hashFn = (text) => `flat-${text}`;
+  const TOTAL_DOCS = 300;
+
+  // citationTextPrefix() keys the fuzzy-matching bucket on the first 3 characters
+  // of the citation text and its year. Each document below gets its own 3-letter
+  // prefix (base-26 over its index) and a year spaced 10 apart from its
+  // neighbours, so no citation-matching bucket — including the +/-1 year window —
+  // ever holds more than one document's own rows. That isolates the B-02
+  // orphan-scoping cost this test measures from #11's bucket-size behaviour
+  // (covered by its own equivalence suite); without this spacing, adjacent doc
+  // indices with near-identical text would fuzzy-merge across documents.
+  function prefixLetters(n) {
+    const a = Math.floor(n / 676) % 26;
+    const b = Math.floor(n / 26) % 26;
+    const c = n % 26;
+    return String.fromCharCode(65 + a, 65 + b, 65 + c);
+  }
+  function citationsFor(i) {
+    const prefix = prefixLetters(i);
+    const year = 1700 + i * 10;
+    return [{ text: `${prefix}vellingcourt, A. (${year}). Unique flat-cost fixture ${i}.`, year: String(year) }];
+  }
+  const docId = (i) => `1.9${String(i).padStart(6, '0')}`;
+
+  for (let i = 0; i < TOTAL_DOCS; i += 1) {
+    await db.reextractDocumentCitations(docId(i), citationsFor(i), hashFn);
+  }
+
+  const originalExecute = client.execute.bind(client);
+  const originalBatch = client.batch ? client.batch.bind(client) : null;
+  let calls = 0;
+  client.execute = async (...args) => {
+    calls += 1;
+    return originalExecute(...args);
+  };
+  if (originalBatch) {
+    client.batch = async (...args) => {
+      calls += 1;
+      return originalBatch(...args);
+    };
+  }
+
+  async function costOfReextracting(i) {
+    calls = 0;
+    // A brand-new citation forces both an insert (no exact-hash match) and the
+    // old one to become orphaned (no other document references it), so every
+    // re-extraction pays the full save + prune + collect path. The +5000 offset
+    // keeps the replacement's (prefix, year) bucket disjoint from every
+    // document's original citation, for the same reason as citationsFor() above.
+    const replacementPrefix = prefixLetters(i + 5000);
+    const replacementYear = 1700 + (i + 5000) * 10;
+    const replacement = [
+      { text: `${replacementPrefix}thistlewood, C. (${replacementYear}). Replacement fixture ${i}.`, year: String(replacementYear) },
+    ];
+    await db.reextractDocumentCitations(docId(i), replacement, hashFn);
+    return calls;
+  }
+
+  try {
+    const early = await costOfReextracting(5);
+    const middle = await costOfReextracting(150);
+    const late = await costOfReextracting(TOTAL_DOCS - 1);
+
+    assert.ok(early > 0, 're-extraction should issue at least one statement');
+    assert.equal(middle, early, `re-extracting doc 150 cost ${middle} statements vs doc 5's ${early} — cost grew with position`);
+    assert.equal(late, early, `re-extracting doc 299 cost ${late} statements vs doc 5's ${early} — cost grew with corpus size`);
+  } finally {
+    client.execute = originalExecute;
+    if (originalBatch) client.batch = originalBatch;
+  }
+});
+
 test('collectOrphanedCitations only removes ids it is given, and only if unlinked', async () => {
   const db = await import('../src/db.js');
   const hashFn = (text) => `collect-${text}`;
