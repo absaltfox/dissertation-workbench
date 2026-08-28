@@ -101,6 +101,16 @@ The Admin Jobs page should show:
 
 Admin actions that start long-running jobs should not block the browser until the work is done. They should return the job id and let the Jobs page display progress.
 
+## Streamed Content Contract
+
+`pdf_stream` source bytes are not worker artifacts. The worker retrieves the original PDF into a uniquely owned operating-system temporary directory, parses the seekable file, and removes the directory in a `finally` block. Before its first streamed retrieval, a process also removes orphaned stream directories whose owner process is no longer running. The temporary streamed PDF must never be uploaded through the artifact API or saved as `file_metrics.pdf_path`; an independently existing cached PDF path or artifact remains unchanged.
+
+Content-enrichment job results include `requestCounts` with separate `metadata`, `fullText`, and `originalPdf` request totals plus `retrievedBytes`. These counters are operational records, not billing semantics: `pdf_stream` increments `originalPdf` even though its source bytes are deleted after parsing.
+
+Enrichment results must also distinguish `totalEnrichmentAttempted`, `totalEnriched`, and `totalEnrichmentFailed`. Batch limits and continuation checkpoints use attempts; success totals include only results that satisfy the snapshotted content policy. A streamed-PDF failure must not be counted as enriched or silently converted to extracted-full-text estimates.
+
+Progressive enrichment jobs additionally persist per-document evidence outside `file_metrics`. Sample, control, and cohort runs are bounded and must pass their recorded policy evaluation before the next phase can start. Control jobs require explicit original-PDF approval, and cohort jobs never auto-continue. See `docs/progressive-enrichment-rollout.md`.
+
 ## PatternRank Concept Rebuild Standard
 
 PatternRank concept extraction must be implemented as a worker-backed job.
@@ -111,14 +121,16 @@ Expected flow:
 2. Web app checks whether a concept rebuild job is already running.
 3. Web app creates an `admin_jobs` row with type such as `concept_rebuild`.
 4. Web app starts a worker using the Python NLP worker image.
-5. Worker claims the job and loads stored dissertation metadata.
-6. Worker applies cheap candidate gates first.
-7. Worker runs PatternRank-style candidate selection, embedding, and ranking.
-8. Worker writes the generated concept artifact/status.
-9. Worker finishes the job with final counts and cache-clearing metadata.
+5. Worker claims the job and selects one highest-priority changed partition.
+6. Worker loads at most the configured partition boundary and reuses content/model-matched document state.
+7. Worker applies cheap candidate and document-frequency gates before computing missing embeddings.
+8. Worker checkpoints changed document states in durable batches and runs PatternRank-style ranking.
+9. Worker writes a versioned scoped artifact and, only for a globally enabled non-overlapping shard, republishes the merged artifact.
+10. Worker finishes the job with final counts and cache-clearing metadata.
 
 PatternRank progress should include these phases:
 
+- `partition_selection`: highest-priority changed scope selected or no-op reported.
 - `load_documents`: documents loaded from the stored corpus.
 - `candidate_generation`: candidate phrases generated and cheap-gated.
 - `embedding`: document and candidate embeddings computed or reused.
@@ -129,7 +141,8 @@ PatternRank progress should include these phases:
 
 PatternRank result counts should include:
 
-- documents processed;
+- partition key and artifact version;
+- documents changed and documents reused;
 - candidates generated;
 - candidates accepted;
 - candidates rejected by gate;
@@ -139,6 +152,23 @@ PatternRank result counts should include:
 - per-document failures.
 
 The Node web app may continue to read the concept artifact exactly as it does today. The worker implementation should preserve the existing artifact fields (`concepts`, `variantToCanonical`, `docFreq`, `idf`) and may add scoring metadata such as `patternRankScore`, `contextScore`, `qualityScore`, or `source`.
+
+Automatic partitions must use stable, disjoint degree-and-exact-year boundaries and remain bounded. An oversized cohort fails closed instead of silently exceeding the memory boundary; a future validated partition-management operation may replace it with non-overlapping program scopes. Explicit rebuild scopes are always excluded from the global merge. Corpus-wide candidate frequency is persisted separately from embeddings; crossing the frequency gate marks affected completed shards pending. The global artifact is published only when every enabled shard is ready. Failed jobs and failed uploads retain prior artifacts, remain discoverable as retryable work, and reuse completed document checkpoints. Retired shards are excluded only after surviving shards have been re-ranked for the changed global frequency gate.
+
+## Citation Extraction and Resolution Standard
+
+Citation extraction and external catalogue resolution are separate admin jobs. Import and general cache reanalysis paths set `extractCitations: false`; they must not create hidden extraction or resolution work.
+
+The bulk citation-extraction job:
+
+- selects a bounded, optionally scoped page in the database;
+- reads only a cached PDF or cached full-text artifact and makes no repository content request;
+- skips a completed row when content checksum and parser version match;
+- persists completed or failed state per document before advancing its cursor;
+- reports whether the job cap was reached; and
+- never starts catalogue resolution.
+
+The catalogue job may use the same corpus scope. It processes globally deduplicated citations, prioritizes citations linked by the most documents, and retains the configured lookup batch and rate boundaries. Operators must start it explicitly after extraction quality is acceptable.
 
 ## Stored Theme Recompute Standard
 

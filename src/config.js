@@ -15,6 +15,12 @@ export const DEFAULT_SOURCE = process.env.UBC_SOURCE || [
   'digitalResourceOriginalRecord'
 ].join(',');
 export const DEFAULT_DOWNLOAD_FILES = process.env.DOWNLOAD_FILES !== '0';
+export const ALLOW_ORIGINAL_PDF_RETRIEVAL = /^(1|true|yes)$/i.test(
+  process.env.ALLOW_ORIGINAL_PDF_RETRIEVAL || ''
+);
+export const CONTENT_RETRIEVAL_ENABLED = !/^(1|true|yes)$/i.test(
+  process.env.DISABLE_CONTENT_RETRIEVAL || ''
+);
 export const FILE_CONCURRENCY = 2;
 export const PDF_DOWNLOAD_RATE_PER_MIN = Number(process.env.PDF_DOWNLOAD_RATE_PER_MIN || 0); // 0 = unlimited
 export const DATA_DIR = process.env.APP_DATA_DIR || path.join(process.cwd(), 'data');
@@ -34,6 +40,19 @@ export const PORT = Number(process.env.PORT || 3000);
 export const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60 * 1000);
 export const WORKBENCH_CACHE_REFRESH_MS = Number(process.env.WORKBENCH_CACHE_REFRESH_MS || 10 * 60 * 1000);
 export const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024; // 200 MB
+// Ceiling on text extracted from one PDF. A text-dense PDF decompresses roughly
+// 10:1, so without this a 200 MB download can force an arbitrarily large string
+// into the heap -- and on Fly os.tmpdir() is tmpfs, so the staging file is RAM
+// too. 20 MB is ~3.3M words; a 1,000-page thesis is nearer 5 MB, so exceeding it
+// means a pathological or hostile file rather than a long dissertation.
+export const DEFAULT_MAX_PDF_TEXT_BYTES = 20 * 1024 * 1024; // 20 MB
+// Parsed defensively: a safety ceiling that silently becomes NaN on a typo
+// ("20mb") fails open -- `size > NaN` is false, so the guard disappears while
+// still looking configured.
+export const MAX_PDF_TEXT_BYTES = (() => {
+  const parsed = Number(process.env.MAX_PDF_TEXT_BYTES);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_PDF_TEXT_BYTES;
+})();
 export const DOWNLOAD_TIMEOUT_MS = 30_000; // 30 seconds
 export const TRUST_PROXY = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '');
 export const PDF_ALLOWED_HOSTS = (process.env.PDF_ALLOWED_HOSTS || 'open.library.ubc.ca,oc-index.library.ubc.ca,circle.library.ubc.ca')

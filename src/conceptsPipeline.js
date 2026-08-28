@@ -440,9 +440,19 @@ async function ensureConceptPaths() {
   await fs.mkdir(CONCEPTS_DIR, { recursive: true });
 }
 
+async function writeJsonAtomically(targetPath, value) {
+  const tempPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    await fs.writeFile(tempPath, JSON.stringify(value, null, 2));
+    await fs.rename(tempPath, targetPath);
+  } finally {
+    await fs.rm(tempPath, { force: true }).catch(() => {});
+  }
+}
+
 async function writeStatus(status) {
   await ensureConceptPaths();
-  await fs.writeFile(STATUS_PATH, JSON.stringify(status, null, 2));
+  await writeJsonAtomically(STATUS_PATH, status);
 }
 
 export async function getConceptPipelineStatus() {
@@ -467,7 +477,7 @@ export async function persistConceptArtifact(artifact, { trigger = 'worker', mes
   const generatedAt = artifact.generatedAt || new Date().toISOString();
   artifact.generatedAt = generatedAt;
   await ensureConceptPaths();
-  await fs.writeFile(LATEST_PATH, JSON.stringify(artifact, null, 2));
+  await writeJsonAtomically(LATEST_PATH, artifact);
   await writeStatus({
     status: 'idle',
     trigger,

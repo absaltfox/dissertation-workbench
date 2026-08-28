@@ -83,19 +83,47 @@ The public `/api/metrics` endpoint is read-only and builds the dashboard from th
 2. Sign in to `Admin`.
 3. Configure/import Open Collections rules in `Admin -> Import`.
 4. Run an import job, usually `Import all` for a new database or `Sync differences` afterward.
-5. Run import/PDF jobs from the Admin UI; on-demand workers process the heavy work outside the web server. Use `npm run worker` only for legacy scheduled sync/catalogue lookup cycles.
+5. Choose a content policy on each saved rule, then use **Import + Enrich Using Rule Policy** when content enrichment is required.
+6. On-demand workers process the heavy work outside the web server. Use `npm run worker` only for legacy scheduled sync/catalogue lookup cycles.
+
+Saved import rules declare one content mode:
+
+- `metadata_only`: never retrieves document content.
+- `full_text_only`: retrieves the repository's extracted `TEXT` derivative, never requests the original PDF, and retains only derived results. Existing legacy full-text cache entries may still be reused.
+- `pdf_stream`: retrieves the original PDF into bounded, worker-local ephemeral storage, parses it, and removes the temporary directory in a `finally` block. A first-use janitor removes directories orphaned by a prior worker process. It retains derived metrics and provenance but creates no PDF cache entry or artifact; any independently existing cached PDF path or artifact remains unchanged.
+- `pdf_cache`: retrieves and retains the original PDF. This mode runs only when `ALLOW_ORIGINAL_PDF_RETRIEVAL=1`.
+
+The server snapshots the selected rules into the durable job when it starts, so later rule edits cannot change a running job. The deployment-wide original-PDF guard is checked independently of the UI and rule configuration.
+
+Content policies are fail-closed: unknown values are rejected by the API, worker, and parser; blocked original-PDF requests fail before retrieval. Until the planned per-rule fallback field is implemented, a `pdf_stream` retrieval or parse failure remains a failed streamed-PDF enrichment and never silently produces estimated full-text metrics. Cached enrichment is mode-specific, so full-text-derived metrics do not satisfy a later PDF request. Successful `pdf_stream` results are recognized by their checksum and exact PDF-derived metrics without retaining the source PDF.
+
+Content processing records its source, SHA-256 checksum, source URL, retrieval time, parser version, repository request counts, and retrieved bytes in `file_metrics`. Import-rule job results aggregate metadata, extracted-full-text, and original-PDF requests separately. A streamed PDF still counts as an original-PDF request and must be treated as a download for policy purposes.
 
 Dashboard reads never page Open Collections. If `/api/metrics` receives query parameters that match a stored sync key, it uses that stored subset; otherwise it falls back to the locally stored corpus. `refresh=1` only bypasses the web process's in-memory metrics payload cache. It does not call Open Collections, download PDFs, recompute file metrics, or extract citations/committee data.
 
 ## API
 
-The main frontend endpoint is:
+The frontend uses bounded workbench slices:
+
+```http
+GET /api/workbench/bootstrap
+GET /api/workbench/documents?limit=50&offset=0
+GET /api/workbench/analytics
+GET /api/workbench/people?limit=50&offset=0
+GET /api/workbench/people/:personKey?limit=50&offset=0
+GET /api/workbench/visualizations
+GET /api/workbench/citations/documents?limit=50&offset=0
+```
+
+Bootstrap, filtered/sorted document pages, citation pages, people pages/details, and large-corpus analytics are executed in the database. The web process caches their bounded responses rather than complete document collections. Analytics responses include at most 100 projected document samples when the stored corpus exceeds 5,000 records; persisted aggregate signals cover the complete filtered corpus. Topic visualizations report when their explicit 5,000-document topic sample is truncated.
+
+The legacy composition endpoint remains available:
 
 ```http
 GET /api/metrics
 ```
 
-`/api/metrics` is the dashboard composition endpoint. Its contract is to read local application tables and return the complete dashboard payload:
+`/api/metrics` reads local application tables and returns a compatibility dashboard payload bounded by `maxRecords`:
 
 - `documents`: stored document metadata from `documents`, enriched with persisted `file_metrics` page/word counts, `document_citations` counts, and `committee_members` roles such as supervisors, committee members, university examiners, and external examiners.
 - `metrics`, `wordCloud`, `ngramCloud`, `methodologies`, supervisor/person networks, topic data, and citation co-occurrence values derived from those local rows.
@@ -106,7 +134,7 @@ Open Collections API calls belong to Admin import/sync flows such as import-rule
 Supported query params:
 
 - `index`, `query`, `term`, `source`: identify the preferred stored sync key. They do not trigger live Open Collections reads from this endpoint.
-- `maxRecords`: bounds live Open Collections paging during admin sync only. Dashboard reads always serve the entire stored corpus (optionally narrowed by `degree`/`program`/`affiliation` filters).
+- `maxRecords`: bounds the legacy `/api/metrics` document collection. Workbench summary and aggregate endpoints cover the complete stored corpus and use pagination for document-level rows.
 - `pageSize`: default `20`, maximum `100`.
 - `scanLimit`: default `max(1000, maxRecords * 10)`. Public guardrails cap anonymous request *rates* (120 requests/minute per IP), not corpus coverage.
 - `subjectLimit`: default `25`.
@@ -123,6 +151,13 @@ These endpoints are available to the browser without an admin session. Anonymous
 | --- | --- | --- |
 | `GET` | `/api/health` | Health check with `{ ok, timestamp }`. |
 | `GET` | `/api/metrics` | Builds dashboard metrics from local app tables; does not fetch Open Collections. |
+| `GET` | `/api/workbench/bootstrap` | Returns database-side corpus counts and facet values without document rows. |
+| `GET` | `/api/workbench/documents` | Returns filtered, searched, and sorted document pages, capped at 100 rows per request. |
+| `GET` | `/api/workbench/analytics` | Returns complete database aggregates; detailed in-memory analytics are retained only for corpora of at most 5,000 records. |
+| `GET` | `/api/workbench/people` | Returns paginated people aggregates from the durable serving projection. |
+| `GET` | `/api/workbench/people/:personKey` | Returns corpus-complete person aggregates and a document page capped at 100 rows. |
+| `GET` | `/api/workbench/visualizations` | Returns topic/network visualizations from an explicitly bounded 5,000-document topic sample. |
+| `GET` | `/api/workbench/citations/documents` | Returns paginated citation-bearing document summaries. |
 | `GET` | `/api/documents/:docId/citations` | Returns citations for one cached document, including sharing counts. |
 | `GET` | `/api/citations/top?limit=50` | Returns the most-cited works, capped at 200. |
 | `GET` | `/api/citations/:citationId/documents` | Returns documents that cite a stored citation. |
@@ -164,12 +199,12 @@ All `/api/admin/*` endpoints require an authenticated admin session. `POST`, `PU
 | `POST` | `/api/admin/import-rules/sync` | Runs one import rule immediately and clears the metrics cache. |
 | `POST` | `/api/admin/import-rules/run` | Starts a background import-rules job for selected or all rules; returns `202`. |
 | `GET` | `/api/admin/jobs` | Returns recent admin jobs, sync runs, catalogue stats, topic status, and concept status. |
-| `POST` | `/api/admin/jobs/catalogue-lookup` | Starts a background Z39.50 lookup job, or returns a dry-run preview. |
+| `POST` | `/api/admin/jobs/catalogue-lookup` | Starts a bounded background Z39.50 lookup job, or returns a dry-run preview; accepts optional corpus scope fields. |
 | `POST` | `/api/admin/jobs/bertopic` | Starts a background BERTopic rebuild job. |
 | `GET` | `/api/admin/documents/sync/status` | Returns global or query-specific document sync status. |
 | `POST` | `/api/admin/documents/sync` | Starts document sync for request body/query options and clears metrics cache. |
 | `GET` | `/api/admin/concepts/status` | Returns concept pipeline status. |
-| `POST` | `/api/admin/concepts/rebuild` | Rebuilds the concept dictionary; returns `409` if a rebuild cannot start. |
+| `POST` | `/api/admin/concepts/rebuild` | Processes the next changed PatternRank partition, or an explicit scoped partition from the request body. |
 | `GET` | `/api/admin/catalogue-lookup/stats` | Returns stored catalogue lookup statistics. |
 | `POST` | `/api/admin/catalogue-lookup` | Runs pending catalogue lookups synchronously, or previews with `dryRun=1`. |
 | `GET` | `/api/admin/cache` | Lists cached file-metric entries. |
@@ -177,7 +212,8 @@ All `/api/admin/*` endpoints require an authenticated admin session. `POST`, `PU
 | `POST` | `/api/admin/cache/refresh` | Clears only the in-memory metrics cache. |
 | `POST` | `/api/admin/cache/:docId/refresh` | Redownloads/reanalyzes one document and clears metrics cache. |
 | `DELETE` | `/api/admin/cache/:docId` | Deletes cached PDF and file metrics for one document. |
-| `POST` | `/api/admin/reparse-all` | Re-extracts committee/citation data from cached PDFs and reruns catalogue lookups. |
+| `POST` | `/api/admin/reparse-all` | Re-extracts non-citation document data from cached PDFs. |
+| `POST` | `/api/admin/reparse-citations` | Extracts citations incrementally from cached PDFs/full text; accepts job limits and corpus scope and never starts catalogue resolution. |
 | `POST` | `/api/admin/reparse-committee` | Re-extracts committee data for cached PDFs missing committee records. |
 | `GET` | `/api/admin/runs` | Returns recent import/sync runs. |
 
@@ -198,7 +234,8 @@ Use `.env.development.example` and `.env.production.example` as the canonical te
 - `SQLITE_PATH`: local SQLite/libSQL file path, default `${APP_DATA_DIR}/metrics.sqlite`.
 - `TURSO_DATABASE_URL`: optional remote libSQL/Turso URL. If omitted, local SQLite is used.
 - `TURSO_AUTH_TOKEN`: required in production when `TURSO_DATABASE_URL` points to Turso/libSQL.
-- `DOWNLOAD_FILES`: default `1`; set `0` to avoid automatic PDF downloads by default. PDF enrichment uses cIRcle REST `ORIGINAL` bitstreams exposed through `digitalResourceOriginalRecord`; full-text fallback uses cIRcle `TEXT` bitstreams.
+- `DOWNLOAD_FILES`: legacy default for direct document-sync and maintenance paths. Saved import rules use their own content mode instead.
+- `ALLOW_ORIGINAL_PDF_RETRIEVAL`: defaults to `0`. When disabled, the PDF retrieval boundary rejects every cIRcle `ORIGINAL` bitstream request, including requests from maintenance paths. Set to `1` only when original-PDF retrieval is an accepted deployment policy.
 - `PDF_DOWNLOAD_RATE_PER_MIN`: optional cIRcle REST PDF download throttle; `0` means unlimited.
 - `CACHE_TTL_MS`: in-memory metrics cache TTL, default `600000`.
 - `TRUST_PROXY`: set `1` behind Fly/reverse proxies.
@@ -232,6 +269,10 @@ Worker-specific settings:
 - `CATALOGUE_LOOKUP_ON_START`: default `1`.
 - `CATALOGUE_LOOKUP_PAGE_SIZE`: default `200`.
 - `CATALOGUE_LOOKUP_BATCH_SIZE`: default `1`; each `yaz-client` session handles one citation so slow OCR-derived queries fail independently instead of timing out a whole batch.
+- `CONCEPT_PARTITION_MAX_DOCUMENTS`: maximum documents loaded by one PatternRank shard, default `5000`.
+- `CONCEPT_CHECKPOINT_BATCH_SIZE`: changed-document checkpoint batch, default `50`.
+- `CONCEPT_MIN_DOCUMENT_FREQUENCY`: pre-embedding phrase frequency gate, default/minimum `2`.
+- `CONCEPT_PARTITION_MAX_CONCEPTS` and `CONCEPT_GLOBAL_MAX_CONCEPTS`: shard/global artifact bounds, default `5000` and `50000`.
 - `YAZ_CLIENT_TIMEOUT_MS`: single-lookup timeout, default `15000`.
 - `YAZ_CLIENT_BATCH_BASE_TIMEOUT_MS`: batch lookup base timeout, default `30000`.
 - `YAZ_CLIENT_BATCH_ITEM_TIMEOUT_MS`: additional timeout per item in a batch, default `2000`.
@@ -320,8 +361,9 @@ In production, startup validates secret configuration. The API-key encryption ke
 - Security response headers are enabled by default.
 - Public `downloadFiles`, `refresh`, and `recomputeFromCache` are restricted by default in production but allowed in local development.
 - PDFs are cached locally and are only redownloaded when force refresh is used.
-- Citation extraction uses GROBID first, then AnyStyle, then regex fallback.
-- Pending citation catalogue lookups use Z39.50 through `yaz-client`.
+- Citation extraction uses GROBID first, then AnyStyle, then regex fallback. Bulk extraction reads only existing cached artifacts and records content/parser checkpoints; metadata imports do not extract citations inline.
+- Pending citation catalogue lookups use Z39.50 through `yaz-client` as a separate, explicitly started, optionally scoped job.
+- PatternRank rebuilds are partitioned and incremental. Automatic degree/year shards form the global dictionary; explicit scopes remain isolated to prevent overlap. See `docs/incremental-patternrank-citations.md`.
 - BERTopic reads cached document abstracts from the database, uses `allenai/specter2_base`, and writes topic assignments back to the database.
 - Per-document attributes, PDF metrics, sync runs, citations, catalogue lookups, admin jobs, users, and run-level metric snapshots are persisted through libSQL: local SQLite by default, or Turso when `TURSO_DATABASE_URL` is set.
 - Metric run snapshots (`metric_runs`) are recorded only when an admin forces `refresh=1`; the table keeps the latest 100 runs.

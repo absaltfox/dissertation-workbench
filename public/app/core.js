@@ -93,6 +93,14 @@ const importAffiliationEl = document.getElementById('importAffiliation');
 const importIndexEl = document.getElementById('importIndex');
 const importQueryEl = document.getElementById('importQuery');
 const importSourceEl = document.getElementById('importSource');
+const importContentModeEl = document.getElementById('importContentMode');
+const importContentFallbackEl = document.getElementById('importContentFallback');
+const importExtractCitationsEl = document.getElementById('importExtractCitations');
+const importExtractCommitteeEl = document.getElementById('importExtractCommittee');
+const importRunConceptsEl = document.getElementById('importRunConcepts');
+const importMaxContentBytesEl = document.getElementById('importMaxContentBytes');
+const importContentConcurrencyEl = document.getElementById('importContentConcurrency');
+const importContentRateLimitEl = document.getElementById('importContentRateLimit');
 const importGeneratedTermEl = document.getElementById('importGeneratedTerm');
 const importRulesListEl = document.getElementById('importRulesList');
 const importRulePreviewEl = document.getElementById('importRulePreview');
@@ -821,6 +829,14 @@ const dom = {
   importIndexEl,
   importQueryEl,
   importSourceEl,
+  importContentModeEl,
+  importContentFallbackEl,
+  importExtractCitationsEl,
+  importExtractCommitteeEl,
+  importRunConceptsEl,
+  importMaxContentBytesEl,
+  importContentConcurrencyEl,
+  importContentRateLimitEl,
   importGeneratedTermEl,
   importRulesListEl,
   importRulePreviewEl,

@@ -9,7 +9,8 @@ import { createSession, destroySession, getSessionCsrfToken } from '../src/auth.
 import { getConceptPipelineStatus } from '../src/conceptsPipeline.js';
 import {
   closeDb, createAdminJob, finishAdminJob, hashAdminJobToken, saveCitations,
-  saveCommitteeMembers, saveDocumentMetadata, saveFileMetric
+  finishEnrichmentRolloutPhase, importRuleRevision, saveCommitteeMembers, saveDocumentMetadata,
+  saveFileMetric, saveImportRule, startEnrichmentRolloutPhase
 } from '../src/db.js';
 
 test.after(async () => {
@@ -162,6 +163,52 @@ test('import rule run validates mode and scope', async () => {
   }
 });
 
+test('progressive enrichment requires an ordered phase and explicit PDF control approval', async () => {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const rule = await saveImportRule({
+    id: `progressive-${suffix}`,
+    name: `Progressive ${suffix}`,
+    degree: 'Doctor of Philosophy',
+    contentMode: 'full_text_only',
+  });
+  const token = createSession('admin');
+  try {
+    const csrfToken = getSessionCsrfToken(token);
+    const noPhase = await request(app)
+      .post('/api/admin/import-rules/run')
+      .set('Cookie', `session=${token}`)
+      .set('x-csrf-token', csrfToken)
+      .send({ mode: 'sync_missing_pdfs', scope: 'selected', ruleIds: [rule.id] })
+      .expect(400);
+    assert.match(noPhase.body.error, /progressive enrichment phase/i);
+
+    const legacyBypass = await request(app)
+      .post('/api/admin/import-rules/sync')
+      .set('Cookie', `session=${token}`)
+      .set('x-csrf-token', csrfToken)
+      .send({ id: rule.id, mode: 'sync_missing_pdfs' })
+      .expect(409);
+    assert.match(legacyBypass.body.error, /progressive import-rules run endpoint/i);
+
+    await startEnrichmentRolloutPhase(rule.id, 'sample', 9001, importRuleRevision(rule));
+    await finishEnrichmentRolloutPhase(rule.id, 'sample', 9001, { passed: true, phase: 'sample' });
+    const noApproval = await request(app)
+      .post('/api/admin/import-rules/run')
+      .set('Cookie', `session=${token}`)
+      .set('x-csrf-token', csrfToken)
+      .send({
+        mode: 'sync_missing_pdfs',
+        scope: 'selected',
+        ruleIds: [rule.id],
+        rolloutPhase: 'control',
+      })
+      .expect(409);
+    assert.match(noApproval.body.error, /explicit approval/i);
+  } finally {
+    destroySession(token);
+  }
+});
+
 test('legacy import-rule sync endpoint uses durable document sync job state', async () => {
   const token = createSession('admin');
   const runningJobId = await createAdminJob({
@@ -190,6 +237,29 @@ test('legacy import-rule sync endpoint uses durable document sync job state', as
     assert.equal(res.body.jobId, runningJobId);
   } finally {
     await finishAdminJob(runningJobId, { status: 'completed', runnerState: 'completed' });
+    destroySession(token);
+  }
+});
+
+test('legacy import-rule sync endpoint rejects invalid content policies', async () => {
+  const token = createSession('admin');
+  try {
+    const res = await request(app)
+      .post('/api/admin/import-rules/sync')
+      .set('Cookie', `session=${token}`)
+      .set('x-csrf-token', getSessionCsrfToken(token))
+      .send({
+        name: 'Invalid content policy',
+        degree: 'Doctor of Education - EdD',
+        contentMode: 'unknown_mode',
+        mode: 'import_all',
+      })
+      .expect('content-type', /application\/json/)
+      .expect(400);
+
+    assert.equal(res.body.error, 'Validation failed');
+    assert.match(res.body.errors.join(' '), /Content mode must be one of/);
+  } finally {
     destroySession(token);
   }
 });

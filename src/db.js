@@ -4,10 +4,11 @@ import crypto from 'node:crypto';
 import { createClient } from '@libsql/client';
 import { SQLITE_PATH, PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL } from './config.js';
 import { logger } from './logger.js';
-import { dedupeSupervisorNames, normalizePersonName, supervisorNameKey } from './supervisors.js';
+import { dedupeSupervisorNames, normalizePersonName, stripMiddleInitials, supervisorNameKey } from './supervisors.js';
 import { encryptMfaSecret, decryptMfaSecret } from './secretCrypto.js';
 import { jaroWinkler } from './fuzzyMatch.js';
 import { documentThemeTerms } from './nlp.js';
+import { normalizeImportRule } from './importRules.js';
 
 let db;
 let schemaReady;
@@ -97,6 +98,23 @@ async function tryExec(client, sql) {
   }
 }
 
+export async function addColumnIfMissing(client, table, column, definition) {
+  const hasColumn = async () => {
+    const result = await client.execute(`PRAGMA table_info(${table})`);
+    return result.rows.some((row) => String(row.name) === column);
+  };
+  if (await hasColumn()) return;
+  try {
+    await client.execute(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  } catch (error) {
+    // Another web/worker process may have applied the same idempotent migration
+    // after our schema read. Accept only that verified outcome; all other errors
+    // remain startup failures.
+    if (await hasColumn()) return;
+    throw error;
+  }
+}
+
 async function ensureSchema(client) {
   await client.executeMultiple(`
     CREATE TABLE IF NOT EXISTS documents (
@@ -111,6 +129,7 @@ async function ensureSchema(client) {
       source_json TEXT,
       source_updated_at TEXT,
       synced_at TEXT,
+      serving_projection_version INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL
     );
 
@@ -127,8 +146,43 @@ async function ensureSchema(client) {
       page_count INTEGER,
       word_source TEXT,
       page_source TEXT,
+      content_source TEXT,
+      content_checksum TEXT,
+      content_source_url TEXT,
+      content_retrieved_at TEXT,
+      parser_version TEXT,
+      metadata_request_count INTEGER DEFAULT 0,
+      full_text_request_count INTEGER DEFAULT 0,
+      original_pdf_request_count INTEGER DEFAULT 0,
+      retrieved_bytes INTEGER DEFAULT 0,
       status TEXT,
       error TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    -- Durable enrichment progress (H-03). Kept out of file_metrics on purpose:
+    -- a marker row in file_metrics would count towards the cache statistics and
+    -- would suppress the 'not_found' failure record that saveFileMetric only
+    -- writes when no metric row exists yet.
+    CREATE TABLE IF NOT EXISTS enrichment_attempts (
+      doc_id TEXT PRIMARY KEY,
+      attempted_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS document_people (
+      doc_id TEXT NOT NULL,
+      person_key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      role TEXT NOT NULL,
+      affiliation TEXT,
+      source TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (doc_id, person_key, role, source)
+    );
+
+    CREATE TABLE IF NOT EXISTS serving_projection_state (
+      projection_key TEXT PRIMARY KEY,
+      projection_value TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
 
@@ -213,8 +267,49 @@ async function ensureSchema(client) {
       requested_index TEXT,
       query TEXT,
       source TEXT,
+      content_mode TEXT NOT NULL DEFAULT 'metadata_only',
+      content_fallback TEXT NOT NULL DEFAULT 'fail_document',
+      extract_citations INTEGER NOT NULL DEFAULT 0,
+      extract_committee INTEGER NOT NULL DEFAULT 1,
+      run_concepts INTEGER NOT NULL DEFAULT 1,
+      max_content_bytes INTEGER NOT NULL DEFAULT 209715200,
+      content_concurrency INTEGER NOT NULL DEFAULT 1,
+      content_rate_limit INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS import_rule_request_limits (
+      rule_id TEXT PRIMARY KEY,
+      timestamps_json TEXT NOT NULL DEFAULT '[]',
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (rule_id) REFERENCES import_rules(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS enrichment_rollouts (
+      rule_id TEXT PRIMARY KEY,
+      rule_revision TEXT,
+      status TEXT NOT NULL,
+      current_phase TEXT,
+      current_job_id INTEGER,
+      sample_job_id INTEGER,
+      control_job_id INTEGER,
+      last_cohort_job_id INTEGER,
+      evaluation_json TEXT,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS enrichment_rollout_evidence (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rule_id TEXT NOT NULL,
+      phase TEXT NOT NULL,
+      job_id INTEGER NOT NULL,
+      doc_id TEXT NOT NULL,
+      content_mode TEXT NOT NULL,
+      rule_revision TEXT,
+      outcome_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE(job_id, doc_id)
     );
 
     CREATE TABLE IF NOT EXISTS committee_members (
@@ -328,6 +423,73 @@ async function ensureSchema(client) {
       embedding   TEXT NOT NULL,
       created_at  TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS concept_partitions (
+      partition_key        TEXT PRIMARY KEY,
+      scope_json           TEXT NOT NULL,
+      priority             INTEGER NOT NULL DEFAULT 0,
+      enabled              INTEGER NOT NULL DEFAULT 1,
+      status               TEXT NOT NULL DEFAULT 'pending',
+      source_document_count INTEGER NOT NULL DEFAULT 0,
+      source_updated_at    TEXT,
+      checkpoint_json      TEXT,
+      artifact_version     INTEGER NOT NULL DEFAULT 0,
+      last_started_at      TEXT,
+      last_completed_at    TEXT,
+      error                TEXT,
+      updated_at           TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS concept_document_state (
+      partition_key   TEXT NOT NULL,
+      doc_id          TEXT NOT NULL,
+      content_checksum TEXT NOT NULL,
+      candidates_json TEXT NOT NULL,
+      embedding_json  TEXT NOT NULL,
+      model_name      TEXT NOT NULL,
+      processed_at    TEXT NOT NULL,
+      PRIMARY KEY (partition_key, doc_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS concept_phrase_embeddings (
+      model_name     TEXT NOT NULL,
+      phrase         TEXT NOT NULL,
+      embedding_json TEXT NOT NULL,
+      updated_at     TEXT NOT NULL,
+      PRIMARY KEY (model_name, phrase)
+    );
+
+    CREATE TABLE IF NOT EXISTS concept_partition_artifacts (
+      partition_key TEXT NOT NULL,
+      version       INTEGER NOT NULL,
+      artifact_json TEXT NOT NULL,
+      document_count INTEGER NOT NULL,
+      created_at    TEXT NOT NULL,
+      PRIMARY KEY (partition_key, version)
+    );
+
+    CREATE TABLE IF NOT EXISTS concept_partition_candidates (
+      partition_key      TEXT NOT NULL,
+      phrase             TEXT NOT NULL,
+      document_frequency INTEGER NOT NULL,
+      PRIMARY KEY (partition_key, phrase)
+    );
+
+    CREATE TABLE IF NOT EXISTS concept_publication_state (
+      id                  INTEGER PRIMARY KEY,
+      published_signature TEXT,
+      published_at        TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS citation_extraction_state (
+      doc_id           TEXT PRIMARY KEY,
+      content_checksum TEXT,
+      parser_version   TEXT NOT NULL,
+      status           TEXT NOT NULL,
+      citation_count   INTEGER NOT NULL DEFAULT 0,
+      error            TEXT,
+      extracted_at     TEXT NOT NULL
+    );
   `);
 
   await tryExec(client, 'ALTER TABLE catalogue_lookups ADD COLUMN bib_id TEXT');
@@ -349,6 +511,7 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN source_json TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN source_updated_at TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN synced_at TEXT');
+  await addColumnIfMissing(client, 'documents', 'serving_projection_version', 'INTEGER NOT NULL DEFAULT 0');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_secret TEXT');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_enabled INTEGER NOT NULL DEFAULT 0');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_enabled_at TEXT');
@@ -363,26 +526,83 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_path TEXT');
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_bytes INTEGER');
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_source_url TEXT');
+  await addColumnIfMissing(client, 'file_metrics', 'content_source', 'TEXT');
+  await addColumnIfMissing(client, 'file_metrics', 'content_checksum', 'TEXT');
+  await addColumnIfMissing(client, 'file_metrics', 'content_source_url', 'TEXT');
+  await addColumnIfMissing(client, 'file_metrics', 'content_retrieved_at', 'TEXT');
+  await addColumnIfMissing(client, 'file_metrics', 'parser_version', 'TEXT');
+  await addColumnIfMissing(client, 'file_metrics', 'metadata_request_count', 'INTEGER DEFAULT 0');
+  await addColumnIfMissing(client, 'file_metrics', 'full_text_request_count', 'INTEGER DEFAULT 0');
+  await addColumnIfMissing(client, 'file_metrics', 'original_pdf_request_count', 'INTEGER DEFAULT 0');
+  await addColumnIfMissing(client, 'file_metrics', 'retrieved_bytes', 'INTEGER DEFAULT 0');
+  await addColumnIfMissing(client, 'import_rules', 'content_mode', "TEXT NOT NULL DEFAULT 'metadata_only'");
+  await addColumnIfMissing(client, 'import_rules', 'content_fallback', "TEXT NOT NULL DEFAULT 'fail_document'");
+  await addColumnIfMissing(client, 'import_rules', 'extract_citations', 'INTEGER NOT NULL DEFAULT 0');
+  await addColumnIfMissing(client, 'import_rules', 'extract_committee', 'INTEGER NOT NULL DEFAULT 1');
+  await addColumnIfMissing(client, 'import_rules', 'run_concepts', 'INTEGER NOT NULL DEFAULT 1');
+  await addColumnIfMissing(client, 'import_rules', 'max_content_bytes', 'INTEGER NOT NULL DEFAULT 209715200');
+  await addColumnIfMissing(client, 'import_rules', 'content_concurrency', 'INTEGER NOT NULL DEFAULT 1');
+  await addColumnIfMissing(client, 'import_rules', 'content_rate_limit', 'INTEGER NOT NULL DEFAULT 0');
+  await addColumnIfMissing(client, 'enrichment_rollouts', 'rule_revision', 'TEXT');
+  await addColumnIfMissing(client, 'enrichment_rollout_evidence', 'rule_revision', 'TEXT');
+  // Citation match keys (M-06 / B-01). `year` is free text and the match year is a
+  // regex extraction from it, so an index on the raw column cannot serve the fuzzy
+  // candidate query. These columns persist exactly what citationMatchYear() and
+  // citationTextPrefix() derive, so the buckets that used to be built in memory
+  // become indexed range scans.
+  await addColumnIfMissing(client, 'citations', 'match_year', 'INTEGER');
+  await addColumnIfMissing(client, 'citations', 'match_prefix', 'TEXT');
+  await addColumnIfMissing(client, 'citations', 'match_key_version', 'INTEGER NOT NULL DEFAULT 0');
+  await tryExec(client, 'CREATE TABLE IF NOT EXISTS enrichment_attempts (doc_id TEXT PRIMARY KEY, attempted_at TEXT NOT NULL)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_sync_key ON documents(sync_key)');
+  // Deliberately NOT an index on documents(sync_key, doc_id). It would serve the
+  // enrichment queue's ordered scan, but it also makes the filtered_people CTE in
+  // queryPeoplePage look cheap enough to inline and re-evaluate once per matched
+  // person: 5,100 documents took that query from 70 ms to 126 s. The queue drives
+  // off the doc_id primary key instead - see listDocumentsPendingEnrichment.
+  await tryExec(client, 'DROP INDEX IF EXISTS idx_documents_sync_key_doc_id');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree ON documents(degree)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_program ON documents(program)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_people_key ON document_people(person_key)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_people_role ON document_people(role)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_concept_partitions_priority ON concept_partitions(enabled, priority DESC, updated_at)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_concept_document_state_doc ON concept_document_state(doc_id)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_concept_partition_artifacts_latest ON concept_partition_artifacts(partition_key, version DESC)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_concept_partition_candidates_phrase ON concept_partition_candidates(phrase, partition_key)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_citation_extraction_status ON citation_extraction_state(status, extracted_at)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_import_rules_updated_at ON import_rules(updated_at)');
+  await client.execute('CREATE INDEX IF NOT EXISTS idx_enrichment_evidence_rule_phase ON enrichment_rollout_evidence(rule_id, phase, job_id)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_username ON password_reset_tokens(username)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_citations_citation_id ON document_citations(citation_id)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_citations_citation_doc ON document_citations(citation_id, doc_id)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_catalogue_lookups_hits_query_title ON catalogue_lookups(hits, query_title)');
+  // Fuzzy candidate buckets for saveCitations: the trailing `id` keeps each bucket
+  // in insertion order so the capped read is an ordered index range scan.
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_citations_match_year ON citations(match_year, id)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_citations_match_prefix ON citations(match_prefix, match_year, id)');
+  // Partial index over rows still awaiting match-key backfill. It carries the
+  // columns the backfill reads so the probe is a covering scan, and it empties
+  // itself as the backfill runs — once the corpus is done the probe reads nothing.
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_citations_match_pending ON citations(id, citation_text, year) WHERE match_key_version = 0');
+  // checkCacheIntegrity reads only these two columns, so a partial covering index
+  // turns its full table scan into an index scan over cached PDFs alone.
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_file_metrics_pdf_path ON file_metrics(doc_id, pdf_path) WHERE pdf_path IS NOT NULL');
+  // scope_where() in build-concepts.py filters every automatic partition by
+  // degree plus a year range on each PatternRank run.
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree_year ON documents(degree, year)');
+
+  await backfillCitationMatchKeys(client);
 
   const cleaned = await cleanupCommitteeArtifacts(client);
   if (cleaned > 0) logger.info(`Cleaned up ${cleaned} committee artefact rows`);
+  await backfillDocumentPeopleProjection(client);
 }
 
 export async function cleanupCommitteeArtifacts(dbInstance = null) {
   const client = dbInstance || await getDb();
-  const result = await client.execute(`
-    DELETE FROM committee_members
-    WHERE lower(name) IN (
+  const artifactNames = `
       'additional supervisory committee members:',
       'additional supervisory committee members',
       'examining committee members',
@@ -390,8 +610,12 @@ export async function cleanupCommitteeArtifacts(dbInstance = null) {
       'supervisory committee members',
       'supervisory committee',
       'committee members'
-    )
+  `;
+  const result = await client.execute(`
+    DELETE FROM committee_members
+    WHERE lower(name) IN (${artifactNames})
   `);
+  await client.execute(`DELETE FROM document_people WHERE lower(name) IN (${artifactNames})`);
   return changes(result);
 }
 
@@ -422,33 +646,178 @@ function withStoredThemes(doc) {
   };
 }
 
+function documentPersonKey(name) {
+  const normalized = supervisorNameKey(name);
+  return normalized ? stripMiddleInitials(normalized) : '';
+}
+
+function authoritativeCommitteeRow(rows, personKey) {
+  return (rows || [])
+    .filter((row) => documentPersonKey(row.name) === personKey)
+    .sort((left, right) => {
+      const sourceRank = Number(right.source === 'api') - Number(left.source === 'api');
+      if (sourceRank) return sourceRank;
+      const updatedRank = String(right.updated_at || '').localeCompare(String(left.updated_at || ''));
+      return updatedRank || Number(right.id || 0) - Number(left.id || 0);
+    })[0] || null;
+}
+
+function metadataPeopleStatements(doc, now = new Date().toISOString()) {
+  const statements = [{
+    sql: "DELETE FROM document_people WHERE doc_id = ? AND source = 'metadata'",
+    args: [doc.id],
+  }];
+  const names = dedupeSupervisorNames(Array.isArray(doc.supervisors) ? doc.supervisors : []);
+  for (const name of names) {
+    const key = documentPersonKey(name);
+    if (!key) continue;
+    statements.push({
+      sql: `
+        INSERT INTO document_people (doc_id, person_key, name, role, affiliation, source, updated_at)
+        VALUES (?, ?, ?, 'Supervisor', NULL, 'metadata', ?)
+        ON CONFLICT(doc_id, person_key, role, source) DO UPDATE SET
+          name = excluded.name,
+          updated_at = excluded.updated_at
+      `,
+      args: [doc.id, key, name, now],
+    });
+  }
+  return statements;
+}
+
+async function backfillDocumentPeopleProjection(client) {
+  let total = 0;
+  while (true) {
+    const result = await client.execute(`
+      SELECT doc_id, metadata_json
+      FROM documents
+      WHERE serving_projection_version < 1
+      ORDER BY doc_id
+      LIMIT 500
+    `);
+    if (!result.rows.length) break;
+    const statements = [];
+    const now = new Date().toISOString();
+    for (const row of result.rows) {
+      let doc = null;
+      try { doc = JSON.parse(row.metadata_json); } catch { doc = { id: row.doc_id, supervisors: [] }; }
+      doc.id ||= row.doc_id;
+      statements.push(...metadataPeopleStatements(doc, now));
+      statements.push({
+        sql: 'UPDATE documents SET serving_projection_version = 1 WHERE doc_id = ?',
+        args: [row.doc_id],
+      });
+    }
+    await client.batch(statements, 'write');
+    total += result.rows.length;
+  }
+  if (total) logger.info('Backfilled metadata-serving people projection', { documents: total });
+
+  const state = await client.execute({
+    sql: 'SELECT projection_value FROM serving_projection_state WHERE projection_key = ?',
+    args: ['committee_people'],
+  });
+  const savedCommitteeState = String(state.rows[0]?.projection_value || '');
+  if (savedCommitteeState === '1' || savedCommitteeState === 'complete') return;
+  let cursor = savedCommitteeState.startsWith('cursor:')
+    ? Math.max(0, Number(savedCommitteeState.slice('cursor:'.length)) || 0)
+    : 0;
+  let committeeRows = 0;
+  while (true) {
+    const transaction = await client.transaction('write');
+    try {
+      const result = await transaction.execute({
+        sql: `
+          SELECT id, doc_id, name, role, affiliation, source, updated_at
+          FROM committee_members
+          WHERE id > ?
+          ORDER BY id
+          LIMIT 500
+        `,
+        args: [cursor],
+      });
+      if (!result.rows.length) {
+        await transaction.commit();
+        break;
+      }
+      const statements = [];
+      const relationships = new Map();
+      for (const row of result.rows) {
+        cursor = Number(row.id);
+        const key = documentPersonKey(row.name);
+        if (!key) continue;
+        const role = row.role || 'Committee Member';
+        relationships.set(`${row.doc_id}\u0000${key}\u0000${role}`, {
+          docId: row.doc_id, personKey: key, role,
+        });
+      }
+      for (const { docId, personKey, role } of relationships.values()) {
+        const candidates = await transaction.execute({
+          sql: `SELECT id, name, role, affiliation, source, updated_at
+                FROM committee_members
+                WHERE doc_id = ? AND COALESCE(role, 'Committee Member') = ?`,
+          args: [docId, role],
+        });
+        const winner = authoritativeCommitteeRow(candidates.rows, personKey);
+        statements.push({
+          sql: `
+            DELETE FROM document_people
+            WHERE doc_id = ? AND person_key = ? AND role = ? AND source <> 'metadata'
+          `,
+          args: [docId, personKey, role],
+        });
+        if (winner) statements.push({
+          sql: `
+            INSERT INTO document_people (doc_id, person_key, name, role, affiliation, source, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `,
+          args: [
+            docId, personKey, winner.name, winner.role || 'Committee Member',
+            winner.affiliation || null, winner.source || 'committee', winner.updated_at,
+          ],
+        });
+      }
+      statements.push({
+        sql: `
+          INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+          VALUES ('committee_people', ?, ?)
+          ON CONFLICT(projection_key) DO UPDATE SET
+            projection_value = excluded.projection_value,
+            updated_at = excluded.updated_at
+        `,
+        args: [`cursor:${cursor}`, new Date().toISOString()],
+      });
+      await transaction.batch(statements);
+      await transaction.commit();
+      committeeRows += result.rows.length;
+    } catch (error) {
+      await transaction.rollback().catch(() => {});
+      throw error;
+    } finally {
+      transaction.close();
+    }
+  }
+  await client.execute({
+    sql: `
+      INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+      VALUES ('committee_people', 'complete', ?)
+      ON CONFLICT(projection_key) DO UPDATE SET
+        projection_value = excluded.projection_value,
+        updated_at = excluded.updated_at
+    `,
+    args: [new Date().toISOString()],
+  });
+  if (committeeRows) logger.info('Backfilled committee people projection', { rows: committeeRows });
+}
+
 export async function saveDocumentMetadata(doc, { syncKey = null, source = null } = {}) {
   doc = withStoredThemes(doc);
   const now = new Date().toISOString();
-  const cols = documentColumns(doc, syncKey, source);
-  await run(`
-    INSERT INTO documents (
-      doc_id, metadata_json, sync_key, title, author, year, degree, program,
-      source_json, source_updated_at, synced_at, updated_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(doc_id) DO UPDATE SET
-      metadata_json = excluded.metadata_json,
-      sync_key = COALESCE(excluded.sync_key, documents.sync_key),
-      title = excluded.title,
-      author = excluded.author,
-      year = excluded.year,
-      degree = excluded.degree,
-      program = excluded.program,
-      source_json = COALESCE(excluded.source_json, documents.source_json),
-      source_updated_at = COALESCE(excluded.source_updated_at, documents.source_updated_at),
-      synced_at = COALESCE(excluded.synced_at, documents.synced_at),
-      updated_at = excluded.updated_at
-  `, [
-    doc.id, JSON.stringify(doc), cols.syncKey, cols.title, cols.author, cols.year,
-    cols.degree, cols.program, cols.sourceJson, cols.sourceUpdatedAt,
-    syncKey ? now : null, now
-  ]);
+  const client = await getDb();
+  await client.batch([
+    saveDocumentStatement(doc, { syncKey, source }, now),
+    ...metadataPeopleStatements(doc, now),
+  ], 'write');
 }
 
 function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now = new Date().toISOString()) {
@@ -458,9 +827,9 @@ function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now 
     sql: `
       INSERT INTO documents (
         doc_id, metadata_json, sync_key, title, author, year, degree, program,
-        source_json, source_updated_at, synced_at, updated_at
+        source_json, source_updated_at, synced_at, serving_projection_version, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
       ON CONFLICT(doc_id) DO UPDATE SET
         metadata_json = excluded.metadata_json,
         sync_key = COALESCE(excluded.sync_key, documents.sync_key),
@@ -472,6 +841,7 @@ function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now 
         source_json = COALESCE(excluded.source_json, documents.source_json),
         source_updated_at = COALESCE(excluded.source_updated_at, documents.source_updated_at),
         synced_at = COALESCE(excluded.synced_at, documents.synced_at),
+        serving_projection_version = excluded.serving_projection_version,
         updated_at = excluded.updated_at
     `,
     args: [
@@ -488,10 +858,16 @@ export async function saveDocumentMetadataBatch(items) {
   const now = new Date().toISOString();
   const client = await getDb();
   await client.batch(
-    cleaned.map((item) => saveDocumentStatement(item.doc, {
-      syncKey: item.syncKey || null,
-      source: item.source || null,
-    }, now)),
+    cleaned.flatMap((item) => {
+      const doc = withStoredThemes(item.doc);
+      return [
+        saveDocumentStatement(doc, {
+          syncKey: item.syncKey || null,
+          source: item.source || null,
+        }, now),
+        ...metadataPeopleStatements(doc, now),
+      ];
+    }),
     'write'
   );
   return cleaned.length;
@@ -507,6 +883,31 @@ export async function documentExists(docId) {
   if (!docId) return false;
   const row = await get('SELECT 1 AS found FROM documents WHERE doc_id = ? LIMIT 1', [docId]);
   return Boolean(row);
+}
+
+const ID_CHUNK_SIZE = 999;
+
+function normalizeDocIdList(docIds) {
+  return Array.from(new Set(
+    (Array.isArray(docIds) ? docIds : [])
+      .map((id) => String(id ?? '').trim())
+      .filter(Boolean)
+  ));
+}
+
+// Batched form of documentExists (H-05). Every statement is a network round trip
+// against Turso, so a page of sync records must cost one SELECT, not one per record.
+export async function documentsExist(docIds = []) {
+  const ids = normalizeDocIdList(docIds);
+  const found = new Set();
+  if (!ids.length) return found;
+  for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = await all(`SELECT doc_id FROM documents WHERE doc_id IN (${placeholders})`, chunk);
+    for (const row of rows) found.add(String(row.doc_id));
+  }
+  return found;
 }
 
 export async function listAllDocumentMetadata() {
@@ -586,6 +987,643 @@ export async function listCachedDocuments({ syncKey, limit = null, offset = 0 } 
       return null;
     }
   }).filter(Boolean);
+}
+
+function affiliationFilterValues(raw) {
+  const value = String(raw || '').trim().toLowerCase();
+  const groups = [
+    ['ubc', 'university of british columbia', 'the university of british columbia'],
+    ['sfu', 'simon fraser university'],
+    ['uvic', 'university of victoria'],
+    ['tru', 'thompson rivers university'],
+    ['rru', 'royal roads university'],
+  ];
+  return groups.find((group) => group.includes(value)) || [value];
+}
+
+function documentServingFilters({ syncKey = null, degree = '', program = '', affiliation = '', q = '' } = {}) {
+  const clauses = [];
+  const args = [];
+  if (syncKey) {
+    clauses.push('d.sync_key = ?');
+    args.push(syncKey);
+  }
+  if (degree) {
+    clauses.push('d.degree = ?');
+    args.push(degree);
+  }
+  if (program) {
+    clauses.push('d.program = ?');
+    args.push(program);
+  }
+  if (affiliation) {
+    const values = affiliationFilterValues(affiliation);
+    clauses.push(`EXISTS (
+      SELECT 1 FROM json_each(d.metadata_json, '$.affiliation') affiliation
+      WHERE lower(trim(CAST(affiliation.value AS TEXT))) IN (${values.map(() => '?').join(', ')})
+    )`);
+    args.push(...values);
+  }
+  if (q) {
+    const pattern = `%${String(q).toLowerCase()}%`;
+    clauses.push(`(
+      lower(COALESCE(d.title, '')) LIKE ? OR
+      lower(COALESCE(d.author, '')) LIKE ? OR
+      lower(COALESCE(d.degree, '')) LIKE ? OR
+      lower(COALESCE(d.program, '')) LIKE ? OR
+      CAST(d.year AS TEXT) LIKE ? OR
+      EXISTS (
+        SELECT 1 FROM json_each(d.metadata_json, '$.supervisors') supervisor
+        WHERE lower(CAST(supervisor.value AS TEXT)) LIKE ?
+      )
+    )`);
+    args.push(pattern, pattern, pattern, pattern, pattern, pattern);
+  }
+  return {
+    where: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '',
+    args,
+  };
+}
+
+const DOCUMENT_PAGE_SORTS = {
+  title: 'lower(COALESCE(d.title, \'\'))',
+  author: 'lower(COALESCE(d.author, \'\'))',
+  year: 'COALESCE(d.year, 0)',
+  degree: 'lower(COALESCE(d.degree, \'\'))',
+  pages: 'COALESCE(fm.page_count, 0)',
+  wordCount: 'COALESCE(fm.word_count, 0)',
+  citationCount: 'COALESCE(dc.citation_count, 0)',
+};
+
+/**
+ * Database-backed document pagination. Filtering, sorting, citation counts,
+ * and LIMIT/OFFSET all happen before metadata JSON reaches the web process.
+ */
+export async function queryCachedDocumentPage({
+  syncKey = null, filters = {}, q = '', sortKey = '', sortDir = 'asc', limit = 50, offset = 0,
+} = {}) {
+  const queryFilters = documentServingFilters({ syncKey, ...filters, q });
+  const countRow = await get(`SELECT COUNT(*) AS total FROM documents d ${queryFilters.where}`, queryFilters.args);
+  const sortExpression = DOCUMENT_PAGE_SORTS[sortKey] || 'COALESCE(d.year, 0)';
+  const direction = sortKey ? (sortDir === 'asc' ? 'ASC' : 'DESC') : 'DESC';
+  const rows = await all(`
+    SELECT d.doc_id, d.metadata_json,
+           fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
+           fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+           COALESCE(dc.citation_count, 0) AS citation_count
+    FROM documents d
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN (
+      SELECT doc_id, COUNT(*) AS citation_count
+      FROM document_citations
+      GROUP BY doc_id
+    ) dc ON dc.doc_id = d.doc_id
+    ${queryFilters.where}
+    ORDER BY ${sortExpression} ${direction}, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
+    LIMIT ? OFFSET ?
+  `, [...queryFilters.args, Math.max(1, Number(limit) || 50), Math.max(0, Number(offset) || 0)]);
+  const documents = rows.map((row) => {
+    try {
+      const doc = applyStoredFileMetricToDocument(JSON.parse(row.metadata_json), row);
+      doc.citationCount = Number(row.citation_count || 0);
+      return doc;
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
+  return { total: Number(countRow?.total || 0), documents };
+}
+
+/** A bounded document page restricted to documents with persisted topic assignments. */
+export async function queryTopicDocumentPage({
+  syncKey = null, filters = {}, limit = 5000, offset = 0,
+} = {}) {
+  const queryFilters = documentServingFilters({ syncKey, ...filters });
+  const topicJoin = 'JOIN (SELECT DISTINCT doc_id FROM document_topics) dt ON dt.doc_id = d.doc_id';
+  const countRow = await get(`
+    SELECT COUNT(*) AS total
+    FROM documents d
+    ${topicJoin}
+    ${queryFilters.where}
+  `, queryFilters.args);
+  const rows = await all(`
+    SELECT d.doc_id, d.metadata_json,
+           fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
+           fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+           COALESCE(dc.citation_count, 0) AS citation_count
+    FROM documents d
+    ${topicJoin}
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN (
+      SELECT doc_id, COUNT(*) AS citation_count
+      FROM document_citations
+      GROUP BY doc_id
+    ) dc ON dc.doc_id = d.doc_id
+    ${queryFilters.where}
+    ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
+    LIMIT ? OFFSET ?
+  `, [...queryFilters.args, Math.max(1, Number(limit) || 5000), Math.max(0, Number(offset) || 0)]);
+  const documents = rows.map((row) => {
+    try {
+      const doc = applyStoredFileMetricToDocument(JSON.parse(row.metadata_json), row);
+      doc.citationCount = Number(row.citation_count || 0);
+      return doc;
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
+  return { total: Number(countRow?.total || 0), documents };
+}
+
+/** Small, database-side bootstrap aggregates for metadata-scale landing pages. */
+export async function getDocumentServingSummary({ syncKey = null } = {}) {
+  const filters = documentServingFilters({ syncKey });
+  const [summary, degrees, programs, affiliations, supervisors] = await Promise.all([
+    get(`SELECT COUNT(*) AS documents FROM documents d ${filters.where}`, filters.args),
+    all(`SELECT DISTINCT d.degree AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.degree IS NOT NULL AND trim(d.degree) <> '' ORDER BY value`, filters.args),
+    all(`SELECT DISTINCT d.program AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.program IS NOT NULL AND trim(d.program) <> '' ORDER BY value`, filters.args),
+    all(`
+      SELECT DISTINCT trim(CAST(affiliation.value AS TEXT)) AS value
+      FROM documents d, json_each(d.metadata_json, '$.affiliation') affiliation
+      ${filters.where}
+      ${filters.where ? 'AND' : 'WHERE'} trim(CAST(affiliation.value AS TEXT)) <> ''
+      ORDER BY value
+    `, filters.args),
+    get(`
+      SELECT COUNT(DISTINCT p.person_key) AS count
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id
+      ${filters.where}
+      ${filters.where ? 'AND' : 'WHERE'} p.source = 'metadata' AND p.role = 'Supervisor'
+    `, filters.args),
+  ]);
+  return {
+    documents: Number(summary?.documents || 0),
+    supervisors: Number(supervisors?.count || 0),
+    facets: {
+      degree: degrees.map((row) => row.value).filter(Boolean),
+      program: programs.map((row) => row.value).filter(Boolean),
+      affiliation: affiliations.map((row) => row.value).filter(Boolean),
+    },
+  };
+}
+
+export async function queryCitationDocumentPage({
+  syncKey = null, filters = {}, q = '', sortKey = 'citationCount', sortDir = 'desc', limit = 50, offset = 0,
+} = {}) {
+  const queryFilters = documentServingFilters({ syncKey, ...filters, q });
+  const counts = await get(`
+    SELECT COUNT(*) AS total,
+           SUM(CASE WHEN COALESCE(dc.citation_count, 0) > 0 THEN 1 ELSE 0 END) AS with_citations
+    FROM documents d
+    LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
+      ON dc.doc_id = d.doc_id
+    ${queryFilters.where}
+  `, queryFilters.args);
+  const sortExpression = DOCUMENT_PAGE_SORTS[sortKey] || DOCUMENT_PAGE_SORTS.citationCount;
+  const direction = sortDir === 'asc' ? 'ASC' : 'DESC';
+  const rows = await all(`
+    SELECT d.doc_id, d.title, d.author, d.year, COALESCE(dc.citation_count, 0) AS citation_count
+    FROM documents d
+    LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
+      ON dc.doc_id = d.doc_id
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    ${queryFilters.where}
+    ORDER BY ${sortExpression} ${direction}, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
+    LIMIT ? OFFSET ?
+  `, [...queryFilters.args, Math.max(1, Number(limit) || 50), Math.max(0, Number(offset) || 0)]);
+  return {
+    total: Number(counts?.total || 0),
+    withCitations: Number(counts?.with_citations || 0),
+    documents: rows.map((row) => ({
+      id: row.doc_id,
+      title: row.title || '',
+      author: row.author || '',
+      year: row.year == null ? null : Number(row.year),
+      citationCount: Number(row.citation_count || 0),
+    })),
+  };
+}
+
+function numericStats(row = {}) {
+  return {
+    count: Number(row.count || 0),
+    min: row.min == null ? null : Number(row.min),
+    max: row.max == null ? null : Number(row.max),
+    mean: row.mean == null ? null : Math.round(Number(row.mean)),
+    median: row.median == null ? null : Number(row.median),
+  };
+}
+
+async function aggregateNumericSeries({ filters, valueSql, reliabilitySql }) {
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  const rows = await all(`
+    WITH values_by_year AS (
+      SELECT d.year AS year, ${valueSql} AS value
+      FROM documents d
+      LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+      ${filters.where}
+      ${qualifier} d.year IS NOT NULL AND ${reliabilitySql}
+    ), ranked AS (
+      SELECT year, value,
+             ROW_NUMBER() OVER (PARTITION BY year ORDER BY value) AS row_num,
+             COUNT(*) OVER (PARTITION BY year) AS partition_count
+      FROM values_by_year
+    )
+    SELECT year, COUNT(*) AS count, MIN(value) AS min, MAX(value) AS max,
+           AVG(value) AS mean,
+           AVG(CASE
+             WHEN row_num IN ((partition_count + 1) / 2, (partition_count + 2) / 2)
+             THEN value
+           END) AS median
+    FROM ranked
+    GROUP BY year
+    ORDER BY year
+  `, filters.args);
+  return rows.map((row) => ({ year: Number(row.year), ...numericStats(row) }));
+}
+
+/**
+ * Metadata-scale analytics computed as bounded SQL aggregates. This deliberately
+ * returns no document collection; document rows have their own paginated API.
+ */
+export async function getDocumentServingAnalytics({ syncKey = null, filters: requestedFilters = {}, subjectLimit = 25 } = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  const activeWords = 'COALESCE(fm.body_word_count, fm.word_count)';
+  const reliableWords = `${activeWords} >= 1000 AND COALESCE(fm.word_source, '') NOT IN ('metadata_text', 'degraded_pdf_text')`;
+  const reliablePages = `fm.page_count >= 10 AND COALESCE(fm.page_source, '') NOT IN ('estimated_from_metadata_words', 'estimated_from_full_text_words')`;
+
+  const [overall, yearCounts, wordRows, pageRows, themes, concepts, methodologies] = await Promise.all([
+    get(`
+      SELECT COUNT(*) AS record_count,
+             COUNT(CASE WHEN ${reliableWords} THEN 1 END) AS word_count,
+             MIN(CASE WHEN ${reliableWords} THEN ${activeWords} END) AS word_min,
+             MAX(CASE WHEN ${reliableWords} THEN ${activeWords} END) AS word_max,
+             AVG(CASE WHEN ${reliableWords} THEN ${activeWords} END) AS word_mean,
+             COUNT(CASE WHEN ${reliablePages} THEN 1 END) AS page_count,
+             MIN(CASE WHEN ${reliablePages} THEN fm.page_count END) AS page_min,
+             MAX(CASE WHEN ${reliablePages} THEN fm.page_count END) AS page_max,
+             AVG(CASE WHEN ${reliablePages} THEN fm.page_count END) AS page_mean,
+             COUNT(json_extract(d.metadata_json, '$.charCount')) AS char_count,
+             MIN(CAST(json_extract(d.metadata_json, '$.charCount') AS INTEGER)) AS char_min,
+             MAX(CAST(json_extract(d.metadata_json, '$.charCount') AS INTEGER)) AS char_max,
+             AVG(CAST(json_extract(d.metadata_json, '$.charCount') AS INTEGER)) AS char_mean
+      FROM documents d
+      LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+      ${filters.where}
+    `, filters.args),
+    all(`
+      SELECT d.year AS year, COUNT(*) AS count
+      FROM documents d
+      ${filters.where}
+      ${qualifier} d.year IS NOT NULL
+      GROUP BY d.year
+      ORDER BY d.year
+    `, filters.args),
+    aggregateNumericSeries({ filters, valueSql: activeWords, reliabilitySql: reliableWords }),
+    aggregateNumericSeries({ filters, valueSql: 'fm.page_count', reliabilitySql: reliablePages }),
+    all(`
+      SELECT trim(CAST(term.value AS TEXT)) AS term, COUNT(DISTINCT d.doc_id) AS count
+      FROM documents d, json_each(d.metadata_json, '$.themes') term
+      ${filters.where}
+      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
+      GROUP BY term
+      ORDER BY count DESC, term ASC
+      LIMIT 70
+    `, filters.args),
+    all(`
+      SELECT trim(CAST(term.value AS TEXT)) AS term, COUNT(DISTINCT d.doc_id) AS count
+      FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
+      ${filters.where}
+      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
+      GROUP BY term
+      ORDER BY count DESC, term ASC
+      LIMIT ?
+    `, [...filters.args, Math.max(1, Math.min(100, Number(subjectLimit) || 25))]),
+    all(`
+      SELECT trim(CAST(term.value AS TEXT)) AS methodology, COUNT(DISTINCT d.doc_id) AS count
+      FROM documents d, json_each(d.metadata_json, '$.methodologies') term
+      ${filters.where}
+      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
+      GROUP BY methodology
+      ORDER BY count DESC, methodology ASC
+      LIMIT 100
+    `, filters.args),
+  ]);
+
+  const wordStats = {
+    count: Number(overall?.word_count || 0),
+    min: overall?.word_min == null ? null : Number(overall.word_min),
+    max: overall?.word_max == null ? null : Number(overall.word_max),
+    mean: overall?.word_mean == null ? null : Math.round(Number(overall.word_mean)),
+    median: null,
+  };
+  const pageStats = {
+    count: Number(overall?.page_count || 0),
+    min: overall?.page_min == null ? null : Number(overall.page_min),
+    max: overall?.page_max == null ? null : Number(overall.page_max),
+    mean: overall?.page_mean == null ? null : Math.round(Number(overall.page_mean)),
+    median: null,
+  };
+  const charStats = {
+    count: Number(overall?.char_count || 0),
+    min: overall?.char_min == null ? null : Number(overall.char_min),
+    max: overall?.char_max == null ? null : Number(overall.char_max),
+    mean: overall?.char_mean == null ? null : Math.round(Number(overall.char_mean)),
+    median: null,
+  };
+  const conceptRows = concepts.map((row) => ({
+    concept: row.term,
+    docCount: Number(row.count || 0),
+    weightedDocEquivalent: Number(row.count || 0),
+    weightedMean: null,
+  }));
+  const wordRowsByYear = new Map(wordRows.map((row) => [row.year, row]));
+  const byYear = yearCounts.map((row) => {
+    const year = Number(row.year);
+    const wordRow = wordRowsByYear.get(year) || {};
+    return {
+      year,
+      count: Number(row.count || 0),
+      min: wordRow.min ?? null,
+      max: wordRow.max ?? null,
+      mean: wordRow.mean ?? null,
+      median: wordRow.median ?? null,
+    };
+  });
+
+  return {
+    metrics: {
+      recordCount: Number(overall?.record_count || 0),
+      overallWordCount: wordStats,
+      overallPageCount: pageStats,
+      overallCharCount: charStats,
+      byConcept: conceptRows,
+      byYear,
+      avgPagesByYear: pageRows,
+      pageTrend: pageRows.map((row) => ({
+        year: row.year, median: row.median, min: row.min, max: row.max, count: row.count,
+      })),
+    },
+    wordCloud: themes.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
+    ngramCloud: concepts.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
+    methodologies: methodologies.map((row) => ({ methodology: row.methodology, count: Number(row.count || 0) })),
+    supervisorNgramMatrix: { supervisors: [], ngrams: [], conceptIds: [], matrix: [] },
+    termCooccurrence: [],
+    conceptTimeline: [],
+    methodologyConceptMatrix: { methodologies: [], concepts: [], conceptIds: [], matrix: [] },
+    topicData: null,
+    methodologyTopicMatrix: { methodologies: [], topics: [], matrix: [] },
+    documents: [],
+  };
+}
+
+const PEOPLE_PAGE_SORTS = {
+  name: 'lower(name)',
+  docCount: 'doc_count',
+  roles: 'lower(roles)',
+  years: 'year_min',
+};
+
+export async function queryPeoplePage({
+  syncKey = null, filters: requestedFilters = {}, q = '', role = '',
+  sortKey = 'docCount', sortDir = 'desc', limit = 50, offset = 0,
+} = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const extra = [];
+  const extraArgs = [];
+  if (q) {
+    const pattern = `%${String(q).toLowerCase()}%`;
+    extra.push(`(
+      lower(p.name) LIKE ? OR lower(p.role) LIKE ? OR lower(COALESCE(p.affiliation, '')) LIKE ?
+    )`);
+    extraArgs.push(pattern, pattern, pattern);
+  }
+  if (role) {
+    extra.push('p.role = ?');
+    extraArgs.push(role);
+  }
+  const matchWhereSql = extra.length ? `WHERE ${extra.join(' AND ')}` : '';
+  const args = [...filters.args, ...extraArgs];
+  const groupedSql = `
+    WITH filtered_people AS (
+      SELECT p.person_key, p.doc_id, p.name, p.role, p.affiliation, d.year
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id
+      ${filters.where}
+    ), matching_keys AS (
+      SELECT DISTINCT p.person_key
+      FROM filtered_people p
+      ${matchWhereSql}
+    )
+    SELECT p.person_key,
+           MAX(p.name) AS name,
+           GROUP_CONCAT(DISTINCT p.role) AS roles,
+           GROUP_CONCAT(DISTINCT NULLIF(p.affiliation, '')) AS affiliations,
+           COUNT(DISTINCT p.doc_id) AS doc_count,
+           MIN(p.year) AS year_min,
+           MAX(p.year) AS year_max
+    FROM filtered_people p
+    JOIN matching_keys matched ON matched.person_key = p.person_key
+    GROUP BY p.person_key
+  `;
+  const countRow = await get(`SELECT COUNT(*) AS total FROM (${groupedSql}) people`, args);
+  const sortExpression = PEOPLE_PAGE_SORTS[sortKey] || PEOPLE_PAGE_SORTS.docCount;
+  const direction = sortDir === 'asc' ? 'ASC' : 'DESC';
+  const rows = await all(`
+    SELECT * FROM (${groupedSql}) people
+    ORDER BY ${sortExpression} ${direction}, lower(name) ${direction}, person_key ASC
+    LIMIT ? OFFSET ?
+  `, [...args, Math.max(1, Number(limit) || 50), Math.max(0, Number(offset) || 0)]);
+  return {
+    total: Number(countRow?.total || 0),
+    people: rows.map((row) => {
+      const yearMin = row.year_min == null ? null : Number(row.year_min);
+      const yearMax = row.year_max == null ? null : Number(row.year_max);
+      return {
+        key: row.person_key,
+        name: row.name,
+        roles: String(row.roles || '').split(',').filter(Boolean),
+        docCount: Number(row.doc_count || 0),
+        affiliations: String(row.affiliations || '').split(',').filter(Boolean).sort(),
+        yearRange: yearMin == null ? '\u2013' : `${yearMin}\u2013${yearMax}`,
+        yearMin: yearMin ?? 9999,
+      };
+    }),
+  };
+}
+
+/**
+ * Returns corpus-complete person aggregates plus one bounded document page.
+ * Relationship roles are aggregated per document so callers do not need to
+ * load every document merely to reconstruct the person's summary.
+ */
+export async function queryPersonDetailPage({
+  personKey, syncKey = null, filters: requestedFilters = {}, limit = 50, offset = 0,
+} = {}) {
+  const key = String(personKey || '').trim().toLowerCase();
+  if (!key) return null;
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filterClause = filters.where ? `${filters.where} AND` : 'WHERE';
+  const relationArgs = [...filters.args, key];
+  const relationWhere = `${filterClause} p.person_key = ?`;
+  const [summary, conceptRows, methodologyRows, coSupervisorRows, topicRows] = await Promise.all([
+    get(`
+      SELECT MAX(p.name) AS name,
+             GROUP_CONCAT(DISTINCT p.role) AS roles,
+             GROUP_CONCAT(DISTINCT NULLIF(p.affiliation, '')) AS affiliations,
+             COUNT(DISTINCT p.doc_id) AS doc_count,
+             MIN(d.year) AS year_min,
+             MAX(d.year) AS year_max
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id
+      ${relationWhere}
+    `, relationArgs),
+    all(`
+      SELECT trim(CAST(term.value AS TEXT)) AS term, COUNT(DISTINCT p.doc_id) AS count
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id,
+           json_each(d.metadata_json, '$.conceptTerms') term
+      ${relationWhere} AND trim(CAST(term.value AS TEXT)) <> ''
+      GROUP BY term
+      ORDER BY count DESC, term ASC
+      LIMIT 12
+    `, relationArgs),
+    all(`
+      SELECT trim(CAST(term.value AS TEXT)) AS methodology, COUNT(DISTINCT p.doc_id) AS count
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id,
+           json_each(d.metadata_json, '$.methodologies') term
+      ${relationWhere} AND trim(CAST(term.value AS TEXT)) <> ''
+      GROUP BY methodology
+      ORDER BY count DESC, methodology ASC
+      LIMIT 100
+    `, relationArgs),
+    all(`
+      SELECT MAX(other.name) AS person_name
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id
+      JOIN document_people other ON other.doc_id = p.doc_id
+        AND other.person_key <> p.person_key
+        AND other.source = 'metadata' AND other.role = 'Supervisor'
+      ${relationWhere}
+      GROUP BY other.person_key
+      ORDER BY lower(MAX(other.name))
+      LIMIT 100
+    `, relationArgs),
+    all(`
+      SELECT dt.topic_id, COUNT(DISTINCT p.doc_id) AS count
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id
+      JOIN document_topics dt ON dt.doc_id = p.doc_id
+      ${relationWhere}
+      GROUP BY dt.topic_id
+      ORDER BY count DESC, dt.topic_id ASC
+      LIMIT 100
+    `, relationArgs),
+  ]);
+  if (!summary?.name || Number(summary.doc_count || 0) === 0) return null;
+
+  const rows = await all(`
+    WITH person_docs AS (
+      SELECT p.doc_id, GROUP_CONCAT(DISTINCT p.role) AS person_roles
+      FROM document_people p
+      JOIN documents d ON d.doc_id = p.doc_id
+      ${relationWhere}
+      GROUP BY p.doc_id
+    ), topic_assignment AS (
+      SELECT dt.doc_id, dt.topic_id, dt.probability
+      FROM document_topics dt
+      WHERE dt.topic_id = (
+        SELECT candidate.topic_id
+        FROM document_topics candidate
+        WHERE candidate.doc_id = dt.doc_id
+        ORDER BY COALESCE(candidate.probability, -1) DESC, candidate.topic_id ASC
+        LIMIT 1
+      )
+    )
+    SELECT d.doc_id, d.metadata_json, pd.person_roles,
+           fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
+           fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+           COALESCE(dc.citation_count, 0) AS citation_count,
+           dt.topic_id, dt.probability
+    FROM person_docs pd
+    JOIN documents d ON d.doc_id = pd.doc_id
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
+      ON dc.doc_id = d.doc_id
+    LEFT JOIN topic_assignment dt ON dt.doc_id = d.doc_id
+    ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
+    LIMIT ? OFFSET ?
+  `, [...relationArgs, Math.max(1, Number(limit) || 50), Math.max(0, Number(offset) || 0)]);
+  const documents = rows.map((row) => {
+    try {
+      const doc = applyStoredFileMetricToDocument(JSON.parse(row.metadata_json), row);
+      doc.citationCount = Number(row.citation_count || 0);
+      doc.topicId = row.topic_id == null ? null : Number(row.topic_id);
+      doc.topicProbability = row.probability == null ? null : Number(row.probability);
+      doc.personRoles = String(row.person_roles || '').split(',').filter(Boolean);
+      return doc;
+    } catch {
+      return null;
+    }
+  }).filter(Boolean);
+  const yearMin = summary.year_min == null ? null : Number(summary.year_min);
+  const yearMax = summary.year_max == null ? null : Number(summary.year_max);
+  return {
+    person: {
+      key,
+      name: summary.name,
+      roles: String(summary.roles || '').split(',').filter(Boolean),
+      docCount: Number(summary.doc_count || 0),
+      affiliations: String(summary.affiliations || '').split(',').filter(Boolean).sort(),
+      yearRange: yearMin == null ? '\u2013' : `${yearMin}\u2013${yearMax}`,
+      yearMin: yearMin ?? 9999,
+      topConcepts: conceptRows.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
+      methodologies: methodologyRows.map((row) => ({ methodology: row.methodology, count: Number(row.count || 0) })),
+      coSupervisors: coSupervisorRows.map((row) => row.person_name).filter(Boolean),
+      topicSummary: topicRows.map((row) => ({ topicId: Number(row.topic_id), count: Number(row.count || 0) })),
+    },
+    documents,
+  };
+}
+
+export async function queryRelatedDocuments(doc, { syncKey = null, limit = 6 } = {}) {
+  const terms = Array.from(new Set([
+    ...(Array.isArray(doc?.themes) ? doc.themes : []),
+    ...(Array.isArray(doc?.conceptTerms) ? doc.conceptTerms : []),
+  ].map((value) => String(value || '').trim().toLowerCase()).filter(Boolean))).slice(0, 24);
+  if (!doc?.id || !terms.length) return [];
+  const values = terms.map(() => '(?)').join(', ');
+  const syncClause = syncKey ? 'AND d.sync_key = ?' : '';
+  const rows = await all(`
+    WITH target_terms(term) AS (VALUES ${values})
+    SELECT d.doc_id, d.title, d.author, d.year, d.degree,
+           COUNT(DISTINCT target_terms.term) AS overlap
+    FROM documents d
+    JOIN target_terms ON (
+      EXISTS (
+        SELECT 1 FROM json_each(d.metadata_json, '$.themes') theme
+        WHERE lower(CAST(theme.value AS TEXT)) = target_terms.term
+      ) OR EXISTS (
+        SELECT 1 FROM json_each(d.metadata_json, '$.conceptTerms') concept
+        WHERE lower(CAST(concept.value AS TEXT)) = target_terms.term
+      )
+    )
+    WHERE d.doc_id <> ? ${syncClause}
+    GROUP BY d.doc_id, d.title, d.author, d.year, d.degree
+    ORDER BY overlap DESC, d.year DESC, d.title ASC
+    LIMIT ?
+  `, [...terms, doc.id, ...(syncKey ? [syncKey] : []), Math.max(1, Math.min(25, Number(limit) || 6))]);
+  return rows.map((row) => ({
+    id: row.doc_id,
+    title: row.title || '',
+    author: row.author || '',
+    year: row.year == null ? null : Number(row.year),
+    degree: row.degree || '',
+    overlap: Number(row.overlap || 0),
+  }));
 }
 
 export async function applyStoredFileMetricsToDocuments(documents = []) {
@@ -993,8 +2031,29 @@ export async function reapStaleAdminJobs(type = null) {
     sql += ' AND type = ?';
     args.push(type);
   }
-  const result = await run(sql, args);
-  return result.changes || 0;
+  const client = await getDb();
+  const results = await client.batch([
+    { sql, args },
+    {
+      sql: `
+        UPDATE enrichment_rollouts
+        SET status = 'blocked', current_phase = NULL, current_job_id = NULL,
+            evaluation_json = json_object(
+              'passed', 0,
+              'phase', current_phase,
+              'interrupted', 1,
+              'error', 'Admin worker timed out or stopped heartbeating.'
+            ),
+            updated_at = ?
+        WHERE current_job_id IN (
+          SELECT id FROM admin_jobs
+          WHERE status = 'timed_out' AND finished_at = ?
+        )
+      `,
+      args: [now, now],
+    },
+  ], 'write');
+  return changes(results[0]);
 }
 
 export async function hasRunningAdminJob(type) {
@@ -1019,10 +2078,37 @@ export async function loadStoredFileMetric(docId) {
   return get(`
     SELECT doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count,
            full_text_path, full_text_bytes, full_text_source_url, page_count,
-           word_source, page_source, status, error, updated_at
+           word_source, page_source, content_source, content_checksum,
+           content_source_url, content_retrieved_at, parser_version,
+           metadata_request_count, full_text_request_count,
+           original_pdf_request_count, retrieved_bytes, status, error, updated_at
     FROM file_metrics
     WHERE doc_id = ?
   `, [docId]);
+}
+
+// Batched form of loadStoredFileMetric (H-05): one SELECT per page of sync
+// records instead of one per record. Returns a Map keyed by doc_id.
+export async function loadStoredFileMetrics(docIds = []) {
+  const ids = normalizeDocIdList(docIds);
+  const byDocId = new Map();
+  if (!ids.length) return byDocId;
+  for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = await all(`
+      SELECT doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count,
+             full_text_path, full_text_bytes, full_text_source_url, page_count,
+             word_source, page_source, content_source, content_checksum,
+             content_source_url, content_retrieved_at, parser_version,
+             metadata_request_count, full_text_request_count,
+             original_pdf_request_count, retrieved_bytes, status, error, updated_at
+      FROM file_metrics
+      WHERE doc_id IN (${placeholders})
+    `, chunk);
+    for (const row of rows) byDocId.set(String(row.doc_id), row);
+  }
+  return byDocId;
 }
 
 export async function saveFileMetric(docId, payload) {
@@ -1031,8 +2117,11 @@ export async function saveFileMetric(docId, payload) {
     INSERT INTO file_metrics (
       doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count,
       full_text_path, full_text_bytes, full_text_source_url, page_count,
-      word_source, page_source, status, error, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      word_source, page_source, content_source, content_checksum,
+      content_source_url, content_retrieved_at, parser_version,
+      metadata_request_count, full_text_request_count,
+      original_pdf_request_count, retrieved_bytes, status, error, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(doc_id) DO UPDATE SET
       pdf_path = excluded.pdf_path,
       download_url = excluded.download_url,
@@ -1045,6 +2134,15 @@ export async function saveFileMetric(docId, payload) {
       page_count = excluded.page_count,
       word_source = excluded.word_source,
       page_source = excluded.page_source,
+      content_source = excluded.content_source,
+      content_checksum = excluded.content_checksum,
+      content_source_url = excluded.content_source_url,
+      content_retrieved_at = excluded.content_retrieved_at,
+      parser_version = excluded.parser_version,
+      metadata_request_count = excluded.metadata_request_count,
+      full_text_request_count = excluded.full_text_request_count,
+      original_pdf_request_count = excluded.original_pdf_request_count,
+      retrieved_bytes = excluded.retrieved_bytes,
       status = excluded.status,
       error = excluded.error,
       updated_at = excluded.updated_at
@@ -1061,6 +2159,15 @@ export async function saveFileMetric(docId, payload) {
     payload.pageCount ?? null,
     payload.wordSource || null,
     payload.pageSource || null,
+    payload.contentSource || null,
+    payload.contentChecksum || null,
+    payload.contentSourceUrl || null,
+    payload.contentRetrievedAt || null,
+    payload.parserVersion || null,
+    payload.metadataRequestCount ?? null,
+    payload.fullTextRequestCount ?? null,
+    payload.originalPdfRequestCount ?? null,
+    payload.retrievedBytes ?? null,
     payload.status || null,
     payload.error || null,
     now
@@ -1071,11 +2178,127 @@ export async function deleteFileMetric(docId) {
   await run('DELETE FROM file_metrics WHERE doc_id = ?', [docId]);
 }
 
+// --- Enrichment queue (H-03) ---
+
+// SQL mirror of hasCachedEnrichmentMetric() in src/sync.js. The two must agree or
+// the local enrichment queue and the in-process policy check will disagree about
+// what is still outstanding, so test/enrichmentPolicyEquivalence.test.js asserts
+// they return the same answer for every content mode over a matrix of stored rows.
+// Branch order is deliberate: the full_text fallback wins over the mode rule
+// whenever the stored word source is DSpace full text, exactly as the JS does.
+export function enrichmentPolicySatisfiedSql(contentMode, contentFallback = null, alias = 'fm') {
+  const counted = `COALESCE(${alias}.word_count, 0) > 0 AND COALESCE(${alias}.page_count, 0) > 0`;
+  const fullText = `${alias}.word_source = 'dspace_full_text' AND ${counted}`;
+  let byMode = '0';
+  if (contentMode === 'pdf_cache') {
+    byMode = `${alias}.pdf_path IS NOT NULL AND ${alias}.pdf_path <> ''`;
+  } else if (contentMode === 'pdf_stream') {
+    byMode = `${alias}.content_source = 'streamed_pdf'`
+      + ` AND ${alias}.content_checksum IS NOT NULL AND ${alias}.content_checksum <> ''`
+      + ` AND ${counted}`;
+  } else if (contentMode === 'full_text_only') {
+    byMode = fullText;
+  }
+  const expression = contentFallback === 'full_text'
+    ? `CASE WHEN ${alias}.word_source = 'dspace_full_text' THEN (${counted}) ELSE (${byMode}) END`
+    : `(${byMode})`;
+  return `COALESCE(${expression}, 0)`;
+}
+
+// The enrichment work queue. Replaces re-scanning Open Collections from record 0
+// on every batch: outstanding documents are found locally, in doc_id order from a
+// cursor, so batch N costs the same as batch 1 no matter how much is already done.
+//
+// `+d.sync_key` is deliberate. It makes the sync-key term unusable as an index
+// lookup, which forces the walk onto the doc_id primary key: the cursor becomes an
+// ordered range scan and ORDER BY needs no sort. Left to itself the planner takes
+// idx_documents_sync_key and then sorts the rule's whole corpus for every batch,
+// which is precisely the per-batch cost this queue exists to remove.
+export async function listDocumentsPendingEnrichment({
+  syncKey = null,
+  contentMode = null,
+  contentFallback = null,
+  attemptedBefore = null,
+  afterDocId = '',
+  limit = 50,
+} = {}) {
+  const args = [];
+  const where = [];
+  if (syncKey) {
+    where.push('+d.sync_key = ?');
+    args.push(syncKey);
+  }
+  const cursor = String(afterDocId || '');
+  if (cursor) {
+    where.push('d.doc_id > ?');
+    args.push(cursor);
+  }
+  where.push(`${enrichmentPolicySatisfiedSql(contentMode, contentFallback, 'fm')} = 0`);
+  if (attemptedBefore) {
+    where.push('(ea.attempted_at IS NULL OR ea.attempted_at < ?)');
+    args.push(String(attemptedBefore));
+  }
+  args.push(Math.max(1, Number(limit) || 1));
+  const rows = await all(`
+    SELECT d.doc_id, d.metadata_json
+    FROM documents d
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN enrichment_attempts ea ON ea.doc_id = d.doc_id
+    WHERE ${where.join(' AND ')}
+    ORDER BY d.doc_id
+    LIMIT ?
+  `, args);
+  return rows.map((row) => {
+    let metadata = null;
+    try { metadata = row.metadata_json ? JSON.parse(row.metadata_json) : null; } catch { metadata = null; }
+    return { docId: String(row.doc_id), metadata };
+  });
+}
+
+export async function markEnrichmentAttempts(docIds = [], attemptedAt = new Date().toISOString()) {
+  const ids = normalizeDocIdList(docIds);
+  if (!ids.length) return 0;
+  const client = await getDb();
+  const stamp = String(attemptedAt || new Date().toISOString());
+  const chunkSize = 250;
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    await client.batch(ids.slice(i, i + chunkSize).map((docId) => ({
+      sql: `
+        INSERT INTO enrichment_attempts (doc_id, attempted_at)
+        VALUES (?, ?)
+        ON CONFLICT(doc_id) DO UPDATE SET attempted_at = excluded.attempted_at
+      `,
+      args: [docId, stamp],
+    })), 'write');
+  }
+  return ids.length;
+}
+
+export async function loadEnrichmentAttempts(docIds = []) {
+  const ids = normalizeDocIdList(docIds);
+  const byDocId = new Map();
+  if (!ids.length) return byDocId;
+  for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
+    const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = await all(
+      `SELECT doc_id, attempted_at FROM enrichment_attempts WHERE doc_id IN (${placeholders})`,
+      chunk
+    );
+    for (const row of rows) byDocId.set(String(row.doc_id), row.attempted_at || null);
+  }
+  return byDocId;
+}
+
 export async function listFileMetrics() {
   const rows = await all(`
     SELECT fm.doc_id, fm.pdf_path, fm.download_url, fm.file_bytes, fm.word_count,
            fm.body_word_count, fm.full_text_path, fm.full_text_bytes, fm.full_text_source_url, fm.page_count,
-           fm.word_source, fm.page_source, fm.status, fm.error, fm.updated_at,
+           fm.word_source, fm.page_source, fm.content_source, fm.content_checksum,
+           fm.content_source_url, fm.content_retrieved_at, fm.parser_version,
+           fm.metadata_request_count, fm.full_text_request_count,
+           fm.original_pdf_request_count, fm.retrieved_bytes,
+           fm.status, fm.error, fm.updated_at,
            d.title, d.author, d.metadata_json
     FROM file_metrics fm
     LEFT JOIN documents d ON d.doc_id = fm.doc_id
@@ -1101,6 +2324,7 @@ export async function getFileMetricsStats() {
            SUM(CASE WHEN file_bytes IS NOT NULL THEN file_bytes ELSE 0 END) AS total_bytes,
            SUM(CASE WHEN status = 'downloaded' OR status = 'redownloaded' OR status = 'cached' OR status = 'recomputed_from_cache' THEN 1 ELSE 0 END) AS with_pdf,
            SUM(CASE WHEN word_source = 'dspace_full_text' THEN 1 ELSE 0 END) AS with_full_text,
+           SUM(CASE WHEN word_source = 'degraded_pdf_text' THEN 1 ELSE 0 END) AS degraded_text,
            SUM(CASE WHEN status = 'not_found' OR status = 'cache_miss' OR status = 'blocked' THEN 1 ELSE 0 END) AS failed,
            MIN(updated_at) AS oldest,
            MAX(updated_at) AS newest
@@ -1298,14 +2522,45 @@ function importRuleFromRow(row) {
     index: row.requested_index || '',
     query: row.query || '',
     source: row.source || '',
+    contentMode: row.content_mode || 'metadata_only',
+    contentFallback: row.content_fallback || 'fail_document',
+    extractCitations: Boolean(row.extract_citations),
+    extractCommittee: row.extract_committee == null ? true : Boolean(row.extract_committee),
+    runConcepts: row.run_concepts == null ? true : Boolean(row.run_concepts),
+    maxContentBytes: Number(row.max_content_bytes || 209715200),
+    contentConcurrency: Number(row.content_concurrency || 1),
+    contentRateLimit: Number(row.content_rate_limit || 0),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
+export function importRuleRevision(input) {
+  const rule = normalizeImportRule(input);
+  const canonical = JSON.stringify({
+    degree: rule.degree,
+    program: rule.program,
+    affiliation: rule.affiliation,
+    index: rule.index,
+    query: rule.query,
+    source: rule.source,
+    contentMode: rule.contentMode,
+    contentFallback: rule.contentFallback,
+    extractCitations: rule.extractCitations,
+    extractCommittee: rule.extractCommittee,
+    runConcepts: rule.runConcepts,
+    maxContentBytes: rule.maxContentBytes,
+    contentConcurrency: rule.contentConcurrency,
+    contentRateLimit: rule.contentRateLimit,
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex');
+}
+
 export async function listImportRules() {
   const rows = await all(`
-    SELECT id, name, degree, program, affiliation, requested_index, query, source, created_at, updated_at
+    SELECT id, name, degree, program, affiliation, requested_index, query, source, content_mode,
+           content_fallback, extract_citations, extract_committee, run_concepts,
+           max_content_bytes, content_concurrency, content_rate_limit, created_at, updated_at
     FROM import_rules
     ORDER BY updated_at DESC, name
   `);
@@ -1314,7 +2569,9 @@ export async function listImportRules() {
 
 export async function getImportRule(id) {
   const row = await get(`
-    SELECT id, name, degree, program, affiliation, requested_index, query, source, created_at, updated_at
+    SELECT id, name, degree, program, affiliation, requested_index, query, source, content_mode,
+           content_fallback, extract_citations, extract_committee, run_concepts,
+           max_content_bytes, content_concurrency, content_rate_limit, created_at, updated_at
     FROM import_rules
     WHERE id = ?
   `, [id]);
@@ -1324,13 +2581,16 @@ export async function getImportRule(id) {
 export async function saveImportRule(rule) {
   const now = new Date().toISOString();
   const id = rule.id || crypto.randomUUID();
-  const existing = await get('SELECT created_at FROM import_rules WHERE id = ?', [id]);
-  const createdAt = existing?.created_at || now;
-  await run(`
+  const existing = await getImportRule(id);
+  const createdAt = existing?.createdAt || now;
+  const normalized = normalizeImportRule({ ...rule, id });
+  const statements = [{ sql: `
     INSERT INTO import_rules (
-      id, name, degree, program, affiliation, requested_index, query, source, created_at, updated_at
+      id, name, degree, program, affiliation, requested_index, query, source, content_mode,
+      content_fallback, extract_citations, extract_committee, run_concepts,
+      max_content_bytes, content_concurrency, content_rate_limit, created_at, updated_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       name = excluded.name,
       degree = excluded.degree,
@@ -1339,25 +2599,248 @@ export async function saveImportRule(rule) {
       requested_index = excluded.requested_index,
       query = excluded.query,
       source = excluded.source,
+      content_mode = excluded.content_mode,
+      content_fallback = excluded.content_fallback,
+      extract_citations = excluded.extract_citations,
+      extract_committee = excluded.extract_committee,
+      run_concepts = excluded.run_concepts,
+      max_content_bytes = excluded.max_content_bytes,
+      content_concurrency = excluded.content_concurrency,
+      content_rate_limit = excluded.content_rate_limit,
       updated_at = excluded.updated_at
-  `, [
+  `, args: [
     id,
-    rule.name,
-    rule.degree || null,
-    rule.program || null,
-    rule.affiliation || null,
-    rule.index || null,
-    rule.query || null,
-    rule.source || null,
+    normalized.name,
+    normalized.degree || null,
+    normalized.program || null,
+    normalized.affiliation || null,
+    normalized.index || null,
+    normalized.query || null,
+    normalized.source || null,
+    normalized.contentMode,
+    normalized.contentFallback,
+    normalized.extractCitations ? 1 : 0,
+    normalized.extractCommittee ? 1 : 0,
+    normalized.runConcepts ? 1 : 0,
+    normalized.maxContentBytes,
+    normalized.contentConcurrency,
+    normalized.contentRateLimit,
     createdAt,
     now,
-  ]);
+  ] }];
+  if (existing && importRuleRevision(existing) !== importRuleRevision(normalized)) {
+    statements.push({ sql: `
+      UPDATE enrichment_rollouts
+      SET status = 'invalidated', current_phase = NULL, current_job_id = NULL,
+          rule_revision = ?, evaluation_json = ?, updated_at = ?
+      WHERE rule_id = ?
+    `, args: [
+      importRuleRevision(normalized),
+      JSON.stringify({ passed: false, reason: 'import_rule_changed' }),
+      now,
+      id,
+    ] });
+  }
+  const client = await getDb();
+  await client.batch(statements, 'write');
   return getImportRule(id);
 }
 
 export async function deleteImportRule(id) {
-  const result = await run('DELETE FROM import_rules WHERE id = ?', [id]);
-  return result.changes > 0;
+  const existing = await getImportRule(id);
+  if (!existing) return false;
+  const client = await getDb();
+  await client.batch([
+    { sql: 'DELETE FROM import_rule_request_limits WHERE rule_id = ?', args: [id] },
+    { sql: 'DELETE FROM enrichment_rollout_evidence WHERE rule_id = ?', args: [id] },
+    { sql: 'DELETE FROM enrichment_rollouts WHERE rule_id = ?', args: [id] },
+    { sql: 'DELETE FROM import_rules WHERE id = ?', args: [id] },
+  ], 'write');
+  return true;
+}
+
+export async function reserveImportRuleRequestSlot(ruleId, limit, {
+  nowMs = Date.now(), windowMs = 60_000,
+} = {}) {
+  if (!ruleId || !Number.isFinite(Number(limit)) || Number(limit) <= 0) return 0;
+  const boundedLimit = Math.max(1, Math.min(600, Math.floor(Number(limit))));
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const row = await get(
+      'SELECT timestamps_json FROM import_rule_request_limits WHERE rule_id = ?',
+      [ruleId]
+    );
+    let timestamps = [];
+    try {
+      const parsed = JSON.parse(row?.timestamps_json || '[]');
+      if (Array.isArray(parsed)) timestamps = parsed;
+    } catch { /* replace malformed limiter state */ }
+    timestamps = timestamps
+      .map(Number)
+      .filter((value) => Number.isFinite(value) && value > nowMs - windowMs)
+      .sort((left, right) => left - right);
+    if (timestamps.length >= boundedLimit) {
+      return Math.max(1, timestamps[0] + windowMs - nowMs);
+    }
+    const nextJson = JSON.stringify([...timestamps, nowMs].slice(-600));
+    let result;
+    if (row) {
+      result = await run(`
+        UPDATE import_rule_request_limits
+        SET timestamps_json = ?, updated_at = ?
+        WHERE rule_id = ? AND timestamps_json = ?
+      `, [nextJson, new Date(nowMs).toISOString(), ruleId, row.timestamps_json]);
+    } else {
+      result = await run(`
+        INSERT OR IGNORE INTO import_rule_request_limits (rule_id, timestamps_json, updated_at)
+        VALUES (?, ?, ?)
+      `, [ruleId, nextJson, new Date(nowMs).toISOString()]);
+    }
+    if (result.changes === 1) return 0;
+  }
+  throw new Error(`Could not reserve content-request quota for import rule ${ruleId}.`);
+}
+
+function enrichmentRolloutFromRow(row) {
+  if (!row) return null;
+  let evaluation = null;
+  try { evaluation = row.evaluation_json ? JSON.parse(row.evaluation_json) : null; } catch { evaluation = null; }
+  return {
+    ruleId: row.rule_id,
+    ruleRevision: row.rule_revision || null,
+    status: row.status,
+    currentPhase: row.current_phase || null,
+    currentJobId: row.current_job_id == null ? null : Number(row.current_job_id),
+    sampleJobId: row.sample_job_id == null ? null : Number(row.sample_job_id),
+    controlJobId: row.control_job_id == null ? null : Number(row.control_job_id),
+    lastCohortJobId: row.last_cohort_job_id == null ? null : Number(row.last_cohort_job_id),
+    evaluation,
+    updatedAt: row.updated_at,
+  };
+}
+
+export async function getEnrichmentRollout(ruleId) {
+  return enrichmentRolloutFromRow(await get(`
+    SELECT rule_id, rule_revision, status, current_phase, current_job_id, sample_job_id,
+           control_job_id, last_cohort_job_id, evaluation_json, updated_at
+    FROM enrichment_rollouts
+    WHERE rule_id = ?
+  `, [ruleId]));
+}
+
+export async function startEnrichmentRolloutPhase(ruleId, phase, jobId, ruleRevision) {
+  const currentRule = await getImportRule(ruleId);
+  if (!currentRule || importRuleRevision(currentRule) !== ruleRevision) {
+    throw new Error(`Import rule ${ruleId} changed after this rollout job was created.`);
+  }
+  const existing = await getEnrichmentRollout(ruleId);
+  const allowed = (
+    (phase === 'sample' && (!existing || existing.status === 'invalidated' || (existing.status === 'blocked' && existing.evaluation?.phase === 'sample')))
+    || (phase === 'control' && (existing?.status === 'awaiting_control' || (existing?.status === 'blocked' && existing.evaluation?.phase === 'control')))
+    || (phase === 'cohort' && (existing?.status === 'ready_for_cohort' || (existing?.status === 'blocked' && existing.evaluation?.phase === 'cohort')))
+  );
+  if (!allowed) {
+    throw new Error(`The ${phase} phase is not allowed while rollout ${ruleId} is ${existing?.status || 'not started'}.`);
+  }
+  if (existing?.ruleRevision && existing.ruleRevision !== ruleRevision) {
+    throw new Error(`Import rule ${ruleId} changed after its rollout evidence was recorded.`);
+  }
+  const now = new Date().toISOString();
+  await run(`
+    INSERT INTO enrichment_rollouts (
+      rule_id, rule_revision, status, current_phase, current_job_id, updated_at
+    ) VALUES (?, ?, 'running', ?, ?, ?)
+    ON CONFLICT(rule_id) DO UPDATE SET
+      status = 'running',
+      rule_revision = excluded.rule_revision,
+      current_phase = excluded.current_phase,
+      current_job_id = excluded.current_job_id,
+      updated_at = excluded.updated_at
+  `, [ruleId, ruleRevision, phase, jobId, now]);
+  return getEnrichmentRollout(ruleId);
+}
+
+export async function saveEnrichmentRolloutEvidence({ ruleId, ruleRevision, phase, jobId, contentMode, outcomes = [] }) {
+  const now = new Date().toISOString();
+  for (const outcome of outcomes) {
+    await run(`
+      INSERT INTO enrichment_rollout_evidence (
+        rule_id, rule_revision, phase, job_id, doc_id, content_mode, outcome_json, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(job_id, doc_id) DO UPDATE SET
+        outcome_json = excluded.outcome_json,
+        content_mode = excluded.content_mode,
+        rule_revision = excluded.rule_revision
+    `, [ruleId, ruleRevision, phase, jobId, String(outcome.docId), contentMode, JSON.stringify(outcome), now]);
+  }
+}
+
+export async function listEnrichmentRolloutEvidence({ ruleId, phase = null, jobId = null } = {}) {
+  const clauses = ['rule_id = ?'];
+  const args = [ruleId];
+  if (phase) { clauses.push('phase = ?'); args.push(phase); }
+  if (jobId != null) { clauses.push('job_id = ?'); args.push(jobId); }
+  const rows = await all(`
+    SELECT rule_id, rule_revision, phase, job_id, doc_id, content_mode, outcome_json, created_at
+    FROM enrichment_rollout_evidence
+    WHERE ${clauses.join(' AND ')}
+    ORDER BY id
+  `, args);
+  return rows.map((row) => {
+    let outcome = null;
+    try { outcome = JSON.parse(row.outcome_json); } catch { outcome = null; }
+    return {
+      ruleId: row.rule_id,
+      ruleRevision: row.rule_revision || null,
+      phase: row.phase,
+      jobId: Number(row.job_id),
+      docId: row.doc_id,
+      contentMode: row.content_mode,
+      outcome,
+      createdAt: row.created_at,
+    };
+  });
+}
+
+export async function finishEnrichmentRolloutPhase(ruleId, phase, jobId, evaluation) {
+  const status = evaluation?.passed
+    ? phase === 'sample'
+      ? 'awaiting_control'
+      : phase === 'cohort' && evaluation.exhausted ? 'completed' : 'ready_for_cohort'
+    : 'blocked';
+  const jobColumn = phase === 'sample'
+    ? 'sample_job_id'
+    : phase === 'control' ? 'control_job_id' : 'last_cohort_job_id';
+  const now = new Date().toISOString();
+  await run(`
+    UPDATE enrichment_rollouts
+    SET status = ?, current_phase = NULL, current_job_id = NULL,
+        ${jobColumn} = ?, evaluation_json = ?, updated_at = ?
+    WHERE rule_id = ? AND current_job_id = ?
+  `, [status, jobId, JSON.stringify(evaluation), now, ruleId, jobId]);
+  return getEnrichmentRollout(ruleId);
+}
+
+export async function failEnrichmentRolloutForJob(jobId, error) {
+  const row = await get(`
+    SELECT rule_id, current_phase
+    FROM enrichment_rollouts
+    WHERE current_job_id = ? AND status = 'running'
+  `, [jobId]);
+  if (!row) return null;
+  const evaluation = {
+    passed: false,
+    phase: row.current_phase,
+    interrupted: true,
+    error: error?.message || String(error || 'Worker interrupted'),
+  };
+  const now = new Date().toISOString();
+  await run(`
+    UPDATE enrichment_rollouts
+    SET status = 'blocked', current_phase = NULL, current_job_id = NULL,
+        evaluation_json = ?, updated_at = ?
+    WHERE rule_id = ? AND current_job_id = ?
+  `, [JSON.stringify(evaluation), now, row.rule_id, jobId]);
+  return getEnrichmentRollout(row.rule_id);
 }
 
 // --- Cache integrity ---
@@ -1385,33 +2868,76 @@ export async function checkCacheIntegrity() {
 export async function saveCommitteeMembers(docId, members, source) {
   const now = new Date().toISOString();
   const seen = new Set();
+  const cleaned = [];
   for (const member of members || []) {
-    const role = member.role || null;
+    const role = member.role || 'Committee Member';
     const normalizedName = normalizePersonName(member.name);
     if (!normalizedName) continue;
     const key = `${String(role || '')}:::${supervisorNameKey(normalizedName) || normalizedName.toLowerCase()}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    await run(`
-      INSERT INTO committee_members (doc_id, name, role, affiliation, source, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-      ON CONFLICT(doc_id, name, role) DO UPDATE SET
-        affiliation = CASE
-          WHEN committee_members.source = 'api' AND excluded.source <> 'api'
-            THEN committee_members.affiliation
-          ELSE excluded.affiliation
-        END,
-        source = CASE
-          WHEN committee_members.source = 'api' AND excluded.source <> 'api'
-            THEN committee_members.source
-          ELSE excluded.source
-        END,
-        updated_at = CASE
-          WHEN committee_members.source = 'api' AND excluded.source <> 'api'
-            THEN committee_members.updated_at
-          ELSE excluded.updated_at
-        END
-    `, [docId, normalizedName, role, member.affiliation || null, source, now]);
+    const personKey = documentPersonKey(normalizedName);
+    cleaned.push({ member, role, normalizedName, personKey });
+  }
+  if (!cleaned.length) return;
+
+  const client = await getDb();
+  const transaction = await client.transaction('write');
+  try {
+    for (const { member, role, normalizedName, personKey } of cleaned) {
+      await transaction.execute({
+        sql: `
+        INSERT INTO committee_members (doc_id, name, role, affiliation, source, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(doc_id, name, role) DO UPDATE SET
+          affiliation = CASE
+            WHEN committee_members.source = 'api' AND excluded.source <> 'api'
+              THEN committee_members.affiliation
+            ELSE excluded.affiliation
+          END,
+          source = CASE
+            WHEN committee_members.source = 'api' AND excluded.source <> 'api'
+              THEN committee_members.source
+            ELSE excluded.source
+          END,
+          updated_at = CASE
+            WHEN committee_members.source = 'api' AND excluded.source <> 'api'
+              THEN committee_members.updated_at
+            ELSE excluded.updated_at
+          END
+        `,
+        args: [docId, normalizedName, role, member.affiliation || null, source || 'committee', now],
+      });
+      if (!personKey) continue;
+      const candidates = await transaction.execute({
+        sql: `SELECT id, name, role, affiliation, source, updated_at
+              FROM committee_members WHERE doc_id = ? AND role = ?`,
+        args: [docId, role],
+      });
+      const winner = authoritativeCommitteeRow(candidates.rows, personKey);
+      await transaction.execute({
+        sql: `DELETE FROM document_people
+              WHERE doc_id = ? AND person_key = ? AND role = ? AND source <> 'metadata'`,
+        args: [docId, personKey, role],
+      });
+      if (winner) {
+        await transaction.execute({
+          sql: `INSERT INTO document_people
+                (doc_id, person_key, name, role, affiliation, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          args: [
+            docId, personKey, winner.name, winner.role || 'Committee Member',
+            winner.affiliation || null, winner.source || 'committee', winner.updated_at || now,
+          ],
+        });
+      }
+    }
+    await transaction.commit();
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    throw error;
+  } finally {
+    transaction.close();
   }
 }
 
@@ -1425,8 +2951,51 @@ export async function deleteCommitteeMembersByRoles(docId, roles, source = null)
     sql += ' AND source = ?';
     params.push(source);
   }
-  const result = await run(sql, params);
-  return result.changes || 0;
+  const client = await getDb();
+  const transaction = await client.transaction('write');
+  try {
+    const before = await transaction.execute({
+      sql: `SELECT name, role FROM committee_members WHERE doc_id = ? AND role IN (${placeholders})`,
+      args: [docId, ...cleanedRoles],
+    });
+    const affected = new Map();
+    for (const row of before.rows) {
+      const personKey = documentPersonKey(row.name);
+      if (personKey) affected.set(`${personKey}\u0000${row.role}`, { personKey, role: row.role });
+    }
+    const result = await transaction.execute({ sql, args: params });
+    for (const { personKey, role } of affected.values()) {
+      const remaining = await transaction.execute({
+        sql: `SELECT id, name, role, affiliation, source, updated_at
+              FROM committee_members WHERE doc_id = ? AND role = ?`,
+        args: [docId, role],
+      });
+      const winner = authoritativeCommitteeRow(remaining.rows, personKey);
+      await transaction.execute({
+        sql: `DELETE FROM document_people
+              WHERE doc_id = ? AND person_key = ? AND role = ? AND source <> 'metadata'`,
+        args: [docId, personKey, role],
+      });
+      if (winner) {
+        await transaction.execute({
+          sql: `INSERT INTO document_people
+                (doc_id, person_key, name, role, affiliation, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          args: [
+            docId, personKey, winner.name, winner.role || 'Committee Member',
+            winner.affiliation || null, winner.source || 'committee', winner.updated_at || new Date().toISOString(),
+          ],
+        });
+      }
+    }
+    await transaction.commit();
+    return changes(result);
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    throw error;
+  } finally {
+    transaction.close();
+  }
 }
 
 export async function loadCommitteeMembers(docId) {
@@ -1451,87 +3020,364 @@ function citationTextPrefix(value) {
   return prefix.length === 3 ? prefix : null;
 }
 
+const FUZZY_CITATION_THRESHOLD = 0.94;
+// Per-bucket cap on fuzzy candidates. The buckets grow with the corpus, so
+// without a cap the per-document cost would still scale with total citations.
+// Below the cap the candidate set is exactly the old in-memory bucket; at the
+// cap the bucket is *unknown*, not empty, and findFuzzyMatch refuses to merge
+// rather than guess from a truncated read. See the note above findFuzzyMatch.
+const FUZZY_CANDIDATE_LIMIT = 2000;
+const CITATION_MATCH_KEY_VERSION = 1;
+const CITATION_BACKFILL_BATCH = 500;
+const CITATION_CANDIDATE_COLUMNS = 'id, citation_hash, citation_text, match_year';
+
+function citationMatchKeys(citationText, yearValue) {
+  return {
+    matchYear: citationMatchYear(yearValue),
+    matchPrefix: citationTextPrefix(citationText),
+  };
+}
+
 function prepareCitationForMatching(row) {
   return {
-    ...row,
+    id: Number(row.id),
+    citation_hash: row.citation_hash,
+    citation_text: row.citation_text,
     matchText: String(row.citation_text || '').toLowerCase(),
-    matchYear: citationMatchYear(row.year),
-    matchPrefix: citationTextPrefix(row.citation_text),
+    matchYear: row.match_year == null ? null : Number(row.match_year),
   };
 }
 
-function pushBucket(map, key, row) {
-  if (key == null) return;
-  const existing = map.get(key);
-  if (existing) {
-    existing.push(row);
-  } else {
-    map.set(key, [row]);
-  }
-}
-
-function buildCitationMatchIndex(rows) {
-  const index = {
-    all: rows,
-    byHash: new Map(rows.map((row) => [row.citation_hash, row])),
-    byYear: new Map(),
-    withoutYear: [],
-    byPrefix: new Map(),
-  };
-  for (const row of rows) {
-    if (row.matchYear == null) {
-      index.withoutYear.push(row);
-    } else {
-      pushBucket(index.byYear, row.matchYear, row);
+// One-time migration for citations written before match_year/match_prefix existed.
+// Every statement is bounded to CITATION_BACKFILL_BATCH rows, and the probe is a
+// covering read of idx_citations_match_pending, which empties itself as the
+// backfill progresses — so on an already-migrated corpus this costs one scan of
+// an empty index rather than a pass over the table.
+export async function backfillCitationMatchKeys(dbInstance = null) {
+  const client = dbInstance || await getDb();
+  let total = 0;
+  let previousFirstId = null;
+  for (;;) {
+    let result;
+    try {
+      result = await client.execute({
+        sql: 'SELECT id, citation_text, year FROM citations WHERE match_key_version = 0 LIMIT ?',
+        args: [CITATION_BACKFILL_BATCH],
+      });
+    } catch {
+      // An older database without the match-key columns: nothing to backfill.
+      return total;
     }
-    pushBucket(index.byPrefix, row.matchPrefix, row);
+    if (!result.rows.length) break;
+    const firstId = Number(result.rows[0].id);
+    // Each batch takes its rows out of the pending set, so the next pass sees new
+    // ones. Seeing the same row twice means the writes are not landing; stop
+    // rather than spin.
+    if (firstId === previousFirstId) {
+      logger.warn('Citation match-key backfill made no progress; stopping', { citationId: firstId });
+      break;
+    }
+    previousFirstId = firstId;
+    const statements = result.rows.map((row) => {
+      const keys = citationMatchKeys(row.citation_text, row.year);
+      return {
+        sql: 'UPDATE citations SET match_year = ?, match_prefix = ?, match_key_version = ? WHERE id = ?',
+        args: [keys.matchYear, keys.matchPrefix, CITATION_MATCH_KEY_VERSION, Number(row.id)],
+      };
+    });
+    await client.batch(statements, 'write');
+    total += result.rows.length;
   }
-  return index;
+  if (total > 0) logger.info(`Backfilled citation match keys for ${total} citations`);
+  return total;
 }
 
-function addCitationToMatchIndex(index, row) {
-  index.all.push(row);
-  index.byHash.set(row.citation_hash, row);
-  if (row.matchYear == null) {
-    index.withoutYear.push(row);
-  } else {
-    pushBucket(index.byYear, row.matchYear, row);
+// Exact matching is a unique-index lookup, so the whole document's hashes are
+// resolved in one round trip instead of materialising the citations table.
+async function loadCitationIdsByHash(hashes) {
+  const idByHash = new Map();
+  const unique = Array.from(new Set(hashes.filter(Boolean)));
+  const chunkSize = 999;
+  for (let i = 0; i < unique.length; i += chunkSize) {
+    const chunk = unique.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(', ');
+    const rows = await all(`SELECT id, citation_hash FROM citations WHERE citation_hash IN (${placeholders})`, chunk);
+    for (const row of rows) idByHash.set(String(row.citation_hash), Number(row.id));
   }
-  pushBucket(index.byPrefix, row.matchPrefix, row);
+  return idByHash;
 }
 
-function fuzzyMatchCandidates(index, text, itemYear) {
+// Reads one or more capped candidate buckets in a single round trip and returns
+// them keyed by bucket, each in ascending id order — the order the in-memory
+// index produced, because it was filled by a rowid-ordered table scan.
+//
+// `saturated` names the buckets that came back exactly full. Those reads were
+// cut off by the LIMIT, so rows past the cut were never compared and the bucket
+// has to be treated as unknown rather than as the whole bucket. Callers must
+// not silently take the best of a truncated read: that is how a cap turns into
+// a merge the old matcher would never have made.
+async function loadCandidateBuckets(arms) {
+  const sql = arms.map((arm) => `SELECT * FROM (
+      SELECT ${arm.bucket} AS bucket, ${CITATION_CANDIDATE_COLUMNS} FROM citations
+      WHERE ${arm.where} ORDER BY ${arm.order || 'id'} LIMIT ${FUZZY_CANDIDATE_LIMIT}
+    )`).join(' UNION ALL ');
+  const rows = await all(sql, arms.flatMap((arm) => arm.args));
+  const byBucket = new Map(arms.map((arm) => [arm.bucket, []]));
+  for (const row of rows) byBucket.get(Number(row.bucket))?.push(prepareCitationForMatching(row));
+  const saturated = new Set();
+  for (const [bucket, candidates] of byBucket) {
+    if (candidates.length >= FUZZY_CANDIDATE_LIMIT) saturated.add(bucket);
+    candidates.sort((a, b) => a.id - b.id);
+  }
+  return { byBucket, saturated };
+}
+
+const characterCountScratch = new Int32Array(256);
+
+function characterCounts(text) {
+  const counts = new Int32Array(256);
+  for (let i = 0; i < text.length; i += 1) counts[text.charCodeAt(i) & 0xff] += 1;
+  return counts;
+}
+
+// Upper bound on jaroWinkler(incoming, candidate), used to skip candidates that
+// provably cannot clear FUZZY_CITATION_THRESHOLD.
+//
+// Jaro's match count can never exceed the size of the character multiset the two
+// strings share, and its transposition term is at most 1, so
+// jaro <= (m/len1 + m/len2 + 1) / 3. Winkler adds at most 4 * 0.1 * (1 - jaro),
+// so jaroWinkler <= 0.6 * jaro + 0.4. Skipping a candidate the bound puts below
+// the threshold cannot change saveCitations' answer: such a candidate is below
+// the threshold in truth as well, so it can neither be accepted nor be the
+// highest-scoring candidate whenever any candidate clears the threshold.
+function jaroWinklerUpperBound(counts, incomingLength, candidateText) {
+  const remaining = characterCountScratch;
+  remaining.set(counts);
+  let matches = 0;
+  for (let i = 0; i < candidateText.length; i += 1) {
+    const code = candidateText.charCodeAt(i) & 0xff;
+    if (remaining[code] > 0) {
+      remaining[code] -= 1;
+      matches += 1;
+    }
+  }
+  if (!matches || !incomingLength || !candidateText.length) return 0;
+  const jaro = ((matches / incomingLength) + (matches / candidateText.length) + 1) / 3;
+  return (0.6 * jaro) + 0.4;
+}
+
+// Highest-scoring candidate in one bucket, keeping the first of any tie exactly
+// as the old `sim > maxSim` loop did.
+function bestInBucket(candidates, incoming, counts) {
+  let best = null;
+  let maxSim = 0;
+  for (const candidate of candidates) {
+    if (jaroWinklerUpperBound(counts, incoming.length, candidate.matchText) < FUZZY_CITATION_THRESHOLD) continue;
+    const sim = jaroWinkler(incoming, candidate.matchText);
+    if (sim > maxSim) {
+      maxSim = sim;
+      best = candidate;
+    }
+  }
+  return { best, maxSim };
+}
+
+// SQL replacement for the old in-memory fuzzyMatchCandidates plus the scan that
+// followed it. The buckets are the ones the in-memory index held — the ±1 year
+// window and the 3-character prefix bucket — and the winner is still the first
+// bucket, in the order y-1, y, y+1, undated-prefix, to attain the highest
+// similarity, so the ±1 window still *blocks* a same-year merge when an adjacent
+// year scores higher.
+//
+// Only the y and undated-prefix buckets can produce an accepted match: a
+// candidate whose year is non-null and different always fails
+// fuzzyYearsCompatible. So the adjacent-year buckets are read only once an
+// acceptable candidate has cleared the threshold — when none does, the old code
+// rejected regardless of what those buckets held.
+//
+// Deliberate difference 1: the old code fell back to comparing against every
+// citation in the corpus when a bucket came back empty. That fallback is the
+// unbounded path B-01 exists to remove, so an empty bucket now simply yields no
+// fuzzy match.
+//
+// Deliberate difference 2: the dated arms are blocked on the incoming citation's
+// 3-character prefix as well as on its year. The old matcher compared a dated
+// incoming against *every* same-year and adjacent-year citation, which is a
+// bucket that grows without bound as the corpus grows. Under a fixed cap that
+// bucket can only be read partially, and a partially read *adjacent-year* bucket
+// is actively dangerous: it drops the ±1 blocker and merges two distinct
+// editions into one row. Prefix blocking is what makes each bucket inherently
+// small — one year, one 3-character prefix — so the read is complete and the
+// blocker is always there. Three things justify narrowing rather than
+// truncating:
+//   * Winkler's prefix bonus already favours same-prefix candidates. A candidate
+//     agreeing on the first four characters gains up to 0.4 * (1 - jaro); one
+//     that differs inside the first three gains at most 0.2 * (1 - jaro). To
+//     outscore a same-prefix candidate that already clears 0.94 it needs a
+//     materially higher raw Jaro, which for citation strings means the texts
+//     diverge almost only at the very start.
+//   * The undated half of the matcher was prefix-blocked in the old code too, so
+//     this makes the dated half consistent with a gate the design already relied
+//     on rather than inventing a new one.
+//   * The alternative is unbounded reads or truncated ones. Truncation is what
+//     produced the wrong merges; unbounded reads are the cost regression the
+//     rewrite exists to remove.
+// It applies symmetrically to the accepting and the vetoing arms, so the veto is
+// never weakened relative to what can be accepted: within the prefix-blocked
+// candidate set the decision is bit-for-bit the old one. A citation shorter than
+// the prefix window has no prefix to block on and falls back to the plain year
+// arms.
+//
+// Deliberate difference 3: a bucket that comes back saturated (see
+// loadCandidateBuckets) refuses the merge instead of taking the best of what it
+// read. Every merge this matcher makes is therefore one the old matcher would
+// also have made from the same candidate set; the cap can cost a merge, but it
+// can no longer invent one. Saturation is reported to the caller so it is
+// visible rather than silent.
+async function findFuzzyMatch(text, itemYear, telemetry = null) {
   const year = citationMatchYear(itemYear) ?? citationMatchYear(text);
   const prefix = citationTextPrefix(text);
-  if (year != null) {
-    const candidates = [];
-    for (let candidateYear = year - 1; candidateYear <= year + 1; candidateYear += 1) {
-      candidates.push(...(index.byYear.get(candidateYear) || []));
-    }
-    if (prefix) {
-      candidates.push(...(index.byPrefix.get(prefix) || []).filter((row) => row.matchYear == null));
-    }
-    return candidates.length ? candidates : index.all;
+  const incoming = text.toLowerCase();
+  const counts = characterCounts(incoming);
+  const refuse = () => {
+    telemetry?.truncationBlockedMerge();
+    return null;
+  };
+
+  if (year == null) {
+    if (!prefix) return null;
+    // ORDER BY match_year, id follows idx_citations_match_prefix, so the cap is an
+    // ordered index range scan; loadCandidateBuckets restores the id ordering.
+    const undated = await loadCandidateBuckets([
+      { bucket: 0, where: 'match_prefix = ?', order: 'match_year, id', args: [prefix] },
+    ]);
+    if (undated.saturated.has(0)) telemetry?.truncatedBucket('undated-prefix', null, prefix);
+    const { best, maxSim } = bestInBucket(undated.byBucket.get(0), incoming, counts);
+    // An incoming citation with no year is compatible with every candidate.
+    if (!best || maxSim < FUZZY_CITATION_THRESHOLD) return null;
+    return undated.saturated.size ? refuse() : { row: best, similarity: maxSim };
   }
 
-  if (!prefix) return index.all;
-  const candidates = index.byPrefix.get(prefix) || [];
-  return candidates.length ? candidates : index.all;
+  const yearArm = (bucket, bucketYear) => (prefix
+    ? { bucket, where: 'match_prefix = ? AND match_year = ?', args: [prefix, bucketYear] }
+    : { bucket, where: 'match_year = ?', args: [bucketYear] });
+
+  const acceptableArms = [yearArm(1, year)];
+  if (prefix) {
+    acceptableArms.push({ bucket: 3, where: 'match_prefix = ? AND match_year IS NULL', args: [prefix] });
+  }
+  const acceptable = await loadCandidateBuckets(acceptableArms);
+  if (acceptable.saturated.has(1)) telemetry?.truncatedBucket('same-year', year, prefix);
+  if (acceptable.saturated.has(3)) telemetry?.truncatedBucket('undated-prefix', null, prefix);
+  const sameYear = bestInBucket(acceptable.byBucket.get(1), incoming, counts);
+  const undated = prefix ? bestInBucket(acceptable.byBucket.get(3), incoming, counts) : { best: null, maxSim: 0 };
+  if (Math.max(sameYear.maxSim, undated.maxSim) < FUZZY_CITATION_THRESHOLD) return null;
+  // A truncated accepting arm may hide the candidate the old matcher would have
+  // picked, so the merge target is not knowable: refuse rather than pick another.
+  if (acceptable.saturated.size) return refuse();
+
+  const adjacent = await loadCandidateBuckets([yearArm(0, year - 1), yearArm(2, year + 1)]);
+  if (adjacent.saturated.has(0)) telemetry?.truncatedBucket('year-before', year - 1, prefix);
+  if (adjacent.saturated.has(2)) telemetry?.truncatedBucket('year-after', year + 1, prefix);
+  // A truncated veto arm cannot prove no adjacent-year work outscores the
+  // accepted candidate, which is exactly the case that conflates two editions.
+  if (adjacent.saturated.size) return refuse();
+  const before = bestInBucket(adjacent.byBucket.get(0), incoming, counts);
+  const after = bestInBucket(adjacent.byBucket.get(2), incoming, counts);
+
+  const overall = Math.max(before.maxSim, sameYear.maxSim, after.maxSim, undated.maxSim);
+  if (before.maxSim === overall) return null;
+  if (sameYear.maxSim === overall) return { row: sameYear.best, similarity: overall };
+  if (after.maxSim === overall) return null;
+  return { row: undated.best, similarity: overall };
 }
 
-const FUZZY_CITATION_THRESHOLD = 0.94;
+// Saturation reporter for one saveCitations call. Every saturated bucket read is
+// counted; the warning is emitted once per bucket so a document whose year is
+// oversubscribed logs a line, not a hundred.
+function citationMatchTelemetry(counts) {
+  const warned = new Set();
+  return {
+    truncatedBucket(bucket, year, prefix) {
+      counts.truncatedBuckets += 1;
+      const key = `${bucket}|${year ?? ''}|${prefix ?? ''}`;
+      if (warned.has(key)) return;
+      warned.add(key);
+      logger.warn('Citation fuzzy-match bucket hit the candidate cap; rows beyond it were not compared', {
+        bucket,
+        year: year ?? null,
+        prefix: prefix ?? null,
+        limit: FUZZY_CANDIDATE_LIMIT,
+      });
+    },
+    truncationBlockedMerge() {
+      counts.truncationBlockedMerges += 1;
+    },
+  };
+}
 
-function fuzzyYearsCompatible(a, b) {
-  return a == null || b == null || a === b;
+function citationFields(item) {
+  const text = typeof item === 'string' ? item : item.text;
+  return {
+    text,
+    author: (typeof item === 'string' ? null : item.author) || null,
+    title: (typeof item === 'string' ? null : item.title) || null,
+    year: (typeof item === 'string' ? null : item.year) || null,
+    source: (typeof item === 'string' ? null : item.source) || null,
+  };
+}
+
+// Inserts (or reuses) a citation row and returns its id, keeping the persisted
+// match keys in step with whatever text/year the row ended up carrying.
+async function upsertCitation(fields, hash, now) {
+  const keys = citationMatchKeys(fields.text, fields.year);
+  await run(`
+    INSERT INTO citations (
+      citation_hash, citation_text, author, title, year, source, created_at,
+      match_year, match_prefix, match_key_version
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(citation_hash) DO UPDATE SET
+      author = COALESCE(excluded.author, citations.author),
+      title = COALESCE(excluded.title, citations.title),
+      year = COALESCE(excluded.year, citations.year),
+      source = COALESCE(excluded.source, citations.source)
+  `, [
+    hash, fields.text, fields.author, fields.title, fields.year, fields.source, now,
+    keys.matchYear, keys.matchPrefix, CITATION_MATCH_KEY_VERSION,
+  ]);
+  const row = await get(`
+    SELECT id, citation_text, year, match_year, match_prefix, match_key_version
+    FROM citations WHERE citation_hash = ?
+  `, [hash]);
+  if (!row) return null;
+  const stored = citationMatchKeys(row.citation_text, row.year);
+  const storedYear = row.match_year == null ? null : Number(row.match_year);
+  if (
+    Number(row.match_key_version) !== CITATION_MATCH_KEY_VERSION
+    || storedYear !== stored.matchYear
+    || (row.match_prefix ?? null) !== stored.matchPrefix
+  ) {
+    await run(
+      'UPDATE citations SET match_year = ?, match_prefix = ?, match_key_version = ? WHERE id = ?',
+      [stored.matchYear, stored.matchPrefix, CITATION_MATCH_KEY_VERSION, Number(row.id)]
+    );
+  }
+  return Number(row.id);
 }
 
 export async function saveCitations(docId, citations, hashFn, { onProgress = null } = {}) {
   const now = new Date().toISOString();
-  
-  // Fetch once, then bucket in memory so fuzzy matching avoids scanning every citation.
-  const existingCitations = (await all('SELECT id, citation_hash, citation_text, author, title, year FROM citations'))
-    .map(prepareCitationForMatching);
-  const matchIndex = buildCitationMatchIndex(existingCitations);
+
+  const items = citations.map((item) => {
+    const fields = citationFields(item);
+    return { ...fields, hash: hashFn(fields.text) };
+  });
+  // Exact matches come from one indexed lookup over this document's hashes only.
+  // Rows created inside the loop are added here, exactly as the old in-memory
+  // hash map grew during the loop.
+  const idByHash = await loadCitationIdsByHash(items.map((item) => item.hash));
+
   const linkedIds = [];
   const counts = {
     processed: 0,
@@ -1539,7 +3385,13 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
     exactMatches: 0,
     fuzzyMatches: 0,
     newCitations: 0,
+    // Candidate buckets that came back at FUZZY_CANDIDATE_LIMIT, and merges
+    // refused because of one. Both stay 0 on a corpus the cap never binds on, so
+    // a non-zero value is the signal that matching is running on partial reads.
+    truncatedBuckets: 0,
+    truncationBlockedMerges: 0,
   };
+  const telemetry = citationMatchTelemetry(counts);
   await onProgress?.({
     phase: 'citation_matching',
     label: 'Matching citations',
@@ -1547,53 +3399,19 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
     counts,
   });
 
-  for (const item of citations) {
-    const text = typeof item === 'string' ? item : item.text;
-    const hash = hashFn(text);
-    
-    let matchedId = null;
-    let matchedHash = hash;
-    let matchedBy = null;
+  for (const item of items) {
+    let matchedId = idByHash.get(item.hash) ?? null;
+    let matchedBy = matchedId ? 'exact' : null;
 
-    // 1. Exact match check
-    if (matchIndex.byHash.has(hash)) {
-      matchedId = matchIndex.byHash.get(hash).id;
-      matchedHash = hash;
-      matchedBy = 'exact';
-    } else {
-      // 2. Fuzzy match check
-      const candidates = fuzzyMatchCandidates(
-        matchIndex,
-        text,
-        typeof item === 'string' ? null : item.year
-      );
-
-      let bestMatch = null;
-      let maxSim = 0;
-
-      const incomingMatchText = text.toLowerCase();
-      for (const candidate of candidates) {
-        const sim = jaroWinkler(incomingMatchText, candidate.matchText);
-        if (sim > maxSim) {
-          maxSim = sim;
-          bestMatch = candidate;
-        }
-      }
-
-      const incomingYear = citationMatchYear(typeof item === 'string' ? null : item.year)
-        ?? citationMatchYear(text);
-      if (
-        bestMatch
-        && maxSim >= FUZZY_CITATION_THRESHOLD
-        && fuzzyYearsCompatible(incomingYear, bestMatch.matchYear)
-      ) {
-        matchedId = bestMatch.id;
-        matchedHash = bestMatch.citation_hash;
+    if (!matchedId) {
+      const fuzzy = await findFuzzyMatch(item.text, item.year, telemetry);
+      if (fuzzy) {
+        matchedId = fuzzy.row.id;
         matchedBy = 'fuzzy';
         logger.info('Fuzzy matched citation', {
-          incoming: text.slice(0, 50),
-          matched: bestMatch.citation_text.slice(0, 50),
-          similarity: maxSim
+          incoming: item.text.slice(0, 50),
+          matched: fuzzy.row.citation_text.slice(0, 50),
+          similarity: fuzzy.similarity
         });
       }
     }
@@ -1609,31 +3427,15 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
       linkedIds.push(matchedId);
     } else {
       counts.newCitations += 1;
-      await run(`
-        INSERT INTO citations (citation_hash, citation_text, author, title, year, source, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(citation_hash) DO UPDATE SET
-          author = COALESCE(excluded.author, citations.author),
-          title = COALESCE(excluded.title, citations.title),
-          year = COALESCE(excluded.year, citations.year),
-          source = COALESCE(excluded.source, citations.source)
-      `, [
-        hash, text,
-        (typeof item === 'string' ? null : item.author) || null,
-        (typeof item === 'string' ? null : item.title) || null,
-        (typeof item === 'string' ? null : item.year) || null,
-        (typeof item === 'string' ? null : item.source) || null,
-        now
-      ]);
-      const row = await get('SELECT id, citation_hash, citation_text, author, title, year FROM citations WHERE citation_hash = ?', [hash]);
-      if (row) {
-        addCitationToMatchIndex(matchIndex, prepareCitationForMatching(row));
+      const citationId = await upsertCitation(item, item.hash, now);
+      if (citationId) {
+        idByHash.set(item.hash, citationId);
         await run(`
           INSERT INTO document_citations (doc_id, citation_id, updated_at)
           VALUES (?, ?, ?)
           ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
-        `, [docId, row.id, now]);
-        linkedIds.push(row.id);
+        `, [docId, citationId, now]);
+        linkedIds.push(citationId);
       }
     }
     counts.processed += 1;
@@ -1723,8 +3525,64 @@ export async function replaceDocumentCitationLinks(docId, keepCitationIds = []) 
     const placeholders = chunk.map(() => '?').join(', ');
     await run(`DELETE FROM document_citations WHERE doc_id = ? AND citation_id IN (${placeholders})`, [docId, ...chunk]);
   }
-  await exec('DELETE FROM catalogue_lookups WHERE citation_id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
-  await exec('DELETE FROM citations WHERE id NOT IN (SELECT DISTINCT citation_id FROM document_citations)');
+  await collectOrphanedCitations(stale);
+}
+
+// Scoped orphan collection (B-02). Only the citations this document just unlinked
+// are considered, so re-extracting one document can never delete a citation — or
+// the Z39.50 result attached to it — that belongs to another document, and cannot
+// destroy a citation another process has inserted but not yet linked. This
+// replaces the two global `NOT IN` anti-joins that used to run once per document.
+export async function collectOrphanedCitations(citationIds = []) {
+  const ids = Array.from(new Set(
+    (citationIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
+  ));
+  if (!ids.length) return 0;
+  let removed = 0;
+  const chunkSize = 900;
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    const placeholders = chunk.map(() => '?').join(', ');
+    await run(`
+      DELETE FROM catalogue_lookups
+      WHERE citation_id IN (${placeholders})
+        AND NOT EXISTS (
+          SELECT 1 FROM document_citations dc WHERE dc.citation_id = catalogue_lookups.citation_id
+        )
+    `, chunk);
+    const result = await run(`
+      DELETE FROM citations
+      WHERE id IN (${placeholders})
+        AND NOT EXISTS (
+          SELECT 1 FROM document_citations dc WHERE dc.citation_id = citations.id
+        )
+    `, chunk);
+    removed += result.changes;
+  }
+  return removed;
+}
+
+// Corpus-wide reconciliation for citations orphaned outside the re-extraction path
+// (interrupted jobs, direct link deletions). Deliberately exported for scheduled
+// maintenance only — calling this per document is the B-02 defect. Keyset-paginated
+// so every statement stays bounded regardless of corpus size.
+export async function sweepOrphanedCitations({ batchSize = 500 } = {}) {
+  const limit = Math.max(1, Math.min(5000, Number(batchSize) || 500));
+  let cursor = 0;
+  let removed = 0;
+  for (;;) {
+    const rows = await all(`
+      SELECT c.id FROM citations c
+      WHERE c.id > ?
+        AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.citation_id = c.id)
+      ORDER BY c.id
+      LIMIT ?
+    `, [cursor, limit]);
+    if (!rows.length) break;
+    cursor = Number(rows[rows.length - 1].id);
+    removed += await collectOrphanedCitations(rows.map((row) => Number(row.id)));
+  }
+  return removed;
 }
 
 export async function clearAllCitations() {
@@ -1739,6 +3597,61 @@ export async function getCitationStats() {
       (SELECT COUNT(*) FROM citations) AS total_citations,
       (SELECT COUNT(*) FROM document_citations) AS total_links
   `);
+}
+
+export async function listPendingCitationExtractions({
+  limit = 100, afterDocId = '', syncKey = null, filters: requestedFilters = {},
+  parserVersion = 'citation-v1',
+} = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  return all(`
+    SELECT d.doc_id, d.metadata_json,
+           fm.pdf_path, fm.full_text_path,
+           COALESCE(fm.content_checksum, fm.updated_at, '') AS content_checksum,
+           fm.content_source, fm.parser_version
+    FROM documents d
+    JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN citation_extraction_state ces ON ces.doc_id = d.doc_id
+    ${filters.where}
+    ${qualifier} d.doc_id > ?
+      AND (fm.pdf_path IS NOT NULL OR fm.full_text_path IS NOT NULL)
+      AND (
+        ces.doc_id IS NULL
+        OR ces.status <> 'completed'
+        OR ces.parser_version <> ?
+        OR COALESCE(ces.content_checksum, '') <> COALESCE(fm.content_checksum, fm.updated_at, '')
+      )
+    ORDER BY d.doc_id
+    LIMIT ?
+  `, [
+    ...filters.args,
+    String(afterDocId || ''),
+    String(parserVersion || 'citation-v1'),
+    Math.max(1, Math.min(1000, Number(limit) || 100)),
+  ]);
+}
+
+export async function saveCitationExtractionState(docId, {
+  contentChecksum = null, parserVersion = 'citation-v1', status = 'completed',
+  citationCount = 0, error = null,
+} = {}) {
+  const now = new Date().toISOString();
+  await run(`
+    INSERT INTO citation_extraction_state (
+      doc_id, content_checksum, parser_version, status, citation_count, error, extracted_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(doc_id) DO UPDATE SET
+      content_checksum = excluded.content_checksum,
+      parser_version = excluded.parser_version,
+      status = excluded.status,
+      citation_count = excluded.citation_count,
+      error = excluded.error,
+      extracted_at = excluded.extracted_at
+  `, [
+    docId, contentChecksum || null, parserVersion || 'citation-v1', status,
+    Math.max(0, Number(citationCount) || 0), error || null, now,
+  ]);
 }
 
 // --- Catalogue lookup functions ---
@@ -1817,7 +3730,35 @@ export async function getTopicBuildStatus() {
   };
 }
 
-export async function listPendingLookups(limit = 100) {
+function pendingLookupOptions(limitOrOptions = 100) {
+  if (limitOrOptions && typeof limitOrOptions === 'object') {
+    return {
+      limit: Math.max(1, Math.min(1000, Number(limitOrOptions.limit) || 100)),
+      syncKey: limitOrOptions.syncKey || null,
+      filters: limitOrOptions.filters || {},
+    };
+  }
+  return { limit: Math.max(1, Math.min(1000, Number(limitOrOptions) || 100)), syncKey: null, filters: {} };
+}
+
+function pendingLookupScope({ syncKey = null, filters: requestedFilters = {} } = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  if (!filters.where) return { sql: '', args: [] };
+  return {
+    sql: `AND EXISTS (
+      SELECT 1
+      FROM document_citations scoped_dc
+      JOIN documents d ON d.doc_id = scoped_dc.doc_id
+      WHERE scoped_dc.citation_id = c.id
+        AND ${filters.where.replace(/^WHERE\s+/, '')}
+    )`,
+    args: filters.args,
+  };
+}
+
+export async function listPendingLookups(limitOrOptions = 100) {
+  const options = pendingLookupOptions(limitOrOptions);
+  const scope = pendingLookupScope(options);
   return all(`
     SELECT c.id, c.citation_text, c.author, c.title, c.year, c.source
     FROM (
@@ -1833,24 +3774,28 @@ export async function listPendingLookups(limit = 100) {
         SELECT 1 FROM catalogue_lookups cl WHERE cl.citation_id = c.id
       )
     ) c
+    WHERE 1 = 1 ${scope.sql}
+    ORDER BY (
+      SELECT COUNT(*) FROM document_citations priority_dc WHERE priority_dc.citation_id = c.id
+    ) DESC, c.id ASC
     LIMIT ?
-  `, [limit]);
+  `, [...scope.args, options.limit]);
 }
 
-export async function countPendingLookups() {
+export async function countPendingLookups(options = {}) {
+  const scope = pendingLookupScope(pendingLookupOptions({ ...options, limit: 1 }));
   const row = await get(`
-    SELECT
-      (
-        (SELECT COUNT(*) FROM citations)
-        - (SELECT COUNT(*) FROM catalogue_lookups)
-        + (
-          SELECT COUNT(*)
-          FROM catalogue_lookups
-          WHERE hits IS NULL
-            AND query_title IS NOT NULL
-        )
-      ) AS total
-  `);
+    SELECT COUNT(*) AS total
+    FROM citations c
+    WHERE (
+      NOT EXISTS (SELECT 1 FROM catalogue_lookups cl WHERE cl.citation_id = c.id)
+      OR EXISTS (
+        SELECT 1 FROM catalogue_lookups cl
+        WHERE cl.citation_id = c.id AND cl.hits IS NULL AND cl.query_title IS NOT NULL
+      )
+    )
+    ${scope.sql}
+  `, scope.args);
   return Number(row?.total || 0);
 }
 
@@ -2203,6 +4148,7 @@ export async function logCacheStats() {
     totalBytes: stats.total_bytes,
     withPdf: stats.with_pdf,
     failed: stats.failed,
+    degradedText: stats.degraded_text,
     oldest: stats.oldest,
     newest: stats.newest,
   });

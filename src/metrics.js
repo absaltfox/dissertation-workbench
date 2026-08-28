@@ -56,7 +56,7 @@ function unique(values) {
 
 const MIN_RELIABLE_WORD_COUNT = 1000;
 const MIN_RELIABLE_PAGE_COUNT = 10;
-const UNRELIABLE_WORD_SOURCES = new Set(['metadata_text']);
+const UNRELIABLE_WORD_SOURCES = new Set(['metadata_text', 'degraded_pdf_text']);
 const UNRELIABLE_PAGE_SOURCES = new Set(['estimated_from_metadata_words', 'estimated_from_full_text_words']);
 
 function extractOcId(value) {

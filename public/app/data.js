@@ -107,7 +107,7 @@ function populateFacetFilters({ reset = true } = {}) {
 function buildAnalytics(docs) {
   const MIN_RELIABLE_WORD_COUNT = 1000;
   const MIN_RELIABLE_PAGE_COUNT = 10;
-  const unreliableWordSources = new Set(['metadata_text']);
+  const unreliableWordSources = new Set(['metadata_text', 'degraded_pdf_text']);
   const unreliablePageSources = new Set(['estimated_from_metadata_words']);
 
   function activeWordCount(doc) {

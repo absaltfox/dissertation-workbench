@@ -145,3 +145,113 @@ test('reextractDocumentCitations preserves lookups and prunes stale links', asyn
   await db.reextractDocumentCitations(docId, [], hashFn);
   assert.equal((await db.loadDocumentCitations(docId)).length, 0);
 });
+
+// --- B-02 (#12): orphan collection is scoped to the document being re-extracted ---
+
+test('re-extraction never touches another document\'s citations or lookups', async () => {
+  const db = await import('../src/db.js');
+  const hashFn = (text) => `scope-${text}`;
+  const keeperDoc = '1.0500001';
+  const reparsedDoc = '1.0500002';
+  const shared = 'Bourdieu, P. (1984). Distinction. Cambridge: Harvard University Press.';
+  const keeperOnly = 'Latour, B. (1987). Science in action. Cambridge: Harvard University Press.';
+  const dropped = 'Goffman, E. (1959). The presentation of self in everyday life. New York: Anchor.';
+
+  const keeperIds = await db.reextractDocumentCitations(keeperDoc, [shared, keeperOnly], hashFn);
+  await db.saveCatalogueLookup(keeperIds[0], {
+    hits: 2, queryAuthor: 'Bourdieu', queryTitle: 'Distinction', bibId: 'shared-1',
+  });
+  await db.saveCatalogueLookup(keeperIds[1], {
+    hits: 5, queryAuthor: 'Latour', queryTitle: 'Science in action', bibId: 'keeper-1',
+  });
+
+  const reparsedIds = await db.reextractDocumentCitations(reparsedDoc, [shared, dropped], hashFn);
+  const droppedId = reparsedIds.find((id) => !keeperIds.includes(id));
+  await db.saveCatalogueLookup(droppedId, {
+    hits: 1, queryAuthor: 'Goffman', queryTitle: 'Presentation of self', bibId: 'dropped-1',
+  });
+
+  // Reparse of the second document drops one citation and keeps the shared one.
+  await db.reextractDocumentCitations(reparsedDoc, [shared], hashFn);
+
+  // The other document is untouched: both links, and both catalogue lookups.
+  assert.equal((await db.loadDocumentCitations(keeperDoc)).length, 2);
+  assert.equal(Number((await db.loadCatalogueLookup(keeperIds[0])).hits), 2);
+  assert.equal(Number((await db.loadCatalogueLookup(keeperIds[1])).hits), 5);
+
+  // The citation only the reparsed document held is collected, lookup included.
+  assert.equal(await db.loadCatalogueLookup(droppedId), null);
+});
+
+test('a citation orphaned outside this document survives a re-extraction', async () => {
+  const db = await import('../src/db.js');
+  const client = await db.getDb();
+  const hashFn = (text) => `stray-${text}`;
+  const now = new Date().toISOString();
+
+  // Stands in for a citation another worker inserted but has not linked yet, and
+  // for one left behind by an interrupted job. The old global anti-join swept both
+  // away — with their catalogue lookups — on the next document processed.
+  await client.execute({
+    sql: `INSERT INTO citations (citation_hash, citation_text, year, created_at, match_key_version)
+          VALUES (?, ?, ?, ?, 0)`,
+    args: ['stray-hash', 'Arendt, H. (1958). The human condition. Chicago: UCP.', '1958', now],
+  });
+  const strayRow = await client.execute({
+    sql: 'SELECT id FROM citations WHERE citation_hash = ?', args: ['stray-hash'],
+  });
+  const strayId = Number(strayRow.rows[0].id);
+  await db.saveCatalogueLookup(strayId, {
+    hits: 7, queryAuthor: 'Arendt', queryTitle: 'The human condition', bibId: 'stray-1',
+  });
+
+  const otherDoc = '1.0600001';
+  const ids = await db.reextractDocumentCitations(otherDoc, [
+    'Sennett, R. (1977). The fall of public man. New York: Knopf.',
+    'Illich, I. (1971). Deschooling society. New York: Harper.',
+  ], hashFn);
+  await db.reextractDocumentCitations(otherDoc, [
+    'Sennett, R. (1977). The fall of public man. New York: Knopf.',
+  ], hashFn);
+  assert.equal(ids.length, 2);
+
+  // Unrelated orphan and its Z39.50 result are still there.
+  assert.equal(Number((await db.loadCatalogueLookup(strayId)).hits), 7);
+
+  // Periodic maintenance — and only periodic maintenance — collects it.
+  const removed = await db.sweepOrphanedCitations({ batchSize: 10 });
+  assert.ok(removed >= 1);
+  assert.equal(await db.loadCatalogueLookup(strayId), null);
+  const gone = await client.execute({
+    sql: 'SELECT COUNT(*) AS n FROM citations WHERE citation_hash = ?', args: ['stray-hash'],
+  });
+  assert.equal(Number(gone.rows[0].n), 0);
+});
+
+test('collectOrphanedCitations only removes ids it is given, and only if unlinked', async () => {
+  const db = await import('../src/db.js');
+  const hashFn = (text) => `collect-${text}`;
+  const docId = '1.0700001';
+  const ids = await db.reextractDocumentCitations(docId, [
+    'Polanyi, K. (1944). The great transformation. New York: Farrar.',
+    'Scott, J. (1998). Seeing like a state. New Haven: Yale University Press.',
+  ], hashFn);
+
+  // Still linked: naming them explicitly must not delete them.
+  assert.equal(await db.collectOrphanedCitations(ids), 0);
+  assert.equal((await db.loadDocumentCitations(docId)).length, 2);
+
+  // Unlinked but not named: left alone, because collection is scoped to the ids
+  // the caller passes rather than to whatever the corpus happens to have orphaned.
+  const client = await db.getDb();
+  await client.execute({
+    sql: `INSERT INTO citations (citation_hash, citation_text, year, created_at, match_key_version)
+          VALUES (?, ?, ?, ?, 1)`,
+    args: ['unnamed-orphan', 'Mills, C. W. (1959). The sociological imagination. New York: OUP.', '1959', new Date().toISOString()],
+  });
+  assert.equal(await db.collectOrphanedCitations(ids), 0);
+  const survived = await client.execute({
+    sql: 'SELECT COUNT(*) AS n FROM citations WHERE citation_hash = ?', args: ['unnamed-orphan'],
+  });
+  assert.equal(Number(survived.rows[0].n), 1);
+});

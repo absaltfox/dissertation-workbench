@@ -5,7 +5,9 @@ import {
   applyCommitteeMembersToDocuments,
   applyStoredFileMetricsToDocuments,
   closeDb,
+  deleteCommitteeMembersByRoles,
   ensureStorage,
+  getDb,
   listCachedDocuments,
   loadDocumentMetadata,
   recomputeStoredDocumentThemes,
@@ -229,4 +231,49 @@ test('stored committee and examiner roles can overlay freshly fetched metadata r
   assert.equal(docs[0].committee.find((member) => member.role === 'University Examiner')?.affiliation, 'Faculty of Education');
   assert.deepEqual(docs[0].supervisors, ['Alex Supervisor']);
   assert.equal(docs[0].supervisorsSource, 'pdf_fallback');
+});
+
+test('committee serving projection preserves authoritative API source precedence', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const docId = `test-committee-precedence-${suffix}`;
+  await saveCommitteeMembers(docId, [
+    { name: 'Priority Person', role: 'External Examiner', affiliation: 'API University' },
+  ], 'api');
+  await saveCommitteeMembers(docId, [
+    { name: 'Priority M. Person', role: 'External Examiner', affiliation: 'PDF University' },
+  ], 'pdf');
+
+  const client = await getDb();
+  const result = await client.execute({
+    sql: `SELECT affiliation, source FROM document_people
+          WHERE doc_id = ? AND person_key = ? AND role = ?`,
+    args: [docId, 'priority person', 'External Examiner'],
+  });
+  assert.deepEqual(result.rows.map((row) => [row.affiliation, row.source]), [
+    ['API University', 'api'],
+  ]);
+
+  assert.equal(await deleteCommitteeMembersByRoles(docId, ['External Examiner'], 'pdf'), 1);
+  const survivingProjection = await client.execute({
+    sql: 'SELECT affiliation, source FROM document_people WHERE doc_id = ? AND person_key = ?',
+    args: [docId, 'priority person'],
+  });
+  assert.deepEqual(survivingProjection.rows.map((row) => [row.affiliation, row.source]), [
+    ['API University', 'api'],
+  ]);
+
+  await saveCommitteeMembers(docId, [
+    { name: '王小明', role: 'Committee Member', affiliation: '清华大学' },
+  ], 'api');
+  const unicodeCanonical = await client.execute({
+    sql: 'SELECT name FROM committee_members WHERE doc_id = ? AND name = ?',
+    args: [docId, '王小明'],
+  });
+  const unicodeProjection = await client.execute({
+    sql: 'SELECT person_key FROM document_people WHERE doc_id = ? AND name = ?',
+    args: [docId, '王小明'],
+  });
+  assert.equal(unicodeCanonical.rows.length, 1);
+  assert.equal(unicodeProjection.rows[0]?.person_key, '王小明');
 });

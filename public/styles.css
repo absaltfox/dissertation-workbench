@@ -1358,6 +1358,17 @@ body.phone-screen-open {
   color: var(--ink-soft);
 }
 
+.settings-section label.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.settings-section label.checkbox-row input {
+  width: auto;
+  margin: 0;
+}
+
 .settings-grid .full { grid-column: 1 / -1; }
 
 .settings-actions {

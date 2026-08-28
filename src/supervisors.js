@@ -73,7 +73,7 @@ export function supervisorNameKey(raw) {
   if (!normalized) return null;
   return stripDiacritics(normalized)
     .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
