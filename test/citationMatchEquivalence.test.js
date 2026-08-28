@@ -391,6 +391,150 @@ test('the fuzzy candidate query never reads the whole citations table', async ()
   );
 });
 
+// #29 (M-06): the combined dated-arm predicate `yearArm()` issues for the
+// accept/veto arms (db.js findFuzzyMatch, ~3277-3279) is the load-bearing query
+// for #11's "narrow the bucket before matching" design — it is what makes hitting
+// FUZZY_CANDIDATE_LIMIT in one cell require a pathological (prefix, year)
+// concentration. The test above only proves the single-predicate shapes
+// (`match_year = ?` alone, `match_prefix = ?` alone); this proves the combined
+// two-column predicate is *also* answered by an index seek, not a scan-then-filter.
+test('the combined match_prefix + match_year predicate is an index range scan', async () => {
+  const client = await db.getDb();
+  const plan = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT * FROM (SELECT 1 AS bucket, id, citation_hash, citation_text, match_year
+                         FROM citations WHERE match_prefix = ? AND match_year = ? ORDER BY id LIMIT 2000)`,
+    args: ['ful', 1991],
+  });
+  const details = plan.rows.map((row) => String(row.detail));
+  for (const detail of details) {
+    assert.ok(!/^SCAN citations\b/.test(detail), `combined dated-arm query fell back to a table scan: ${detail}`);
+  }
+  assert.ok(
+    details.some((detail) => detail.includes('idx_citations_match_prefix')
+      && detail.includes('match_prefix=?') && detail.includes('match_year=?')),
+    `combined predicate did not bind both columns of idx_citations_match_prefix in one seek: ${details.join(' | ')}`
+  );
+});
+
+// #29 (M-06): EXPLAIN QUERY PLAN coverage for the other three indexed hot
+// queries the plan calls out, plus a check that dropping
+// idx_documents_sync_key_doc_id (db.js ~563) did not regress any sync_key
+// consumer to a table scan.
+test('documents filtered on degree, ordered by year, use idx_documents_degree_year', async () => {
+  const client = await db.getDb();
+  // Literal shape of queryCachedDocumentPage (db.js) with a degree filter and the
+  // default year sort — the combined predicate idx_documents_degree_year(degree, year)
+  // exists to serve.
+  const plan = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT d.doc_id, d.metadata_json,
+                 fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
+                 fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+                 COALESCE(dc.citation_count, 0) AS citation_count
+          FROM documents d
+          LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+          LEFT JOIN (
+            SELECT doc_id, COUNT(*) AS citation_count
+            FROM document_citations
+            GROUP BY doc_id
+          ) dc ON dc.doc_id = d.doc_id
+          WHERE d.degree = ?
+          ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
+          LIMIT ? OFFSET ?`,
+    args: ['PhD', 50, 0],
+  });
+  const details = plan.rows.map((row) => String(row.detail));
+  for (const detail of details) {
+    assert.ok(!/^SCAN d\b/.test(detail), `documents degree filter fell back to a table scan: ${detail}`);
+  }
+  assert.ok(
+    details.some((detail) => detail.includes('idx_documents_degree_year') && detail.includes('degree=?')),
+    `degree filter did not use idx_documents_degree_year: ${details.join(' | ')}`
+  );
+});
+
+test('the pending catalogue-lookup query uses idx_catalogue_lookups_hits_query_title', async () => {
+  const client = await db.getDb();
+  // Literal shape of listPendingLookups' first UNION ALL arm (db.js).
+  const plan = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT c.id, c.citation_text
+          FROM catalogue_lookups cl
+          JOIN citations c ON c.id = cl.citation_id
+          WHERE cl.hits IS NULL
+            AND cl.query_title IS NOT NULL`,
+  });
+  const details = plan.rows.map((row) => String(row.detail));
+  assert.ok(
+    details.some((detail) => detail.includes('idx_catalogue_lookups_hits_query_title')),
+    `pending-lookup query did not use idx_catalogue_lookups_hits_query_title: ${details.join(' | ')}`
+  );
+});
+
+test('file_metrics pdf_path lookups use idx_file_metrics_pdf_path', async () => {
+  const client = await db.getDb();
+  // Literal shape of the cache-integrity sweep query (db.js ~2849).
+  const plan = await client.execute({
+    sql: 'EXPLAIN QUERY PLAN SELECT doc_id, pdf_path FROM file_metrics WHERE pdf_path IS NOT NULL',
+  });
+  const details = plan.rows.map((row) => String(row.detail));
+  for (const detail of details) {
+    assert.ok(!/^SCAN file_metrics$/.test(detail), `pdf_path lookup fell back to an unindexed table scan: ${detail}`);
+  }
+  assert.ok(
+    details.some((detail) => detail.includes('idx_file_metrics_pdf_path')),
+    `pdf_path lookup did not use idx_file_metrics_pdf_path: ${details.join(' | ')}`
+  );
+});
+
+test('dropping idx_documents_sync_key_doc_id did not regress sync_key consumers to a table scan', async () => {
+  const client = await db.getDb();
+
+  // listDocumentsPendingEnrichment (db.js ~2217): the `+d.sync_key` de-index is
+  // deliberate (comment at ~2212) — it forces the walk onto the doc_id PRIMARY KEY
+  // so the cursor is an ordered range scan instead of re-sorting the whole rule's
+  // corpus every batch. Confirm it lands on the PK, not a bare table scan.
+  const queuePlan = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT d.doc_id, d.metadata_json
+          FROM documents d
+          LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+          LEFT JOIN enrichment_attempts ea ON ea.doc_id = d.doc_id
+          WHERE +d.sync_key = ?
+            AND d.doc_id > ?
+            AND COALESCE((fm.word_source = 'dspace_full_text'
+                 AND (COALESCE(fm.word_count, 0) > 0 AND COALESCE(fm.page_count, 0) > 0)), 0) = 0
+          ORDER BY d.doc_id
+          LIMIT ?`,
+    args: ['sk', 'doc-0', 20],
+  });
+  const queueDetails = queuePlan.rows.map((row) => String(row.detail));
+  for (const detail of queueDetails) {
+    assert.ok(!/^SCAN d\b/.test(detail), `listDocumentsPendingEnrichment fell back to a table scan: ${detail}`);
+  }
+  assert.ok(
+    queueDetails.some((detail) => /USING (INDEX sqlite_autoindex_documents_1|PRIMARY KEY)/.test(detail) && detail.includes('doc_id>?')),
+    `listDocumentsPendingEnrichment did not land on the doc_id primary key: ${queueDetails.join(' | ')}`
+  );
+
+  // listCachedDocuments (db.js ~963) filters plainly on sync_key (no de-index
+  // trick) and must still use idx_documents_sync_key.
+  const plainPlan = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT d.doc_id FROM documents d WHERE d.sync_key = ? ORDER BY d.year DESC, d.title LIMIT ? OFFSET ?`,
+    args: ['sk', 10, 0],
+  });
+  const plainDetails = plainPlan.rows.map((row) => String(row.detail));
+  for (const detail of plainDetails) {
+    assert.ok(!/^SCAN d\b/.test(detail), `listCachedDocuments fell back to a table scan: ${detail}`);
+  }
+  assert.ok(
+    plainDetails.some((detail) => detail.includes('idx_documents_sync_key') && detail.includes('sync_key=?')),
+    `listCachedDocuments did not use idx_documents_sync_key: ${plainDetails.join(' | ')}`
+  );
+});
+
 test('match keys are backfilled for citations written before the columns existed', async () => {
   const client = await db.getDb();
   await client.execute({
