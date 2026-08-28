@@ -218,3 +218,74 @@ test('the default sync-mode filter batches existence checks into one query per p
     client.execute = originalExecute;
   }
 });
+
+// #19 (H-05): filterSyncItemsForMode's batching is unit-tested in isolation
+// above. This proves it holds on the full sync_missing_pdfs production path —
+// documentsExist + loadStoredFileMetrics + loadEnrichmentAttempts all batched
+// over one upstream page — with the issue's literal "single-digit statements"
+// criterion, not just "fewer than one per record".
+test('sync_missing_pdfs answers a 100-record upstream page in single-digit statements', async () => {
+  const { runDocumentSync } = await import('../src/sync.js');
+  const client = await db.getDb();
+
+  // normalizeRecord() only derives a stable doc id from something matching the
+  // OC handle shape (digits.digits) — an arbitrary string id falls through to a
+  // title:author fallback, so the fixture ids must look like real OC handles.
+  const hits = Array.from({ length: 100 }, (_, index) => ({
+    _source: { id: `1.08${String(index).padStart(5, '0')}`, title: `Doc ${index}`, author: `Author ${index}` },
+  }));
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/search/8.5')) {
+      return new Response(JSON.stringify({ data: { hits: { total: 100, hits } } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    // resolveIndexName's own /collections probe (DEFAULT_INDEX is '' so this
+    // should never fire, but fail loudly rather than hang on a real network call
+    // if that assumption ever changes).
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  // Every id the upstream page will report is pre-seeded as already satisfying
+  // the full_text_only policy, so the whole page is skipped without a single
+  // document actually being enriched — isolating the batched-check cost this
+  // test targets from the (expected, per-document) cost of analyzing a PDF.
+  for (const hit of hits) {
+    await db.saveFileMetric(hit._source.id, {
+      status: 'full_text', wordSource: 'dspace_full_text', wordCount: 1000, pageCount: 10,
+    });
+  }
+
+  const originalExecute = client.execute.bind(client);
+  const statements = [];
+  client.execute = async (statement, ...rest) => {
+    statements.push(typeof statement === 'string' ? statement : statement.sql);
+    return originalExecute(statement, ...rest);
+  };
+  try {
+    const result = await runDocumentSync({
+      mode: 'sync_missing_pdfs',
+      baseUrl: 'https://oc-index.test',
+      term: 'degree.raw,Doctor of Philosophy - PhD',
+      source: 'id,title,author',
+      pageSize: 100,
+      scanLimit: 100,
+      syncMaxRecords: 100,
+      downloadFiles: true,
+      contentMode: 'full_text_only',
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.totalSeen, 100);
+    assert.equal(result.totalSkipped, 100, 'every pre-satisfied document should be skipped, not enriched');
+    assert.equal(result.totalEnrichmentAttempted, 0);
+    assert.ok(
+      statements.length < 10,
+      `expected single-digit statements for a 100-record page, saw ${statements.length}:\n${statements.join('\n---\n')}`
+    );
+  } finally {
+    client.execute = originalExecute;
+    globalThis.fetch = originalFetch;
+  }
+});
