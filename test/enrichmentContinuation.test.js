@@ -62,6 +62,31 @@ function statementCounter(client) {
   return counter;
 }
 
+// Statement *count* cannot tell a cheap indexed page apart from an expensive
+// scan that happens to still be one statement (that is exactly what the
+// sparse-pending-tail test's own comment concedes). This captures the EXPLAIN
+// QUERY PLAN for every real listDocumentsPendingEnrichment SELECT (db.js
+// ~2217) issued while it runs, by intercepting client.execute and running
+// `EXPLAIN QUERY PLAN <the same SQL and args>` alongside the real call — so
+// the plan is asserted against the exact statement the drain path issues,
+// not a hand-copied lookalike.
+const PENDING_ENRICHMENT_QUERY_RE = /FROM\s+documents\s+d\b[\s\S]*ORDER BY d\.doc_id/;
+function explainCapturer(client) {
+  const originalExecute = client.execute.bind(client);
+  const captured = [];
+  client.execute = async (arg) => {
+    const sql = typeof arg === 'string' ? arg : arg.sql;
+    if (PENDING_ENRICHMENT_QUERY_RE.test(sql)) {
+      const args = typeof arg === 'string' ? [] : (arg.args || []);
+      const plan = await originalExecute({ sql: `EXPLAIN QUERY PLAN ${sql}`, args });
+      captured.push({ sql, args, details: plan.rows.map((row) => String(row.detail)) });
+    }
+    return originalExecute(arg);
+  };
+  captured.restore = () => { client.execute = originalExecute; };
+  return captured;
+}
+
 // --- 1. startContinuationJob: params_json size is constant across continuations ---
 
 test('startContinuationJob keeps nextParams JSON size constant across many continuations', async () => {
@@ -245,7 +270,13 @@ test('a sparse pending tail behind dense unrelated + satisfied documents still c
 
   const BATCH_SIZE = 1;
   const BATCHES_TO_RUN = Math.min(CLUSTERS, 25);
-  const { costs } = await runBatches({ syncKey: ourSyncKey, pdfBatchSize: BATCH_SIZE, batches: BATCHES_TO_RUN, client });
+  const explained = explainCapturer(client);
+  let costs;
+  try {
+    ({ costs } = await runBatches({ syncKey: ourSyncKey, pdfBatchSize: BATCH_SIZE, batches: BATCHES_TO_RUN, client }));
+  } finally {
+    explained.restore();
+  }
 
   assert.equal(costs.length, BATCHES_TO_RUN, 'every batch should find its one pending document locally, without falling through to the upstream scan');
   for (const { result } of costs) {
@@ -270,4 +301,44 @@ test('a sparse pending tail behind dense unrelated + satisfied documents still c
     lastBatch, firstBatch,
     `last batch cost ${lastBatch} statements vs first batch's ${firstBatch} under the sparse-tail shape`
   );
+
+  // The metric the statement count above is blind to: under this exact
+  // sparse-tail corpus, does the listDocumentsPendingEnrichment page query stay
+  // on the doc_id primary key (as the `+d.sync_key` de-index at db.js ~2212
+  // intends), or does the planner fall back to idx_documents_sync_key and
+  // re-sort this rule's whole (noise-diluted) corpus on every batch? Either
+  // shape is still exactly "one SELECT statement", so the statement-count
+  // assertions above pass regardless -- this is the cost the reviewer's
+  // finding says they cannot see.
+  //
+  // Batch 1 has no cursor yet, so its correct plan is a bounded SCAN of the
+  // doc_id index from the start (LIMIT stops it at the first match); every
+  // later batch has a cursor and its correct plan is a SEARCH seeking
+  // straight to it. Both are fine -- what would NOT be fine, and is the
+  // actual regression this asserts against, is landing on
+  // idx_documents_sync_key instead (which cannot also serve the doc_id
+  // ORDER BY, so it forces a "USE TEMP B-TREE FOR ORDER BY" over every
+  // matching row instead of stopping at the cursor).
+  assert.ok(explained.length >= BATCHES_TO_RUN, `expected an EXPLAIN capture per batch, got ${explained.length} for ${BATCHES_TO_RUN} batches`);
+  explained.forEach(({ details, sql }, i) => {
+    const hasCursor = sql.includes('d.doc_id > ?'); // absent only on batch 1, before any cursor exists
+    assert.ok(
+      !details.some((detail) => detail.includes('idx_documents_sync_key')),
+      `batch ${i} landed on idx_documents_sync_key instead of the doc_id primary key: ${details.join(' | ')}\nSQL: ${sql}`
+    );
+    assert.ok(
+      !details.some((detail) => /TEMP B-TREE/.test(detail)),
+      `batch ${i} needed a temp-b-tree sort -- the doc_id de-index stopped working: ${details.join(' | ')}\nSQL: ${sql}`
+    );
+    assert.ok(
+      details.some((detail) => /USING INDEX sqlite_autoindex_documents_1/.test(detail) && detail.startsWith(hasCursor ? 'SEARCH d ' : '')),
+      `batch ${i} did not access documents via the doc_id primary key as expected (cursor present: ${hasCursor}): ${details.join(' | ')}`
+    );
+    if (hasCursor) {
+      assert.ok(
+        details.some((detail) => detail.includes('doc_id>?')),
+        `batch ${i} had a cursor but did not seek on doc_id>?: ${details.join(' | ')}`
+      );
+    }
+  });
 });

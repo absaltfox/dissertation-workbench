@@ -305,6 +305,67 @@ test('re-extraction cost does not grow with corpus size or document position', a
   }
 });
 
+// The statement-count test above proves the DELETEs stay a fixed number of
+// statements regardless of corpus size or position -- but a count is blind to
+// what each statement scans. The historical bug this replaced (57a3b98) was two
+// *global* `NOT IN (SELECT DISTINCT citation_id FROM document_citations)`
+// anti-joins: also a fixed number of statements (one per table), yet each one
+// a full SCAN of citations/catalogue_lookups that grows linearly with corpus
+// size. Statement count cannot tell these apart; EXPLAIN QUERY PLAN can.
+test('collectOrphanedCitations deletes via SEARCH on the primary key, not a full table SCAN', async () => {
+  const db = await import('../src/db.js');
+  const client = await db.getDb();
+  const hashFn = (text) => `explain-${text}`;
+  const docId = '1.9900001';
+
+  await db.reextractDocumentCitations(docId, [
+    { text: 'Explainton, A. (2001). Original explain fixture.', year: '2001' },
+  ], hashFn);
+
+  // Capture the exact DELETE statements collectOrphanedCitations issues (src/db.js
+  // ~3565) by intercepting client.execute while re-extracting with a brand-new
+  // citation, which orphans the original and forces both DELETEs down the same
+  // path costOfReextracting() exercises above. This asserts against the SQL the
+  // code actually runs, not a hand-copied lookalike that could drift from it.
+  const originalExecute = client.execute.bind(client);
+  const captured = [];
+  client.execute = async (arg) => {
+    const sql = typeof arg === 'string' ? arg : arg.sql;
+    if (/^\s*DELETE FROM (catalogue_lookups|citations)\b/.test(sql)) {
+      captured.push({ sql, args: typeof arg === 'string' ? [] : (arg.args || []) });
+    }
+    return originalExecute(arg);
+  };
+  try {
+    await db.reextractDocumentCitations(docId, [
+      { text: 'Explainton, B. (2002). Replacement explain fixture.', year: '2002' },
+    ], hashFn);
+  } finally {
+    client.execute = originalExecute;
+  }
+
+  assert.equal(
+    captured.length, 2,
+    `expected exactly the catalogue_lookups and citations orphan DELETEs, captured: ${captured.map((c) => c.sql).join(' || ')}`
+  );
+
+  for (const { sql, args } of captured) {
+    // eslint-disable-next-line no-await-in-loop
+    const plan = await client.execute({ sql: `EXPLAIN QUERY PLAN ${sql}`, args });
+    const details = plan.rows.map((row) => String(row.detail));
+    for (const detail of details) {
+      assert.ok(
+        !/^SCAN (citations|catalogue_lookups)\b/.test(detail),
+        `orphan-collection DELETE fell back to a full table scan (the pre-B-02 global NOT IN anti-join shape): ${detail}\nSQL: ${sql}`
+      );
+    }
+    assert.ok(
+      details.some((detail) => /^SEARCH (citations|catalogue_lookups) USING INTEGER PRIMARY KEY/.test(detail)),
+      `orphan-collection DELETE did not SEARCH on the integer primary key: ${details.join(' | ')}\nSQL: ${sql}`
+    );
+  }
+});
+
 test('collectOrphanedCitations only removes ids it is given, and only if unlinked', async () => {
   const db = await import('../src/db.js');
   const hashFn = (text) => `collect-${text}`;
