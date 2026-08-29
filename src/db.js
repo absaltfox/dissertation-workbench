@@ -2785,7 +2785,34 @@ const CAS_BACKOFF_OPTIONS = { baseMs: 5, factor: 1.6, jitterRatio: 0.4, capMs: 2
 // `RATE_LIMIT_STATE_CORRUPT` so evaluateEnrichmentRun can exclude it from the
 // enrichment-quality success rate rather than counting infra noise as a bad
 // PDF (see src/services/enrichmentRollout.js).
-export async function reserveImportRuleRequestSlot(ruleId, limit, {
+//
+// Retry-safe (#18 Layer A, corrected): a transient error out of the SELECT or
+// the CAS UPDATE/INSERT below (a dropped connection mid-round-trip, not
+// ordinary CAS contention — contention never throws, see above) is retried by
+// wrapping the WHOLE function body in `withDbRetry`, not just an individual
+// statement. This is deliberate and was verified safe, not assumed: retrying
+// the entire function re-reads `timestamps_json` from scratch and re-derives
+// its decision from that fresh read, so a retried call can only ever (a) see
+// its own prior attempt's write already applied (if the UPDATE actually
+// committed despite the client-side error) and skip re-adding a slot because
+// the window now looks fuller, or (b) at worst append `nowMs` a second time,
+// which makes the limiter *more* conservative, never less — it can never
+// double-grant a slot to two distinct real requests, because the calling
+// content-request path only invokes this once per real request regardless of
+// how many times it is retried internally. This function was previously
+// listed as one of the seven Layer-A-wrapped functions (see the design notes
+// above and docs/phase-b-completion-plan.md §2.1's audit table) but was not
+// actually wrapped — a transient SELECT/UPDATE failure threw on the first
+// attempt with zero retries. `reserveImportRuleRequestSlotOnce` below is the
+// un-retried body; this exported function is the retry-wrapped entry point.
+export async function reserveImportRuleRequestSlot(ruleId, limit, options = {}) {
+  return withDbRetry(
+    () => reserveImportRuleRequestSlotOnce(ruleId, limit, options),
+    { label: 'reserveImportRuleRequestSlot' }
+  );
+}
+
+async function reserveImportRuleRequestSlotOnce(ruleId, limit, {
   nowMs = Date.now(), windowMs = 60_000, wait = defaultRetryWait, maxAttempts = 20,
   backoff = computeBackoffDelayMs,
 } = {}) {

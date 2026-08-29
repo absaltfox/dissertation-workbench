@@ -345,6 +345,74 @@ test('reserveImportRuleRequestSlot throws a tagged, non-retryable error only whe
   }
 });
 
+// Regression test for Finding 1 (review of #18/#23): reserveImportRuleRequestSlot
+// was listed as one of the seven Layer-A withDbRetry-wrapped functions, and its
+// own internal 20-attempt CAS loop and jittered backoff make it *look*
+// retry-hardened, but the function itself was never actually passed through
+// withDbRetry. A transient error out of its SELECT or CAS UPDATE (a dropped
+// connection mid-round-trip — not ordinary CAS contention, which never throws)
+// threw immediately with zero retries. These two tests fail against the
+// unwrapped function (the SELECT/UPDATE error propagates straight out, so the
+// call rejects instead of returning 0) and pass once the whole function is
+// wrapped in withDbRetry.
+test('reserveImportRuleRequestSlot retries a transient error on the initial SELECT and still acquires the slot', async () => {
+  const rule = await db.saveImportRule({ id: `slot-transient-select-${Date.now()}`, name: 'Transient SELECT fixture' });
+  const client = await db.getDb();
+  const originalExecute = client.execute.bind(client);
+  let failuresRemaining = 1;
+  let selectAttempts = 0;
+  client.execute = async (statement, ...rest) => {
+    const sql = typeof statement === 'string' ? statement : statement.sql;
+    if (/SELECT timestamps_json FROM import_rule_request_limits/.test(sql)) {
+      selectAttempts += 1;
+      if (failuresRemaining > 0) {
+        failuresRemaining -= 1;
+        const error = new Error('server closed the connection');
+        error.code = 'HRANA_CLOSED_ERROR'; // transient shape
+        throw error;
+      }
+    }
+    return originalExecute(statement, ...rest);
+  };
+  try {
+    const result = await db.reserveImportRuleRequestSlot(rule.id, 5, { nowMs: 40_000, windowMs: 60_000 });
+    assert.equal(result, 0, 'expected the slot to be acquired once the retry absorbs the transient SELECT error');
+    assert.ok(selectAttempts >= 2, `expected the SELECT to be retried at least once, saw ${selectAttempts} attempt(s)`);
+  } finally {
+    client.execute = originalExecute;
+  }
+});
+
+test('reserveImportRuleRequestSlot retries a transient error on the CAS UPDATE and still acquires the slot', async () => {
+  const rule = await db.saveImportRule({ id: `slot-transient-update-${Date.now()}`, name: 'Transient UPDATE fixture' });
+  // Seed an existing row so the CAS path is the UPDATE branch, not INSERT OR IGNORE.
+  await db.reserveImportRuleRequestSlot(rule.id, 5, { nowMs: 1_000, windowMs: 60_000 });
+  const client = await db.getDb();
+  const originalExecute = client.execute.bind(client);
+  let failuresRemaining = 1;
+  let updateAttempts = 0;
+  client.execute = async (statement, ...rest) => {
+    const sql = typeof statement === 'string' ? statement : statement.sql;
+    if (/UPDATE import_rule_request_limits/.test(sql)) {
+      updateAttempts += 1;
+      if (failuresRemaining > 0) {
+        failuresRemaining -= 1;
+        const error = new Error('server closed the connection');
+        error.code = 'HRANA_CLOSED_ERROR'; // transient shape
+        throw error;
+      }
+    }
+    return originalExecute(statement, ...rest);
+  };
+  try {
+    const result = await db.reserveImportRuleRequestSlot(rule.id, 5, { nowMs: 41_000, windowMs: 60_000 });
+    assert.equal(result, 0, 'expected the slot to be acquired once the retry absorbs the transient UPDATE error');
+    assert.ok(updateAttempts >= 2, `expected the UPDATE to be retried at least once, saw ${updateAttempts} attempt(s)`);
+  } finally {
+    client.execute = originalExecute;
+  }
+});
+
 // --- Gate harness 1 (#18): induced DB disconnect mid-page ------------------
 //
 // Simulates a transient libsql error partway through a concurrent page by
@@ -661,6 +729,95 @@ test('gate 2: contentConcurrency 8 against a low, fast-window content rate limit
     assert.ok(casStatements > docs.length, `expected more than one limiter statement per document under real contention, saw ${casStatements}`);
   } finally {
     client.execute = originalExecute;
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// --- Combined gate (Finding 2 / #10's literal "and"): induced DB disconnect --
+// --- AND a limiter contention spike, in the SAME sync page -------------------
+//
+// The #10 completion gate reads "survives an induced DB disconnect AND a
+// limiter contention spike" — a single run exercising both fault conditions
+// at once, not the two gates run separately (which is all Gate 1 and Gate 2
+// above ever do). This is exactly the compounding-latency interaction
+// docs/phase-b-completion-plan.md §2.1's caveat worried about: Layer A's
+// withDbRetry backoff on the disconnected document's DB calls, layered on top
+// of genuine rate-limit queuing for every document under contentConcurrency:
+// 8 against a low contentRateLimit, must not multiply into a slow or
+// mis-recorded run.
+test('combined gate: a DB disconnect and a limiter contention spike in the same page both resolve correctly and quickly', async () => {
+  const originalFetch = globalThis.fetch;
+  const suffix = `3${Date.now()}`;
+  const docs = buildGateDocs(suffix, 16);
+  const targetDocId = docs[7].id;
+  globalThis.fetch = fullTextFetchMock(docs);
+  const rule = await db.saveImportRule({ id: `combined-gate-rule-${suffix}`, name: `Combined gate rule ${suffix}` });
+
+  const client = await db.getDb();
+  // Sustained (always-fails) disconnect on one document's metadata save — the
+  // same shape as gate 1a — layered on top of gate 2's contention setup below.
+  const restore = induceDbDisconnect(client, { targetDocId, atCall: 1, failureBudget: Infinity });
+  try {
+    const startedAt = Date.now();
+    const result = await runDocumentSync({
+      mode: 'sync_missing_pdfs',
+      baseUrl: 'https://oc-index.test',
+      term: `degree.raw,Combined-${suffix}`,
+      source: 'id,title,author,digitalResourceOriginalRecord',
+      pageSize: 100,
+      scanLimit: 100,
+      syncMaxRecords: 100,
+      pdfBatchSize: docs.length,
+      contentMode: 'full_text_only',
+      contentConcurrency: 8,
+      contentRateLimit: 2,
+      contentRateWindowMs: 100,
+      importRuleId: rule.id,
+      downloadFiles: false,
+    });
+    const elapsedMs = Date.now() - startedAt;
+
+    // The run does not abort.
+    assert.equal(result.ok, true, 'the run must not fail from either induced fault, individually or combined');
+    const latestRun = await db.getLatestSyncRun(result.syncKey);
+    assert.notEqual(latestRun.status, 'failed', 'the sync_runs row must not be marked failed');
+
+    // The disconnected document is retried (or, since this is a sustained
+    // failure exhausting Layer A's retries, durably recorded as failed) —
+    // never silently dropped and never crashing the page.
+    const targetOutcome = result.enrichmentOutcomes.find((item) => item.docId === targetDocId);
+    assert.ok(targetOutcome, 'the disconnected document must still produce an outcome entry');
+    assert.ok(targetOutcome.error, 'the disconnected document outcome must carry the DB error');
+    assert.equal(targetOutcome.recorded, true, 'the disconnected document failure must be durably recorded');
+    assert.equal(targetOutcome.outcomeKind, 'document_error',
+      'the disconnected document must be tagged as a document error, not limiter contention');
+    const storedTarget = await db.loadStoredFileMetric(targetDocId);
+    assert.ok(storedTarget?.error, 'the disconnected document must have a durable file_metrics row with an error');
+
+    // No document anywhere in the page is recorded as failed due to limiter
+    // contention — every other document (all of which race the same
+    // contentRateLimit: 2 / contentConcurrency: 8 contention as the
+    // disconnected one) must succeed normally.
+    const others = result.enrichmentOutcomes.filter((item) => item.docId !== targetDocId);
+    assert.equal(others.length, docs.length - 1);
+    for (const outcome of others) {
+      assert.equal(outcome.error, null,
+        `expected ${outcome.docId} to succeed; limiter contention must never surface as a document failure alongside the disconnect`);
+    }
+    assert.ok(
+      !result.enrichmentOutcomes.some((o) => /reserve content-request quota|RATE_LIMIT_STATE_CORRUPT/.test(o.error || '')),
+      `no outcome should carry a limiter-exhaustion error: ${JSON.stringify(result.enrichmentOutcomes.filter((o) => o.error))}`
+    );
+
+    // The combined fault does not blow up latency: genuine rate-limit queuing
+    // (16 docs at limit 2/100ms, concurrency 8) takes real but small time, and
+    // Layer A's backoff on the disconnected document's retries (base 25ms,
+    // capped, few attempts) does not compound this into anything resembling a
+    // real 60s wait. A generous bound well under one second confirms no
+    // accidental fallback to the real 60_000ms limiter window occurred.
+    assert.ok(elapsedMs < 5_000, `expected the combined-fault run to complete quickly, took ${elapsedMs}ms`);
+  } finally {
+    restore();
     globalThis.fetch = originalFetch;
   }
 });
