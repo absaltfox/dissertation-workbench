@@ -441,6 +441,44 @@ export function buildNgramCloud(records, maxTerms = 60) {
     .map(([term, count]) => ({ term, count }));
 }
 
+// Non-topical phrases excluded from the concept cloud and co-occurrence/
+// timeline panels. Covers three categories:
+//   • Statistical / experimental-design vocabulary (quantitative boilerplate)
+//   • Results-reporting boilerplate (findings indicate, results showed, …)
+//   • Generic academic-writing filler (based upon, further investigation, …)
+// Lives here (not in metrics.js or db.js) so both the JS aggregators
+// (metrics.js) and the SQL-ported panels (db.js) can import one shared
+// definition without a circular dependency between those two modules. Keep
+// in sync with COOCCURRENCE_BLOCKLIST in public/app/core.js.
+export const COOCCURRENCE_BLOCKLIST = new Set([
+  // Statistical and experimental design
+  'significant differences', 'statistically significant', 'significant difference',
+  'significant relationships', 'significant relationship', 'significantly related',
+  'control group', 'treatment groups', 'treatment group',
+  'experimental groups', 'experimental group', 'experimental design',
+  'randomly assigned', 'randomly selected', 'random sample',
+  'dependent variables', 'independent variables', 'dependent variable', 'independent variable',
+  'predictor variables', 'criterion variables',
+  'regression analysis', 'regression analyses', 'multiple regression', 'stepwise regression',
+  'factor analysis', 'path analysis', 'discriminant analysis', 'canonical analysis',
+  'analysis variance', 'multivariate analysis', 'repeated measures',
+  'three groups', 'two groups',
+  // Results / findings boilerplate
+  'results indicated', 'results showed', 'results suggest', 'results revealed',
+  'analysis revealed', 'analysis indicated', 'analyses indicated',
+  'findings indicate', 'findings indicated', 'findings suggest',
+  // Generic academic-writing filler
+  'data analysis', 'data collected', 'data collection', 'data gathering', 'data sources',
+  'analyzed using', 'semi structured', 'interview data',
+  'attitudes toward', 'determine whether', 'based upon', 'directed towards',
+  'further investigation', 'important factor', 'wide range',
+  'higher levels', 'high levels', 'second part', 'first part',
+  // Older psychometric / measurement instruments
+  'main effects', 'significant main', 'interaction effects', 'post test',
+  'discriminant function', 'tennessee self', 'concept scale',
+  'native indian', // archaic, from older dissertations — not a useful discovery concept
+]);
+
 export const METHODOLOGY_KEYWORDS = new Map([
   ['Qualitative', /\bqualitative\b/i],
   ['Quantitative', /\bquantitative\b/i],

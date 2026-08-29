@@ -1,5 +1,7 @@
 import { Router } from 'express';
-import { buildMetricsPayloadFromRecords, collectMetricRecords, collectMetrics, enrichDocumentSignals } from '../metrics.js';
+import {
+  buildMetricsPayloadFromRecords, collectMetricRecords, collectMetrics, enrichDocumentSignals, buildTermCooccurrence
+} from '../metrics.js';
 import {
   ALLOW_PUBLIC_REFRESH, CACHE_TTL_MS, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT
 } from '../config.js';
@@ -20,6 +22,15 @@ const WORKBENCH_SLICE_TTL_MS = CACHE_TTL_MS;
 const ANALYTICS_DOCUMENT_SAMPLE_LIMIT = 100;
 const DETAILED_ANALYTICS_RECORD_LIMIT = 5000;
 const VISUALIZATION_DOCUMENT_LIMIT = 5000;
+// Hard server-side ceiling on /api/metrics regardless of role (#24). This route
+// runs every JS aggregator in buildMetricsPayloadFromRecords over whatever
+// record count it is handed and synchronously serializes the whole `documents`
+// array; without a ceiling an admin request (e.g. maxRecords=56000) can stall
+// the event loop and risk exceeding V8's max string length. Matches
+// VISUALIZATION_DOCUMENT_LIMIT for consistency with every other route in this
+// phase. Admins who need the full corpus should page through
+// /api/workbench/* instead (already scale-tested, cursor-paged).
+const ADMIN_MAX_RECORDS_CEILING = 5000;
 
 function readRawMetricsParams(req) {
   return {
@@ -543,6 +554,24 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
         limit: ANALYTICS_DOCUMENT_SAMPLE_LIMIT,
         offset: 0,
       });
+      // #15 termCooccurrence: the one panel of the six that isn't a
+      // straight SQL port (pairwise term combinatorics — the same
+      // unbounded-self-join shape #25/#26 already had to bound). Shipped as
+      // a bounded-sample real answer instead of null: reuse the same
+      // VISUALIZATION_DOCUMENT_LIMIT-sized sample pattern already proven
+      // for /workbench/visualizations' supervisorNetwork/citationCooccurrence,
+      // now safe to run at this size thanks to #26's scaled threshold and
+      // term-vocabulary cap. The sampling is disclosed via
+      // source.termCooccurrenceSampled/SampleSize/SampleOf — distinct from
+      // the other five panels' "not computed above N" language, since this
+      // one *is* computed, just on a sample rather than the full corpus.
+      const termSample = await queryCachedDocumentPage({
+        syncKey: documentCache.syncKey,
+        filters,
+        limit: VISUALIZATION_DOCUMENT_LIMIT,
+        offset: 0,
+      });
+      const termCooccurrence = buildTermCooccurrence(enrichDocumentSignals(termSample.documents));
       return {
         generatedAt: new Date().toISOString(),
         source: {
@@ -553,9 +582,13 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
           documentsReturned: documentSample.documents.length,
           documentsTruncated: documentSample.total > documentSample.documents.length,
           detailedAnalyticsRecordLimit: DETAILED_ANALYTICS_RECORD_LIMIT,
+          termCooccurrenceSampled: true,
+          termCooccurrenceSampleSize: termSample.documents.length,
+          termCooccurrenceSampleOf: termSample.total,
           readOnlyFileEnrichment: true,
         },
         ...aggregate,
+        termCooccurrence,
         documents: documentSample.documents.map(analyticsDoc),
       };
     });
@@ -751,7 +784,9 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       res.status(403).json({ error: 'refresh is restricted to authenticated admin sessions.' });
       return;
     }
-    const effectiveMaxRecords = isAdminRequest ? maxRecords : Math.min(maxRecords, PUBLIC_MAX_RECORDS);
+    const effectiveMaxRecords = isAdminRequest
+      ? Math.min(maxRecords, ADMIN_MAX_RECORDS_CEILING)
+      : Math.min(maxRecords, PUBLIC_MAX_RECORDS);
     const effectiveScanLimit = isAdminRequest ? scanLimit : Math.min(scanLimit, PUBLIC_SCAN_LIMIT);
 
     const cacheKey = JSON.stringify({
