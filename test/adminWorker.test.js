@@ -628,12 +628,17 @@ test('automatic PatternRank publishes only a complete generation and reconciles 
   const autoDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-auto-'));
   const sqlitePath = path.join(autoDir, 'metrics.sqlite');
   const latestPath = path.join(autoDir, 'concepts', 'latest.json');
+  // Two different *degrees* (not two years of the same degree): the automatic
+  // partition family groups by (degree, decade) by default (#21), so two years
+  // of one degree now collapse into a single cohort and would publish after just
+  // one run, defeating this test's whole point (multi-cohort gating/retirement).
+  // Two degrees in the same decade keep two distinct cohorts under either grouping.
   const setup = `
 import json, sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 db.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, degree TEXT, year INTEGER, updated_at TEXT NOT NULL)")
-for year in (2024, 2025):
-    doc = {"id": f"auto-{year}", "title": "Community Learning Leadership", "abstract": "Community learning leadership supports schools.", "subjects": ["community learning leadership"], "degree": "Auto Degree", "year": year}
+for degree, year in (("Auto Degree Alpha", 2024), ("Auto Degree Beta", 2025)):
+    doc = {"id": f"auto-{degree.split()[-1].lower()}", "title": "Community Learning Leadership", "abstract": "Community learning leadership supports schools.", "subjects": ["community learning leadership"], "degree": degree, "year": year}
     db.execute("INSERT INTO documents VALUES (?, ?, ?, ?, ?)", (doc["id"], json.dumps(doc), doc["degree"], year, "2026-01-01T00:00:00+00:00"))
 db.commit()
 `;
@@ -677,7 +682,7 @@ db.commit()
   artifact = JSON.parse(await fs.readFile(latestPath, 'utf8'));
   assert.equal(artifact.source.documents, 2);
 
-  await execFileAsync('python3', ['-c', 'import sqlite3, sys; db=sqlite3.connect(sys.argv[1]); db.execute("DELETE FROM documents WHERE year = 2024"); db.commit()', sqlitePath]);
+  await execFileAsync('python3', ['-c', 'import sqlite3, sys; db=sqlite3.connect(sys.argv[1]); db.execute("DELETE FROM documents WHERE degree = ?", ("Auto Degree Alpha",)); db.commit()', sqlitePath]);
   await run();
   artifact = JSON.parse(await fs.readFile(latestPath, 'utf8'));
   assert.equal(artifact.source.documents, 1);

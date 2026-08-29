@@ -30,6 +30,25 @@ MIN_RANK_SCORE = float(os.environ.get("CONCEPT_PATTERNRANK_MIN_SCORE", "0.28"))
 MIN_DOCUMENT_FREQUENCY = max(2, int(os.environ.get("CONCEPT_MIN_DOCUMENT_FREQUENCY", "2")))
 CHECKPOINT_BATCH_SIZE = max(10, int(os.environ.get("CONCEPT_CHECKPOINT_BATCH_SIZE", "50")))
 MAX_PARTITION_DOCUMENTS = max(100, int(os.environ.get("CONCEPT_PARTITION_MAX_DOCUMENTS", "5000")))
+# #21: the automatic partition family groups documents by (degree, year-bucket).
+# Decade buckets are the default -- see cohort_year_bucket() below and
+# docs/phase-c-completion-plan.md #21 for why: exact-year grouping put the first
+# complete global concept dictionary years away at the pre-existing daily cadence,
+# and decade coarsening cuts cohort count by roughly the average distinct years per
+# degree with no schema change (partition_key hashes the scope, so old per-year
+# partitions just age out through the existing retirement path). Set to "year" to
+# restore the old exact-year grouping.
+CONCEPT_PARTITION_GRANULARITY = os.environ.get("CONCEPT_PARTITION_GRANULARITY", "decade").strip().lower()
+if CONCEPT_PARTITION_GRANULARITY not in ("decade", "year"):
+    CONCEPT_PARTITION_GRANULARITY = "decade"
+# #20: how many concept_partitions rows discover_partition bulk-upserts per
+# statement. 9 params/row; 80 rows/statement keeps a batch at 720 params, safely
+# under even the conservative pre-3.32 SQLite parameter-count ceiling of 999 (the
+# actual limit -- SQLITE_MAX_VARIABLE_NUMBER -- is not queryable through the
+# sqlite3/libsql_client APIs this file uses, so this stays a fixed, conservative
+# constant rather than something probed at runtime).
+PARTITION_WRITE_BATCH_SIZE = max(10, int(os.environ.get("CONCEPT_PARTITION_WRITE_BATCH_SIZE", "80")))
+PARTITION_KEY_CHUNK_SIZE = 500
 MAX_PARTITION_CONCEPTS = max(100, int(os.environ.get("CONCEPT_PARTITION_MAX_CONCEPTS", "5000")))
 MAX_GLOBAL_CONCEPTS = max(MAX_PARTITION_CONCEPTS, int(os.environ.get("CONCEPT_GLOBAL_MAX_CONCEPTS", "50000")))
 # A 2-gram is only folded into a containing 3-gram when the pair is well attested;
@@ -831,6 +850,29 @@ def ensure_incremental_schema(client):
     ]
     for statement in statements:
         client.execute(statement)
+    # #22: partition dirty-detection keys on a content fingerprint (see
+    # compute_cohort_content_fingerprints) instead of source_updated_at, which any
+    # enrichment pass bumps regardless of whether title/abstract/subjects changed.
+    _ensure_column(client, "concept_partitions", "content_fingerprint", "TEXT")
+
+
+def _ensure_column(client, table, column, sql_type):
+    """Idempotently add a column to an existing table.
+
+    ensure_incremental_schema only ever does CREATE TABLE IF NOT EXISTS -- there is
+    no ALTER-a-column-in idiom in this file yet (unlike src/db.js's tryExec pattern
+    for indexes/columns elsewhere in the app). SQLite and libsql both raise on a
+    duplicate column, so the guard is a plain try/except rather than an
+    information_schema probe, keeping this portable across the local sqlite3 module
+    used in tests and the remote libsql client used against Turso in production.
+    """
+    try:
+        client.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+    except Exception as exc:
+        message = str(exc).lower()
+        if "duplicate column" in message or "already exists" in message:
+            return
+        raise
 
 
 def load_job_params(client, job_id):
@@ -895,42 +937,164 @@ def scope_where(scope, alias="d"):
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
 
+def cohort_year_bucket(year):
+    """Coarsen a document year into the automatic-partition grouping key (#21)."""
+    year = int(year or 0)
+    if year <= 0:
+        return 0
+    if CONCEPT_PARTITION_GRANULARITY == "year":
+        return year
+    return (year // 10) * 10
+
+
+def _year_bucket_sql():
+    """SQL expression computing the same bucket cohort_year_bucket() computes in
+    Python, so the automatic GROUP BY (one round trip) can bucket server-side
+    instead of pulling every document's raw year back to bucket it here."""
+    if CONCEPT_PARTITION_GRANULARITY == "year":
+        return "COALESCE(year, 0)"
+    return "(CASE WHEN COALESCE(year, 0) <= 0 THEN 0 ELSE (COALESCE(year, 0) / 10) * 10 END)"
+
+
+def _cohort_scope_from_bucket(degree, bucket):
+    scope = {}
+    if degree:
+        scope["degree"] = degree
+    bucket = int(bucket or 0)
+    if bucket > 0:
+        scope["yearFrom"] = bucket
+        scope["yearTo"] = bucket if CONCEPT_PARTITION_GRANULARITY == "year" else bucket + 9
+    else:
+        scope["yearMissing"] = True
+    return scope
+
+
+def compute_content_fingerprint(doc_fields):
+    """sha256 over a cohort's concept-relevant fields only -- title, abstract (or
+    description), subjects, the same fields document_text()/doc_segments() actually
+    read -- sorted by doc_id so row order never affects the result (#22). Comparing
+    this instead of source_updated_at is the point of the fix: saveDocumentMetadata
+    (src/db.js) bumps updated_at on every write regardless of whether any of these
+    fields changed, and Phase B's runEnrichmentBatch (src/sync.js) calls it twice
+    per document per enrichment pass, so a plain timestamp compare re-marks a
+    cohort dirty on every enrichment run even when nothing concept-relevant moved.
+    """
+    parts = sorted(
+        f"{doc_id}\x1f{title or ''}\x1f{abstract or ''}\x1f{subjects or ''}"
+        for doc_id, title, abstract, subjects in doc_fields
+    )
+    return hashlib.sha256("\x1e".join(parts).encode("utf-8")).hexdigest()
+
+
+def fetch_cohort_content_fingerprints(client):
+    """One bulk per-document projection (json_extract, not an ordered GROUP_CONCAT --
+    the local sqlite3 module supports SQLite 3.44+'s ordered aggregate, but whether
+    Turso's libsql engine does cannot be verified without a live Turso connection,
+    and json_extract is a much older, more universally-supported feature), grouped
+    in Python into the same (degree, year-bucket) cohorts the automatic GROUP BY
+    query above uses, and hashed into one content fingerprint per cohort.
+    """
+    rows = client.execute(
+        """SELECT doc_id, COALESCE(degree, '') AS degree, COALESCE(year, 0) AS year,
+                  json_extract(metadata_json, '$.title') AS title,
+                  COALESCE(json_extract(metadata_json, '$.abstract'),
+                           json_extract(metadata_json, '$.description')) AS abstract,
+                  json_extract(metadata_json, '$.subjects') AS subjects
+           FROM documents"""
+    ).rows
+    grouped = {}
+    for row in rows:
+        cohort_key = (row["degree"] or "", cohort_year_bucket(row["year"]))
+        grouped.setdefault(cohort_key, []).append(
+            (row["doc_id"], row["title"], row["abstract"], row["subjects"])
+        )
+    return {cohort_key: compute_content_fingerprint(fields) for cohort_key, fields in grouped.items()}
+
+
+def fetch_scope_content_fingerprint(client, scope):
+    """Same fingerprint as fetch_cohort_content_fingerprints, scoped to one explicit
+    (non-automatic) partition scope -- kept as a single scoped query, matching the
+    explicit-scope path's existing once-per-job (not per-cohort) COUNT query."""
+    where, args = scope_where(scope)
+    rows = client.execute(
+        f"""SELECT d.doc_id AS doc_id,
+                   json_extract(d.metadata_json, '$.title') AS title,
+                   COALESCE(json_extract(d.metadata_json, '$.abstract'),
+                            json_extract(d.metadata_json, '$.description')) AS abstract,
+                   json_extract(d.metadata_json, '$.subjects') AS subjects
+            FROM documents d{where}""",
+        args,
+    ).rows
+    fields = [(row["doc_id"], row["title"], row["abstract"], row["subjects"]) for row in rows]
+    return compute_content_fingerprint(fields)
+
+
+def _upsert_partition_rows_bulk(client, rows):
+    """Bulk-upsert concept_partitions rows -- only the ones discover_partition found
+    to have actually changed this pass -- chunked at PARTITION_WRITE_BATCH_SIZE.
+    This is #20's fix: a first-ever pass over K fresh automatic cohorts costs
+    O(K / batch_size) statements here, not O(K); a rerun with nothing changed calls
+    this with an empty list and costs zero.
+    """
+    if not rows:
+        return
+    for start in range(0, len(rows), PARTITION_WRITE_BATCH_SIZE):
+        chunk = rows[start:start + PARTITION_WRITE_BATCH_SIZE]
+        placeholders = ",".join(["(?, ?, ?, ?, ?, ?, ?, ?, ?)"] * len(chunk))
+        params = []
+        for row in chunk:
+            params.extend(row)
+        client.execute(
+            f"""INSERT INTO concept_partitions (
+                  partition_key, scope_json, priority, enabled, status, source_document_count,
+                  source_updated_at, content_fingerprint, updated_at
+                ) VALUES {placeholders}
+                ON CONFLICT(partition_key) DO UPDATE SET
+                  scope_json = excluded.scope_json,
+                  priority = MAX(concept_partitions.priority, excluded.priority),
+                  enabled = excluded.enabled,
+                  source_document_count = excluded.source_document_count,
+                  source_updated_at = excluded.source_updated_at,
+                  content_fingerprint = excluded.content_fingerprint,
+                  status = excluded.status,
+                  updated_at = excluded.updated_at""",
+            params,
+        )
+
+
 def discover_partition(client, requested_scope=None, priority=0, force=False):
+    """Select the highest-priority changed partition, and persist scheduling state
+    for every candidate cohort.
+
+    #20 fix: the automatic path used to issue 3 statements per candidate cohort --
+    a per-cohort ``concept_partitions`` lookup, a per-cohort COUNT/MAX that
+    recomputes exactly what the GROUP BY summary below already returned for that
+    cohort, and an unconditional upsert even when nothing changed. That made every
+    run cost 3x the automatic cohort count in round trips, even when nothing in the
+    corpus changed anywhere. Fixed by: (a) using the GROUP BY summary rows directly
+    for document_count/source_updated_at on the automatic path -- no redundant
+    per-cohort COUNT; (b) one bulk ``concept_partitions`` fetch, indexed in memory,
+    instead of a per-cohort lookup; (c) writing only cohorts whose persisted state
+    actually changed this pass (see the unchanged-checks below), via one chunked
+    bulk upsert, plus retirement computed as a set difference over data already in
+    memory instead of relying on an unconditional updated_at bump to mark "seen".
+    The explicit-scope path is untouched: one job, one scope, a fresh COUNT is
+    already O(1) and legitimately needs current data.
+
+    #21: the automatic family's GROUP BY key is a (degree, year-bucket) cohort --
+    see cohort_year_bucket()/_year_bucket_sql() for the decade-vs-year grouping.
+
+    #22: "dirty" is decided by a content fingerprint of concept-relevant fields
+    (compute_content_fingerprint), not source_updated_at, which any enrichment
+    pass bumps regardless of whether title/abstract/subjects actually changed.
+    """
     requested_scope = normalized_scope(requested_scope)
     explicit_scope = bool(requested_scope)
-    if requested_scope:
-        candidates = [requested_scope]
-    else:
-        rows = client.execute(
-            """SELECT COALESCE(degree, '') AS degree,
-                      COALESCE(year, 0) AS partition_year,
-                      COUNT(*) AS document_count, MAX(updated_at) AS source_updated_at
-               FROM documents
-               GROUP BY COALESCE(degree, ''), COALESCE(year, 0)
-               ORDER BY degree, partition_year"""
-        ).rows
-        candidates = []
-        for row in rows:
-            scope = {}
-            if row["degree"]:
-                scope["degree"] = row["degree"]
-            if int(row["partition_year"] or 0) > 0:
-                scope["yearFrom"] = int(row["partition_year"])
-                scope["yearTo"] = int(row["partition_year"])
-            else:
-                scope["yearMissing"] = True
-            candidates.append(scope)
-
-    ranked = []
-    blocked = []
-    publication_changed = False
     now = utc_now()
-    for scope in candidates:
-        key = partition_key(scope, "custom" if explicit_scope else "automatic")
-        existing_rows = client.execute(
-            "SELECT * FROM concept_partitions WHERE partition_key = ?", [key]
-        ).rows
-        existing = existing_rows[0] if existing_rows else None
+
+    if explicit_scope:
+        scope = requested_scope
+        key = partition_key(scope, "custom")
         where, args = scope_where(scope)
         summary_rows = client.execute(
             f"SELECT COUNT(*) AS document_count, MAX(updated_at) AS source_updated_at FROM documents d{where}",
@@ -938,71 +1102,143 @@ def discover_partition(client, requested_scope=None, priority=0, force=False):
         ).rows
         summary = summary_rows[0]
         count = int(summary["document_count"] or 0)
-        if not count:
-            continue
+        cohorts = []
+        if count:
+            cohorts.append({
+                "scope": scope, "key": key, "count": count,
+                "sourceUpdatedAt": summary["source_updated_at"],
+                "fingerprint": fetch_scope_content_fingerprint(client, scope),
+            })
+        existing_rows = client.execute("SELECT * FROM concept_partitions WHERE partition_key = ?", [key]).rows
+        existing_by_key = {key: existing_rows[0]} if existing_rows else {}
+    else:
+        bucket_sql = _year_bucket_sql()
+        rows = client.execute(
+            f"""SELECT COALESCE(degree, '') AS degree, {bucket_sql} AS partition_year,
+                      COUNT(*) AS document_count, MAX(updated_at) AS source_updated_at
+               FROM documents
+               GROUP BY COALESCE(degree, ''), {bucket_sql}
+               ORDER BY degree, partition_year"""
+        ).rows
+        fingerprints = fetch_cohort_content_fingerprints(client)
+        cohorts = []
+        for row in rows:
+            count = int(row["document_count"] or 0)
+            if not count:
+                continue
+            degree = row["degree"] or ""
+            bucket = int(row["partition_year"] or 0)
+            scope = _cohort_scope_from_bucket(degree, bucket)
+            cohorts.append({
+                "scope": scope, "key": partition_key(scope, "automatic"), "count": count,
+                "sourceUpdatedAt": row["source_updated_at"],
+                "fingerprint": fingerprints.get((degree, bucket), ""),
+            })
+        existing_by_key = {
+            row["partition_key"]: row for row in client.execute("SELECT * FROM concept_partitions").rows
+        }
+
+    ranked = []
+    blocked = []
+    publication_changed = False
+    seen_keys = set()
+    blocked_writes = []
+    normal_upsert_rows = []
+
+    for cohort in cohorts:
+        key = cohort["key"]
+        scope = cohort["scope"]
+        count = cohort["count"]
+        seen_keys.add(key)
+        existing = existing_by_key.get(key)
+        scope_json = json.dumps(scope, sort_keys=True)
+
         if count > MAX_PARTITION_DOCUMENTS:
             message = (
                 f"Concept partition {key} contains {count} documents; refine it into non-overlapping program "
                 f"scopes or raise CONCEPT_PARTITION_MAX_DOCUMENTS={MAX_PARTITION_DOCUMENTS} after capacity testing."
             )
-            if requested_scope:
+            if explicit_scope:
                 raise ValueError(message)
             if existing and int(existing["enabled"] or 0) == 1 and int(existing["artifact_version"] or 0) > 0:
                 publication_changed = True
-            client.execute(
-                """INSERT INTO concept_partitions (
-                     partition_key, scope_json, priority, enabled, status, source_document_count,
-                     source_updated_at, error, updated_at
-                   ) VALUES (?, ?, ?, 0, 'blocked', ?, ?, ?, ?)
-                   ON CONFLICT(partition_key) DO UPDATE SET
-                     scope_json = excluded.scope_json, enabled = 0, status = 'blocked',
-                     source_document_count = excluded.source_document_count,
-                     source_updated_at = excluded.source_updated_at, error = excluded.error,
-                     updated_at = excluded.updated_at""",
-                [key, json.dumps(scope, sort_keys=True), int(priority), count, summary["source_updated_at"], message, now],
+            unchanged = (
+                existing is not None
+                and existing["scope_json"] == scope_json
+                and int(existing["enabled"] or 0) == 0
+                and existing["status"] == "blocked"
+                and int(existing["source_document_count"] or 0) == count
+                and str(existing["source_updated_at"] or "") == str(cohort["sourceUpdatedAt"] or "")
+                and str(existing["error"] or "") == message
             )
+            if not unchanged:
+                blocked_writes.append((key, scope_json, int(priority), count, cohort["sourceUpdatedAt"], message, now))
             blocked.append(message)
             continue
+
         last_completed = existing["last_completed_at"] if existing else None
+        existing_fingerprint = existing["content_fingerprint"] if existing else None
         dirty = (
             force or not last_completed
-            or str(summary["source_updated_at"] or "") > str(last_completed or "")
-            or (existing is not None and int(existing["source_document_count"] or 0) != count)
             or (existing is not None and existing["status"] != "complete")
+            or (existing is not None and int(existing["source_document_count"] or 0) != count)
+            or str(cohort["fingerprint"] or "") != str(existing_fingerprint or "")
         )
+        effective_priority = max(int(existing["priority"] or 0), int(priority)) if existing else int(priority)
+        effective_enabled = 0 if explicit_scope else 1
+        effective_status = "pending" if dirty else "complete"
+        unchanged = (
+            existing is not None
+            and existing["scope_json"] == scope_json
+            and int(existing["priority"] or 0) == effective_priority
+            and int(existing["enabled"] or 0) == effective_enabled
+            and existing["status"] == effective_status
+            and int(existing["source_document_count"] or 0) == count
+            and str(existing["source_updated_at"] or "") == str(cohort["sourceUpdatedAt"] or "")
+            and str(existing["content_fingerprint"] or "") == str(cohort["fingerprint"] or "")
+        )
+        if not unchanged:
+            normal_upsert_rows.append((
+                key, scope_json, int(priority), effective_enabled, effective_status,
+                count, cohort["sourceUpdatedAt"], cohort["fingerprint"], now,
+            ))
+        if dirty:
+            ranked.append((int(priority) + (1000 if not last_completed else 0), str(last_completed or ""), key, scope, count))
+
+    for row in blocked_writes:
         client.execute(
             """INSERT INTO concept_partitions (
                  partition_key, scope_json, priority, enabled, status, source_document_count,
-                 source_updated_at, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 source_updated_at, error, updated_at
+               ) VALUES (?, ?, ?, 0, 'blocked', ?, ?, ?, ?)
                ON CONFLICT(partition_key) DO UPDATE SET
-                 scope_json = excluded.scope_json,
-                 priority = MAX(concept_partitions.priority, excluded.priority),
-                 enabled = excluded.enabled,
+                 scope_json = excluded.scope_json, enabled = 0, status = 'blocked',
                  source_document_count = excluded.source_document_count,
-                 source_updated_at = excluded.source_updated_at,
-                 status = excluded.status,
+                 source_updated_at = excluded.source_updated_at, error = excluded.error,
                  updated_at = excluded.updated_at""",
-            [
-                key, json.dumps(scope, sort_keys=True), int(priority),
-                1 if not explicit_scope else 0,
-                "pending" if dirty else "complete", count, summary["source_updated_at"], now,
-            ],
+            list(row),
         )
-        if dirty:
-            ranked.append((int(priority) + (1000 if not last_completed else 0), str(last_completed or ""), key, scope, count))
+    _upsert_partition_rows_bulk(client, normal_upsert_rows)
+
     if not explicit_scope:
-        retired_rows = client.execute(
-            "SELECT partition_key FROM concept_partitions WHERE enabled = 1 AND updated_at <> ?",
-            [now],
-        ).rows
-        publication_changed = publication_changed or bool(retired_rows)
-        client.execute(
-            """UPDATE concept_partitions
-               SET enabled = 0, status = 'retired', updated_at = ?
-               WHERE enabled = 1 AND updated_at <> ?""",
-            [now, now],
-        )
+        # Retirement: a set difference over data already in memory, rather than
+        # relying on every surviving cohort's updated_at being bumped this pass to
+        # mark it "seen" -- that bump is exactly the unconditional write #20 removes.
+        currently_enabled_keys = {
+            key for key, row in existing_by_key.items() if int(row["enabled"] or 0) == 1
+        }
+        retire_keys = currently_enabled_keys - seen_keys
+        publication_changed = publication_changed or bool(retire_keys)
+        if retire_keys:
+            retire_list = sorted(retire_keys)
+            for start in range(0, len(retire_list), PARTITION_KEY_CHUNK_SIZE):
+                chunk = retire_list[start:start + PARTITION_KEY_CHUNK_SIZE]
+                placeholders = ",".join("?" for _ in chunk)
+                client.execute(
+                    f"""UPDATE concept_partitions SET enabled = 0, status = 'retired', updated_at = ?
+                        WHERE partition_key IN ({placeholders})""",
+                    [now, *chunk],
+                )
         if publication_changed:
             # A removed shard can move phrases below the corpus-wide DF gate.
             # Re-rank every surviving shard before publishing the new generation.
@@ -1011,18 +1247,15 @@ def discover_partition(client, requested_scope=None, priority=0, force=False):
                 [utc_now()],
             )
             ranked_keys = {item[2] for item in ranked}
-            pending_rows = client.execute(
-                """SELECT partition_key, scope_json, source_document_count, priority, last_completed_at
-                   FROM concept_partitions WHERE enabled = 1 AND status = 'pending'"""
-            ).rows
-            for row in pending_rows:
-                if row["partition_key"] in ranked_keys:
+            for key, row in existing_by_key.items():
+                if key in retire_keys or key in ranked_keys:
                     continue
-                ranked.append((
-                    int(row["priority"] or 0), str(row["last_completed_at"] or ""),
-                    row["partition_key"], json.loads(row["scope_json"]),
-                    int(row["source_document_count"] or 0),
-                ))
+                if int(row["enabled"] or 0) == 1 and row["status"] == "complete":
+                    ranked.append((
+                        int(row["priority"] or 0), str(row["last_completed_at"] or ""),
+                        key, json.loads(row["scope_json"]), int(row["source_document_count"] or 0),
+                    ))
+
     if not ranked:
         if not explicit_scope and (publication_changed or global_publication_pending(client)):
             return {"publishOnly": True, "publishGlobally": True, "warnings": blocked[:3]}
