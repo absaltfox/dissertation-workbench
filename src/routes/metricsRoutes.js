@@ -20,6 +20,15 @@ const WORKBENCH_SLICE_TTL_MS = CACHE_TTL_MS;
 const ANALYTICS_DOCUMENT_SAMPLE_LIMIT = 100;
 const DETAILED_ANALYTICS_RECORD_LIMIT = 5000;
 const VISUALIZATION_DOCUMENT_LIMIT = 5000;
+// Hard server-side ceiling on /api/metrics regardless of role (#24). This route
+// runs every JS aggregator in buildMetricsPayloadFromRecords over whatever
+// record count it is handed and synchronously serializes the whole `documents`
+// array; without a ceiling an admin request (e.g. maxRecords=56000) can stall
+// the event loop and risk exceeding V8's max string length. Matches
+// VISUALIZATION_DOCUMENT_LIMIT for consistency with every other route in this
+// phase. Admins who need the full corpus should page through
+// /api/workbench/* instead (already scale-tested, cursor-paged).
+const ADMIN_MAX_RECORDS_CEILING = 5000;
 
 function readRawMetricsParams(req) {
   return {
@@ -751,7 +760,9 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       res.status(403).json({ error: 'refresh is restricted to authenticated admin sessions.' });
       return;
     }
-    const effectiveMaxRecords = isAdminRequest ? maxRecords : Math.min(maxRecords, PUBLIC_MAX_RECORDS);
+    const effectiveMaxRecords = isAdminRequest
+      ? Math.min(maxRecords, ADMIN_MAX_RECORDS_CEILING)
+      : Math.min(maxRecords, PUBLIC_MAX_RECORDS);
     const effectiveScanLimit = isAdminRequest ? scanLimit : Math.min(scanLimit, PUBLIC_SCAN_LIMIT);
 
     const cacheKey = JSON.stringify({
