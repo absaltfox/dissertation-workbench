@@ -1704,3 +1704,140 @@ print(json.dumps({"few": run(few), "many": run(many)}, sort_keys=True))
   assert.equal(many.telemetry.extensionEdgesSkipped, 7);
   assert.equal(many.telemetry.extensionFanInLimit, 2);
 });
+
+// #35 half: a hub with two co-stemming surface forms ("student outcome" /
+// "student outcomes") must not have its fan-in decision counted twice just
+// because cluster_phrases's `extensions` dict is keyed by literal surface phrase.
+// Regression cover: before the fix, this fixture reports Hubs=2/Edges=8 (each
+// surface form independently decides "skip" and increments the shared counters);
+// grouping by component root and merging each root's absorbed set as a set (not a
+// concatenated list, which silently reintroduces the same double-count) gives the
+// truthful Hubs=1/Edges=4.
+test('variant clustering counts one fan-in decision per hub even with a co-stemming surface pair', async () => {
+  const clusterDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-fanin-costem-'));
+  const harnessPath = path.join(clusterDir, 'costem_fanin_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+hub1 = "student outcome"
+hub2 = "student outcomes"
+extensions = [hub1 + " " + w for w in ("policy", "funding", "tracking", "equity")]
+phrases = {hub1, hub2, *extensions}
+clusters, telemetry = bc.cluster_phrases(phrases, {p: 5 for p in phrases})
+print(json.dumps({
+    "telemetry": telemetry,
+    "hubCluster": sorted(next(c for c in clusters if hub1 in c)),
+    "clusters": len(clusters),
+}, sort_keys=True))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync(
+    'python3',
+    [harnessPath, path.resolve('scripts/build-concepts.py')],
+    { cwd: path.resolve('.'), env: { ...process.env, CONCEPT_VARIANT_EXTENSION_MAX_FAN_IN: '2' } },
+  );
+  const { telemetry, hubCluster, clusters } = JSON.parse(stdout);
+
+  // The truthful count: one hub (however many surface forms it has), 4 withheld
+  // extensions -- not the doubled Hubs=2/Edges=8 the surface-form keying produced.
+  assert.equal(telemetry.extensionHubsSkipped, 1);
+  assert.equal(telemetry.extensionEdgesSkipped, 4);
+  // Both co-stemming surface forms stay together (R1 already merged them); none of
+  // the 4 extensions folds in, since together they exceed the fan-in limit of 2.
+  assert.deepEqual(hubCluster, ['student outcome', 'student outcomes']);
+  assert.equal(clusters, 5);
+});
+
+// #31 half: fan-in must hold through merge_partition_artifacts, not just within one
+// shard's own cluster_phrases pass. Three shards each independently keep 2
+// extensions of the *same* hub -- each shard is legal on its own (2 <= the cap of
+// 2), but the union across shards is 6, well past it. Regression cover: before the
+// fix, merge unions every shard's variants unconditionally, so the merged hub ends
+// up with all 6 extensions attached (7-member component) and reports zero
+// withheld edges even though the fan-in limit was blown at merge time.
+test('merge re-enforces extension fan-in across shards and reports it truthfully', async () => {
+  const mergeDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-merge-fanin-'));
+  const harnessPath = path.join(mergeDir, 'merge_fanin_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+client = bc.SqliteClientWrapper(sys.argv[2])
+bc.ensure_incremental_schema(client)
+for shard in json.loads(sys.argv[3]):
+    documents = shard["artifact"]["stats"]["documents"]
+    client.execute(
+        "INSERT OR REPLACE INTO concept_partitions (partition_key, scope_json, priority, enabled,"
+        " status, source_document_count, artifact_version, updated_at)"
+        " VALUES (?, '{}', 0, 1, 'complete', ?, 1, '2026-01-01T00:00:00+00:00')",
+        [shard["key"], documents],
+    )
+    client.execute(
+        "INSERT OR REPLACE INTO concept_partition_artifacts (partition_key, version, artifact_json,"
+        " document_count, created_at) VALUES (?, 1, ?, ?, '2026-01-01T00:00:00+00:00')",
+        [shard["key"], json.dumps(shard["artifact"]), documents],
+    )
+merged = bc.merge_partition_artifacts(client)
+hub = "student outcome"
+hub_concept = next(
+    c for c in merged["concepts"] if c["canonical"] == hub or hub in c.get("variants", [])
+)
+print(json.dumps({
+    "hubMembers": sorted([hub_concept["canonical"], *hub_concept["variants"]]),
+    "totalConcepts": len(merged["concepts"]),
+    "stats": merged["stats"],
+    "canonicals": sorted(c["canonical"] for c in merged["concepts"]),
+}, sort_keys=True))
+`, 'utf8');
+
+  const hub = 'student outcome';
+  const shard = (key, extensions) => ({
+    key,
+    artifact: {
+      stats: { documents: 5, clusterTruncatedBuckets: 0, clusterTruncatedHeads: 0, clusterExtensionHubsSkipped: 0, clusterExtensionEdgesSkipped: 0 },
+      partition: { key },
+      concepts: [{
+        canonical: hub,
+        variants: extensions,
+        variantRules: Object.fromEntries(extensions.map((e) => [e, 'R3'])),
+        variantDocFreq: Object.fromEntries(extensions.map((e) => [e, 3])),
+        docFreq: 5,
+        docIndexes: [0, 1, 2, 3, 4],
+        patternRankScore: 0.6,
+      }],
+    },
+  });
+  const shards = [
+    shard('p-outcome-1', [`${hub} policy`, `${hub} funding`]),
+    shard('p-outcome-2', [`${hub} tracking`, `${hub} equity`]),
+    shard('p-outcome-3', [`${hub} access`, `${hub} quality`]),
+  ];
+  const dbPath = path.join(mergeDir, 'merge-fanin.sqlite');
+  const { stdout } = await execFileAsync(
+    'python3',
+    [harnessPath, path.resolve('scripts/build-concepts.py'), dbPath, JSON.stringify(shards)],
+    { cwd: path.resolve('.'), env: { ...process.env, CONCEPT_VARIANT_EXTENSION_MAX_FAN_IN: '2' } },
+  );
+  const result = JSON.parse(stdout);
+
+  // The hub's merged component must not exceed the fan-in limit + 1 (itself),
+  // regardless of how many shards independently, legally, contributed to it.
+  assert.ok(result.hubMembers.length <= 3, `hub component grew to ${result.hubMembers.length} members: ${result.hubMembers}`);
+  assert.deepEqual(result.hubMembers, [hub]);
+  // Every withheld extension survives as its own concept rather than vanishing.
+  assert.equal(result.totalConcepts, 7);
+  assert.deepEqual(result.canonicals, [
+    hub, `${hub} access`, `${hub} equity`, `${hub} funding`, `${hub} policy`, `${hub} quality`, `${hub} tracking`,
+  ]);
+  // Truthful telemetry: zero shard withheld anything on its own (each stayed
+  // within its own 2-extension cap), so every withheld edge counted here was
+  // caught by merge's own cross-shard re-check, and the totals must say so.
+  assert.equal(result.stats.mergeExtensionHubsSkipped, 1);
+  assert.equal(result.stats.mergeExtensionEdgesSkipped, 6);
+  assert.equal(result.stats.clusterExtensionHubsSkipped, 1);
+  assert.equal(result.stats.clusterExtensionEdgesSkipped, 6);
+});

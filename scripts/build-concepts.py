@@ -364,8 +364,14 @@ def cosine(a, b):
 def stem_for_similarity(token):
     """Strip common English plural suffixes for comparison only.
 
-    Mirrors ``stemForSim`` in src/conceptsPipeline.js so the Python worker and the
-    JavaScript pipeline cluster the same phrases the same way.
+    Mirrors ``stemForSim`` in src/conceptsPipeline.js -- the two functions apply the
+    identical plural-stripping rule, byte for byte. That is the only clustering
+    primitive the two pipelines still share: this worker's cluster_phrases() uses
+    blocking rules R1/R2/R3 with an enforced variant-extension fan-in cap, which
+    conceptsPipeline.js's clustering (an O(P^2) all-pairs threshold with no fan-in
+    cap) does not implement. conceptsPipeline.js's own clustering path is dead code
+    in production (see #34) -- only its persistence helpers, getConceptPipelineStatus
+    and persistConceptArtifact, are still live.
     """
     if len(token) > 5 and token.endswith("ies"):
         return token[:-3] + "y"
@@ -376,6 +382,30 @@ def stem_for_similarity(token):
 
 def phrase_stems(phrase):
     return tuple(stem_for_similarity(token) for token in phrase.split())
+
+
+def classify_variant_rule(canonical, phrase):
+    """Classify which cluster_phrases rule could connect ``phrase`` to ``canonical``.
+
+    Purely structural, derived from the two strings alone -- correct regardless of
+    which pass produced them (fresh partition build, merge, or a legacy artifact
+    that predates this classification) because R1 and R2 can only ever connect
+    phrases with identical *token counts* (R1 buckets on a stemmed-token frozenset,
+    R2 buckets on a stemmed-modifier tuple, both keyed by structures whose size is
+    the token count) while R3 is the only rule that connects a 2-gram to a 3-gram.
+    So a token-count mismatch is an exact, cheap R3 test; among same-length pairs,
+    an identical stemmed token set is R1 and anything else is R2. Used both to tag
+    freshly-built variants (see build_variant_map) and, at merge time, to classify
+    variants read back from any artifact -- old (bare-string, no tag) or new
+    (tagged) alike -- without trusting a possibly-stale stored value.
+    """
+    canonical_stems = phrase_stems(canonical)
+    variant_stems = phrase_stems(phrase)
+    if len(canonical_stems) != len(variant_stems):
+        return "R3"
+    if frozenset(canonical_stems) == frozenset(variant_stems):
+        return "R1"
+    return "R2"
 
 
 class DisjointSet:
@@ -526,17 +556,40 @@ def cluster_phrases(phrases, document_frequency):
         for phrase in absorbed:
             roots_before.setdefault(phrase, forest.find(phrase))
 
+    # `extensions` above is keyed by the literal surface bigram, but two distinct
+    # surface forms that co-stem (e.g. "student outcome" / "student outcomes") are
+    # already unioned by R1 by this point and so share one root -- meaning both keys
+    # independently hold the *same* absorbed trigram set for what is logically one
+    # hub. Grouping by root here, and merging each root's absorbed phrases with set
+    # union rather than list concatenation (concatenation would just double-count
+    # the shared trigrams under a different name), collapses that back to exactly
+    # one fan-in decision and one counter increment per hub, no matter how many
+    # surface forms it has (#35) -- verified by reproduction: keying by root while
+    # still concatenating gives the same doubled Edges=8 the surface-form keying
+    # did; only deduplicating the absorbed set gives the true Hubs=1/Edges=4.
+    extensions_by_root = {}
+    hub_repr = {}
+    for shorter, absorbed in extensions.items():
+        root = roots_before[shorter]
+        extensions_by_root.setdefault(root, set()).update(absorbed)
+        # Lexicographically smallest surface form, matching DisjointSet.components()'s
+        # own sort convention, so operators see one concrete, readable phrase per hub.
+        hub_repr[root] = min(hub_repr.get(root, shorter), shorter)
+
     extension_hubs_skipped = 0
     extension_edges_skipped = 0
-    for shorter in sorted(extensions):
-        absorbed = extensions[shorter]
-        distinct = {roots_before[phrase] for phrase in absorbed} - {roots_before[shorter]}
+    skipped_hub_sample = []
+    for root in sorted(extensions_by_root, key=lambda item: hub_repr[item]):
+        absorbed = extensions_by_root[root]
+        distinct = {roots_before[phrase] for phrase in absorbed} - {root}
         if len(distinct) > MAX_VARIANT_EXTENSION_FAN_IN:
             extension_hubs_skipped += 1
             extension_edges_skipped += len(absorbed)
+            if len(skipped_hub_sample) < 5:
+                skipped_hub_sample.append(hub_repr[root])
             continue
         for phrase in absorbed:
-            forest.union(shorter, phrase)
+            forest.union(root, phrase)
 
     return forest.components(), {
         "truncatedBuckets": truncated_buckets,
@@ -545,6 +598,7 @@ def cluster_phrases(phrases, document_frequency):
         "extensionHubsSkipped": extension_hubs_skipped,
         "extensionEdgesSkipped": extension_edges_skipped,
         "extensionFanInLimit": MAX_VARIANT_EXTENSION_FAN_IN,
+        "extensionHubsSkippedSample": skipped_hub_sample,
     }
 
 
@@ -562,7 +616,7 @@ def pick_canonical(cluster, document_frequency):
     return min(cluster, key=sort_key)
 
 
-def build_variant_map(concepts):
+def build_variant_map(concepts, doc_freq_for=None):
     """Project concepts[].variants into the flat map the JS consumer resolves through.
 
     Built from the *final* concept list so no variant can point at a canonical that
@@ -570,7 +624,21 @@ def build_variant_map(concepts):
     as a variant key. That second property matters: src/metrics.js resolves with
     ``variantMap[term] || (canonicalSet.has(term) ? term : null)``, so a canonical
     that leaked into the map would be silently redirected away from its own entry.
+
+    Also attaches two additive, non-breaking per-concept fields alongside the
+    unchanged ``variants`` string list -- ``variantRules`` (phrase -> "R1"|"R2"|"R3",
+    via classify_variant_rule) and ``variantDocFreq`` (phrase -> that phrase's own
+    document frequency, from ``doc_freq_for``, independent of the cluster's combined
+    docFreq). Both exist for #31's merge-time fan-in re-check: it needs to know which
+    variant edges are extension (R3, fan-in-limited) edges, and needs a phrase's own
+    frequency to give a cross-shard-orphaned extension an honest standalone concept
+    if the merge ends up withholding it from its shard's hub. Deliberately additive
+    (not a replacement of ``variants``) so every existing reader of the plain string
+    list -- src/metrics.js, this file's own assert_alias_invariants, the test suite --
+    keeps working unchanged; only merge_partition_artifacts's new fan-in re-check
+    (and, best-effort, legacy artifacts lacking these fields) needs to look them up.
     """
+    doc_freq_for = doc_freq_for or (lambda _phrase: 0)
     canonicals = {concept["canonical"] for concept in concepts}
     variant_to_canonical = {}
     for concept in concepts:
@@ -589,10 +657,18 @@ def build_variant_map(concepts):
     # A variant may have lost its owner to the tie-break above; drop it from that
     # concept so concepts[].variants and the map stay in exact agreement.
     for concept in concepts:
-        concept["variants"] = sorted(
+        canonical = concept["canonical"]
+        final_variants = sorted(
             variant for variant in concept["variants"]
-            if variant_to_canonical.get(variant) == concept["canonical"]
+            if variant_to_canonical.get(variant) == canonical
         )
+        concept["variants"] = final_variants
+        concept["variantRules"] = {
+            variant: classify_variant_rule(canonical, variant) for variant in final_variants
+        }
+        concept["variantDocFreq"] = {
+            variant: int(doc_freq_for(variant) or 0) for variant in final_variants
+        }
     return variant_to_canonical
 
 
@@ -1271,13 +1347,26 @@ def merge_partition_artifacts(client):
     total_docs = 0
     truncated_buckets = 0
     truncated_heads = 0
-    extension_hubs_skipped = 0
-    extension_edges_skipped = 0
+    shard_extension_hubs_skipped = 0
+    shard_extension_edges_skipped = 0
     shard_doc_freq = {}
     shard_score = {}
     shards = []
     partitions = []
     relations = DisjointSet()
+    # R3 (extension) edges are deferred rather than unioned immediately: fan-in was
+    # already enforced once, per shard, by cluster_phrases, but shard A keeping 2
+    # extensions of hub X and shard B independently keeping a *different* 2 of the
+    # same hub X each stay within their own shard's cap while jointly exceeding the
+    # global one once naively unioned (#31). So R1/R2 edges (no cap, never cross a
+    # token-count boundary -- see classify_variant_rule) are applied immediately, and
+    # every R3 edge is collected here to be re-checked, as one global population,
+    # after every shard has been scanned.
+    extension_edges = set()
+    # phrase -> [(shard_index, docFreq, patternRankScore), ...], populated only for
+    # R3 variants (see the loop below) and consulted only if the fan-in re-check
+    # ends up withholding that specific phrase from its hub.
+    orphaned_extension_doc_freq = {}
     for row in rows:
         artifact = json.loads(row["artifact_json"])
         stats = artifact.get("stats", {})
@@ -1287,9 +1376,10 @@ def merge_partition_artifacts(client):
         # operator looks, and under-clustering in any shard shows up there.
         truncated_buckets += int(stats.get("clusterTruncatedBuckets", 0) or 0)
         truncated_heads += int(stats.get("clusterTruncatedHeads", 0) or 0)
-        extension_hubs_skipped += int(stats.get("clusterExtensionHubsSkipped", 0) or 0)
-        extension_edges_skipped += int(stats.get("clusterExtensionEdgesSkipped", 0) or 0)
+        shard_extension_hubs_skipped += int(stats.get("clusterExtensionHubsSkipped", 0) or 0)
+        shard_extension_edges_skipped += int(stats.get("clusterExtensionEdgesSkipped", 0) or 0)
         partitions.append(artifact.get("partition", {}))
+        shard_index = len(shards)
         shard = {"documents": documents, "docFreq": {}, "docIndexes": {}}
         for concept in artifact.get("concepts", []):
             canonical = concept.get("canonical")
@@ -1304,11 +1394,89 @@ def merge_partition_artifacts(client):
             # shards - which really are document-disjoint - is sound. Only the
             # component-level roll-up below has to union instead of add.
             shard_doc_freq[canonical] = shard_doc_freq.get(canonical, 0) + doc_freq
-            shard_score[canonical] = max(shard_score.get(canonical, 0.0), float(concept.get("patternRankScore", 0)))
+            score = float(concept.get("patternRankScore", 0))
+            shard_score[canonical] = max(shard_score.get(canonical, 0.0), score)
             relations.add(canonical)
+            variant_rules = concept.get("variantRules") or {}
+            variant_doc_freq = concept.get("variantDocFreq") or {}
             for variant in concept.get("variants", []) or []:
-                relations.union(variant, canonical)
+                relations.add(variant)
+                rule = variant_rules.get(variant) or classify_variant_rule(canonical, variant)
+                if rule == "R3":
+                    # Deliberately NOT folded into shard_doc_freq/shard["docFreq"]
+                    # here (unlike the canonical, above): a variant's own frequency
+                    # is already fully represented via its shard's canonical, whose
+                    # docFreq is the *cluster's* combined frequency. Adding it again
+                    # here would double count it in both the canonical-tie-break
+                    # (`attested`, below) and merged_component_doc_freq's per-shard
+                    # sum -- confirmed by reproduction: it silently swapped which of
+                    # "learning community"/"learning communities" won the R1 tie
+                    # once both carried an equal, inflated shard_doc_freq. Recorded
+                    # here only as a fallback source, applied lazily (see
+                    # orphaned_extension_doc_freq below) if and only if the fan-in
+                    # re-check actually withholds this specific phrase from its hub
+                    # -- the one case where it stops being reachable any other way.
+                    vdf = int(variant_doc_freq.get(variant, 0) or 0)
+                    if vdf:
+                        orphaned_extension_doc_freq.setdefault(variant, []).append((shard_index, vdf, score))
+                    # R3 only ever connects a 2-gram (the hub) to a 3-gram (the
+                    # extension it absorbs); token count alone tells them apart
+                    # regardless of which one this shard chose as its canonical.
+                    if len(canonical.split()) < len(variant.split()):
+                        extension_edges.add((canonical, variant))
+                    else:
+                        extension_edges.add((variant, canonical))
+                else:
+                    relations.union(variant, canonical)
         shards.append(shard)
+
+    # Global fan-in re-check, mirroring cluster_phrases's own algorithm (roots
+    # snapshotted before any extension is applied; fan-in counted in distinct
+    # components, not surface forms) but over the merged R1/R2-only forest built
+    # above, so a hub's *global* absorption -- not just each shard's local slice of
+    # it -- is what gets capped.
+    roots_before = {}
+    for hub, extension in extension_edges:
+        roots_before.setdefault(hub, relations.find(hub))
+        roots_before.setdefault(extension, relations.find(extension))
+    extensions_by_hub_root = {}
+    hub_repr = {}
+    for hub, extension in extension_edges:
+        root = roots_before[hub]
+        extensions_by_hub_root.setdefault(root, set()).add(extension)
+        hub_repr[root] = min(hub_repr.get(root, hub), hub)
+
+    merge_extension_hubs_skipped = 0
+    merge_extension_edges_skipped = 0
+    merge_skipped_hub_sample = []
+    for root in sorted(extensions_by_hub_root, key=lambda item: hub_repr[item]):
+        absorbed = extensions_by_hub_root[root]
+        distinct = {roots_before[phrase] for phrase in absorbed} - {root}
+        if len(distinct) > MAX_VARIANT_EXTENSION_FAN_IN:
+            # Not logged here: merge_partition_artifacts has no reporter and existing
+            # test harnesses (merge_harness.py and friends) parse its stdout as a
+            # single JSON blob, so a stray print() here would break them. main()
+            # logs a summary from mergeExtensionHubsSkipped/EdgesSkipped once merge
+            # returns instead (see the two call sites below).
+            merge_extension_hubs_skipped += 1
+            merge_extension_edges_skipped += len(absorbed)
+            if len(merge_skipped_hub_sample) < 5:
+                merge_skipped_hub_sample.append(hub_repr[root])
+            # A withheld phrase stops being reachable via its hub's cluster, so give
+            # it its own standalone attestation now if it has no other source (i.e.
+            # it was never any shard's own canonical) -- otherwise it would silently
+            # vanish from the merged dictionary rather than surviving as its own
+            # concept, the way a per-shard-withheld extension already does.
+            for phrase in absorbed:
+                if phrase in shard_doc_freq:
+                    continue
+                for shard_index, vdf, score in orphaned_extension_doc_freq.get(phrase, []):
+                    shards[shard_index]["docFreq"][phrase] = shards[shard_index]["docFreq"].get(phrase, 0) + vdf
+                    shard_doc_freq[phrase] = shard_doc_freq.get(phrase, 0) + vdf
+                    shard_score[phrase] = max(shard_score.get(phrase, 0.0), score)
+            continue
+        for phrase in absorbed:
+            relations.union(root, phrase)
 
     # Cross-shard collision rule. Shard A may call a phrase a variant of X while shard
     # B calls the same phrase a variant of Y, or promotes it to a canonical of its own.
@@ -1344,10 +1512,18 @@ def merge_partition_artifacts(client):
         })
     concepts.sort(key=lambda concept: (-concept["docFreq"], -concept["patternRankScore"], concept["canonical"]))
     concepts = concepts[:MAX_GLOBAL_CONCEPTS]
-    variant_to_canonical = build_variant_map(concepts)
+    variant_to_canonical = build_variant_map(
+        concepts, doc_freq_for=lambda phrase: merged_component_doc_freq([phrase], shards, total_docs)
+    )
     generated_at = utc_now()
     merged = {
-        "version": 3,
+        # v4: see the matching comment at the partition-artifact site. The merged
+        # artifact additionally carries mergeExtensionHubsSkipped/EdgesSkipped,
+        # counting *only* cross-shard fan-in caught by this function's own re-check
+        # (#31); clusterExtensionHubsSkipped/EdgesSkipped below is the truthful total
+        # -- every shard's own permanently-withheld edges (which the merge cannot
+        # and does not reinstate) plus this merge-level re-check's own withholding.
+        "version": 4,
         "generatedAt": generated_at,
         "source": {"documents": total_docs, "method": "patternrank_incremental", "model": MODEL_NAME, "partitions": partitions},
         "stats": {
@@ -1358,8 +1534,11 @@ def merge_partition_artifacts(client):
             "concepts": len(concepts), "singleDocConcepts": sum(1 for concept in concepts if concept["docFreq"] == 1),
             "aliases": len(variant_to_canonical), "patternRankRejected": 0, "documents": total_docs, "failed": 0,
             "clusterTruncatedBuckets": truncated_buckets, "clusterTruncatedHeads": truncated_heads,
-            "clusterExtensionHubsSkipped": extension_hubs_skipped,
-            "clusterExtensionEdgesSkipped": extension_edges_skipped,
+            "clusterExtensionHubsSkipped": shard_extension_hubs_skipped + merge_extension_hubs_skipped,
+            "clusterExtensionEdgesSkipped": shard_extension_edges_skipped + merge_extension_edges_skipped,
+            "mergeExtensionHubsSkipped": merge_extension_hubs_skipped,
+            "mergeExtensionEdgesSkipped": merge_extension_edges_skipped,
+            "mergeExtensionHubsSkippedSample": merge_skipped_hub_sample,
             "partitions": len(partitions),
         },
         "concepts": concepts,
@@ -1367,6 +1546,23 @@ def merge_partition_artifacts(client):
     }
     assert_document_frequency_invariants(merged, "merged concept artifact")
     return assert_alias_invariants(merged, "merged concept artifact")
+
+
+def log_merge_fanin(reporter, merged_artifact):
+    """Log cross-shard extension fan-in withheld by merge_partition_artifacts's own
+    re-check (#31), if any. Kept out of merge_partition_artifacts itself so its
+    output stays pure JSON for the existing test harnesses that parse its stdout."""
+    stats = merged_artifact.get("stats", {})
+    hubs = int(stats.get("mergeExtensionHubsSkipped", 0) or 0)
+    edges = int(stats.get("mergeExtensionEdgesSkipped", 0) or 0)
+    if hubs:
+        sample = stats.get("mergeExtensionHubsSkippedSample") or []
+        sample_note = f" (e.g. {', '.join(repr(s) for s in sample)})" if sample else ""
+        reporter.append_log(
+            f"{hubs} hub(s){sample_note} would have exceeded the extension fan-in limit only once "
+            f"every shard's independently-kept extensions were combined at merge time; {edges} "
+            "extension(s) were withheld from their hub and kept as distinct concepts instead.\n"
+        )
 
 
 def main():
@@ -1406,6 +1602,7 @@ def main():
                     f"Cannot republish after partition retirement while {readiness['pending']} partitions are pending."
                 )
             merged_artifact = merge_partition_artifacts(client)
+            log_merge_fanin(reporter, merged_artifact)
             upload_concept_artifact(merged_artifact)
             mark_global_published(client)
             result = {
@@ -1571,9 +1768,11 @@ def main():
                 "always the lexicographically later ones. Raise CONCEPT_MAX_BUCKET_COMPARISONS to cluster them.\n"
             )
         if cluster_truncation["extensionHubsSkipped"]:
+            sample = cluster_truncation.get("extensionHubsSkippedSample") or []
+            sample_note = f" (e.g. {', '.join(repr(s) for s in sample)})" if sample else ""
             reporter.append_log(
                 f"{cluster_truncation['extensionHubsSkipped']} phrase(s) in partition {key} had more than "
-                f"{cluster_truncation['extensionFanInLimit']} longer forms extending them, so "
+                f"{cluster_truncation['extensionFanInLimit']} longer forms extending them{sample_note}, so "
                 f"{cluster_truncation['extensionEdgesSkipped']} extension(s) were kept as distinct concepts "
                 "rather than folded into the shorter phrase. These are hub topics, not sliding-window "
                 "fragments. Raise CONCEPT_VARIANT_EXTENSION_MAX_FAN_IN to merge them anyway.\n"
@@ -1603,9 +1802,16 @@ def main():
             })
         concepts.sort(key=lambda concept: (-concept["docFreq"], -concept["patternRankScore"], concept["canonical"]))
         concepts = concepts[:MAX_PARTITION_CONCEPTS]
-        variant_to_canonical = build_variant_map(concepts)
+        variant_to_canonical = build_variant_map(concepts, doc_freq_for=phrase_document_frequency.get)
         artifact = {
-            "version": 3, "generatedAt": utc_now(),
+            # v4: concepts[].variants is unchanged (a plain phrase-string list), but
+            # each concept now also carries variantRules/variantDocFreq (see
+            # build_variant_map) so merge_partition_artifacts can re-enforce the
+            # extension fan-in cap over the *global* component graph (#31/#35)
+            # instead of trusting each shard's already-applied, shard-local cap.
+            # Additive fields only -- no existing reader of concepts[].variants,
+            # variantToCanonical, or stats needs to change for this bump.
+            "version": 4, "generatedAt": utc_now(),
             "source": {"documents": len(docs), "method": "patternrank_incremental", "model": MODEL_NAME, "scope": scope},
             "stats": {
                 "candidatePhrases": len(phrase_docs), "qualityFilteredPhrases": len(accepted_docs),
@@ -1634,6 +1840,7 @@ def main():
         should_publish = selected["publishGlobally"] and readiness["complete"]
         if should_publish:
             merged_artifact = merge_partition_artifacts(client)
+            log_merge_fanin(reporter, merged_artifact)
         reporter.report(
             "write_results", "Writing Versioned Results",
             detail=(
