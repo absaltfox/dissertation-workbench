@@ -115,6 +115,30 @@ stream + parse, not by corpus size.
   operator can deliberately re-attempt previously failed documents; the nightly
   run never sets it.
 
+## UI controls
+
+Two controls, each following an existing admin-panel precedent.
+
+- **Manual run** — a new fieldset in the Operational Jobs grid
+  (`public/index.html` `#admin-jobs` → `.job-controls-grid`), modeled on the
+  existing "Bibliographic Lookups" block (`index.html:722`): a batch-size /
+  max-documents input, a "Run Citation Scan" button posting to
+  `POST /api/admin/jobs/citation-scan`, a "Retry previous failures" checkbox
+  (the explicit `retryFailures` opt-in), and a "Preview Pending" line showing how
+  many documents currently qualify. Handlers go in `public/app/admin.js` beside
+  the existing `runCatalogueLookupsBtn` wiring. Progress, logs, and result counts
+  appear in the existing Admin Jobs list automatically — the job is just another
+  `admin_jobs` row, so no separate progress UI is needed.
+- **Schedule** — configured by env only, matching the daily concept rebuild
+  (which uses `DAILY_HOUR_LOCAL` and is never toggled from the UI). The knobs are
+  `CITATION_SCAN_NIGHTLY_ENABLED` and `CITATION_SCAN_NIGHTLY_HOUR_LOCAL`
+  (documented in `.env.*.example`). The UI surfaces the schedule **read-only** as
+  a new status card in the settings status grid
+  (`public/index.html:705`, beside `documentSyncStatus` /
+  `conceptPipelineStatus`), showing: enabled?, scheduled hour, last run, next run,
+  and pending-backlog count. There is no in-UI enable/hour switch; changing the
+  schedule is a config change, as with concept rebuild.
+
 ## Reconciliation (unchanged, still separate)
 
 The new job produces/updates deduplicated citation rows but starts **no** external
@@ -146,8 +170,14 @@ decoupled per `docs/admin-worker-job-standards.md`; this plan does not chain the
 - `src/server.js` — second daily scheduler + shared `scheduleDaily` helper; wiring
   beside `stopDailyConceptScheduler`.
 - `src/routes/adminJobsRoutes.js` (or `adminOperationsRoutes.js`) — on-demand
-  endpoint with optional `retryFailures`.
-- `public/app/admin.js`, `public/index.html` — trigger + status surfacing.
+  endpoint with optional `retryFailures`; extend the jobs status payload with
+  citation-scan schedule state (enabled, hour, last/next run, pending count) so
+  the status card has a data source, mirroring `conceptPipelineStatus`.
+- `public/index.html` — new "Citation Scan" run fieldset in the Operational Jobs
+  grid, and a read-only schedule status card in the settings status grid.
+- `public/app/admin.js` — run-button + preview handlers and status-card render.
+- `.env.development.example`, `.env.production.example` — document the new nightly
+  scan env knobs.
 - `docs/admin-worker-job-standards.md` — document the re-streaming citation scan
   job and its selection/failure/rate rules.
 
