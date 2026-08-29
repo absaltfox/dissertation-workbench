@@ -383,14 +383,11 @@ def cosine(a, b):
 def stem_for_similarity(token):
     """Strip common English plural suffixes for comparison only.
 
-    Mirrors ``stemForSim`` in src/conceptsPipeline.js -- the two functions apply the
-    identical plural-stripping rule, byte for byte. That is the only clustering
-    primitive the two pipelines still share: this worker's cluster_phrases() uses
-    blocking rules R1/R2/R3 with an enforced variant-extension fan-in cap, which
-    conceptsPipeline.js's clustering (an O(P^2) all-pairs threshold with no fan-in
-    cap) does not implement. conceptsPipeline.js's own clustering path is dead code
-    in production (see #34) -- only its persistence helpers, getConceptPipelineStatus
-    and persistConceptArtifact, are still live.
+    This worker's cluster_phrases() is the sole concept-clustering implementation:
+    it uses blocking rules R1/R2/R3 with an enforced variant-extension fan-in cap.
+    The former JavaScript clustering path (an O(P^2) all-pairs threshold with no
+    fan-in cap) was removed in #34; src/conceptsPipeline.js now retains only its
+    persistence helpers, getConceptPipelineStatus and persistConceptArtifact.
     """
     if len(token) > 5 and token.endswith("ies"):
         return token[:-3] + "y"
