@@ -628,12 +628,17 @@ test('automatic PatternRank publishes only a complete generation and reconciles 
   const autoDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-auto-'));
   const sqlitePath = path.join(autoDir, 'metrics.sqlite');
   const latestPath = path.join(autoDir, 'concepts', 'latest.json');
+  // Two different *degrees* (not two years of the same degree): the automatic
+  // partition family groups by (degree, decade) by default (#21), so two years
+  // of one degree now collapse into a single cohort and would publish after just
+  // one run, defeating this test's whole point (multi-cohort gating/retirement).
+  // Two degrees in the same decade keep two distinct cohorts under either grouping.
   const setup = `
 import json, sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 db.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, degree TEXT, year INTEGER, updated_at TEXT NOT NULL)")
-for year in (2024, 2025):
-    doc = {"id": f"auto-{year}", "title": "Community Learning Leadership", "abstract": "Community learning leadership supports schools.", "subjects": ["community learning leadership"], "degree": "Auto Degree", "year": year}
+for degree, year in (("Auto Degree Alpha", 2024), ("Auto Degree Beta", 2025)):
+    doc = {"id": f"auto-{degree.split()[-1].lower()}", "title": "Community Learning Leadership", "abstract": "Community learning leadership supports schools.", "subjects": ["community learning leadership"], "degree": degree, "year": year}
     db.execute("INSERT INTO documents VALUES (?, ?, ?, ?, ?)", (doc["id"], json.dumps(doc), doc["degree"], year, "2026-01-01T00:00:00+00:00"))
 db.commit()
 `;
@@ -677,7 +682,7 @@ db.commit()
   artifact = JSON.parse(await fs.readFile(latestPath, 'utf8'));
   assert.equal(artifact.source.documents, 2);
 
-  await execFileAsync('python3', ['-c', 'import sqlite3, sys; db=sqlite3.connect(sys.argv[1]); db.execute("DELETE FROM documents WHERE year = 2024"); db.commit()', sqlitePath]);
+  await execFileAsync('python3', ['-c', 'import sqlite3, sys; db=sqlite3.connect(sys.argv[1]); db.execute("DELETE FROM documents WHERE degree = ?", ("Auto Degree Alpha",)); db.commit()', sqlitePath]);
   await run();
   artifact = JSON.parse(await fs.readFile(latestPath, 'utf8'));
   assert.equal(artifact.source.documents, 1);
@@ -1703,4 +1708,492 @@ print(json.dumps({"few": run(few), "many": run(many)}, sort_keys=True))
   assert.equal(many.telemetry.extensionHubsSkipped, 1);
   assert.equal(many.telemetry.extensionEdgesSkipped, 7);
   assert.equal(many.telemetry.extensionFanInLimit, 2);
+});
+
+// #35 half: a hub with two co-stemming surface forms ("student outcome" /
+// "student outcomes") must not have its fan-in decision counted twice just
+// because cluster_phrases's `extensions` dict is keyed by literal surface phrase.
+// Regression cover: before the fix, this fixture reports Hubs=2/Edges=8 (each
+// surface form independently decides "skip" and increments the shared counters);
+// grouping by component root and merging each root's absorbed set as a set (not a
+// concatenated list, which silently reintroduces the same double-count) gives the
+// truthful Hubs=1/Edges=4.
+test('variant clustering counts one fan-in decision per hub even with a co-stemming surface pair', async () => {
+  const clusterDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-fanin-costem-'));
+  const harnessPath = path.join(clusterDir, 'costem_fanin_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+hub1 = "student outcome"
+hub2 = "student outcomes"
+extensions = [hub1 + " " + w for w in ("policy", "funding", "tracking", "equity")]
+phrases = {hub1, hub2, *extensions}
+clusters, telemetry = bc.cluster_phrases(phrases, {p: 5 for p in phrases})
+print(json.dumps({
+    "telemetry": telemetry,
+    "hubCluster": sorted(next(c for c in clusters if hub1 in c)),
+    "clusters": len(clusters),
+}, sort_keys=True))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync(
+    'python3',
+    [harnessPath, path.resolve('scripts/build-concepts.py')],
+    { cwd: path.resolve('.'), env: { ...process.env, CONCEPT_VARIANT_EXTENSION_MAX_FAN_IN: '2' } },
+  );
+  const { telemetry, hubCluster, clusters } = JSON.parse(stdout);
+
+  // The truthful count: one hub (however many surface forms it has), 4 withheld
+  // extensions -- not the doubled Hubs=2/Edges=8 the surface-form keying produced.
+  assert.equal(telemetry.extensionHubsSkipped, 1);
+  assert.equal(telemetry.extensionEdgesSkipped, 4);
+  // Both co-stemming surface forms stay together (R1 already merged them); none of
+  // the 4 extensions folds in, since together they exceed the fan-in limit of 2.
+  assert.deepEqual(hubCluster, ['student outcome', 'student outcomes']);
+  assert.equal(clusters, 5);
+});
+
+// #31 half: fan-in must hold through merge_partition_artifacts, not just within one
+// shard's own cluster_phrases pass. Three shards each independently keep 2
+// extensions of the *same* hub -- each shard is legal on its own (2 <= the cap of
+// 2), but the union across shards is 6, well past it. Regression cover: before the
+// fix, merge unions every shard's variants unconditionally, so the merged hub ends
+// up with all 6 extensions attached (7-member component) and reports zero
+// withheld edges even though the fan-in limit was blown at merge time.
+test('merge re-enforces extension fan-in across shards and reports it truthfully', async () => {
+  const mergeDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-merge-fanin-'));
+  const harnessPath = path.join(mergeDir, 'merge_fanin_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+client = bc.SqliteClientWrapper(sys.argv[2])
+bc.ensure_incremental_schema(client)
+for shard in json.loads(sys.argv[3]):
+    documents = shard["artifact"]["stats"]["documents"]
+    client.execute(
+        "INSERT OR REPLACE INTO concept_partitions (partition_key, scope_json, priority, enabled,"
+        " status, source_document_count, artifact_version, updated_at)"
+        " VALUES (?, '{}', 0, 1, 'complete', ?, 1, '2026-01-01T00:00:00+00:00')",
+        [shard["key"], documents],
+    )
+    client.execute(
+        "INSERT OR REPLACE INTO concept_partition_artifacts (partition_key, version, artifact_json,"
+        " document_count, created_at) VALUES (?, 1, ?, ?, '2026-01-01T00:00:00+00:00')",
+        [shard["key"], json.dumps(shard["artifact"]), documents],
+    )
+merged = bc.merge_partition_artifacts(client)
+hub = "student outcome"
+hub_concept = next(
+    c for c in merged["concepts"] if c["canonical"] == hub or hub in c.get("variants", [])
+)
+print(json.dumps({
+    "hubMembers": sorted([hub_concept["canonical"], *hub_concept["variants"]]),
+    "totalConcepts": len(merged["concepts"]),
+    "stats": merged["stats"],
+    "canonicals": sorted(c["canonical"] for c in merged["concepts"]),
+}, sort_keys=True))
+`, 'utf8');
+
+  const hub = 'student outcome';
+  const shard = (key, extensions) => ({
+    key,
+    artifact: {
+      stats: { documents: 5, clusterTruncatedBuckets: 0, clusterTruncatedHeads: 0, clusterExtensionHubsSkipped: 0, clusterExtensionEdgesSkipped: 0 },
+      partition: { key },
+      concepts: [{
+        canonical: hub,
+        variants: extensions,
+        variantRules: Object.fromEntries(extensions.map((e) => [e, 'R3'])),
+        variantDocFreq: Object.fromEntries(extensions.map((e) => [e, 3])),
+        docFreq: 5,
+        docIndexes: [0, 1, 2, 3, 4],
+        patternRankScore: 0.6,
+      }],
+    },
+  });
+  const shards = [
+    shard('p-outcome-1', [`${hub} policy`, `${hub} funding`]),
+    shard('p-outcome-2', [`${hub} tracking`, `${hub} equity`]),
+    shard('p-outcome-3', [`${hub} access`, `${hub} quality`]),
+  ];
+  const dbPath = path.join(mergeDir, 'merge-fanin.sqlite');
+  const { stdout } = await execFileAsync(
+    'python3',
+    [harnessPath, path.resolve('scripts/build-concepts.py'), dbPath, JSON.stringify(shards)],
+    { cwd: path.resolve('.'), env: { ...process.env, CONCEPT_VARIANT_EXTENSION_MAX_FAN_IN: '2' } },
+  );
+  const result = JSON.parse(stdout);
+
+  // The hub's merged component must not exceed the fan-in limit + 1 (itself),
+  // regardless of how many shards independently, legally, contributed to it.
+  assert.ok(result.hubMembers.length <= 3, `hub component grew to ${result.hubMembers.length} members: ${result.hubMembers}`);
+  assert.deepEqual(result.hubMembers, [hub]);
+  // Every withheld extension survives as its own concept rather than vanishing.
+  assert.equal(result.totalConcepts, 7);
+  assert.deepEqual(result.canonicals, [
+    hub, `${hub} access`, `${hub} equity`, `${hub} funding`, `${hub} policy`, `${hub} quality`, `${hub} tracking`,
+  ]);
+  // Truthful telemetry: zero shard withheld anything on its own (each stayed
+  // within its own 2-extension cap), so every withheld edge counted here was
+  // caught by merge's own cross-shard re-check, and the totals must say so.
+  assert.equal(result.stats.mergeExtensionHubsSkipped, 1);
+  assert.equal(result.stats.mergeExtensionEdgesSkipped, 6);
+  assert.equal(result.stats.clusterExtensionHubsSkipped, 1);
+  assert.equal(result.stats.clusterExtensionEdgesSkipped, 6);
+});
+
+// ---------------------------------------------------------------------------
+// Phase C gates (#10 completion gate): countable cold start (#21, supported by
+// #20), no-op rerun (#22, supported by #20), fan-in holds through merge
+// (#31/#35, covered by the two tests immediately above this section).
+// ---------------------------------------------------------------------------
+
+// Gate A, statement-count half (#20): discover_partition's own statement count
+// must not scale with cohort count once nothing is changing -- this is the
+// mechanical fix Gate A's run-count bound depends on (fewer statements per
+// cohort is what makes a much larger K tractable at all).
+test('Gate A / #20: discover_partition statement count does not scale with cohort count on a steady-state pass', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'gate-a-statement-count-'));
+  const harnessPath = path.join(dir, 'statement_count_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sqlite3, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+db_path = sys.argv[2]
+k = int(sys.argv[3])
+
+db = sqlite3.connect(db_path)
+db.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, degree TEXT, year INTEGER, updated_at TEXT NOT NULL)")
+for i in range(k):
+    doc = {
+        "id": f"doc-{i}", "title": f"Distinct Topic {i}",
+        "abstract": f"Distinct topic {i} discussion of unrelated subject matter.",
+        "subjects": [f"topic-{i}"],
+    }
+    db.execute(
+        "INSERT INTO documents VALUES (?, ?, ?, ?, ?)",
+        (doc["id"], json.dumps(doc), f"Degree {i}", 2020, "2026-01-01T00:00:00+00:00"),
+    )
+db.commit()
+db.close()
+
+client = bc.SqliteClientWrapper(db_path)
+bc.ensure_incremental_schema(client)
+
+counts = {"calls": 0}
+def counting_execute(sql, params=None):
+    counts["calls"] += 1
+    cursor = client.conn.cursor()
+    cursor.execute(sql, tuple(params or ()))
+    client.conn.commit()
+    class ResultSet:
+        def __init__(self, cursor):
+            self.rows = cursor.fetchall()
+    return ResultSet(cursor)
+client.execute = counting_execute
+
+# Pass 1: nothing in concept_partitions yet (a from-scratch cold start).
+counts["calls"] = 0
+bc.discover_partition(client)
+fresh_pass_statements = counts["calls"]
+
+# Simulate every cohort's worker run having finished successfully, so pass 2
+# starts from "last completed pass had no changes" -- the scenario #20's fix
+# targets, and the one this test's assertions are about.
+client.execute(
+    "UPDATE concept_partitions SET status = 'complete', last_completed_at = updated_at, artifact_version = 1 WHERE enabled = 1"
+)
+bc.mark_global_published(client)
+
+counts["calls"] = 0
+selected = bc.discover_partition(client)
+unchanged_pass_statements = counts["calls"]
+
+print(json.dumps({
+    "freshPassStatements": fresh_pass_statements,
+    "unchangedPassStatements": unchanged_pass_statements,
+    "selectedIsNone": selected is None,
+}))
+`, 'utf8');
+
+  const measure = async (k) => {
+    const dbPath = path.join(dir, `statements-${k}.sqlite`);
+    const { stdout } = await execFileAsync(
+      'python3',
+      [harnessPath, path.resolve('scripts/build-concepts.py'), dbPath, String(k)],
+      { cwd: path.resolve('.') },
+    );
+    return JSON.parse(stdout);
+  };
+
+  const small = await measure(5);
+  const large = await measure(50);
+
+  assert.equal(small.selectedIsNone, true);
+  assert.equal(large.selectedIsNone, true);
+  // The steady-state statement count must not grow with cohort count.
+  assert.equal(small.unchangedPassStatements, large.unchangedPassStatements);
+  assert.ok(
+    small.unchangedPassStatements <= 6,
+    `expected a small constant, got ${small.unchangedPassStatements}`,
+  );
+  // Both K=5 and K=50 fit inside one write batch (PARTITION_WRITE_BATCH_SIZE),
+  // so even the from-scratch pass stays flat here -- a world apart from the
+  // pre-fix 3-statements-per-cohort growth (15 vs 150 for these two K values).
+  assert.equal(small.freshPassStatements, large.freshPassStatements);
+});
+
+// Gate A, run-count half (#21): phrase-disjoint cohorts publish in exactly K
+// runs, and decade coarsening needs strictly fewer runs than exact-year
+// grouping over the same corpus.
+test('Gate A / #21: phrase-disjoint cohorts publish in exactly K runs, fewer under decade coarsening', async () => {
+  const gateDir = await fs.mkdtemp(path.join(testDataDir, 'gate-a-disjoint-'));
+  const buildDb = async (sqlitePath) => {
+    const setup = `
+import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, degree TEXT, year INTEGER, updated_at TEXT NOT NULL)")
+degrees = {
+    "Disjoint Physics": ("Quantum Entanglement Research", "Quantum entanglement research explores nonlocal correlation phenomena.", ["quantum entanglement research"]),
+    "Disjoint History": ("Colonial Trade Networks", "Colonial trade networks reshaped regional maritime commerce routes.", ["colonial trade networks"]),
+}
+for degree, (title, abstract, subjects) in degrees.items():
+    for year in (2021, 2022, 2023):
+        doc_id = f"{degree.split()[-1].lower()}-{year}"
+        doc = {"id": doc_id, "title": title, "abstract": abstract, "subjects": subjects, "degree": degree, "year": year}
+        db.execute("INSERT INTO documents VALUES (?, ?, ?, ?, ?)", (doc_id, json.dumps(doc), degree, year, "2026-01-01T00:00:00+00:00"))
+db.commit()
+`;
+    await execFileAsync('python3', ['-c', setup, sqlitePath]);
+  };
+
+  const countRunsUntilPublished = async (granularity) => {
+    const dir = await fs.mkdtemp(path.join(gateDir, `${granularity}-`));
+    const sqlitePath = path.join(dir, 'metrics.sqlite');
+    const latestPath = path.join(dir, 'concepts', 'latest.json');
+    await buildDb(sqlitePath);
+    const env = {
+      ...process.env,
+      SQLITE_PATH: sqlitePath,
+      APP_DATA_DIR: dir,
+      TURSO_DATABASE_URL: '',
+      ADMIN_JOB_ID: '',
+      NODE_ENV: 'test',
+      CONCEPT_EMBEDDING_BACKEND: 'deterministic_test',
+      CONCEPT_PATTERNRANK_MIN_SCORE: '-1',
+      CONCEPT_PARTITION_GRANULARITY: granularity,
+    };
+    let runs = 0;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await execFileAsync('python3', ['scripts/build-concepts.py'], { cwd: path.resolve('.'), env });
+      runs += 1;
+      try { await fs.access(latestPath); break; } catch { /* first generation still incomplete */ }
+    }
+    await fs.access(latestPath); // fail loudly (not silently time out) if it never published
+    return runs;
+  };
+
+  const decadeRuns = await countRunsUntilPublished('decade');
+  const yearRuns = await countRunsUntilPublished('year');
+
+  // Two phrase-disjoint degrees, each spanning one decade -> exactly 2 decade
+  // cohorts with no shared vocabulary to ripple: the clean K == runs bound.
+  assert.equal(decadeRuns, 2);
+  // The same corpus under exact-year grouping splits into up to 6 cohorts (2
+  // degrees x 3 years) -- strictly more runs to reach the same first generation.
+  assert.ok(
+    yearRuns > decadeRuns,
+    `expected year-granularity runs (${yearRuns}) > decade-granularity runs (${decadeRuns})`,
+  );
+});
+
+// Gate A, vocabulary-sharing half (#21): cohorts that share borderline
+// vocabulary may need a bounded number of extra runs past K (the
+// save_partition_candidates DF-crossing ripple), but that ripple must converge
+// -- a subsequent, completely unchanged run must re-pend nothing.
+test('Gate A / #21: vocabulary-sharing cohorts publish within K + a small ripple bound, and the ripple converges', async () => {
+  const gateDir = await fs.mkdtemp(path.join(testDataDir, 'gate-a-vocab-share-'));
+  const sqlitePath = path.join(gateDir, 'metrics.sqlite');
+  const latestPath = path.join(gateDir, 'concepts', 'latest.json');
+  const setup = `
+import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, degree TEXT, year INTEGER, updated_at TEXT NOT NULL)")
+for degree in ("Vocab Share Alpha", "Vocab Share Beta"):
+    doc_id = degree.split()[-1].lower()
+    doc = {"id": doc_id, "title": "Community Learning Leadership", "abstract": "Community learning leadership supports schools.", "subjects": ["community learning leadership"], "degree": degree, "year": 2021}
+    db.execute("INSERT INTO documents VALUES (?, ?, ?, ?, ?)", (doc_id, json.dumps(doc), degree, 2021, "2026-01-01T00:00:00+00:00"))
+db.commit()
+`;
+  await execFileAsync('python3', ['-c', setup, sqlitePath]);
+  const env = {
+    ...process.env,
+    SQLITE_PATH: sqlitePath,
+    APP_DATA_DIR: gateDir,
+    TURSO_DATABASE_URL: '',
+    ADMIN_JOB_ID: '',
+    NODE_ENV: 'test',
+    CONCEPT_EMBEDDING_BACKEND: 'deterministic_test',
+    CONCEPT_PATTERNRANK_MIN_SCORE: '-1',
+  };
+  const run = () => execFileAsync('python3', ['scripts/build-concepts.py'], { cwd: path.resolve('.'), env });
+  const fetchPartitionStates = async () => {
+    const { stdout } = await execFileAsync('python3', ['-c',
+      'import sqlite3, json, sys\n' +
+      'db = sqlite3.connect(sys.argv[1])\n' +
+      'db.row_factory = sqlite3.Row\n' +
+      'rows = [dict(r) for r in db.execute("SELECT partition_key, status, content_fingerprint, updated_at FROM concept_partitions ORDER BY partition_key")]\n' +
+      'print(json.dumps(rows, sort_keys=True))\n',
+      sqlitePath]);
+    return JSON.parse(stdout);
+  };
+
+  const K = 2;
+  const RIPPLE_BOUND = 3; // documented small ripple allowance -- see #21 in docs/phase-c-completion-plan.md
+  let runs = 0;
+  for (let attempt = 0; attempt < K + RIPPLE_BOUND; attempt += 1) {
+    await run();
+    runs += 1;
+    try { await fs.access(latestPath); break; } catch { /* first generation still incomplete */ }
+  }
+  await fs.access(latestPath);
+  assert.ok(runs <= K + RIPPLE_BOUND, `expected <= ${K + RIPPLE_BOUND} runs, took ${runs}`);
+  assert.ok(
+    runs > K,
+    'expected this shared-vocabulary fixture to need at least one extra run past K -- a fixture with zero ripple would not exercise the bound this gate checks',
+  );
+
+  // Ripple convergence: one further, completely unchanged run must not re-pend
+  // anything. Comparing status, content_fingerprint AND updated_at makes this a
+  // genuine no-op check (Gate B's own property), not just "still converged".
+  const beforeExtra = await fetchPartitionStates();
+  await run();
+  const afterExtra = await fetchPartitionStates();
+  assert.deepEqual(afterExtra, beforeExtra);
+});
+
+// Gate B (#22, supported by #20): a real enrichment pass (sync.js's
+// runEnrichmentBatch double-calls saveDocumentMetadata per document) that
+// changes no concept-relevant field must be a genuine no-op on the next concept
+// rebuild -- not merely "no re-embedding", but no re-pend of the partition at
+// all. A true-positive companion guards against a fix that is simply "never
+// mark dirty".
+test('Gate B / #22: an enrichment pass with no concept-relevant change is a genuine no-op rerun', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const degree = `Gate B Fixture ${suffix}`;
+  const baseDoc = {
+    author: 'Gate B Tester',
+    degree,
+    year: 2025,
+    abstract: 'Indigenous language revitalization sustains community knowledge systems.',
+    subjects: ['indigenous language revitalization'],
+    supervisors: [],
+  };
+  const docA = { ...baseDoc, id: `gateb-a-${suffix}`, title: 'Indigenous Language Revitalization A' };
+  const docB = { ...baseDoc, id: `gateb-b-${suffix}`, title: 'Indigenous Language Revitalization B' };
+  await saveDocumentMetadata(docA);
+  await saveDocumentMetadata(docB);
+
+  const runPatternRank = async () => {
+    const jobId = await createAdminJob({
+      type: 'concept_rebuild',
+      label: 'Gate B Test',
+      params: { scope: { degree }, method: 'patternrank_incremental' },
+      runnerType: 'local',
+    });
+    await execFileAsync('python3', ['scripts/build-concepts.py'], {
+      cwd: path.resolve('.'),
+      env: {
+        ...process.env,
+        ADMIN_JOB_ID: String(jobId),
+        NODE_ENV: 'test',
+        CONCEPT_EMBEDDING_BACKEND: 'deterministic_test',
+        CONCEPT_PATTERNRANK_MIN_SCORE: '-1',
+      },
+    });
+    return getAdminJob(jobId);
+  };
+
+  const first = await runPatternRank();
+  assert.equal(first.status, 'completed');
+  assert.equal(first.result.partitionVersion, 1);
+  const partitionKey = first.result.partition;
+
+  const db = await getDb();
+  const fetchPartitionRow = async () => (await db.execute({
+    sql: 'SELECT status, content_fingerprint, updated_at FROM concept_partitions WHERE partition_key = ?',
+    args: [partitionKey],
+  })).rows[0];
+  const before = await fetchPartitionRow();
+  assert.equal(before.status, 'complete');
+
+  // Reproduce sync.js's runEnrichmentBatch double-call shape (src/sync.js:317,340):
+  // saveDocumentMetadata called twice per document per enrichment pass, with
+  // byte-identical title/abstract/subjects both times -- only updated_at moves.
+  await saveDocumentMetadata(docA);
+  await saveDocumentMetadata(docA);
+  await saveDocumentMetadata(docB);
+  await saveDocumentMetadata(docB);
+
+  const second = await runPatternRank();
+  assert.equal(second.status, 'completed');
+  assert.equal(second.result.noChanges, true);
+
+  const after = await fetchPartitionRow();
+  assert.equal(after.status, 'complete');
+  assert.equal(after.content_fingerprint, before.content_fingerprint);
+  // Never re-pended, never re-written: #20's "no write for an unchanged cohort"
+  // and #22's "no false-dirty from a timestamp-only change" holding together.
+  assert.equal(after.updated_at, before.updated_at);
+
+  // True-positive companion: a genuinely different title/abstract must still be
+  // detected and reprocessed.
+  await saveDocumentMetadata({
+    ...docA,
+    title: 'Indigenous Language Revitalization A Revised',
+    abstract: 'Revised: elders document oral history archives and land-based curricula.',
+  });
+  const third = await runPatternRank();
+  assert.equal(third.status, 'completed');
+  assert.equal(third.result.documentsChanged, 1);
+  assert.equal(third.result.partitionVersion, 2);
+  const afterRevision = await fetchPartitionRow();
+  assert.notEqual(afterRevision.content_fingerprint, before.content_fingerprint);
+});
+
+// Gate B support: the new concept_partitions.content_fingerprint column is
+// added by a fresh ALTER-TABLE primitive (ensure_incremental_schema previously
+// only ever did CREATE TABLE IF NOT EXISTS) -- must be idempotent against an
+// already-migrated database.
+test('#22: content_fingerprint column migration is idempotent', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'gate-b-migration-'));
+  const dbPath = path.join(dir, 'metrics.sqlite');
+  const harnessPath = path.join(dir, 'migration_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+client = bc.SqliteClientWrapper(sys.argv[2])
+bc.ensure_incremental_schema(client)
+bc.ensure_incremental_schema(client)
+cols = [row[1] for row in client.conn.execute("PRAGMA table_info(concept_partitions)").fetchall()]
+print(json.dumps({"columnCount": cols.count("content_fingerprint"), "hasColumn": "content_fingerprint" in cols}))
+`, 'utf8');
+  const { stdout } = await execFileAsync(
+    'python3',
+    [harnessPath, path.resolve('scripts/build-concepts.py'), dbPath],
+    { cwd: path.resolve('.') },
+  );
+  const result = JSON.parse(stdout);
+  assert.equal(result.hasColumn, true);
+  assert.equal(result.columnCount, 1);
 });

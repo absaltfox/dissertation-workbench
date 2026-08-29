@@ -30,6 +30,25 @@ MIN_RANK_SCORE = float(os.environ.get("CONCEPT_PATTERNRANK_MIN_SCORE", "0.28"))
 MIN_DOCUMENT_FREQUENCY = max(2, int(os.environ.get("CONCEPT_MIN_DOCUMENT_FREQUENCY", "2")))
 CHECKPOINT_BATCH_SIZE = max(10, int(os.environ.get("CONCEPT_CHECKPOINT_BATCH_SIZE", "50")))
 MAX_PARTITION_DOCUMENTS = max(100, int(os.environ.get("CONCEPT_PARTITION_MAX_DOCUMENTS", "5000")))
+# #21: the automatic partition family groups documents by (degree, year-bucket).
+# Decade buckets are the default -- see cohort_year_bucket() below and
+# docs/phase-c-completion-plan.md #21 for why: exact-year grouping put the first
+# complete global concept dictionary years away at the pre-existing daily cadence,
+# and decade coarsening cuts cohort count by roughly the average distinct years per
+# degree with no schema change (partition_key hashes the scope, so old per-year
+# partitions just age out through the existing retirement path). Set to "year" to
+# restore the old exact-year grouping.
+CONCEPT_PARTITION_GRANULARITY = os.environ.get("CONCEPT_PARTITION_GRANULARITY", "decade").strip().lower()
+if CONCEPT_PARTITION_GRANULARITY not in ("decade", "year"):
+    CONCEPT_PARTITION_GRANULARITY = "decade"
+# #20: how many concept_partitions rows discover_partition bulk-upserts per
+# statement. 9 params/row; 80 rows/statement keeps a batch at 720 params, safely
+# under even the conservative pre-3.32 SQLite parameter-count ceiling of 999 (the
+# actual limit -- SQLITE_MAX_VARIABLE_NUMBER -- is not queryable through the
+# sqlite3/libsql_client APIs this file uses, so this stays a fixed, conservative
+# constant rather than something probed at runtime).
+PARTITION_WRITE_BATCH_SIZE = max(10, int(os.environ.get("CONCEPT_PARTITION_WRITE_BATCH_SIZE", "80")))
+PARTITION_KEY_CHUNK_SIZE = 500
 MAX_PARTITION_CONCEPTS = max(100, int(os.environ.get("CONCEPT_PARTITION_MAX_CONCEPTS", "5000")))
 MAX_GLOBAL_CONCEPTS = max(MAX_PARTITION_CONCEPTS, int(os.environ.get("CONCEPT_GLOBAL_MAX_CONCEPTS", "50000")))
 # A 2-gram is only folded into a containing 3-gram when the pair is well attested;
@@ -364,8 +383,11 @@ def cosine(a, b):
 def stem_for_similarity(token):
     """Strip common English plural suffixes for comparison only.
 
-    Mirrors ``stemForSim`` in src/conceptsPipeline.js so the Python worker and the
-    JavaScript pipeline cluster the same phrases the same way.
+    This worker's cluster_phrases() is the sole concept-clustering implementation:
+    it uses blocking rules R1/R2/R3 with an enforced variant-extension fan-in cap.
+    The former JavaScript clustering path (an O(P^2) all-pairs threshold with no
+    fan-in cap) was removed in #34; src/conceptsPipeline.js now retains only its
+    persistence helpers, getConceptPipelineStatus and persistConceptArtifact.
     """
     if len(token) > 5 and token.endswith("ies"):
         return token[:-3] + "y"
@@ -376,6 +398,30 @@ def stem_for_similarity(token):
 
 def phrase_stems(phrase):
     return tuple(stem_for_similarity(token) for token in phrase.split())
+
+
+def classify_variant_rule(canonical, phrase):
+    """Classify which cluster_phrases rule could connect ``phrase`` to ``canonical``.
+
+    Purely structural, derived from the two strings alone -- correct regardless of
+    which pass produced them (fresh partition build, merge, or a legacy artifact
+    that predates this classification) because R1 and R2 can only ever connect
+    phrases with identical *token counts* (R1 buckets on a stemmed-token frozenset,
+    R2 buckets on a stemmed-modifier tuple, both keyed by structures whose size is
+    the token count) while R3 is the only rule that connects a 2-gram to a 3-gram.
+    So a token-count mismatch is an exact, cheap R3 test; among same-length pairs,
+    an identical stemmed token set is R1 and anything else is R2. Used both to tag
+    freshly-built variants (see build_variant_map) and, at merge time, to classify
+    variants read back from any artifact -- old (bare-string, no tag) or new
+    (tagged) alike -- without trusting a possibly-stale stored value.
+    """
+    canonical_stems = phrase_stems(canonical)
+    variant_stems = phrase_stems(phrase)
+    if len(canonical_stems) != len(variant_stems):
+        return "R3"
+    if frozenset(canonical_stems) == frozenset(variant_stems):
+        return "R1"
+    return "R2"
 
 
 class DisjointSet:
@@ -526,17 +572,40 @@ def cluster_phrases(phrases, document_frequency):
         for phrase in absorbed:
             roots_before.setdefault(phrase, forest.find(phrase))
 
+    # `extensions` above is keyed by the literal surface bigram, but two distinct
+    # surface forms that co-stem (e.g. "student outcome" / "student outcomes") are
+    # already unioned by R1 by this point and so share one root -- meaning both keys
+    # independently hold the *same* absorbed trigram set for what is logically one
+    # hub. Grouping by root here, and merging each root's absorbed phrases with set
+    # union rather than list concatenation (concatenation would just double-count
+    # the shared trigrams under a different name), collapses that back to exactly
+    # one fan-in decision and one counter increment per hub, no matter how many
+    # surface forms it has (#35) -- verified by reproduction: keying by root while
+    # still concatenating gives the same doubled Edges=8 the surface-form keying
+    # did; only deduplicating the absorbed set gives the true Hubs=1/Edges=4.
+    extensions_by_root = {}
+    hub_repr = {}
+    for shorter, absorbed in extensions.items():
+        root = roots_before[shorter]
+        extensions_by_root.setdefault(root, set()).update(absorbed)
+        # Lexicographically smallest surface form, matching DisjointSet.components()'s
+        # own sort convention, so operators see one concrete, readable phrase per hub.
+        hub_repr[root] = min(hub_repr.get(root, shorter), shorter)
+
     extension_hubs_skipped = 0
     extension_edges_skipped = 0
-    for shorter in sorted(extensions):
-        absorbed = extensions[shorter]
-        distinct = {roots_before[phrase] for phrase in absorbed} - {roots_before[shorter]}
+    skipped_hub_sample = []
+    for root in sorted(extensions_by_root, key=lambda item: hub_repr[item]):
+        absorbed = extensions_by_root[root]
+        distinct = {roots_before[phrase] for phrase in absorbed} - {root}
         if len(distinct) > MAX_VARIANT_EXTENSION_FAN_IN:
             extension_hubs_skipped += 1
             extension_edges_skipped += len(absorbed)
+            if len(skipped_hub_sample) < 5:
+                skipped_hub_sample.append(hub_repr[root])
             continue
         for phrase in absorbed:
-            forest.union(shorter, phrase)
+            forest.union(root, phrase)
 
     return forest.components(), {
         "truncatedBuckets": truncated_buckets,
@@ -545,6 +614,7 @@ def cluster_phrases(phrases, document_frequency):
         "extensionHubsSkipped": extension_hubs_skipped,
         "extensionEdgesSkipped": extension_edges_skipped,
         "extensionFanInLimit": MAX_VARIANT_EXTENSION_FAN_IN,
+        "extensionHubsSkippedSample": skipped_hub_sample,
     }
 
 
@@ -562,7 +632,7 @@ def pick_canonical(cluster, document_frequency):
     return min(cluster, key=sort_key)
 
 
-def build_variant_map(concepts):
+def build_variant_map(concepts, doc_freq_for=None):
     """Project concepts[].variants into the flat map the JS consumer resolves through.
 
     Built from the *final* concept list so no variant can point at a canonical that
@@ -570,7 +640,21 @@ def build_variant_map(concepts):
     as a variant key. That second property matters: src/metrics.js resolves with
     ``variantMap[term] || (canonicalSet.has(term) ? term : null)``, so a canonical
     that leaked into the map would be silently redirected away from its own entry.
+
+    Also attaches two additive, non-breaking per-concept fields alongside the
+    unchanged ``variants`` string list -- ``variantRules`` (phrase -> "R1"|"R2"|"R3",
+    via classify_variant_rule) and ``variantDocFreq`` (phrase -> that phrase's own
+    document frequency, from ``doc_freq_for``, independent of the cluster's combined
+    docFreq). Both exist for #31's merge-time fan-in re-check: it needs to know which
+    variant edges are extension (R3, fan-in-limited) edges, and needs a phrase's own
+    frequency to give a cross-shard-orphaned extension an honest standalone concept
+    if the merge ends up withholding it from its shard's hub. Deliberately additive
+    (not a replacement of ``variants``) so every existing reader of the plain string
+    list -- src/metrics.js, this file's own assert_alias_invariants, the test suite --
+    keeps working unchanged; only merge_partition_artifacts's new fan-in re-check
+    (and, best-effort, legacy artifacts lacking these fields) needs to look them up.
     """
+    doc_freq_for = doc_freq_for or (lambda _phrase: 0)
     canonicals = {concept["canonical"] for concept in concepts}
     variant_to_canonical = {}
     for concept in concepts:
@@ -589,10 +673,18 @@ def build_variant_map(concepts):
     # A variant may have lost its owner to the tie-break above; drop it from that
     # concept so concepts[].variants and the map stay in exact agreement.
     for concept in concepts:
-        concept["variants"] = sorted(
+        canonical = concept["canonical"]
+        final_variants = sorted(
             variant for variant in concept["variants"]
-            if variant_to_canonical.get(variant) == concept["canonical"]
+            if variant_to_canonical.get(variant) == canonical
         )
+        concept["variants"] = final_variants
+        concept["variantRules"] = {
+            variant: classify_variant_rule(canonical, variant) for variant in final_variants
+        }
+        concept["variantDocFreq"] = {
+            variant: int(doc_freq_for(variant) or 0) for variant in final_variants
+        }
     return variant_to_canonical
 
 
@@ -755,6 +847,29 @@ def ensure_incremental_schema(client):
     ]
     for statement in statements:
         client.execute(statement)
+    # #22: partition dirty-detection keys on a content fingerprint (see
+    # compute_cohort_content_fingerprints) instead of source_updated_at, which any
+    # enrichment pass bumps regardless of whether title/abstract/subjects changed.
+    _ensure_column(client, "concept_partitions", "content_fingerprint", "TEXT")
+
+
+def _ensure_column(client, table, column, sql_type):
+    """Idempotently add a column to an existing table.
+
+    ensure_incremental_schema only ever does CREATE TABLE IF NOT EXISTS -- there is
+    no ALTER-a-column-in idiom in this file yet (unlike src/db.js's tryExec pattern
+    for indexes/columns elsewhere in the app). SQLite and libsql both raise on a
+    duplicate column, so the guard is a plain try/except rather than an
+    information_schema probe, keeping this portable across the local sqlite3 module
+    used in tests and the remote libsql client used against Turso in production.
+    """
+    try:
+        client.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+    except Exception as exc:
+        message = str(exc).lower()
+        if "duplicate column" in message or "already exists" in message:
+            return
+        raise
 
 
 def load_job_params(client, job_id):
@@ -819,42 +934,164 @@ def scope_where(scope, alias="d"):
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
 
+def cohort_year_bucket(year):
+    """Coarsen a document year into the automatic-partition grouping key (#21)."""
+    year = int(year or 0)
+    if year <= 0:
+        return 0
+    if CONCEPT_PARTITION_GRANULARITY == "year":
+        return year
+    return (year // 10) * 10
+
+
+def _year_bucket_sql():
+    """SQL expression computing the same bucket cohort_year_bucket() computes in
+    Python, so the automatic GROUP BY (one round trip) can bucket server-side
+    instead of pulling every document's raw year back to bucket it here."""
+    if CONCEPT_PARTITION_GRANULARITY == "year":
+        return "COALESCE(year, 0)"
+    return "(CASE WHEN COALESCE(year, 0) <= 0 THEN 0 ELSE (COALESCE(year, 0) / 10) * 10 END)"
+
+
+def _cohort_scope_from_bucket(degree, bucket):
+    scope = {}
+    if degree:
+        scope["degree"] = degree
+    bucket = int(bucket or 0)
+    if bucket > 0:
+        scope["yearFrom"] = bucket
+        scope["yearTo"] = bucket if CONCEPT_PARTITION_GRANULARITY == "year" else bucket + 9
+    else:
+        scope["yearMissing"] = True
+    return scope
+
+
+def compute_content_fingerprint(doc_fields):
+    """sha256 over a cohort's concept-relevant fields only -- title, abstract (or
+    description), subjects, the same fields document_text()/doc_segments() actually
+    read -- sorted by doc_id so row order never affects the result (#22). Comparing
+    this instead of source_updated_at is the point of the fix: saveDocumentMetadata
+    (src/db.js) bumps updated_at on every write regardless of whether any of these
+    fields changed, and Phase B's runEnrichmentBatch (src/sync.js) calls it twice
+    per document per enrichment pass, so a plain timestamp compare re-marks a
+    cohort dirty on every enrichment run even when nothing concept-relevant moved.
+    """
+    parts = sorted(
+        f"{doc_id}\x1f{title or ''}\x1f{abstract or ''}\x1f{subjects or ''}"
+        for doc_id, title, abstract, subjects in doc_fields
+    )
+    return hashlib.sha256("\x1e".join(parts).encode("utf-8")).hexdigest()
+
+
+def fetch_cohort_content_fingerprints(client):
+    """One bulk per-document projection (json_extract, not an ordered GROUP_CONCAT --
+    the local sqlite3 module supports SQLite 3.44+'s ordered aggregate, but whether
+    Turso's libsql engine does cannot be verified without a live Turso connection,
+    and json_extract is a much older, more universally-supported feature), grouped
+    in Python into the same (degree, year-bucket) cohorts the automatic GROUP BY
+    query above uses, and hashed into one content fingerprint per cohort.
+    """
+    rows = client.execute(
+        """SELECT doc_id, COALESCE(degree, '') AS degree, COALESCE(year, 0) AS year,
+                  json_extract(metadata_json, '$.title') AS title,
+                  COALESCE(json_extract(metadata_json, '$.abstract'),
+                           json_extract(metadata_json, '$.description')) AS abstract,
+                  json_extract(metadata_json, '$.subjects') AS subjects
+           FROM documents"""
+    ).rows
+    grouped = {}
+    for row in rows:
+        cohort_key = (row["degree"] or "", cohort_year_bucket(row["year"]))
+        grouped.setdefault(cohort_key, []).append(
+            (row["doc_id"], row["title"], row["abstract"], row["subjects"])
+        )
+    return {cohort_key: compute_content_fingerprint(fields) for cohort_key, fields in grouped.items()}
+
+
+def fetch_scope_content_fingerprint(client, scope):
+    """Same fingerprint as fetch_cohort_content_fingerprints, scoped to one explicit
+    (non-automatic) partition scope -- kept as a single scoped query, matching the
+    explicit-scope path's existing once-per-job (not per-cohort) COUNT query."""
+    where, args = scope_where(scope)
+    rows = client.execute(
+        f"""SELECT d.doc_id AS doc_id,
+                   json_extract(d.metadata_json, '$.title') AS title,
+                   COALESCE(json_extract(d.metadata_json, '$.abstract'),
+                            json_extract(d.metadata_json, '$.description')) AS abstract,
+                   json_extract(d.metadata_json, '$.subjects') AS subjects
+            FROM documents d{where}""",
+        args,
+    ).rows
+    fields = [(row["doc_id"], row["title"], row["abstract"], row["subjects"]) for row in rows]
+    return compute_content_fingerprint(fields)
+
+
+def _upsert_partition_rows_bulk(client, rows):
+    """Bulk-upsert concept_partitions rows -- only the ones discover_partition found
+    to have actually changed this pass -- chunked at PARTITION_WRITE_BATCH_SIZE.
+    This is #20's fix: a first-ever pass over K fresh automatic cohorts costs
+    O(K / batch_size) statements here, not O(K); a rerun with nothing changed calls
+    this with an empty list and costs zero.
+    """
+    if not rows:
+        return
+    for start in range(0, len(rows), PARTITION_WRITE_BATCH_SIZE):
+        chunk = rows[start:start + PARTITION_WRITE_BATCH_SIZE]
+        placeholders = ",".join(["(?, ?, ?, ?, ?, ?, ?, ?, ?)"] * len(chunk))
+        params = []
+        for row in chunk:
+            params.extend(row)
+        client.execute(
+            f"""INSERT INTO concept_partitions (
+                  partition_key, scope_json, priority, enabled, status, source_document_count,
+                  source_updated_at, content_fingerprint, updated_at
+                ) VALUES {placeholders}
+                ON CONFLICT(partition_key) DO UPDATE SET
+                  scope_json = excluded.scope_json,
+                  priority = MAX(concept_partitions.priority, excluded.priority),
+                  enabled = excluded.enabled,
+                  source_document_count = excluded.source_document_count,
+                  source_updated_at = excluded.source_updated_at,
+                  content_fingerprint = excluded.content_fingerprint,
+                  status = excluded.status,
+                  updated_at = excluded.updated_at""",
+            params,
+        )
+
+
 def discover_partition(client, requested_scope=None, priority=0, force=False):
+    """Select the highest-priority changed partition, and persist scheduling state
+    for every candidate cohort.
+
+    #20 fix: the automatic path used to issue 3 statements per candidate cohort --
+    a per-cohort ``concept_partitions`` lookup, a per-cohort COUNT/MAX that
+    recomputes exactly what the GROUP BY summary below already returned for that
+    cohort, and an unconditional upsert even when nothing changed. That made every
+    run cost 3x the automatic cohort count in round trips, even when nothing in the
+    corpus changed anywhere. Fixed by: (a) using the GROUP BY summary rows directly
+    for document_count/source_updated_at on the automatic path -- no redundant
+    per-cohort COUNT; (b) one bulk ``concept_partitions`` fetch, indexed in memory,
+    instead of a per-cohort lookup; (c) writing only cohorts whose persisted state
+    actually changed this pass (see the unchanged-checks below), via one chunked
+    bulk upsert, plus retirement computed as a set difference over data already in
+    memory instead of relying on an unconditional updated_at bump to mark "seen".
+    The explicit-scope path is untouched: one job, one scope, a fresh COUNT is
+    already O(1) and legitimately needs current data.
+
+    #21: the automatic family's GROUP BY key is a (degree, year-bucket) cohort --
+    see cohort_year_bucket()/_year_bucket_sql() for the decade-vs-year grouping.
+
+    #22: "dirty" is decided by a content fingerprint of concept-relevant fields
+    (compute_content_fingerprint), not source_updated_at, which any enrichment
+    pass bumps regardless of whether title/abstract/subjects actually changed.
+    """
     requested_scope = normalized_scope(requested_scope)
     explicit_scope = bool(requested_scope)
-    if requested_scope:
-        candidates = [requested_scope]
-    else:
-        rows = client.execute(
-            """SELECT COALESCE(degree, '') AS degree,
-                      COALESCE(year, 0) AS partition_year,
-                      COUNT(*) AS document_count, MAX(updated_at) AS source_updated_at
-               FROM documents
-               GROUP BY COALESCE(degree, ''), COALESCE(year, 0)
-               ORDER BY degree, partition_year"""
-        ).rows
-        candidates = []
-        for row in rows:
-            scope = {}
-            if row["degree"]:
-                scope["degree"] = row["degree"]
-            if int(row["partition_year"] or 0) > 0:
-                scope["yearFrom"] = int(row["partition_year"])
-                scope["yearTo"] = int(row["partition_year"])
-            else:
-                scope["yearMissing"] = True
-            candidates.append(scope)
-
-    ranked = []
-    blocked = []
-    publication_changed = False
     now = utc_now()
-    for scope in candidates:
-        key = partition_key(scope, "custom" if explicit_scope else "automatic")
-        existing_rows = client.execute(
-            "SELECT * FROM concept_partitions WHERE partition_key = ?", [key]
-        ).rows
-        existing = existing_rows[0] if existing_rows else None
+
+    if explicit_scope:
+        scope = requested_scope
+        key = partition_key(scope, "custom")
         where, args = scope_where(scope)
         summary_rows = client.execute(
             f"SELECT COUNT(*) AS document_count, MAX(updated_at) AS source_updated_at FROM documents d{where}",
@@ -862,71 +1099,151 @@ def discover_partition(client, requested_scope=None, priority=0, force=False):
         ).rows
         summary = summary_rows[0]
         count = int(summary["document_count"] or 0)
-        if not count:
-            continue
+        cohorts = []
+        if count:
+            cohorts.append({
+                "scope": scope, "key": key, "count": count,
+                "sourceUpdatedAt": summary["source_updated_at"],
+                "fingerprint": fetch_scope_content_fingerprint(client, scope),
+            })
+        existing_rows = client.execute("SELECT * FROM concept_partitions WHERE partition_key = ?", [key]).rows
+        existing_by_key = {key: existing_rows[0]} if existing_rows else {}
+    else:
+        bucket_sql = _year_bucket_sql()
+        rows = client.execute(
+            f"""SELECT COALESCE(degree, '') AS degree, {bucket_sql} AS partition_year,
+                      COUNT(*) AS document_count, MAX(updated_at) AS source_updated_at
+               FROM documents
+               GROUP BY COALESCE(degree, ''), {bucket_sql}
+               ORDER BY degree, partition_year"""
+        ).rows
+        fingerprints = fetch_cohort_content_fingerprints(client)
+        cohorts = []
+        for row in rows:
+            count = int(row["document_count"] or 0)
+            if not count:
+                continue
+            degree = row["degree"] or ""
+            bucket = int(row["partition_year"] or 0)
+            scope = _cohort_scope_from_bucket(degree, bucket)
+            cohorts.append({
+                "scope": scope, "key": partition_key(scope, "automatic"), "count": count,
+                "sourceUpdatedAt": row["source_updated_at"],
+                "fingerprint": fingerprints.get((degree, bucket), ""),
+            })
+        existing_by_key = {
+            row["partition_key"]: row for row in client.execute("SELECT * FROM concept_partitions").rows
+        }
+
+    ranked = []
+    blocked = []
+    publication_changed = False
+    seen_keys = set()
+    blocked_writes = []
+    normal_upsert_rows = []
+
+    for cohort in cohorts:
+        key = cohort["key"]
+        scope = cohort["scope"]
+        count = cohort["count"]
+        seen_keys.add(key)
+        existing = existing_by_key.get(key)
+        scope_json = json.dumps(scope, sort_keys=True)
+
         if count > MAX_PARTITION_DOCUMENTS:
             message = (
                 f"Concept partition {key} contains {count} documents; refine it into non-overlapping program "
                 f"scopes or raise CONCEPT_PARTITION_MAX_DOCUMENTS={MAX_PARTITION_DOCUMENTS} after capacity testing."
             )
-            if requested_scope:
+            if explicit_scope:
                 raise ValueError(message)
             if existing and int(existing["enabled"] or 0) == 1 and int(existing["artifact_version"] or 0) > 0:
                 publication_changed = True
-            client.execute(
-                """INSERT INTO concept_partitions (
-                     partition_key, scope_json, priority, enabled, status, source_document_count,
-                     source_updated_at, error, updated_at
-                   ) VALUES (?, ?, ?, 0, 'blocked', ?, ?, ?, ?)
-                   ON CONFLICT(partition_key) DO UPDATE SET
-                     scope_json = excluded.scope_json, enabled = 0, status = 'blocked',
-                     source_document_count = excluded.source_document_count,
-                     source_updated_at = excluded.source_updated_at, error = excluded.error,
-                     updated_at = excluded.updated_at""",
-                [key, json.dumps(scope, sort_keys=True), int(priority), count, summary["source_updated_at"], message, now],
+            # source_updated_at is deliberately NOT part of this comparison: it is
+            # informational only (see the dirty check below, #22) and including it
+            # here would write on every pass a routine metadata refresh bumps
+            # documents.updated_at, even with the cohort's status/count/fingerprint
+            # genuinely unchanged -- defeating the "unchanged rerun is a no-op"
+            # guarantee for exactly the case it exists to cover.
+            unchanged = (
+                existing is not None
+                and existing["scope_json"] == scope_json
+                and int(existing["enabled"] or 0) == 0
+                and existing["status"] == "blocked"
+                and int(existing["source_document_count"] or 0) == count
+                and str(existing["error"] or "") == message
             )
+            if not unchanged:
+                blocked_writes.append((key, scope_json, int(priority), count, cohort["sourceUpdatedAt"], message, now))
             blocked.append(message)
             continue
+
         last_completed = existing["last_completed_at"] if existing else None
+        existing_fingerprint = existing["content_fingerprint"] if existing else None
         dirty = (
             force or not last_completed
-            or str(summary["source_updated_at"] or "") > str(last_completed or "")
-            or (existing is not None and int(existing["source_document_count"] or 0) != count)
             or (existing is not None and existing["status"] != "complete")
+            or (existing is not None and int(existing["source_document_count"] or 0) != count)
+            or str(cohort["fingerprint"] or "") != str(existing_fingerprint or "")
         )
+        effective_priority = max(int(existing["priority"] or 0), int(priority)) if existing else int(priority)
+        effective_enabled = 0 if explicit_scope else 1
+        effective_status = "pending" if dirty else "complete"
+        # source_updated_at is deliberately NOT part of this comparison -- see the
+        # matching note on the blocked-cohort branch above. It is still persisted
+        # (below) whenever some *other* field changes, so it is never wildly
+        # stale; it just isn't, on its own, a reason to write.
+        unchanged = (
+            existing is not None
+            and existing["scope_json"] == scope_json
+            and int(existing["priority"] or 0) == effective_priority
+            and int(existing["enabled"] or 0) == effective_enabled
+            and existing["status"] == effective_status
+            and int(existing["source_document_count"] or 0) == count
+            and str(existing["content_fingerprint"] or "") == str(cohort["fingerprint"] or "")
+        )
+        if not unchanged:
+            normal_upsert_rows.append((
+                key, scope_json, int(priority), effective_enabled, effective_status,
+                count, cohort["sourceUpdatedAt"], cohort["fingerprint"], now,
+            ))
+        if dirty:
+            ranked.append((int(priority) + (1000 if not last_completed else 0), str(last_completed or ""), key, scope, count))
+
+    for row in blocked_writes:
         client.execute(
             """INSERT INTO concept_partitions (
                  partition_key, scope_json, priority, enabled, status, source_document_count,
-                 source_updated_at, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 source_updated_at, error, updated_at
+               ) VALUES (?, ?, ?, 0, 'blocked', ?, ?, ?, ?)
                ON CONFLICT(partition_key) DO UPDATE SET
-                 scope_json = excluded.scope_json,
-                 priority = MAX(concept_partitions.priority, excluded.priority),
-                 enabled = excluded.enabled,
+                 scope_json = excluded.scope_json, enabled = 0, status = 'blocked',
                  source_document_count = excluded.source_document_count,
-                 source_updated_at = excluded.source_updated_at,
-                 status = excluded.status,
+                 source_updated_at = excluded.source_updated_at, error = excluded.error,
                  updated_at = excluded.updated_at""",
-            [
-                key, json.dumps(scope, sort_keys=True), int(priority),
-                1 if not explicit_scope else 0,
-                "pending" if dirty else "complete", count, summary["source_updated_at"], now,
-            ],
+            list(row),
         )
-        if dirty:
-            ranked.append((int(priority) + (1000 if not last_completed else 0), str(last_completed or ""), key, scope, count))
+    _upsert_partition_rows_bulk(client, normal_upsert_rows)
+
     if not explicit_scope:
-        retired_rows = client.execute(
-            "SELECT partition_key FROM concept_partitions WHERE enabled = 1 AND updated_at <> ?",
-            [now],
-        ).rows
-        publication_changed = publication_changed or bool(retired_rows)
-        client.execute(
-            """UPDATE concept_partitions
-               SET enabled = 0, status = 'retired', updated_at = ?
-               WHERE enabled = 1 AND updated_at <> ?""",
-            [now, now],
-        )
+        # Retirement: a set difference over data already in memory, rather than
+        # relying on every surviving cohort's updated_at being bumped this pass to
+        # mark it "seen" -- that bump is exactly the unconditional write #20 removes.
+        currently_enabled_keys = {
+            key for key, row in existing_by_key.items() if int(row["enabled"] or 0) == 1
+        }
+        retire_keys = currently_enabled_keys - seen_keys
+        publication_changed = publication_changed or bool(retire_keys)
+        if retire_keys:
+            retire_list = sorted(retire_keys)
+            for start in range(0, len(retire_list), PARTITION_KEY_CHUNK_SIZE):
+                chunk = retire_list[start:start + PARTITION_KEY_CHUNK_SIZE]
+                placeholders = ",".join("?" for _ in chunk)
+                client.execute(
+                    f"""UPDATE concept_partitions SET enabled = 0, status = 'retired', updated_at = ?
+                        WHERE partition_key IN ({placeholders})""",
+                    [now, *chunk],
+                )
         if publication_changed:
             # A removed shard can move phrases below the corpus-wide DF gate.
             # Re-rank every surviving shard before publishing the new generation.
@@ -935,18 +1252,15 @@ def discover_partition(client, requested_scope=None, priority=0, force=False):
                 [utc_now()],
             )
             ranked_keys = {item[2] for item in ranked}
-            pending_rows = client.execute(
-                """SELECT partition_key, scope_json, source_document_count, priority, last_completed_at
-                   FROM concept_partitions WHERE enabled = 1 AND status = 'pending'"""
-            ).rows
-            for row in pending_rows:
-                if row["partition_key"] in ranked_keys:
+            for key, row in existing_by_key.items():
+                if key in retire_keys or key in ranked_keys:
                     continue
-                ranked.append((
-                    int(row["priority"] or 0), str(row["last_completed_at"] or ""),
-                    row["partition_key"], json.loads(row["scope_json"]),
-                    int(row["source_document_count"] or 0),
-                ))
+                if int(row["enabled"] or 0) == 1 and row["status"] == "complete":
+                    ranked.append((
+                        int(row["priority"] or 0), str(row["last_completed_at"] or ""),
+                        key, json.loads(row["scope_json"]), int(row["source_document_count"] or 0),
+                    ))
+
     if not ranked:
         if not explicit_scope and (publication_changed or global_publication_pending(client)):
             return {"publishOnly": True, "publishGlobally": True, "warnings": blocked[:3]}
@@ -1271,13 +1585,26 @@ def merge_partition_artifacts(client):
     total_docs = 0
     truncated_buckets = 0
     truncated_heads = 0
-    extension_hubs_skipped = 0
-    extension_edges_skipped = 0
+    shard_extension_hubs_skipped = 0
+    shard_extension_edges_skipped = 0
     shard_doc_freq = {}
     shard_score = {}
     shards = []
     partitions = []
     relations = DisjointSet()
+    # R3 (extension) edges are deferred rather than unioned immediately: fan-in was
+    # already enforced once, per shard, by cluster_phrases, but shard A keeping 2
+    # extensions of hub X and shard B independently keeping a *different* 2 of the
+    # same hub X each stay within their own shard's cap while jointly exceeding the
+    # global one once naively unioned (#31). So R1/R2 edges (no cap, never cross a
+    # token-count boundary -- see classify_variant_rule) are applied immediately, and
+    # every R3 edge is collected here to be re-checked, as one global population,
+    # after every shard has been scanned.
+    extension_edges = set()
+    # phrase -> [(shard_index, docFreq, patternRankScore), ...], populated only for
+    # R3 variants (see the loop below) and consulted only if the fan-in re-check
+    # ends up withholding that specific phrase from its hub.
+    orphaned_extension_doc_freq = {}
     for row in rows:
         artifact = json.loads(row["artifact_json"])
         stats = artifact.get("stats", {})
@@ -1287,9 +1614,10 @@ def merge_partition_artifacts(client):
         # operator looks, and under-clustering in any shard shows up there.
         truncated_buckets += int(stats.get("clusterTruncatedBuckets", 0) or 0)
         truncated_heads += int(stats.get("clusterTruncatedHeads", 0) or 0)
-        extension_hubs_skipped += int(stats.get("clusterExtensionHubsSkipped", 0) or 0)
-        extension_edges_skipped += int(stats.get("clusterExtensionEdgesSkipped", 0) or 0)
+        shard_extension_hubs_skipped += int(stats.get("clusterExtensionHubsSkipped", 0) or 0)
+        shard_extension_edges_skipped += int(stats.get("clusterExtensionEdgesSkipped", 0) or 0)
         partitions.append(artifact.get("partition", {}))
+        shard_index = len(shards)
         shard = {"documents": documents, "docFreq": {}, "docIndexes": {}}
         for concept in artifact.get("concepts", []):
             canonical = concept.get("canonical")
@@ -1304,11 +1632,89 @@ def merge_partition_artifacts(client):
             # shards - which really are document-disjoint - is sound. Only the
             # component-level roll-up below has to union instead of add.
             shard_doc_freq[canonical] = shard_doc_freq.get(canonical, 0) + doc_freq
-            shard_score[canonical] = max(shard_score.get(canonical, 0.0), float(concept.get("patternRankScore", 0)))
+            score = float(concept.get("patternRankScore", 0))
+            shard_score[canonical] = max(shard_score.get(canonical, 0.0), score)
             relations.add(canonical)
+            variant_rules = concept.get("variantRules") or {}
+            variant_doc_freq = concept.get("variantDocFreq") or {}
             for variant in concept.get("variants", []) or []:
-                relations.union(variant, canonical)
+                relations.add(variant)
+                rule = variant_rules.get(variant) or classify_variant_rule(canonical, variant)
+                if rule == "R3":
+                    # Deliberately NOT folded into shard_doc_freq/shard["docFreq"]
+                    # here (unlike the canonical, above): a variant's own frequency
+                    # is already fully represented via its shard's canonical, whose
+                    # docFreq is the *cluster's* combined frequency. Adding it again
+                    # here would double count it in both the canonical-tie-break
+                    # (`attested`, below) and merged_component_doc_freq's per-shard
+                    # sum -- confirmed by reproduction: it silently swapped which of
+                    # "learning community"/"learning communities" won the R1 tie
+                    # once both carried an equal, inflated shard_doc_freq. Recorded
+                    # here only as a fallback source, applied lazily (see
+                    # orphaned_extension_doc_freq below) if and only if the fan-in
+                    # re-check actually withholds this specific phrase from its hub
+                    # -- the one case where it stops being reachable any other way.
+                    vdf = int(variant_doc_freq.get(variant, 0) or 0)
+                    if vdf:
+                        orphaned_extension_doc_freq.setdefault(variant, []).append((shard_index, vdf, score))
+                    # R3 only ever connects a 2-gram (the hub) to a 3-gram (the
+                    # extension it absorbs); token count alone tells them apart
+                    # regardless of which one this shard chose as its canonical.
+                    if len(canonical.split()) < len(variant.split()):
+                        extension_edges.add((canonical, variant))
+                    else:
+                        extension_edges.add((variant, canonical))
+                else:
+                    relations.union(variant, canonical)
         shards.append(shard)
+
+    # Global fan-in re-check, mirroring cluster_phrases's own algorithm (roots
+    # snapshotted before any extension is applied; fan-in counted in distinct
+    # components, not surface forms) but over the merged R1/R2-only forest built
+    # above, so a hub's *global* absorption -- not just each shard's local slice of
+    # it -- is what gets capped.
+    roots_before = {}
+    for hub, extension in extension_edges:
+        roots_before.setdefault(hub, relations.find(hub))
+        roots_before.setdefault(extension, relations.find(extension))
+    extensions_by_hub_root = {}
+    hub_repr = {}
+    for hub, extension in extension_edges:
+        root = roots_before[hub]
+        extensions_by_hub_root.setdefault(root, set()).add(extension)
+        hub_repr[root] = min(hub_repr.get(root, hub), hub)
+
+    merge_extension_hubs_skipped = 0
+    merge_extension_edges_skipped = 0
+    merge_skipped_hub_sample = []
+    for root in sorted(extensions_by_hub_root, key=lambda item: hub_repr[item]):
+        absorbed = extensions_by_hub_root[root]
+        distinct = {roots_before[phrase] for phrase in absorbed} - {root}
+        if len(distinct) > MAX_VARIANT_EXTENSION_FAN_IN:
+            # Not logged here: merge_partition_artifacts has no reporter and existing
+            # test harnesses (merge_harness.py and friends) parse its stdout as a
+            # single JSON blob, so a stray print() here would break them. main()
+            # logs a summary from mergeExtensionHubsSkipped/EdgesSkipped once merge
+            # returns instead (see the two call sites below).
+            merge_extension_hubs_skipped += 1
+            merge_extension_edges_skipped += len(absorbed)
+            if len(merge_skipped_hub_sample) < 5:
+                merge_skipped_hub_sample.append(hub_repr[root])
+            # A withheld phrase stops being reachable via its hub's cluster, so give
+            # it its own standalone attestation now if it has no other source (i.e.
+            # it was never any shard's own canonical) -- otherwise it would silently
+            # vanish from the merged dictionary rather than surviving as its own
+            # concept, the way a per-shard-withheld extension already does.
+            for phrase in absorbed:
+                if phrase in shard_doc_freq:
+                    continue
+                for shard_index, vdf, score in orphaned_extension_doc_freq.get(phrase, []):
+                    shards[shard_index]["docFreq"][phrase] = shards[shard_index]["docFreq"].get(phrase, 0) + vdf
+                    shard_doc_freq[phrase] = shard_doc_freq.get(phrase, 0) + vdf
+                    shard_score[phrase] = max(shard_score.get(phrase, 0.0), score)
+            continue
+        for phrase in absorbed:
+            relations.union(root, phrase)
 
     # Cross-shard collision rule. Shard A may call a phrase a variant of X while shard
     # B calls the same phrase a variant of Y, or promotes it to a canonical of its own.
@@ -1344,10 +1750,18 @@ def merge_partition_artifacts(client):
         })
     concepts.sort(key=lambda concept: (-concept["docFreq"], -concept["patternRankScore"], concept["canonical"]))
     concepts = concepts[:MAX_GLOBAL_CONCEPTS]
-    variant_to_canonical = build_variant_map(concepts)
+    variant_to_canonical = build_variant_map(
+        concepts, doc_freq_for=lambda phrase: merged_component_doc_freq([phrase], shards, total_docs)
+    )
     generated_at = utc_now()
     merged = {
-        "version": 3,
+        # v4: see the matching comment at the partition-artifact site. The merged
+        # artifact additionally carries mergeExtensionHubsSkipped/EdgesSkipped,
+        # counting *only* cross-shard fan-in caught by this function's own re-check
+        # (#31); clusterExtensionHubsSkipped/EdgesSkipped below is the truthful total
+        # -- every shard's own permanently-withheld edges (which the merge cannot
+        # and does not reinstate) plus this merge-level re-check's own withholding.
+        "version": 4,
         "generatedAt": generated_at,
         "source": {"documents": total_docs, "method": "patternrank_incremental", "model": MODEL_NAME, "partitions": partitions},
         "stats": {
@@ -1358,8 +1772,11 @@ def merge_partition_artifacts(client):
             "concepts": len(concepts), "singleDocConcepts": sum(1 for concept in concepts if concept["docFreq"] == 1),
             "aliases": len(variant_to_canonical), "patternRankRejected": 0, "documents": total_docs, "failed": 0,
             "clusterTruncatedBuckets": truncated_buckets, "clusterTruncatedHeads": truncated_heads,
-            "clusterExtensionHubsSkipped": extension_hubs_skipped,
-            "clusterExtensionEdgesSkipped": extension_edges_skipped,
+            "clusterExtensionHubsSkipped": shard_extension_hubs_skipped + merge_extension_hubs_skipped,
+            "clusterExtensionEdgesSkipped": shard_extension_edges_skipped + merge_extension_edges_skipped,
+            "mergeExtensionHubsSkipped": merge_extension_hubs_skipped,
+            "mergeExtensionEdgesSkipped": merge_extension_edges_skipped,
+            "mergeExtensionHubsSkippedSample": merge_skipped_hub_sample,
             "partitions": len(partitions),
         },
         "concepts": concepts,
@@ -1367,6 +1784,23 @@ def merge_partition_artifacts(client):
     }
     assert_document_frequency_invariants(merged, "merged concept artifact")
     return assert_alias_invariants(merged, "merged concept artifact")
+
+
+def log_merge_fanin(reporter, merged_artifact):
+    """Log cross-shard extension fan-in withheld by merge_partition_artifacts's own
+    re-check (#31), if any. Kept out of merge_partition_artifacts itself so its
+    output stays pure JSON for the existing test harnesses that parse its stdout."""
+    stats = merged_artifact.get("stats", {})
+    hubs = int(stats.get("mergeExtensionHubsSkipped", 0) or 0)
+    edges = int(stats.get("mergeExtensionEdgesSkipped", 0) or 0)
+    if hubs:
+        sample = stats.get("mergeExtensionHubsSkippedSample") or []
+        sample_note = f" (e.g. {', '.join(repr(s) for s in sample)})" if sample else ""
+        reporter.append_log(
+            f"{hubs} hub(s){sample_note} would have exceeded the extension fan-in limit only once "
+            f"every shard's independently-kept extensions were combined at merge time; {edges} "
+            "extension(s) were withheld from their hub and kept as distinct concepts instead.\n"
+        )
 
 
 def main():
@@ -1406,6 +1840,7 @@ def main():
                     f"Cannot republish after partition retirement while {readiness['pending']} partitions are pending."
                 )
             merged_artifact = merge_partition_artifacts(client)
+            log_merge_fanin(reporter, merged_artifact)
             upload_concept_artifact(merged_artifact)
             mark_global_published(client)
             result = {
@@ -1571,9 +2006,11 @@ def main():
                 "always the lexicographically later ones. Raise CONCEPT_MAX_BUCKET_COMPARISONS to cluster them.\n"
             )
         if cluster_truncation["extensionHubsSkipped"]:
+            sample = cluster_truncation.get("extensionHubsSkippedSample") or []
+            sample_note = f" (e.g. {', '.join(repr(s) for s in sample)})" if sample else ""
             reporter.append_log(
                 f"{cluster_truncation['extensionHubsSkipped']} phrase(s) in partition {key} had more than "
-                f"{cluster_truncation['extensionFanInLimit']} longer forms extending them, so "
+                f"{cluster_truncation['extensionFanInLimit']} longer forms extending them{sample_note}, so "
                 f"{cluster_truncation['extensionEdgesSkipped']} extension(s) were kept as distinct concepts "
                 "rather than folded into the shorter phrase. These are hub topics, not sliding-window "
                 "fragments. Raise CONCEPT_VARIANT_EXTENSION_MAX_FAN_IN to merge them anyway.\n"
@@ -1603,9 +2040,16 @@ def main():
             })
         concepts.sort(key=lambda concept: (-concept["docFreq"], -concept["patternRankScore"], concept["canonical"]))
         concepts = concepts[:MAX_PARTITION_CONCEPTS]
-        variant_to_canonical = build_variant_map(concepts)
+        variant_to_canonical = build_variant_map(concepts, doc_freq_for=phrase_document_frequency.get)
         artifact = {
-            "version": 3, "generatedAt": utc_now(),
+            # v4: concepts[].variants is unchanged (a plain phrase-string list), but
+            # each concept now also carries variantRules/variantDocFreq (see
+            # build_variant_map) so merge_partition_artifacts can re-enforce the
+            # extension fan-in cap over the *global* component graph (#31/#35)
+            # instead of trusting each shard's already-applied, shard-local cap.
+            # Additive fields only -- no existing reader of concepts[].variants,
+            # variantToCanonical, or stats needs to change for this bump.
+            "version": 4, "generatedAt": utc_now(),
             "source": {"documents": len(docs), "method": "patternrank_incremental", "model": MODEL_NAME, "scope": scope},
             "stats": {
                 "candidatePhrases": len(phrase_docs), "qualityFilteredPhrases": len(accepted_docs),
@@ -1634,6 +2078,7 @@ def main():
         should_publish = selected["publishGlobally"] and readiness["complete"]
         if should_publish:
             merged_artifact = merge_partition_artifacts(client)
+            log_merge_fanin(reporter, merged_artifact)
         reporter.report(
             "write_results", "Writing Versioned Results",
             detail=(
