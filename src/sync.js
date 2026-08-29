@@ -67,6 +67,14 @@ function sourceUpdatedAt(raw) {
   return raw?.updated_at || raw?.updatedAt || raw?.date_updated || raw?.dateModified || null;
 }
 
+// #28: identify the upstream record without carrying any of its content
+// fields. Only ever read to build the trimmed provenance stub below — never
+// spread the full `raw` object into anything that gets persisted.
+function rawSourceId(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  return raw._id ?? raw.id ?? raw.identifier ?? raw.Identifier ?? null;
+}
+
 // Without an injected existence check the batched form is used: one SELECT per
 // page of records rather than one per record (H-05). Callers that inject their own
 // existsFn — tests — keep the per-document seam.
@@ -648,8 +656,13 @@ async function runSync(syncKey, source, apiKey, runId, {
         return {
           doc: normalized,
           syncKey,
+          // #28: never spread the full upstream OC record here. Only a
+          // trimmed provenance stub is kept — documents.source_json is not a
+          // full-record cache. The write path (db.js documentColumns) also
+          // enforces this as a standing invariant, independent of what this
+          // call site passes.
           source: {
-            ...raw,
+            id: rawSourceId(raw),
             sourceUpdatedAt: sourceUpdatedAt(raw),
           },
         };

@@ -677,6 +677,77 @@ async function ensureSchema(client) {
   const cleaned = await cleanupCommitteeArtifacts(client);
   if (cleaned > 0) logger.info(`Cleaned up ${cleaned} committee artefact rows`);
   await backfillDocumentPeopleProjection(client);
+  await backfillSourceJsonProvenance(client);
+}
+
+const SOURCE_JSON_TRIM_STATE_KEY = 'source_json_trim';
+const SOURCE_JSON_TRIM_BATCH = 500;
+
+// #28 migration: rewrites every existing documents.source_json row (which may
+// currently hold the full upstream OC record, including a full_text/
+// transcript/text/ocr/body-shaped field) to the trimmed { id, sourceUpdatedAt }
+// provenance stub produced by trimmedSourceProvenance(). One-time and
+// idempotent: once serving_projection_state records 'source_json_trim' as
+// 'complete', later calls (every server startup runs ensureSchema) are a
+// single no-op read. Rows with NULL or malformed source_json are left
+// untouched rather than throwing — there is nothing to trim. This is
+// distinct from, and does not touch, sync_runs.source_json (a per-run
+// request-options record on a different table, not per-document upstream
+// data).
+export async function backfillSourceJsonProvenance(dbInstance = null) {
+  const client = dbInstance || await getDb();
+  const state = await client.execute({
+    sql: 'SELECT projection_value FROM serving_projection_state WHERE projection_key = ?',
+    args: [SOURCE_JSON_TRIM_STATE_KEY],
+  });
+  if (String(state.rows[0]?.projection_value || '') === 'complete') return 0;
+
+  let total = 0;
+  let cursor = '';
+  for (;;) {
+    const result = await client.execute({
+      sql: `
+        SELECT doc_id, source_json
+        FROM documents
+        WHERE doc_id > ? AND source_json IS NOT NULL
+        ORDER BY doc_id
+        LIMIT ?
+      `,
+      args: [cursor, SOURCE_JSON_TRIM_BATCH],
+    });
+    if (!result.rows.length) break;
+    const statements = [];
+    for (const row of result.rows) {
+      cursor = row.doc_id;
+      let parsed = null;
+      try { parsed = JSON.parse(row.source_json); } catch { parsed = null; }
+      if (!parsed || typeof parsed !== 'object') continue; // malformed JSON: leave unchanged
+      const trimmed = trimmedSourceProvenance(parsed);
+      const nextJson = trimmed ? JSON.stringify(trimmed) : null;
+      if (nextJson === row.source_json) continue; // already trimmed: no write needed
+      statements.push({
+        sql: 'UPDATE documents SET source_json = ? WHERE doc_id = ?',
+        args: [nextJson, row.doc_id],
+      });
+    }
+    if (statements.length) {
+      await client.batch(statements, 'write');
+      total += statements.length;
+    }
+  }
+
+  await client.execute({
+    sql: `
+      INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+      VALUES (?, 'complete', ?)
+      ON CONFLICT(projection_key) DO UPDATE SET
+        projection_value = excluded.projection_value,
+        updated_at = excluded.updated_at
+    `,
+    args: [SOURCE_JSON_TRIM_STATE_KEY, new Date().toISOString()],
+  });
+  if (total > 0) logger.info(`Trimmed source_json provenance for ${total} documents`);
+  return total;
 }
 
 export async function cleanupCommitteeArtifacts(dbInstance = null) {
@@ -700,7 +771,25 @@ export async function cleanupCommitteeArtifacts(dbInstance = null) {
 
 // --- Document functions ---
 
+// #28: documents.source_json is a provenance stub, never a full-record cache.
+// This is an allowlist, not a denylist: only `id`/`sourceUpdatedAt` are ever
+// read off `source` here, so `full_text`/`FullText`/`transcript`/`text`/`ocr`/
+// `body` (or any other upstream field) can never ride into source_json
+// through this path, regardless of what shape a caller passes as `source`.
+// This is a standing invariant enforced at the write path, not a one-time
+// cleanup — do not widen this to a spread or a denylist-based filter without
+// re-auditing every call site that constructs a `source` object.
+function trimmedSourceProvenance(source) {
+  if (!source || typeof source !== 'object') return null;
+  const id = source.id ?? source._id ?? source.identifier ?? source.Identifier ?? null;
+  const sourceUpdatedAt = source.sourceUpdatedAt ?? source.updatedAt ?? source.updated_at
+    ?? source.date_updated ?? source.dateModified ?? null;
+  if (id == null && sourceUpdatedAt == null) return null;
+  return { id, sourceUpdatedAt };
+}
+
 function documentColumns(doc, syncKey = null, source = null) {
+  const provenance = trimmedSourceProvenance(source);
   return {
     syncKey,
     title: doc.title || null,
@@ -708,8 +797,8 @@ function documentColumns(doc, syncKey = null, source = null) {
     year: doc.year ?? null,
     degree: doc.degree || null,
     program: doc.program || null,
-    sourceJson: source ? JSON.stringify(source) : null,
-    sourceUpdatedAt: source?.sourceUpdatedAt || source?.updatedAt || null,
+    sourceJson: provenance ? JSON.stringify(provenance) : null,
+    sourceUpdatedAt: provenance?.sourceUpdatedAt || null,
   };
 }
 
