@@ -23,7 +23,12 @@ export function validateMetricsParams({ maxRecords, pageSize, scanLimit, subject
   }
   if (scanLimit != null && scanLimit !== '') {
     const n = Number(scanLimit);
-    if (!Number.isFinite(n) || n < 1 || n > 50000) errors.push('scanLimit must be between 1 and 50000.');
+    // #17: raised in step with worker.js's sync scanLimit default so an
+    // operator raising the sync-side ceiling doesn't hit a confusing,
+    // unrelated cap when pointing the analytics/metrics scan at the same
+    // figure. This cap is independent of (and does not gate) the sync job's
+    // own scanLimit — see src/worker.js and src/sync.js's publicSource().
+    if (!Number.isFinite(n) || n < 1 || n > 200000) errors.push('scanLimit must be between 1 and 200000.');
   }
   if (subjectLimit != null && subjectLimit !== '') {
     const n = Number(subjectLimit);

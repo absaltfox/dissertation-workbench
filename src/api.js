@@ -69,7 +69,15 @@ export function collectCandidateUrls(doc, id, doi) {
   return unique(candidates);
 }
 
-export async function fetchPage({ baseUrl, index, apiKey, from, pageSize, query, term, source }) {
+// #17 Track 2 (H-02): unverified against the real endpoint — sync.js probes
+// this defensively (falls back to unsorted `from` paging if the request
+// itself is rejected) rather than assuming it works. Needs live confirmation
+// against oc-index.library.ubc.ca, which is unreachable from this sandbox.
+export const OC_STABLE_SORT_FIELD = 'id:asc';
+
+export async function fetchPage({
+  baseUrl, index, apiKey, from, pageSize, query, term, source, sort = null, searchAfter = null,
+}) {
   const headers = { accept: 'application/json' };
   if (apiKey) {
     headers['x-api-key'] = apiKey;
@@ -77,11 +85,18 @@ export async function fetchPage({ baseUrl, index, apiKey, from, pageSize, query,
   }
 
   const apiRoot = new URL('/search/8.5', baseUrl).toString();
-  const params = [
-    `size=${encodeURIComponent(String(pageSize))}`,
-    `from=${encodeURIComponent(String(from))}`
-  ];
+  const params = [`size=${encodeURIComponent(String(pageSize))}`];
+  // #17 Track 2: search_after replaces `from` entirely once a cursor is
+  // available (mixing the two is invalid for cursor-based deep pagination);
+  // until then, or if the endpoint turns out not to support it, `from`-based
+  // paging (today's unconditional behavior) is unchanged.
+  if (searchAfter != null) {
+    params.push(`search_after=${encodeURIComponent(JSON.stringify(searchAfter))}`);
+  } else {
+    params.push(`from=${encodeURIComponent(String(from))}`);
+  }
   if (index) params.unshift(`index=${encodeURIComponent(index)}`);
+  if (sort) params.push(`sort=${encodeURIComponent(sort)}`);
 
   if (query) params.push(`q=${encodeURIComponent(query)}`);
   if (term) {
@@ -195,6 +210,14 @@ export function extractHits(payload) {
     // Inject the Elasticsearch index name so collectCandidateUrls can derive the collection number
     if (source && typeof source === 'object' && hit?._index && !source.__oc_index) {
       source.__oc_index = hit._index;
+    }
+    // #17 Track 2: propagate the hit's own `sort` cursor value, when the
+    // endpoint returns one, so a caller can attempt search_after-based deep
+    // pagination. Left undefined when absent — that absence is itself the
+    // capability-detection signal sync.js's OC-scan loop uses to fall back to
+    // plain `from` paging (see OC_STABLE_SORT_FIELD's caveat above).
+    if (source && typeof source === 'object' && hit?.sort !== undefined && source.__oc_sort === undefined) {
+      source.__oc_sort = hit.sort;
     }
     return source;
   }).filter(Boolean);
