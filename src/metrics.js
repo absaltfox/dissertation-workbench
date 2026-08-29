@@ -556,13 +556,43 @@ const COOCCURRENCE_BLOCKLIST = new Set([
   'native indian', // archaic, from older dissertations — not a useful discovery concept
 ]);
 
-function buildTermCooccurrence(records, topN = 20) {
-  const dict = loadConceptDictionary();
-  const pairCounts = new Map();
-  const termCounts = new Map(); // per-document frequency within this corpus view
-  const N = records.length;
+// #26: the floor below was a bare `2`, tuned by inspection for the corpus
+// size at the time (~400 documents) and never revisited as the corpus grew.
+// A fixed floor stops trimming low-signal pairs as N grows, so the
+// (post-filter) ranked list balloons toward the concept vocabulary's full
+// pair space. Co-occurrence significance conventionally scales sub-linearly
+// with corpus size — this mirrors why `lift`, not raw `count`, already
+// carries the ranking signal below. Named and exported so its concrete
+// behavior (minCount stays 2 up to N≈1600; ≈12 at N=56,000) is a pinned,
+// testable contract, not inline math.
+export function termCooccurrenceMinCount(n) {
+  return Math.max(2, Math.round(Math.sqrt(n / 400)));
+}
 
-  for (const rec of records) {
+// #26: hard, corpus-size-independent cap on how many distinct concept terms
+// ever enter the pairwise loop below. Each document only ever contributes a
+// bounded number of terms (docConceptTerms' own limit), so per-document work
+// is already bounded — but pairCounts' *key space* is bounded by the number
+// of distinct multi-doc concept terms seen across the whole record set, which
+// is not bounded by anything else here and could otherwise grow with the
+// corpus (a larger, more varied corpus surfaces a larger concept
+// vocabulary). This caps that independently of both N and the minCount
+// threshold, which only shrinks the output after the Map is already built.
+const TERM_COOCCURRENCE_MAX_TERMS = 400;
+
+export function buildTermCooccurrence(records, topN = 20) {
+  const dict = loadConceptDictionary();
+  const N = records.length;
+  const minCount = termCooccurrenceMinCount(N);
+
+  // Pass 1: per-document term lists (already deduped/filtered) plus each
+  // term's document frequency, without building any pairs yet — so the
+  // allowlist below can cap the term vocabulary before the quadratic pairing
+  // step runs, rather than after an unbounded Map has already been built.
+  const docFreq = new Map();
+  const perDocTerms = new Array(records.length);
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
     // Use a generous budget (20) so multi-doc concepts aren't crowded out by
     // high-IDF single-doc concepts occupying all the top slots.  Then keep only
     // multi-doc concepts: single-doc concepts (docFreq=1) can never co-occur
@@ -575,8 +605,26 @@ function buildTermCooccurrence(records, topN = 20) {
       // trivially in quantitative studies regardless of topic. These belong in
       // the Methodology panel; including them here hides meaningful topic pairs.
       .filter((c) => !COOCCURRENCE_BLOCKLIST.has(c));
-    for (const c of unique) termCounts.set(c, (termCounts.get(c) || 0) + 1);
-    const sorted = [...unique].sort();
+    if (unique.length < 2) continue;
+    perDocTerms[i] = unique;
+    for (const c of unique) docFreq.set(c, (docFreq.get(c) || 0) + 1);
+  }
+
+  const allowedTerms = new Set(
+    Array.from(docFreq.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, TERM_COOCCURRENCE_MAX_TERMS)
+      .map(([term]) => term)
+  );
+
+  const pairCounts = new Map();
+  const termCounts = new Map(); // per-document frequency within this corpus view
+  for (const unique of perDocTerms) {
+    if (!unique) continue;
+    const filtered = unique.filter((c) => allowedTerms.has(c));
+    if (filtered.length < 2) continue;
+    for (const c of filtered) termCounts.set(c, (termCounts.get(c) || 0) + 1);
+    const sorted = [...filtered].sort();
     for (let i = 0; i < sorted.length; i++) {
       for (let j = i + 1; j < sorted.length; j++) {
         const key = `${sorted[i]}|||${sorted[j]}`;
@@ -586,7 +634,7 @@ function buildTermCooccurrence(records, topN = 20) {
   }
 
   return Array.from(pairCounts.entries())
-    .filter(([, count]) => count >= 2) // minimum co-occurrence (corpus is ~400 docs)
+    .filter(([, count]) => count >= minCount)
     .map(([key, count]) => {
       const [termA, termB] = key.split('|||');
       const freqA = termCounts.get(termA) || 1;
@@ -807,11 +855,22 @@ function buildTopicsByYear(topics, documents, leafToParent) {
     });
 }
 
-function buildSupervisorNetwork(records, minEdge = 1) {
+// #27: two-pass by design. Pass 1 builds only nodeMap (docCount per person) —
+// no edges, no `docs` arrays — so the top-N cut can be computed before any
+// pairwise memory is allocated. Pass 2 re-scans records and builds edges
+// (with their `docs` arrays) only for pairs whose *both* endpoints already
+// survived the top-N cut. The single-pass predecessor built a full edgeMap
+// (docs arrays included) for every co-authorship pair in every record, then
+// discarded all but the top-30-node-qualifying edges afterward — so every
+// non-qualifying edge's `docs` array was fully populated for nothing. This
+// changes cost, not output: same top-N nodes, same qualifying edges, same
+// weights, same docs lists for the edges that survive.
+export function buildSupervisorNetwork(records, minEdge = 1, topN = 30) {
   const nodeMap = new Map(); // name -> docCount
-  const edgeMap = new Map(); // "A|||B" -> { weight, docs }
+  const perRecordPeople = new Array(records.length);
 
-  for (const rec of records) {
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
     const people = [];
     for (const s of (rec.supervisors || [])) people.push(s);
     if (rec.committee) {
@@ -822,15 +881,26 @@ function buildSupervisorNetwork(records, minEdge = 1) {
       }
     }
     if (people.length === 0) continue;
+    for (const p of people) nodeMap.set(p, (nodeMap.get(p) || 0) + 1);
+    perRecordPeople[i] = people;
+  }
 
-    for (const p of people) {
-      nodeMap.set(p, (nodeMap.get(p) || 0) + 1);
-    }
+  const topNodes = Array.from(nodeMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, topN);
+  const topSet = new Set(topNodes.map(([name]) => name));
 
-    const sorted = [...people].sort();
-    for (let i = 0; i < sorted.length; i++) {
-      for (let j = i + 1; j < sorted.length; j++) {
-        const key = `${sorted[i]}|||${sorted[j]}`;
+  const edgeMap = new Map(); // "A|||B" -> { weight, docs } — only for topSet pairs
+  for (let i = 0; i < records.length; i++) {
+    const people = perRecordPeople[i];
+    if (!people) continue;
+    const qualifying = people.filter((p) => topSet.has(p));
+    if (qualifying.length < 2) continue;
+    const rec = records[i];
+    const sorted = [...qualifying].sort();
+    for (let a = 0; a < sorted.length; a++) {
+      for (let b = a + 1; b < sorted.length; b++) {
+        const key = `${sorted[a]}|||${sorted[b]}`;
         if (!edgeMap.has(key)) edgeMap.set(key, { weight: 0, docs: [] });
         const e = edgeMap.get(key);
         e.weight += 1;
@@ -839,18 +909,9 @@ function buildSupervisorNetwork(records, minEdge = 1) {
     }
   }
 
-  // Top 30 nodes by docCount
-  const topNodes = Array.from(nodeMap.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 30);
-  const topSet = new Set(topNodes.map(([name]) => name));
-
   const nodes = topNodes.map(([id, docCount]) => ({ id, docCount }));
   const edges = Array.from(edgeMap.entries())
-    .filter(([key, e]) => {
-      const [a, b] = key.split('|||');
-      return topSet.has(a) && topSet.has(b) && e.weight >= minEdge;
-    })
+    .filter(([, e]) => e.weight >= minEdge)
     .map(([key, e]) => {
       const [source, target] = key.split('|||');
       return { source, target, weight: e.weight, docs: e.docs };

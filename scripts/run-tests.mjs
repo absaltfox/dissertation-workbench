@@ -10,7 +10,10 @@ import { spawn } from 'node:child_process';
 
 const dataDir = mkdtempSync(path.join(tmpdir(), 'oc-test-data-'));
 
-const child = spawn(process.execPath, ['--test', ...process.argv.slice(2)], {
+// --expose-gc lets peak-heap scaling tests (Phase D #26/#27) force a
+// collection between measurements for a much less noisy heapUsed delta.
+// Tests that don't call global.gc() are unaffected.
+const child = spawn(process.execPath, ['--expose-gc', '--test', ...process.argv.slice(2)], {
   stdio: 'inherit',
   env: {
     ...process.env,
