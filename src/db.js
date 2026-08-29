@@ -4086,11 +4086,35 @@ export async function countPendingLookups(options = {}) {
   return Number(row?.total || 0);
 }
 
-export async function getCitationCooccurrence(limit = 100) {
+// #25: dc1/dc2's self-join has no bound on its own — both arms already use
+// covering indexes (dc1: idx_document_citations_citation_doc; dc2: the
+// implicit index behind PRIMARY KEY(doc_id, citation_id)), verified by
+// EXPLAIN QUERY PLAN, so this was never an indexing gap. The bottleneck is
+// the *cardinality* the join is asked to process: with no document-set bound
+// it processes every document that contains any of the top-50 citations
+// corpus-wide, which grows with total corpus size regardless of how bounded
+// the caller's own document sample already is. `docIds`, when supplied,
+// scopes both top_citations and the self-join to that bounded set via a
+// single JSON-array parameter (`WHERE doc_id IN (SELECT value FROM
+// json_each(?))`) rather than a giant literal IN list, which risks
+// exceeding libsql's parameter-count ceiling above a few hundred ids. Do not
+// add a new index here — the existing ones already cover this query; the fix
+// is bounding the input, not the lookup path.
+export async function getCitationCooccurrence(limit = 100, docIds = null) {
+  const hasBound = Array.isArray(docIds) && docIds.length > 0;
+  const boundJson = hasBound ? JSON.stringify(docIds) : null;
+  const topCitationsFilter = hasBound ? 'WHERE doc_id IN (SELECT value FROM json_each(?))' : '';
+  const selfJoinFilter = hasBound ? 'AND dc1.doc_id IN (SELECT value FROM json_each(?))' : '';
+  const args = [];
+  if (hasBound) args.push(boundJson);
+  if (hasBound) args.push(boundJson);
+  args.push(limit);
+
   return all(`
     WITH top_citations AS (
       SELECT citation_id, COUNT(DISTINCT doc_id) AS cnt
       FROM document_citations
+      ${topCitationsFilter}
       GROUP BY citation_id
       HAVING cnt >= 2
       ORDER BY cnt DESC
@@ -4107,11 +4131,12 @@ export async function getCitationCooccurrence(limit = 100) {
     JOIN citations c2 ON c2.id = dc2.citation_id
     JOIN top_citations tc1 ON tc1.citation_id = c1.id
     JOIN top_citations tc2 ON tc2.citation_id = c2.id
+    WHERE 1 = 1 ${selfJoinFilter}
     GROUP BY dc1.citation_id, dc2.citation_id
     HAVING shared >= 2
     ORDER BY shared DESC
     LIMIT ?
-  `, [limit]);
+  `, args);
 }
 
 export async function getTopCitedWorks(limit = 50) {

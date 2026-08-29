@@ -920,8 +920,12 @@ export function buildSupervisorNetwork(records, minEdge = 1, topN = 30) {
   return { nodes, edges };
 }
 
-async function buildCitationCooccurrenceNetwork() {
-  const rows = await getCitationCooccurrence(100);
+// #25: docIds bounds the self-join in getCitationCooccurrence to the same
+// document sample the rest of this payload is scoped to, instead of the
+// caller's bound silently being ignored while this one panel's cost tracks
+// the full corpus's citation-table size.
+async function buildCitationCooccurrenceNetwork(docIds = null) {
+  const rows = await getCitationCooccurrence(100, docIds);
   const nodeMap = new Map();
 
   for (const row of rows) {
@@ -1099,11 +1103,12 @@ export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjec
   const metrics = buildMetrics(normalizedRecords, subjectLimit);
   if (persistRun) await saveRunMetrics(sourceMeta, metrics);
 
+  const docIds = normalizedRecords.map((doc) => doc.id).filter(Boolean);
+
   // Load BERTopic results if available
   let topicData = null;
   if (await hasTopics()) {
     const topics = await loadTopics();
-    const docIds = normalizedRecords.map((doc) => doc.id).filter(Boolean);
     const docTopics = await loadDocumentTopics(docIds);
     // Attach topic_id and UMAP coords to each document
     const topicCoords = await loadDocumentTopicCoords(docIds);
@@ -1153,7 +1158,7 @@ export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjec
     conceptTimeline: buildConceptTimeline(normalizedRecords),
     methodologyConceptMatrix: buildMethodologyConceptMatrix(normalizedRecords),
     supervisorNetwork: buildSupervisorNetwork(normalizedRecords),
-    citationCooccurrence: await buildCitationCooccurrenceNetwork(),
+    citationCooccurrence: await buildCitationCooccurrenceNetwork(docIds),
     methodologyTopicMatrix: topicData ? buildMethodologyTopicMatrix(normalizedRecords, topicData.topics) : null,
     topicData
   };
