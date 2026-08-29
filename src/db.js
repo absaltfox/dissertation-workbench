@@ -85,6 +85,85 @@ async function all(sql, args = []) {
   return result.rows;
 }
 
+// --- #18/#23: transient-DB retry classification and backoff ---
+//
+// A libsql connection blip (a closed websocket, a dropped HTTP round trip) can
+// surface at any statement. Retrying blindly is only safe for calls whose
+// underlying writes are provably idempotent (see the seven wrapped functions
+// below, `withDbRetry`'s own call sites) — this is deliberately NOT a blanket
+// wrap of `execute`/`client.batch`, since a non-idempotent write retried after
+// an ambiguous "did it commit" failure risks double-applying it.
+
+// Jittered exponential backoff: base * factor^attempt, ±jitterRatio jitter,
+// capped at capMs. `attempt` is 0-based (the delay *before* attempt N, N>=1).
+export function computeBackoffDelayMs(attempt, {
+  baseMs = 25, factor = 2, jitterRatio = 0.3, capMs = 5_000, random = Math.random,
+} = {}) {
+  const raw = Math.min(capMs, baseMs * (factor ** Math.max(0, attempt)));
+  const jitter = raw * jitterRatio * (random() * 2 - 1); // +/- jitterRatio
+  return Math.max(1, Math.round(raw + jitter));
+}
+
+const TRANSIENT_DB_CODES = new Set([
+  'HRANA_WEBSOCKET_ERROR', 'HRANA_CLOSED_ERROR', 'HRANA_PROTO_ERROR',
+  'SERVER_ERROR', 'INTERNAL_ERROR', 'UNKNOWN',
+]);
+const PERMANENT_DB_CODES = new Set(['PROTOCOL_VERSION_ERROR', 'TRANSACTION_CLOSED']);
+const TRANSIENT_MESSAGE_PATTERN = /ECONNRESET|ETIMEDOUT|EPIPE|fetch failed|socket hang up|network/i;
+
+// Classifies a caught error as 'transient' (worth retrying — a connection blip
+// with no evidence the statement committed) or 'permanent' (a schema/syntax/
+// data problem no retry can fix, or an error we cannot positively identify as
+// transient — defaulting an unrecognized error to permanent is deliberate:
+// masking a real bug as routine flakiness is worse than under-retrying).
+export function classifyDbError(error) {
+  const code = String(error?.code || '');
+  if (TRANSIENT_DB_CODES.has(code) || /^SQLITE_BUSY|^SQLITE_LOCKED/.test(code)) return 'transient';
+  if (PERMANENT_DB_CODES.has(code) || /^SQLITE_CONSTRAINT|^SQLITE_MISUSE|^SQLITE_ERROR/.test(code)) {
+    return 'permanent';
+  }
+  if (error?.name === 'MisuseError') return 'permanent';
+  if (!code) {
+    const message = `${error?.message || ''} ${error?.cause?.message || ''}`;
+    if (TRANSIENT_MESSAGE_PATTERN.test(message)) return 'transient';
+  }
+  return 'permanent';
+}
+
+const DB_RETRY_MAX_ATTEMPTS = Number(process.env.DB_RETRY_MAX_ATTEMPTS) || 4;
+
+// Retries `fn` only on a `classifyDbError(error) === 'transient'` result, with
+// jittered exponential backoff between attempts. A permanent error, or a
+// transient one that survives every retry, is re-thrown unwrapped so the
+// caller's own classification (e.g. sync.js's per-document vs. page-level
+// boundary) still sees the original error shape.
+export async function withDbRetry(fn, {
+  label = 'db-operation', maxAttempts = DB_RETRY_MAX_ATTEMPTS, wait = defaultRetryWait,
+  backoff = computeBackoffDelayMs,
+} = {}) {
+  let lastError;
+  for (let attempt = 0; attempt < Math.max(1, maxAttempts); attempt += 1) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      const isLastAttempt = attempt >= Math.max(1, maxAttempts) - 1;
+      if (isLastAttempt || classifyDbError(error) !== 'transient') throw error;
+      logger.warn('Retrying transient DB error', {
+        label, attempt: attempt + 1, maxAttempts, error: error?.message || String(error),
+      });
+      // eslint-disable-next-line no-await-in-loop
+      await wait(backoff(attempt));
+    }
+  }
+  throw lastError;
+}
+
+function defaultRetryWait(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
 async function exec(sql) {
   const client = await getDb();
   await client.executeMultiple(sql);
@@ -810,14 +889,21 @@ async function backfillDocumentPeopleProjection(client) {
   if (committeeRows) logger.info('Backfilled committee people projection', { rows: committeeRows });
 }
 
+// Retry-safe (#18 Layer A): one atomic client.batch() — a DELETE-then-upsert of
+// document_people rows plus the document upsert — so a full retry after an
+// ambiguous failure always re-runs the same leading DELETE and re-converges to
+// the same end state. Do not add a plain (non-upserting) INSERT to this
+// function without re-auditing this guarantee.
 export async function saveDocumentMetadata(doc, { syncKey = null, source = null } = {}) {
-  doc = withStoredThemes(doc);
-  const now = new Date().toISOString();
-  const client = await getDb();
-  await client.batch([
-    saveDocumentStatement(doc, { syncKey, source }, now),
-    ...metadataPeopleStatements(doc, now),
-  ], 'write');
+  return withDbRetry(async () => {
+    doc = withStoredThemes(doc);
+    const now = new Date().toISOString();
+    const client = await getDb();
+    await client.batch([
+      saveDocumentStatement(doc, { syncKey, source }, now),
+      ...metadataPeopleStatements(doc, now),
+    ], 'write');
+  }, { label: 'saveDocumentMetadata' });
 }
 
 function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now = new Date().toISOString()) {
@@ -1784,6 +1870,8 @@ export async function createSyncRun(syncKey, source) {
   return Number(result.lastInsertRowid || result.lastInsertRowId || 0);
 }
 
+// Retry-safe (#18 Layer A): a single `UPDATE ... WHERE id = ?`, idempotent by
+// primary key — re-applying the same patch after an ambiguous failure is safe.
 export async function updateSyncRun(id, patch) {
   if (!id) return;
   const fields = [];
@@ -1803,7 +1891,10 @@ export async function updateSyncRun(id, patch) {
   }
   if (!fields.length) return;
   args.push(id);
-  await run(`UPDATE sync_runs SET ${fields.join(', ')} WHERE id = ?`, args);
+  return withDbRetry(
+    () => run(`UPDATE sync_runs SET ${fields.join(', ')} WHERE id = ?`, args),
+    { label: 'updateSyncRun' }
+  );
 }
 
 export async function getLatestSyncRun(syncKey = null) {
@@ -2074,8 +2165,9 @@ export async function listAdminJobs(limit = 25) {
 
 // --- File metric functions ---
 
+// Retry-safe (#18 Layer A): pure read.
 export async function loadStoredFileMetric(docId) {
-  return get(`
+  return withDbRetry(() => get(`
     SELECT doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count,
            full_text_path, full_text_bytes, full_text_source_url, page_count,
            word_source, page_source, content_source, content_checksum,
@@ -2084,11 +2176,12 @@ export async function loadStoredFileMetric(docId) {
            original_pdf_request_count, retrieved_bytes, status, error, updated_at
     FROM file_metrics
     WHERE doc_id = ?
-  `, [docId]);
+  `, [docId]), { label: 'loadStoredFileMetric' });
 }
 
 // Batched form of loadStoredFileMetric (H-05): one SELECT per page of sync
 // records instead of one per record. Returns a Map keyed by doc_id.
+// Retry-safe (#18 Layer A): pure reads, chunk by chunk.
 export async function loadStoredFileMetrics(docIds = []) {
   const ids = normalizeDocIdList(docIds);
   const byDocId = new Map();
@@ -2096,7 +2189,8 @@ export async function loadStoredFileMetrics(docIds = []) {
   for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
     const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
     const placeholders = chunk.map(() => '?').join(', ');
-    const rows = await all(`
+    // eslint-disable-next-line no-await-in-loop
+    const rows = await withDbRetry(() => all(`
       SELECT doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count,
              full_text_path, full_text_bytes, full_text_source_url, page_count,
              word_source, page_source, content_source, content_checksum,
@@ -2105,13 +2199,18 @@ export async function loadStoredFileMetrics(docIds = []) {
              original_pdf_request_count, retrieved_bytes, status, error, updated_at
       FROM file_metrics
       WHERE doc_id IN (${placeholders})
-    `, chunk);
+    `, chunk), { label: 'loadStoredFileMetrics' });
     for (const row of rows) byDocId.set(String(row.doc_id), row);
   }
   return byDocId;
 }
 
+// Retry-safe (#18 Layer A): `INSERT ... ON CONFLICT DO UPDATE` upsert.
 export async function saveFileMetric(docId, payload) {
+  return withDbRetry(() => saveFileMetricOnce(docId, payload), { label: 'saveFileMetric' });
+}
+
+async function saveFileMetricOnce(docId, payload) {
   const now = new Date().toISOString();
   await run(`
     INSERT INTO file_metrics (
@@ -2255,6 +2354,8 @@ export async function listDocumentsPendingEnrichment({
   });
 }
 
+// Retry-safe (#18 Layer A): each chunk is one client.batch() of upserts —
+// a retry re-applies the same `attempted_at` stamp to the same doc_ids.
 export async function markEnrichmentAttempts(docIds = [], attemptedAt = new Date().toISOString()) {
   const ids = normalizeDocIdList(docIds);
   if (!ids.length) return 0;
@@ -2262,18 +2363,21 @@ export async function markEnrichmentAttempts(docIds = [], attemptedAt = new Date
   const stamp = String(attemptedAt || new Date().toISOString());
   const chunkSize = 250;
   for (let i = 0; i < ids.length; i += chunkSize) {
-    await client.batch(ids.slice(i, i + chunkSize).map((docId) => ({
+    const chunk = ids.slice(i, i + chunkSize);
+    // eslint-disable-next-line no-await-in-loop
+    await withDbRetry(() => client.batch(chunk.map((docId) => ({
       sql: `
         INSERT INTO enrichment_attempts (doc_id, attempted_at)
         VALUES (?, ?)
         ON CONFLICT(doc_id) DO UPDATE SET attempted_at = excluded.attempted_at
       `,
       args: [docId, stamp],
-    })), 'write');
+    })), 'write'), { label: 'markEnrichmentAttempts' });
   }
   return ids.length;
 }
 
+// Retry-safe (#18 Layer A): pure reads, chunk by chunk.
 export async function loadEnrichmentAttempts(docIds = []) {
   const ids = normalizeDocIdList(docIds);
   const byDocId = new Map();
@@ -2281,10 +2385,11 @@ export async function loadEnrichmentAttempts(docIds = []) {
   for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
     const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
     const placeholders = chunk.map(() => '?').join(', ');
-    const rows = await all(
+    // eslint-disable-next-line no-await-in-loop
+    const rows = await withDbRetry(() => all(
       `SELECT doc_id, attempted_at FROM enrichment_attempts WHERE doc_id IN (${placeholders})`,
       chunk
-    );
+    ), { label: 'loadEnrichmentAttempts' });
     for (const row of rows) byDocId.set(String(row.doc_id), row.attempted_at || null);
   }
   return byDocId;
@@ -2659,12 +2764,41 @@ export async function deleteImportRule(id) {
   return true;
 }
 
+// CAS backoff is intentionally smaller/faster-capped than Layer A's
+// withDbRetry default — this loop can run up to `maxAttempts` times per call
+// under real contention (many concurrent workers on one import rule), so a
+// large base/cap here would multiply into unacceptable worst-case latency.
+const CAS_BACKOFF_OPTIONS = { baseMs: 5, factor: 1.6, jitterRatio: 0.4, capMs: 200 };
+
+// #23: never throws for ordinary contention. Jittered backoff is inserted
+// between CAS attempts (spreading collisions in time instead of every
+// contending worker retrying in lockstep), and exhausting the attempt budget
+// returns a wait duration — reusing the same "next window boundary"
+// computation the "window is full" branch below already does, since 20
+// straight CAS collisions is operationally the same situation as a full
+// window from the caller's point of view (createRequestRateLimiter's
+// `reserveSlot` loop already knows how to wait on a returned waitMs and try
+// again). The one case this cannot paper over — the persisted state being
+// unparseable on every single attempt, never once recovering even after this
+// function's own CAS tried to replace it — is genuine data corruption, not
+// contention, and is the sole remaining throw path; it is tagged
+// `RATE_LIMIT_STATE_CORRUPT` so evaluateEnrichmentRun can exclude it from the
+// enrichment-quality success rate rather than counting infra noise as a bad
+// PDF (see src/services/enrichmentRollout.js).
 export async function reserveImportRuleRequestSlot(ruleId, limit, {
-  nowMs = Date.now(), windowMs = 60_000,
+  nowMs = Date.now(), windowMs = 60_000, wait = defaultRetryWait, maxAttempts = 20,
+  backoff = computeBackoffDelayMs,
 } = {}) {
   if (!ruleId || !Number.isFinite(Number(limit)) || Number(limit) <= 0) return 0;
   const boundedLimit = Math.max(1, Math.min(600, Math.floor(Number(limit))));
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  let everParsed = false;
+  let lastTimestamps = [];
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    if (attempt > 0) {
+      // eslint-disable-next-line no-await-in-loop
+      await wait(backoff(attempt - 1, CAS_BACKOFF_OPTIONS));
+    }
+    // eslint-disable-next-line no-await-in-loop
     const row = await get(
       'SELECT timestamps_json FROM import_rule_request_limits WHERE rule_id = ?',
       [ruleId]
@@ -2672,17 +2806,19 @@ export async function reserveImportRuleRequestSlot(ruleId, limit, {
     let timestamps = [];
     try {
       const parsed = JSON.parse(row?.timestamps_json || '[]');
-      if (Array.isArray(parsed)) timestamps = parsed;
+      if (Array.isArray(parsed)) { timestamps = parsed; everParsed = true; }
     } catch { /* replace malformed limiter state */ }
     timestamps = timestamps
       .map(Number)
       .filter((value) => Number.isFinite(value) && value > nowMs - windowMs)
       .sort((left, right) => left - right);
+    lastTimestamps = timestamps;
     if (timestamps.length >= boundedLimit) {
       return Math.max(1, timestamps[0] + windowMs - nowMs);
     }
     const nextJson = JSON.stringify([...timestamps, nowMs].slice(-600));
     let result;
+    // eslint-disable-next-line no-await-in-loop
     if (row) {
       result = await run(`
         UPDATE import_rule_request_limits
@@ -2697,7 +2833,16 @@ export async function reserveImportRuleRequestSlot(ruleId, limit, {
     }
     if (result.changes === 1) return 0;
   }
-  throw new Error(`Could not reserve content-request quota for import rule ${ruleId}.`);
+  if (!everParsed) {
+    const err = new Error(
+      `Rate-limit state for import rule ${ruleId} is corrupt: timestamps_json was not valid JSON after ${maxAttempts} attempts.`
+    );
+    err.code = 'RATE_LIMIT_STATE_CORRUPT';
+    throw err;
+  }
+  return lastTimestamps.length
+    ? Math.max(1, lastTimestamps[0] + windowMs - nowMs)
+    : backoff(maxAttempts, CAS_BACKOFF_OPTIONS);
 }
 
 function enrichmentRolloutFromRow(row) {
