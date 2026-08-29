@@ -7,7 +7,8 @@ import { logger } from './logger.js';
 import { dedupeSupervisorNames, normalizePersonName, stripMiddleInitials, supervisorNameKey } from './supervisors.js';
 import { encryptMfaSecret, decryptMfaSecret } from './secretCrypto.js';
 import { jaroWinkler } from './fuzzyMatch.js';
-import { documentThemeTerms } from './nlp.js';
+import { documentThemeTerms, COOCCURRENCE_BLOCKLIST } from './nlp.js';
+import { buildParentClusters, buildTopicsByYearFromCounts } from './topicHierarchy.js';
 import { normalizeImportRule } from './importRules.js';
 
 let db;
@@ -1418,6 +1419,276 @@ async function aggregateNumericSeries({ filters, valueSql, reliabilitySql }) {
   return rows.map((row) => ({ year: Number(row.year), ...numericStats(row) }));
 }
 
+// #15: SQL ports of five of the six panels that previously went silently
+// empty above DETAILED_ANALYTICS_RECORD_LIMIT. Each mirrors a JS aggregator
+// in metrics.js closely enough to be behaviorally equivalent on real
+// ingested data (docConceptTerms() short-circuits to the stored
+// `conceptTerms` array for every real document, so a direct
+// json_each(d.metadata_json, '$.conceptTerms') read reproduces it) — proven
+// per-panel by a JS-vs-SQL cross-check test on an identical fixture rather
+// than assumed. `termCooccurrence` (pairwise combinatorics, the same
+// unbounded-self-join shape #25/#26 already had to bound) is deliberately
+// NOT ported here — it is served as a bounded real sample at the route layer
+// (metricsRoutes.js), reusing buildTermCooccurrence from metrics.js, since
+// db.js cannot import metrics.js without a circular dependency.
+
+async function computeConceptTimelineSql(filters, qualifier, topN = 8) {
+  const blocklistJson = JSON.stringify([...COOCCURRENCE_BLOCKLIST]);
+  const topConcepts = await all(`
+    SELECT trim(CAST(term.value AS TEXT)) AS concept, COUNT(DISTINCT d.doc_id) AS total_docs
+    FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
+    ${filters.where}
+    ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
+      AND trim(CAST(term.value AS TEXT)) NOT IN (SELECT value FROM json_each(?))
+    GROUP BY concept
+    ORDER BY total_docs DESC, concept ASC
+    LIMIT ?
+  `, [...filters.args, blocklistJson, topN]);
+  if (!topConcepts.length) return [];
+
+  const conceptListJson = JSON.stringify(topConcepts.map((row) => row.concept));
+  const yearRows = await all(`
+    SELECT trim(CAST(term.value AS TEXT)) AS concept, d.year AS year, COUNT(DISTINCT d.doc_id) AS count
+    FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
+    ${filters.where}
+    ${qualifier} d.year IS NOT NULL
+      AND trim(CAST(term.value AS TEXT)) IN (SELECT value FROM json_each(?))
+    GROUP BY concept, d.year
+  `, [...filters.args, conceptListJson]);
+
+  const yearsByConcept = new Map();
+  for (const row of yearRows) {
+    if (!yearsByConcept.has(row.concept)) yearsByConcept.set(row.concept, []);
+    yearsByConcept.get(row.concept).push({ year: Number(row.year), count: Number(row.count || 0) });
+  }
+  return topConcepts.map((row) => ({
+    concept: row.concept,
+    totalDocs: Number(row.total_docs || 0),
+    data: (yearsByConcept.get(row.concept) || []).sort((a, b) => a.year - b.year),
+  }));
+}
+
+async function computeMethodologyConceptMatrixSql(filters, qualifier, topM = 10, topC = 10) {
+  const topMethodologies = await all(`
+    SELECT trim(CAST(m.value AS TEXT)) AS methodology, COUNT(*) AS count
+    FROM documents d, json_each(d.metadata_json, '$.methodologies') m
+    ${filters.where}
+    ${qualifier} trim(CAST(m.value AS TEXT)) <> ''
+    GROUP BY methodology
+    ORDER BY count DESC, methodology ASC
+    LIMIT ?
+  `, [...filters.args, topM]);
+  if (!topMethodologies.length) {
+    return { methodologies: [], concepts: [], conceptIds: [], matrix: [] };
+  }
+
+  // Mirrors buildMethodologyConceptMatrix's own weighting exactly: a
+  // document's concept counts are incremented once per methodology on that
+  // document (the JS loop increments conceptCounts *inside* the methodology
+  // loop), so a document with 2 methodologies weights its concepts' ranking
+  // score by 2, not 1. This only affects which concepts land in the top-C
+  // set, not the final cross-tab values below.
+  const topConcepts = await all(`
+    SELECT trim(CAST(term.value AS TEXT)) AS concept,
+           SUM((SELECT COUNT(*) FROM json_each(d.metadata_json, '$.methodologies'))) AS weighted_count
+    FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
+    ${filters.where}
+    ${qualifier} term.key < 10
+      AND trim(CAST(term.value AS TEXT)) <> ''
+      AND EXISTS (SELECT 1 FROM json_each(d.metadata_json, '$.methodologies'))
+    GROUP BY concept
+    ORDER BY weighted_count DESC, concept ASC
+    LIMIT ?
+  `, [...filters.args, topC]);
+  if (!topConcepts.length) {
+    return { methodologies: topMethodologies.map((r) => r.methodology), concepts: [], conceptIds: [], matrix: [] };
+  }
+
+  const methList = topMethodologies.map((r) => r.methodology);
+  const conceptList = topConcepts.map((r) => r.concept);
+  const cellRows = await all(`
+    SELECT trim(CAST(m.value AS TEXT)) AS methodology,
+           trim(CAST(term.value AS TEXT)) AS concept,
+           COUNT(*) AS count
+    FROM documents d,
+         json_each(d.metadata_json, '$.methodologies') m,
+         json_each(d.metadata_json, '$.conceptTerms') term
+    ${filters.where}
+    ${qualifier} term.key < 10
+      AND trim(CAST(m.value AS TEXT)) IN (SELECT value FROM json_each(?))
+      AND trim(CAST(term.value AS TEXT)) IN (SELECT value FROM json_each(?))
+    GROUP BY methodology, concept
+  `, [...filters.args, JSON.stringify(methList), JSON.stringify(conceptList)]);
+
+  const methIndex = new Map(methList.map((name, i) => [name, i]));
+  const conceptIndex = new Map(conceptList.map((name, i) => [name, i]));
+  const matrix = methList.map(() => conceptList.map(() => 0));
+  for (const row of cellRows) {
+    const mi = methIndex.get(row.methodology);
+    const ci = conceptIndex.get(row.concept);
+    if (mi == null || ci == null) continue;
+    matrix[mi][ci] = Number(row.count || 0);
+  }
+
+  return {
+    methodologies: methList,
+    concepts: conceptList,
+    conceptIds: conceptList.map((label) => `c:${label.replace(/\s+/g, '_')}`),
+    matrix,
+  };
+}
+
+async function computeMethodologyTopicMatrixSql(filters, qualifier, topics) {
+  const topMethodologies = await all(`
+    SELECT trim(CAST(m.value AS TEXT)) AS methodology, COUNT(*) AS count
+    FROM documents d, json_each(d.metadata_json, '$.methodologies') m
+    ${filters.where}
+    ${qualifier} trim(CAST(m.value AS TEXT)) <> ''
+    GROUP BY methodology
+    ORDER BY count DESC, methodology ASC
+    LIMIT 10
+  `, filters.args);
+  const validTopics = topics.filter((t) => t.topicId !== -1).slice(0, 8);
+  if (!topMethodologies.length || !validTopics.length) {
+    return { methodologies: topMethodologies.map((r) => r.methodology), topics: validTopics.map((t) => ({ topicId: t.topicId, label: t.label })), matrix: [] };
+  }
+
+  const methList = topMethodologies.map((r) => r.methodology);
+  const topicIdList = validTopics.map((t) => t.topicId);
+  const cellRows = await all(`
+    SELECT dt.topic_id AS topic_id, trim(CAST(m.value AS TEXT)) AS methodology, COUNT(DISTINCT d.doc_id) AS count
+    FROM documents d
+    JOIN document_topics dt ON dt.doc_id = d.doc_id
+    , json_each(d.metadata_json, '$.methodologies') m
+    ${filters.where}
+    ${qualifier} dt.topic_id IN (SELECT value FROM json_each(?))
+      AND trim(CAST(m.value AS TEXT)) IN (SELECT value FROM json_each(?))
+    GROUP BY dt.topic_id, methodology
+  `, [...filters.args, JSON.stringify(topicIdList), JSON.stringify(methList)]);
+
+  const methIndex = new Map(methList.map((name, i) => [name, i]));
+  const topicIndex = new Map(topicIdList.map((id, i) => [id, i]));
+  const matrix = methList.map(() => topicIdList.map(() => 0));
+  for (const row of cellRows) {
+    const mi = methIndex.get(row.methodology);
+    const ti = topicIndex.get(Number(row.topic_id));
+    if (mi == null || ti == null) continue;
+    matrix[mi][ti] = Number(row.count || 0);
+  }
+
+  return {
+    methodologies: methList,
+    topics: validTopics.map((t) => ({ topicId: t.topicId, label: t.label })),
+    matrix,
+  };
+}
+
+async function computeTopicDataByYearSql(filters, qualifier, topics, hierarchy) {
+  const parentInfo = hierarchy ? buildParentClusters(hierarchy, topics) : null;
+  const rows = await all(`
+    SELECT dt.topic_id AS topic_id, d.year AS year, COUNT(*) AS count
+    FROM documents d
+    JOIN document_topics dt ON dt.doc_id = d.doc_id
+    ${filters.where}
+    ${qualifier} d.year IS NOT NULL
+    GROUP BY dt.topic_id, d.year
+  `, filters.args);
+  const countRows = rows.map((row) => ({
+    topicId: Number(row.topic_id), year: Number(row.year), count: Number(row.count || 0),
+  }));
+  return parentInfo
+    ? buildTopicsByYearFromCounts(parentInfo.parentClusters, countRows, parentInfo.leafToParent)
+    : buildTopicsByYearFromCounts(topics, countRows);
+}
+
+// #15 supervisorNgramMatrix filter decision (per the plan's review
+// correction): role IN ('Supervisor', 'Co-Supervisor') regardless of
+// `source`, DISTINCT person_key. The JS path's `rec.supervisors` (what
+// buildSupervisorNgramMatrix in metrics.js actually counts) is populated by
+// applyCommitteeMembersToDocuments, which merges committee-derived
+// Supervisor/Co-Supervisor names into `rec.supervisors` alongside
+// metadata-sourced ones — those committee rows land in document_people with
+// source values other than 'metadata' ('api', 'pdf_fallback', 'committee').
+// A `source = 'metadata'`-only filter would silently undercount. DISTINCT is
+// required because the same person can have both a metadata row and a
+// committee row for the same document (differing `source`), which would
+// otherwise double-count that document for that person.
+//
+// Known simplification: a person's display name is taken as MIN(p.name)
+// across their rows, which is a deterministic but arbitrary tiebreak when
+// different sources spell the same person's name differently. The JS path's
+// name string is whichever source added them to `rec.supervisors` first.
+// This does not affect *who* is counted or their doc counts, only which
+// spelling variant is displayed when sources disagree — disclosed here
+// rather than silently assumed correct.
+async function computeSupervisorNgramMatrixSql(filters, qualifier, topN = 12, topM = 10) {
+  const supervisorFilters = filters.where
+    ? `${filters.where} AND p.role IN ('Supervisor', 'Co-Supervisor')`
+    : `WHERE p.role IN ('Supervisor', 'Co-Supervisor')`;
+  const topSupervisors = await all(`
+    SELECT p.person_key AS person_key, MIN(p.name) AS name, COUNT(DISTINCT p.doc_id) AS count
+    FROM document_people p
+    JOIN documents d ON d.doc_id = p.doc_id
+    ${supervisorFilters}
+    GROUP BY p.person_key
+    ORDER BY count DESC, name ASC
+    LIMIT ?
+  `, [...filters.args, topN]);
+  if (!topSupervisors.length) return { supervisors: [], ngrams: [], conceptIds: [], matrix: [] };
+
+  const topNgrams = await all(`
+    SELECT trim(CAST(term.value AS TEXT)) AS concept, COUNT(DISTINCT d.doc_id) AS count
+    FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
+    ${filters.where}
+    ${qualifier} term.key < 10
+      AND trim(CAST(term.value AS TEXT)) <> ''
+      AND EXISTS (
+        SELECT 1 FROM document_people p
+        WHERE p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
+      )
+    GROUP BY concept
+    ORDER BY count DESC, concept ASC
+    LIMIT ?
+  `, [...filters.args, topM]);
+  if (!topNgrams.length) {
+    return {
+      supervisors: topSupervisors.map((r) => r.name),
+      ngrams: [], conceptIds: [], matrix: [],
+    };
+  }
+
+  const supKeyList = topSupervisors.map((r) => r.person_key);
+  const ngramList = topNgrams.map((r) => r.concept);
+  const cellRows = await all(`
+    SELECT p.person_key AS person_key, trim(CAST(term.value AS TEXT)) AS concept, COUNT(DISTINCT d.doc_id) AS count
+    FROM documents d
+    JOIN document_people p ON p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
+    , json_each(d.metadata_json, '$.conceptTerms') term
+    ${filters.where}
+    ${qualifier} term.key < 10
+      AND p.person_key IN (SELECT value FROM json_each(?))
+      AND trim(CAST(term.value AS TEXT)) IN (SELECT value FROM json_each(?))
+    GROUP BY p.person_key, concept
+  `, [...filters.args, JSON.stringify(supKeyList), JSON.stringify(ngramList)]);
+
+  const supIndex = new Map(supKeyList.map((key, i) => [key, i]));
+  const ngramIndex = new Map(ngramList.map((label, i) => [label, i]));
+  const matrix = supKeyList.map(() => ngramList.map(() => 0));
+  for (const row of cellRows) {
+    const si = supIndex.get(row.person_key);
+    const ni = ngramIndex.get(row.concept);
+    if (si == null || ni == null) continue;
+    matrix[si][ni] = Number(row.count || 0);
+  }
+
+  return {
+    supervisors: topSupervisors.map((r) => r.name),
+    ngrams: ngramList,
+    conceptIds: ngramList.map((label) => `c:${label.replace(/\s+/g, '_')}`),
+    matrix,
+  };
+}
+
 /**
  * Metadata-scale analytics computed as bounded SQL aggregates. This deliberately
  * returns no document collection; document rows have their own paginated API.
@@ -1429,7 +1700,7 @@ export async function getDocumentServingAnalytics({ syncKey = null, filters: req
   const reliableWords = `${activeWords} >= 1000 AND COALESCE(fm.word_source, '') NOT IN ('metadata_text', 'degraded_pdf_text')`;
   const reliablePages = `fm.page_count >= 10 AND COALESCE(fm.page_source, '') NOT IN ('estimated_from_metadata_words', 'estimated_from_full_text_words')`;
 
-  const [overall, yearCounts, wordRows, pageRows, themes, concepts, methodologies] = await Promise.all([
+  const analyticsRows = await Promise.all([
     get(`
       SELECT COUNT(*) AS record_count,
              COUNT(CASE WHEN ${reliableWords} THEN 1 END) AS word_count,
@@ -1485,7 +1756,34 @@ export async function getDocumentServingAnalytics({ syncKey = null, filters: req
       ORDER BY count DESC, methodology ASC
       LIMIT 100
     `, filters.args),
+    computeConceptTimelineSql(filters, qualifier),
+    computeMethodologyConceptMatrixSql(filters, qualifier),
+    hasTopics(),
   ]);
+  const [
+    overall, yearCounts, wordRows, pageRows, themes, concepts, methodologies,
+    conceptTimeline, methodologyConceptMatrix, topicsExist,
+  ] = analyticsRows;
+
+  // supervisorNgramMatrix, methodologyTopicMatrix, and topicData all need
+  // topics/hierarchy state that isn't known until hasTopics() resolves, so
+  // they run in a second, smaller wave rather than the main Promise.all
+  // above (which itself still runs everything independent of topic state
+  // concurrently, per #24's original layout).
+  const [supervisorNgramMatrix, methodologyTopicMatrixAndTopicData] = await Promise.all([
+    computeSupervisorNgramMatrixSql(filters, qualifier),
+    (async () => {
+      if (!topicsExist) return { methodologyTopicMatrix: { methodologies: [], topics: [], matrix: [] }, topicData: null };
+      const topics = await loadTopics();
+      const [methodologyTopicMatrix, hierarchy] = await Promise.all([
+        computeMethodologyTopicMatrixSql(filters, qualifier, topics),
+        loadTopicHierarchy(),
+      ]);
+      const byYear = await computeTopicDataByYearSql(filters, qualifier, topics, hierarchy);
+      return { methodologyTopicMatrix, topicData: { topics, byYear } };
+    })(),
+  ]);
+  const { methodologyTopicMatrix, topicData } = methodologyTopicMatrixAndTopicData;
 
   const wordStats = {
     count: Number(overall?.word_count || 0),
@@ -1544,12 +1842,17 @@ export async function getDocumentServingAnalytics({ syncKey = null, filters: req
     wordCloud: themes.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
     ngramCloud: concepts.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
     methodologies: methodologies.map((row) => ({ methodology: row.methodology, count: Number(row.count || 0) })),
-    supervisorNgramMatrix: { supervisors: [], ngrams: [], conceptIds: [], matrix: [] },
-    termCooccurrence: [],
-    conceptTimeline: [],
-    methodologyConceptMatrix: { methodologies: [], concepts: [], conceptIds: [], matrix: [] },
-    topicData: null,
-    methodologyTopicMatrix: { methodologies: [], topics: [], matrix: [] },
+    // #15: five of six panels are now real SQL-backed aggregates, computed
+    // above next to the other bounded aggregates in this function.
+    // termCooccurrence has no SQL port (see the comment above this
+    // function) — it stays null here; the caller (metricsRoutes.js) is
+    // responsible for filling it with a bounded, disclosed-sample answer.
+    supervisorNgramMatrix,
+    termCooccurrence: null,
+    conceptTimeline,
+    methodologyConceptMatrix,
+    topicData,
+    methodologyTopicMatrix,
     documents: [],
   };
 }

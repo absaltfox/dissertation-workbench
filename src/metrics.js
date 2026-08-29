@@ -13,12 +13,13 @@ import {
 import {
   toArray, flattenText, extractYear, parsePageCount, buildWordCloud,
   buildMethodologyStats, extractNgrams, detectMethodologies, isLowSignalConceptPhrase,
-  isLowSignalConceptTerm, documentThemeTerms
+  isLowSignalConceptTerm, documentThemeTerms, COOCCURRENCE_BLOCKLIST
 } from './nlp.js';
 import { fetchPage, extractHits, resolveIndexName, collectCandidateUrls } from './api.js';
 import { enrichDocumentsWithFileAnalysis } from './pdf.js';
 import { dedupeSupervisorNames } from './supervisors.js';
 import { canonicalizeDomainText } from './domainDictionary.js';
+import { buildParentClusters, buildTopicsByYear } from './topicHierarchy.js';
 
 function average(values) {
   if (!values.length) return null;
@@ -521,41 +522,6 @@ function buildSupervisorNgramMatrix(records, topN = 12, topM = 10) {
   };
 }
 
-// Non-topical phrases excluded from the concept cloud and co-occurrence panel.
-// Covers three categories:
-//   • Statistical / experimental-design vocabulary (quantitative boilerplate)
-//   • Results-reporting boilerplate (findings indicate, results showed, …)
-//   • Generic academic-writing filler (based upon, further investigation, …)
-// Keep in sync with COOCCURRENCE_BLOCKLIST in public/app.js.
-const COOCCURRENCE_BLOCKLIST = new Set([
-  // Statistical and experimental design
-  'significant differences', 'statistically significant', 'significant difference',
-  'significant relationships', 'significant relationship', 'significantly related',
-  'control group', 'treatment groups', 'treatment group',
-  'experimental groups', 'experimental group', 'experimental design',
-  'randomly assigned', 'randomly selected', 'random sample',
-  'dependent variables', 'independent variables', 'dependent variable', 'independent variable',
-  'predictor variables', 'criterion variables',
-  'regression analysis', 'regression analyses', 'multiple regression', 'stepwise regression',
-  'factor analysis', 'path analysis', 'discriminant analysis', 'canonical analysis',
-  'analysis variance', 'multivariate analysis', 'repeated measures',
-  'three groups', 'two groups',
-  // Results / findings boilerplate
-  'results indicated', 'results showed', 'results suggest', 'results revealed',
-  'analysis revealed', 'analysis indicated', 'analyses indicated',
-  'findings indicate', 'findings indicated', 'findings suggest',
-  // Generic academic-writing filler
-  'data analysis', 'data collected', 'data collection', 'data gathering', 'data sources',
-  'analyzed using', 'semi structured', 'interview data',
-  'attitudes toward', 'determine whether', 'based upon', 'directed towards',
-  'further investigation', 'important factor', 'wide range',
-  'higher levels', 'high levels', 'second part', 'first part',
-  // Older psychometric / measurement instruments
-  'main effects', 'significant main', 'interaction effects', 'post test',
-  'discriminant function', 'tennessee self', 'concept scale',
-  'native indian', // archaic, from older dissertations — not a useful discovery concept
-]);
-
 // #26: the floor below was a bare `2`, tuned by inspection for the corpus
 // size at the time (~400 documents) and never revisited as the corpus grew.
 // A fixed floor stops trimming low-signal pairs as N grows, so the
@@ -766,93 +732,6 @@ function buildMethodologyConceptMatrix(records, topM = 10, topC = 10) {
     conceptIds: topConcepts,
     matrix
   };
-}
-
-function buildParentClusters(hierarchy, topics, targetK = 10) {
-  const { leafTopicIds, linkage } = hierarchy;
-  const N = leafTopicIds.length;
-  if (N <= targetK) {
-    // Fewer leaves than target — each leaf is its own parent
-    const parentClusters = topics.filter((t) => t.topicId !== -1).map((t, i) => ({
-      parentId: i, topicId: i, label: t.label, docCount: t.docCount, children: [t.topicId],
-    }));
-    const leafToParent = new Map(parentClusters.map((p) => [p.children[0], p.parentId]));
-    return { parentClusters, leafToParent };
-  }
-
-  // Union-find over N leaves + up to N-1 merge nodes
-  const parent = new Array(N + linkage.length).fill(-1);
-  const find = (x) => { while (parent[x] !== -1) x = parent[x]; return x; };
-  const union = (a, b, into) => { parent[find(a)] = into; parent[find(b)] = into; };
-
-  // Apply first N - targetK merges (linkage is sorted by distance)
-  const mergesToApply = N - targetK;
-  for (let m = 0; m < mergesToApply; m++) {
-    const [i, j] = linkage[m];
-    union(i, j, N + m);
-  }
-
-  // Collect connected components — each root is a parent cluster
-  const rootToChildren = new Map();
-  const leafIdxToTopicId = new Map();
-  const topicDocCount = new Map(topics.map((t) => [t.topicId, t.docCount || 0]));
-  for (let i = 0; i < N; i++) {
-    leafIdxToTopicId.set(i, leafTopicIds[i]);
-    const root = find(i);
-    if (!rootToChildren.has(root)) rootToChildren.set(root, []);
-    rootToChildren.get(root).push(leafTopicIds[i]);
-  }
-
-  const topicLabelMap = new Map(topics.map((t) => [t.topicId, t.label]));
-  const parentClusters = [];
-  const leafToParent = new Map();
-  let parentIdx = 0;
-
-  for (const [, children] of rootToChildren) {
-    // Label = label of the child topic with the most docs
-    const bestChild = children.reduce((best, tid) =>
-      (topicDocCount.get(tid) || 0) > (topicDocCount.get(best) || 0) ? tid : best
-    , children[0]);
-    const totalDocs = children.reduce((sum, tid) => sum + (topicDocCount.get(tid) || 0), 0);
-    parentClusters.push({
-      parentId: parentIdx, topicId: parentIdx,
-      label: topicLabelMap.get(bestChild) || `Cluster ${parentIdx}`,
-      docCount: totalDocs, children,
-    });
-    for (const tid of children) leafToParent.set(tid, parentIdx);
-    parentIdx++;
-  }
-
-  parentClusters.sort((a, b) => b.docCount - a.docCount);
-  // Re-index after sort
-  const oldToNew = new Map(parentClusters.map((p, i) => [p.parentId, i]));
-  for (const p of parentClusters) p.parentId = p.topicId = oldToNew.get(p.parentId);
-  for (const [tid, oldPid] of leafToParent) leafToParent.set(tid, oldToNew.get(oldPid));
-
-  return { parentClusters, leafToParent };
-}
-
-function buildTopicsByYear(topics, documents, leafToParent) {
-  const yearCounts = new Map(); // topicId -> Map<year, count>
-
-  for (const doc of documents) {
-    if (doc.topicId == null || !doc.year) continue;
-    const resolvedId = leafToParent ? (leafToParent.get(doc.topicId) ?? doc.topicId) : doc.topicId;
-    if (!yearCounts.has(resolvedId)) yearCounts.set(resolvedId, new Map());
-    const ym = yearCounts.get(resolvedId);
-    ym.set(doc.year, (ym.get(doc.year) || 0) + 1);
-  }
-
-  return topics
-    .filter((t) => t.topicId !== -1)
-    .slice(0, 10)
-    .map((topic) => {
-      const ym = yearCounts.get(topic.topicId) || new Map();
-      const data = Array.from(ym.entries())
-        .map(([year, count]) => ({ year: Number(year), count }))
-        .sort((a, b) => a.year - b.year);
-      return { topicId: topic.topicId, label: topic.label, data };
-    });
 }
 
 // #27: two-pass by design. Pass 1 builds only nodeMap (docCount per person) —

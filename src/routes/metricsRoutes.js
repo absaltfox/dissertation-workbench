@@ -1,5 +1,7 @@
 import { Router } from 'express';
-import { buildMetricsPayloadFromRecords, collectMetricRecords, collectMetrics, enrichDocumentSignals } from '../metrics.js';
+import {
+  buildMetricsPayloadFromRecords, collectMetricRecords, collectMetrics, enrichDocumentSignals, buildTermCooccurrence
+} from '../metrics.js';
 import {
   ALLOW_PUBLIC_REFRESH, CACHE_TTL_MS, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT
 } from '../config.js';
@@ -552,6 +554,24 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
         limit: ANALYTICS_DOCUMENT_SAMPLE_LIMIT,
         offset: 0,
       });
+      // #15 termCooccurrence: the one panel of the six that isn't a
+      // straight SQL port (pairwise term combinatorics — the same
+      // unbounded-self-join shape #25/#26 already had to bound). Shipped as
+      // a bounded-sample real answer instead of null: reuse the same
+      // VISUALIZATION_DOCUMENT_LIMIT-sized sample pattern already proven
+      // for /workbench/visualizations' supervisorNetwork/citationCooccurrence,
+      // now safe to run at this size thanks to #26's scaled threshold and
+      // term-vocabulary cap. The sampling is disclosed via
+      // source.termCooccurrenceSampled/SampleSize/SampleOf — distinct from
+      // the other five panels' "not computed above N" language, since this
+      // one *is* computed, just on a sample rather than the full corpus.
+      const termSample = await queryCachedDocumentPage({
+        syncKey: documentCache.syncKey,
+        filters,
+        limit: VISUALIZATION_DOCUMENT_LIMIT,
+        offset: 0,
+      });
+      const termCooccurrence = buildTermCooccurrence(enrichDocumentSignals(termSample.documents));
       return {
         generatedAt: new Date().toISOString(),
         source: {
@@ -562,9 +582,13 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
           documentsReturned: documentSample.documents.length,
           documentsTruncated: documentSample.total > documentSample.documents.length,
           detailedAnalyticsRecordLimit: DETAILED_ANALYTICS_RECORD_LIMIT,
+          termCooccurrenceSampled: true,
+          termCooccurrenceSampleSize: termSample.documents.length,
+          termCooccurrenceSampleOf: termSample.total,
           readOnlyFileEnrichment: true,
         },
         ...aggregate,
+        termCooccurrence,
         documents: documentSample.documents.map(analyticsDoc),
       };
     });
