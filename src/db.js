@@ -3717,31 +3717,28 @@ export async function getCitationForSummon(citationId) {
 }
 
 export async function getCatalogueLookupStats() {
-  const row = await get(`
-    SELECT
-      (SELECT COUNT(*) FROM catalogue_lookups) AS total,
-      (SELECT COUNT(*) FROM catalogue_lookups WHERE hits > 0) AS found,
-      (SELECT COUNT(*) FROM catalogue_lookups WHERE hits = 0) AS not_found,
-      (SELECT COUNT(*) FROM catalogue_lookups WHERE hits = -1) AS failed,
-      (SELECT COUNT(*) FROM catalogue_lookups WHERE hits IS NULL) AS skipped,
-      (
-        (SELECT COUNT(*) FROM citations)
-        - (SELECT COUNT(*) FROM catalogue_lookups)
-        + (
-          SELECT COUNT(*)
-          FROM catalogue_lookups
-          WHERE hits IS NULL
-            AND query_title IS NOT NULL
-        )
-      ) AS pending
-  `);
+  const [row, pending] = await Promise.all([
+    get(`
+      SELECT
+        (SELECT COUNT(*) FROM catalogue_lookups) AS total,
+        (SELECT COUNT(*) FROM catalogue_lookups WHERE hits > 0) AS found,
+        (SELECT COUNT(*) FROM catalogue_lookups WHERE hits = 0) AS not_found,
+        (SELECT COUNT(*) FROM catalogue_lookups WHERE hits = -1) AS failed,
+        (SELECT COUNT(*) FROM catalogue_lookups WHERE hits IS NULL) AS skipped
+    `),
+    // Reuse countPendingLookups()'s predicate (NOT a table-total subtraction) so the
+    // dashboard number can never disagree with the pager/resolution-job's own count.
+    // See #30 (M-09): the previous arithmetic here double-counted/under-counted once
+    // citations and catalogue_lookups rows could be deleted independently of each other.
+    countPendingLookups(),
+  ]);
   return {
     total: Number(row?.total || 0),
     found: Number(row?.found || 0),
     not_found: Number(row?.not_found || 0),
     failed: Number(row?.failed || 0),
     skipped: Number(row?.skipped || 0),
-    pending: Number(row?.pending || 0),
+    pending: Number(pending || 0),
   };
 }
 

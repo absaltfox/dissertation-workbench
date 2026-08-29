@@ -472,6 +472,48 @@ test('the pending catalogue-lookup query uses idx_catalogue_lookups_hits_query_t
   );
 });
 
+test('the pending catalogue-lookup query\'s NOT EXISTS arm avoids a full table scan', async () => {
+  const client = await db.getDb();
+  // Literal shape of listPendingLookups' second UNION ALL arm (db.js).
+  const plan = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT c.id, c.citation_text
+          FROM citations c
+          WHERE NOT EXISTS (
+            SELECT 1 FROM catalogue_lookups cl WHERE cl.citation_id = c.id
+          )`,
+  });
+  const details = plan.rows.map((row) => String(row.detail));
+  assert.ok(!details.some((detail) => /^SCAN cl\b/.test(detail)),
+    `NOT EXISTS arm fell back to a full scan of catalogue_lookups: ${details.join(' | ')}`);
+  assert.ok(
+    details.some((detail) => /SEARCH cl USING INTEGER PRIMARY KEY/.test(detail)),
+    `NOT EXISTS arm did not use catalogue_lookups' citation_id primary key: ${details.join(' | ')}`
+  );
+});
+
+test('countPendingLookups\' combined OR predicate — the query getCatalogueLookupStats now reuses — avoids a full scan', async () => {
+  const client = await db.getDb();
+  // Literal shape of countPendingLookups' body (db.js), unscoped (no syncKey/filters).
+  const plan = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT COUNT(*) AS total
+          FROM citations c
+          WHERE (
+            NOT EXISTS (SELECT 1 FROM catalogue_lookups cl WHERE cl.citation_id = c.id)
+            OR EXISTS (
+              SELECT 1 FROM catalogue_lookups cl
+              WHERE cl.citation_id = c.id AND cl.hits IS NULL AND cl.query_title IS NOT NULL
+            )
+          )`,
+  });
+  const details = plan.rows.map((row) => String(row.detail));
+  assert.ok(!details.some((detail) => /^SCAN catalogue_lookups\b/.test(detail)),
+    `countPendingLookups' OR predicate fell back to a full scan of catalogue_lookups: ${details.join(' | ')}`);
+  assert.ok(details.some((detail) => /^SCAN c\b/.test(detail)),
+    `expected the outer scan to be over citations (the driving table): ${details.join(' | ')}`);
+});
+
 test('file_metrics pdf_path lookups use idx_file_metrics_pdf_path', async () => {
   const client = await db.getDb();
   // Literal shape of the cache-integrity sweep query (db.js ~2849).
