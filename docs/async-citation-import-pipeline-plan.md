@@ -1,160 +1,180 @@
 # Async Citation Import Pipeline Plan
 
-Goal: an import captures word counts and other metadata immediately. Citation
-**scanning** happens inline while the streamed document bytes are already in
-hand, and only citation **reconciliation** (external Z39.50 catalogue
-resolution) is deferred to a job that runs nightly, or on demand.
+Goal: keep imports lightweight and citation-free, and move all citation work to
+a scheduled job that re-streams each document's PDF when it needs one.
 
-**We do not cache PDFs or full text — streaming is the intended behavior.** That
-constraint is the whole reason for the split below: deferring the *scan* would
-force a re-fetch (the bytes are gone after parse), so the scan must run inline;
-reconciliation needs no document bytes at all, so it defers cleanly.
+- **Import is unchanged.** It keeps `extractCitations: false` and continues to
+  capture page count, word counts, supervisor and committee analysis, and
+  full-text-derived metadata. No citation scanning happens at import.
+- **A new scheduled job does citation extraction and analysis** for documents
+  that do not yet have citations *and* have no previously recorded extraction
+  failure. Because we do not cache PDFs or full text, this job **re-streams** the
+  PDF from the repository to scan it. That extra download is an accepted cost.
 
-## Why the split falls this way (the physics)
+## Why this shape
 
-For a streamed import (`pdf_stream`, `full_text_only`) the full text exists only
-transiently during parsing and is then discarded — nothing is written to
-`file_metrics.pdf_path` or `full_text_path` (`persistFullText:false`,
-`src/pdf.js:2224`, `:2331`). So:
+We rejected caching (streaming is intentional) and rejected inline extraction at
+import (keeps imports light). The remaining consistent option is: scan later, and
+since nothing is cached, re-stream the bytes at scan time. The download cost is
+real but bounded and rate-limited, and it only touches documents that still need
+citations — a shrinking set, not the whole corpus every night.
 
-- **Scanning must be inline.** It is the one moment the bytes exist. Deferring it
-  would require re-downloading from the repository — exactly what streaming
-  exists to avoid.
-- **Reconciliation must be deferred.** Z39.50 resolution is slow, external, and
-  rate-limited, and it operates on globally deduplicated citation rows
-  (`document_citations` / `catalogue_lookups`), needing no PDF or full text. It
-  is the expensive half and the only half worth deferring.
+## Current state we build on
 
-These two are already cleanly decoupled in the code: inline extraction
-(`src/pdf.js:2104`) writes citations via `reextractDocumentCitations` and never
-calls a catalogue lookup; resolution is the wholly separate `catalogue_lookup`
-job (`src/services/adminJobs.js`, `src/catalogue.js`).
+- **Import already excludes citations** (`src/sync.js:277`,
+  `extractCitations: false`), and committee/word-count/pages extraction is
+  independent of citation extraction (`src/pdf.js:2041`–`2140`). No change needed
+  there — the "no citation extraction" path stays exactly as is.
+- **Streaming + inline extraction already exists.** `analyzeDocumentFile` in
+  `contentMode: 'pdf_stream'` streams the PDF to a temp file under the
+  streamed-content contract (rate-limited `acquireDownloadSlot`, temp dir removed
+  after parse, nothing cached — `src/pdf.js:2250`+), and runs GROBID/AnyStyle
+  citation extraction when `extractCitations: true` (`src/pdf.js:2104`). The new
+  job drives this per document; it does not need new parsing or streaming code.
+- **`citation_extraction_state`** already records per-document status, content
+  checksum, parser version, count, and error (`src/db.js:3664`). It is the
+  natural home for "has citations" / "previously failed" bookkeeping.
+- **Reconciliation is already a separate deferred job** (`catalogue_lookup`) that
+  reads citation tables, not document bytes. It stays as-is downstream (see
+  below).
+- **A daily-scheduler pattern already exists** (`scheduleDailyConceptRebuildJob`,
+  `src/server.js:74`, firing at `DAILY_HOUR_LOCAL = 2`) to mirror.
 
-## Current state
+## The new job: `citation_scan` (re-streaming extraction)
 
-- **Import captures metadata but currently extracts no citations.** The
-  enrichment path hardcodes `extractCitations: false` (`src/sync.js:277`), so
-  streamed imports get word counts, pages, and committee — but no citations at
-  all, and (because nothing is cached) nothing can back-fill them later. This is
-  the gap the hybrid closes.
-- **A rule-level `extractCitations` flag already exists** in the schema, the
-  validator, and the admin UI (`src/importRules.js:63,92,141`;
-  `src/routes/adminImportRoutes.js:36`) but is currently inert — the runner
-  ignores it. The hybrid gives it teeth.
-- **Inline extraction already picks the best available parser.** With a temp
-  streamed PDF in hand it runs GROBID; `full_text_only` falls back to AnyStyle on
-  the in-memory text (`src/pdf.js:2108-2127`). No cache required either way.
-- **Reconciliation already exists as a bounded, deduplicated job**
-  (`catalogue_lookup`, `POST /api/admin/jobs/catalogue-lookup`), rate-limited and
-  prioritized by citation link count. It is only ever started by hand today.
-- **A daily-scheduler pattern already exists** for concept rebuilds
-  (`scheduleDailyConceptRebuildJob`, `src/server.js:74`, firing at
-  `DAILY_HOUR_LOCAL = 2`). The nightly reconciliation runner mirrors it.
+A worker-backed admin job, bounded and restartable per
+`docs/admin-worker-job-standards.md`.
 
-## Proposed change
+### Selection
 
-### 1. Scan inline at import (governed by the existing rule flag)
+Pick a bounded page of documents that:
 
-In the enrichment path, replace the hardcoded `extractCitations: false` with the
-rule's own `extractCitations` flag (defaulting off, so behavior is unchanged
-until an operator opts a rule in):
+1. have a streamable source (a resolvable repository PDF/full-text URL — the same
+   `documents` + `file_metrics` rows that recorded a successful content download
+   during import); **and**
+2. do **not** already have citations — no `citation_extraction_state` row with
+   `status = 'completed'` for the current parser version, and no
+   `document_citations` rows; **and**
+3. have **no previously recorded failure** — no `citation_extraction_state` row
+   with `status = 'failed'` for the current parser version.
 
-- `src/sync.js` `runEnrichmentBatch`: pass `extractCitations: rule.extractCitations`
-  (thread the flag through `importRuleToSyncOptions` /
-  `contentModeEnrichesDocuments`).
-- Keep `strictCitationErrors: false` here: a citation-parse failure logs a
-  warning and must not fail the whole document import (`src/pdf.js:2136`). The
-  document still lands with its metadata and word count.
-- Optionally write `citation_extraction_state` on inline runs too, purely for
-  observability (how many docs scanned / failed). Note that under streaming a
-  failed inline scan cannot be retried without a re-fetch, so this state is a
-  report, not a retry queue.
+This is a **new** selection query — deliberately *not*
+`listPendingCitationExtractions`, which requires cached `pdf_path`/`full_text_path`
+(none exist here) and *re-includes* failed rows. The new query requires no cached
+bytes and *excludes* failures so the nightly run does not retry known-bad
+documents forever. A parser-version bump naturally re-opens completed rows for a
+fresh scan; failures from the old version are likewise re-opened by the version
+change, not by status.
 
-This adds citation-parse cost to the import batch. That is the accepted trade of
-choosing streaming over caching, and it is bounded by the existing PDF batch
-size, so import batches stay bounded.
+### Per-document work
 
-### 2. Defer only reconciliation to a nightly (and on-demand) job
+For each selected document:
 
-Reconciliation stays exactly the `catalogue_lookup` job it is today, but gains an
-unattended driver:
+1. Load metadata (`loadDocumentMetadata`).
+2. `analyzeDocumentFile(doc, { contentMode: 'pdf_stream', downloadFiles: true,
+   forceDownload: true, recomputeFromCache: false, extractCommittee: false,
+   extractCitations: true, strictCitationErrors: true, artifactClient })` — this
+   streams, parses, extracts, dedups, writes `document_citations`, and deletes the
+   temp PDF. Nothing is cached.
+3. Record outcome in `citation_extraction_state`:
+   - success → `status: 'completed'`, `citationCount`, current parser version;
+   - failure → `status: 'failed'` with the error, so it is excluded next run.
+4. A per-document failure is counted and logged, never fatal to the batch
+   (job-standard failure semantics).
 
-- **Nightly scheduler** beside the concept one in `src/server.js`, gated by new
-  config in `src/config.js`:
-  - `CATALOGUE_NIGHTLY_ENABLED` (default off).
-  - `CATALOGUE_NIGHTLY_HOUR_LOCAL` (default e.g. 3, staggered from the 2:00
-    concept rebuild so the two nightly jobs never contend for the worker).
-  - `CATALOGUE_NIGHTLY_BATCH_SIZE` — reuse the existing lookup batch cap.
-  - Factor the concept scheduler's timer/`msUntilNext…` math into a shared
-    `scheduleDaily(hourLocal, fn)` helper so both share one tested path.
-- **Backlog drain, not one page.** On fire, run one `catalogue_lookup` batch and,
-  while pending lookups remain, schedule a continuation of itself using the same
-  durable-cursor pattern as PDF-batch continuation (`startContinuationJob`,
-  `src/services/importPdfJobRunner.js:71`) so `params_json` stays O(1) per batch.
-  Guard with `hasRunningAdminJob('catalogue_lookup')` so a long night never
-  overlaps itself.
-- **On-demand parity.** The existing `POST /api/admin/jobs/catalogue-lookup`
-  already covers manual runs; keep it. The nightly path is the same job type with
-  a `trigger: 'scheduled'` label, mirroring the concept-rebuild convention.
+Dedup cost is already bounded per document (the Phase-1/#11 bucketed fuzzy
+matcher, hard-capped, `src/db.js:3024`+), so per-document cost is dominated by the
+stream + parse, not by corpus size.
 
-### 3. What the old extraction job becomes
+### Bounding, draining, and rate
 
-`reparse_citations` stays as an on-demand **backfill/repair** tool — useful after
-a parser-version bump or to scan documents that predate the rule flag — but it is
-no longer on the critical path and is not part of the nightly run. Under a
-pure-streaming corpus it can only touch documents that happen to have cached
-bytes, so for streamed rules it is effectively vestigial; that is expected and
-fine. Leave it in place, do not wire it into the nightly job.
+- Bounded page size and a `maxDocuments` cap per run (reuse the existing
+  reparse-citations caps).
+- When pending documents remain, schedule a continuation of the job using the
+  durable-cursor pattern (`startContinuationJob`,
+  `src/services/importPdfJobRunner.js:71`) so `params_json` stays O(1) per batch
+  and the backlog drains across successive nights.
+- All downloads go through the existing `PDF_DOWNLOAD_RATE_PER_MIN` slot limiter
+  and the streamed-content contract (temp dir per doc, removed in `finally`,
+  orphan cleanup on process start).
 
-## Guardrails (invariants to preserve)
+## Scheduling
 
-- **No caching, no re-fetch.** Inline scan reads the transient streamed bytes
-  only; nothing new is written to `pdf_path` / `full_text_path`, and the nightly
-  reconciliation job issues zero repository content requests.
-- Public dashboard reads still start no extraction or resolution work.
-- Resolution stays Z39.50 rate- and batch-bounded; the nightly driver inherits
-  those limits and adds no new external-traffic path.
-- Two nightly jobs (concepts, citations) run at different hours and rely on
-  `hasRunningAdminJob` so they never block each other on the single worker.
+- **Nightly:** a second daily scheduler beside the concept one in
+  `src/server.js`, gated by new config in `src/config.js`:
+  - `CITATION_SCAN_NIGHTLY_ENABLED` (default off).
+  - `CITATION_SCAN_NIGHTLY_HOUR_LOCAL` (default e.g. 3, staggered from the 2:00
+    concept rebuild so the two never contend for the single worker).
+  - `CITATION_SCAN_PAGE_SIZE` / `CITATION_SCAN_MAX_DOCUMENTS` per-run bounds.
+  - Factor the concept scheduler's `msUntilNext…`/timer math into a shared
+    `scheduleDaily(hourLocal, fn)` helper.
+  - Guard with `hasRunningAdminJob('citation_scan')` so a long night never
+    overlaps itself.
+- **On demand:** `POST /api/admin/jobs/citation-scan` (202 + `jobId`) plus an
+  Admin Jobs button. Include an explicit `retryFailures: true` option so an
+  operator can deliberately re-attempt previously failed documents; the nightly
+  run never sets it.
+
+## Reconciliation (unchanged, still separate)
+
+The new job produces/updates deduplicated citation rows but starts **no** external
+catalogue traffic — same rule as the existing extraction path. Z39.50
+reconciliation stays the separate `catalogue_lookup` job, run on demand today and
+optionally on its own nightly schedule later. Extraction and resolution remain
+decoupled per `docs/admin-worker-job-standards.md`; this plan does not chain them.
+
+## Guardrails
+
+- Import stays citation-free and unchanged; word count / pages / committee /
+  supervisor extraction is untouched.
+- No caching: the scan job streams to a temp file and deletes it; it never writes
+  `pdf_path` / `full_text_path`.
+- Re-streaming is the one deliberate new download path. It is rate-limited,
+  bounded per run, and scoped to documents still missing citations — so nightly
+  download volume shrinks as the backlog drains.
+- Public dashboard reads start no extraction, streaming, or resolution work.
+- Failures are durable and excluded from automatic retry; only an explicit
+  `retryFailures` run reconsiders them.
 
 ## Files touched
 
-- `src/sync.js` — thread `rule.extractCitations` into the enrichment analyze call
-  (the one-line policy change that closes the gap).
-- `src/importRules.js` — surface the flag through `importRuleToSyncOptions` if it
-  is not already carried there.
-- `src/config.js` — nightly catalogue-reconciliation knobs.
-- `src/server.js` — second daily scheduler + shared `scheduleDaily` helper;
-  start/stop wiring beside `stopDailyConceptScheduler`.
-- `src/services/adminJobs.js` — continuation/backlog-drain wrapper around
-  `catalogue_lookup`.
-- `src/routes/adminJobsRoutes.js` — scheduled-label plumbing (endpoint already
-  exists).
-- `public/app/admin.js`, `public/index.html` — surface the rule flag's effect and
-  nightly reconciliation status (the flag UI already exists).
-- `docs/admin-worker-job-standards.md` — update the citation standard: extraction
-  is inline-at-import under the rule flag; only resolution is deferred/scheduled.
+- `src/db.js` — new selection query (docs missing citations, no recorded failure,
+  streamable source).
+- `src/services/importPdfJobRunner.js` — new `citation_scan` job type (stream +
+  extract per doc, record state, continuation to drain).
+- `src/config.js` — nightly scan knobs and per-run bounds.
+- `src/server.js` — second daily scheduler + shared `scheduleDaily` helper; wiring
+  beside `stopDailyConceptScheduler`.
+- `src/routes/adminJobsRoutes.js` (or `adminOperationsRoutes.js`) — on-demand
+  endpoint with optional `retryFailures`.
+- `public/app/admin.js`, `public/index.html` — trigger + status surfacing.
+- `docs/admin-worker-job-standards.md` — document the re-streaming citation scan
+  job and its selection/failure/rate rules.
 
 ## Tests
 
-- **Inline scan:** an enrichment run with `extractCitations` on writes
-  `document_citations` for a streamed doc and issues no catalogue lookup; with the
-  flag off, no citations are written (unchanged behavior); a citation-parse
-  failure logs and does not fail the document import.
-- **No re-fetch / no cache:** the inline path writes no `pdf_path` /
-  `full_text_path`; the nightly reconciliation run issues zero repository content
-  requests.
-- **Nightly reconciliation:** scheduler `msUntilNext` boundary math;
-  enabled/disabled gate; no overlap while a previous run is active; continuation
-  drains a multi-batch backlog with O(1) `params_json`; per-citation lookup
-  failures counted, not fatal.
-- **Route:** scheduled label carried; `alreadyRunning` short-circuit; public reads
-  start nothing.
+- **Selection:** includes a streamable doc with no citations and no failure;
+  excludes a completed doc; excludes a previously failed doc (unless
+  `retryFailures`); a parser-version bump re-opens a completed doc.
+- **Per-document:** a successful scan writes `document_citations` and a
+  `completed` state and issues no catalogue lookup; a parse failure writes a
+  `failed` state, is counted, and does not fail the batch.
+- **Streaming contract:** the job streams via the rate limiter, writes no
+  `pdf_path`/`full_text_path`, and removes its temp files.
+- **Draining:** continuation drains a multi-batch backlog with O(1) `params_json`;
+  `maxDocuments`/page-size caps honored; backlog shrinks run over run.
+- **Scheduler:** `msUntilNext` boundary math; enabled/disabled gate; no overlap
+  while a previous run is active.
+- **Route:** `202 Accepted` with `jobId`; `alreadyRunning` short-circuit;
+  `retryFailures` respected; public reads start nothing.
 
 ## Out of scope
 
-- Changing the citation parser (GROBID/AnyStyle) or the Z39.50 client.
-- Any form of PDF/full-text caching — explicitly rejected; streaming stands.
+- Any PDF/full-text caching — explicitly rejected; streaming (and re-streaming)
+  stands.
+- Changing the citation parser (GROBID/AnyStyle), the dedup matcher, or the Z39.50
+  client.
+- Chaining reconciliation into this job — it remains a separate deferred job.
 - Cross-machine cron (Fly scheduled machines) — the in-process daily scheduler
-  mirrors the concept-rebuild approach and can be swapped for a machine cron later
-  without changing the job contract.
+  mirrors the concept-rebuild approach and can be swapped later without changing
+  the job contract.
