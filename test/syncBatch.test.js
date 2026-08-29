@@ -9,6 +9,7 @@ let closeDb;
 let createAdminJob;
 let ensureStorage;
 let getAdminJob;
+let getLatestSyncRun;
 let loadStoredFileMetric;
 let runDocumentSync;
 let runImportPdfAdminJob;
@@ -46,6 +47,7 @@ test.before(async () => {
     createAdminJob,
     ensureStorage,
     getAdminJob,
+    getLatestSyncRun,
     loadStoredFileMetric,
     reserveImportRuleRequestSlot,
     saveImportRule,
@@ -229,6 +231,46 @@ test('sync_missing_pdfs batches missing PDF attempts and reports per-document pr
       downloadFiles: true,
     });
     assert.equal(scanLimited.enrichmentExhausted, false);
+    // #17: apiTotal (100) was never confirmed reached — maxRecords truncated
+    // the scan to 3 — so the persisted run status must be 'incomplete', not
+    // a blanket 'completed', per the plan's second verification bullet.
+    assert.equal(scanLimited.runStatus, 'incomplete');
+    assert.equal((await getLatestSyncRun(scanLimited.syncKey)).status, 'incomplete');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// --- #17 (H-02): incomplete vs completed run status ---
+
+test('a fully upstream-exhausted scan reports status completed', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/search/8.5')) {
+      const payload = searchPayload();
+      payload.data.hits.total = 3;
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  try {
+    const result = await runDocumentSync({
+      mode: 'import_all',
+      baseUrl: 'https://oc-index.test',
+      term: 'degree.raw,Status-Completed-Fixture',
+      source: 'id,title,author',
+      pageSize: 100,
+      scanLimit: 100,
+      syncMaxRecords: 100,
+      downloadFiles: false,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.totalSeen, 3);
+    assert.equal(result.runStatus, 'completed');
+    assert.equal((await getLatestSyncRun(result.syncKey)).status, 'completed');
   } finally {
     globalThis.fetch = originalFetch;
   }

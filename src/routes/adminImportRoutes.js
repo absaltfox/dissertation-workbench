@@ -202,7 +202,12 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
     const rule = cleanImportRequest(req.query);
     const term = buildImportRuleTerm(rule) || DEFAULT_TERM;
     const pageSize = 5;
-    const scanLimit = parseNumberParam(req.query.scanLimit, 50_000, 1, 50_000);
+    // #17: the trailing (1, 50_000) args are dead — parseNumberParam's real
+    // signature is (value, fallback) only, so they have never clamped
+    // anything here. This route is a dry-run preview and never starts a sync
+    // job (see docs/phase-b-completion-plan.md §1), but the fallback default
+    // is raised in step with worker.js's sync scanLimit for consistency.
+    const scanLimit = parseNumberParam(req.query.scanLimit, 200_000);
     const maxRecords = parseNumberParam(req.query.maxRecords, 9999, 1, 9999);
     const index = rule.index ? await resolveIndexName(DEFAULT_BASE_URL, rule.index, apiKey) : null;
     const payload = await fetchPage({

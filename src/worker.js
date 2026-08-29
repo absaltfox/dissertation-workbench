@@ -18,8 +18,11 @@ function syncOptions() {
     term: process.env.DOCUMENT_SYNC_TERM ?? DEFAULT_TERM,
     source: process.env.DOCUMENT_SYNC_SOURCE ?? DEFAULT_SOURCE,
     pageSize: Number(process.env.DOCUMENT_SYNC_PAGE_SIZE || 100),
-    scanLimit: Number(process.env.DOCUMENT_SYNC_SCAN_LIMIT || 50_000),
-    syncMaxRecords: DOCUMENT_SYNC_MAX_RECORDS || Number(process.env.DOCUMENT_SYNC_SCAN_LIMIT || 50_000),
+    // #17 (H-02): was 50_000, already smaller than the corpus (~56k docs) —
+    // a scheduled sync could never see the whole corpus in one pass. Raised
+    // with headroom; still operator-overridable via DOCUMENT_SYNC_SCAN_LIMIT.
+    scanLimit: Number(process.env.DOCUMENT_SYNC_SCAN_LIMIT || 200_000),
+    syncMaxRecords: DOCUMENT_SYNC_MAX_RECORDS || Number(process.env.DOCUMENT_SYNC_SCAN_LIMIT || 200_000),
     apiKey: process.env.DOCUMENT_SYNC_API_KEY || DEFAULT_API_KEY,
   };
 }

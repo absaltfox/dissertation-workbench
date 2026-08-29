@@ -2,7 +2,7 @@ import {
   DEFAULT_BASE_URL, DEFAULT_INDEX, DEFAULT_QUERY, DEFAULT_SOURCE, DEFAULT_TERM,
   DOCUMENT_SYNC_MAX_RECORDS
 } from './config.js';
-import { fetchPage, extractHits, resolveIndexName } from './api.js';
+import { fetchPage, extractHits, resolveIndexName, OC_STABLE_SORT_FIELD } from './api.js';
 import {
   createSyncRun, documentExists, documentsExist, getDocumentCacheStats, getLatestSyncRun,
   listDocumentsPendingEnrichment, loadEnrichmentAttempts, loadStoredFileMetric,
@@ -32,7 +32,13 @@ function publicSource(source) {
     pageSize = 100,
     maxRecords = 9999,
     syncMaxRecords = null,
-    scanLimit = 50_000,
+    // #17: raised well above the ~56k corpus size (was 50_000, which the
+    // corpus had already outgrown). buildMetricsSourceOptions always supplies
+    // a concrete scanLimit today, so this default rarely fires in practice —
+    // it is raised anyway so a caller that constructs a source object
+    // directly (bypassing buildMetricsSourceOptions) doesn't silently
+    // truncate the scan below the corpus size.
+    scanLimit = 200_000,
     downloadFiles = true,
   } = source;
   return {
@@ -196,6 +202,24 @@ async function runSync(syncKey, source, apiKey, runId, {
   let upstreamExhausted = false;
   const pdfAttemptedIds = [];
   const enrichmentOutcomes = [];
+  // #17: standing overlap/skip safety net for the OC scan (§2.3 Track 1).
+  // Doc ids seen so far *within this one scan pass* — a page returning an id
+  // already in this set means Open Collections' unstable ordering re-served a
+  // record it already returned this pass (a tie-break shift), which is
+  // exactly the silent-skip/duplicate failure mode #17 is about. Not
+  // persisted beyond one run: at corpus scale (~56k ids as strings) this is a
+  // few MB, trivial for a single scan's lifetime.
+  const seenDocIdsThisPass = new Set();
+  let duplicateDocIdsThisPass = 0;
+  // #17 Track 2: whether the OC endpoint accepts/honors a stable sort. Starts
+  // 'unknown' and is probed defensively on the first live page — if the
+  // request itself is rejected, or accepted but hits never carry back a sort
+  // cursor, this degrades gracefully rather than assuming vendor support that
+  // has not been verified against the real endpoint (see docs/phase-b-completion-plan.md
+  // §1 — oc-index.library.ubc.ca is unreachable from this environment).
+  let sortCapability = 'unknown'; // 'unknown' | 'sorted' | 'unsupported'
+  let searchAfterCapability = 'unknown'; // 'unknown' | 'supported' | 'unsupported'
+  let searchAfterCursor = null;
   const startingHeapBytes = process.memoryUsage().heapUsed;
   let peakHeapBytes = startingHeapBytes;
   const requestCounts = {
@@ -459,8 +483,17 @@ async function runSync(syncKey, source, apiKey, runId, {
   }
 
   async function finishSync() {
+    // #17: a run whose apiTotal is known (a live OC scan happened) but whose
+    // totalSeen never confirmed reaching it — the scan hit scanLimit/
+    // maxRecords/pdfBatchLimit before exhausting the upstream, or the API
+    // stopped returning results early (unstable deep pagination) — reports
+    // 'incomplete' rather than a blanket 'completed'. apiTotal stays null on
+    // the local-queue-drain-only path (no live OC scan happened this run),
+    // which keeps reporting 'completed' exactly as before — this status is
+    // specifically about OC-scan paging confidence, not queue-drain progress.
+    const runStatus = (apiTotal === null || totalSeen === apiTotal) ? 'completed' : 'incomplete';
     await updateSyncRun(runId, {
-      status: 'completed',
+      status: runStatus,
       totalSeen,
       totalSaved,
       apiTotal,
@@ -470,6 +503,7 @@ async function runSync(syncKey, source, apiKey, runId, {
     logger.info('Open Collections sync completed', {
       syncKey,
       mode,
+      status: runStatus,
       totalSeen,
       totalSaved,
       totalSkipped,
@@ -482,16 +516,19 @@ async function runSync(syncKey, source, apiKey, runId, {
       totalEnrichmentFailed,
       heapGrowthBytes: Math.max(0, peakHeapBytes - startingHeapBytes),
       requestCounts,
+      duplicateDocIdsThisPass,
       seconds: Math.round((Date.now() - startedAt) / 1000),
     });
     return {
       ok: true,
+      runStatus,
       totalSeen,
       totalSaved,
       totalSkipped,
       apiTotal,
       pdfBatchLimitReached,
       enrichmentExhausted,
+      duplicateDocIdsThisPass,
       pdfAttemptedIds,
       totalEnrichmentAttempted,
       totalEnriched,
@@ -531,7 +568,7 @@ async function runSync(syncKey, source, apiKey, runId, {
         counts: { processed: totalSeen, total: apiTotal ?? source.maxRecords },
       });
       requestCounts.metadata += 1;
-      const payload = await fetchPage({
+      const pageRequest = {
         baseUrl: source.baseUrl,
         index,
         apiKey,
@@ -540,12 +577,70 @@ async function runSync(syncKey, source, apiKey, runId, {
         query: source.query,
         term: source.term,
         source: source.source,
-      });
+      };
+      if (sortCapability !== 'unsupported') pageRequest.sort = OC_STABLE_SORT_FIELD;
+      if (searchAfterCapability === 'supported' && searchAfterCursor != null) {
+        pageRequest.searchAfter = searchAfterCursor;
+      }
+      let payload;
+      try {
+        payload = await fetchPage(pageRequest);
+        if (sortCapability === 'unknown') sortCapability = 'sorted';
+      } catch (error) {
+        // #17 Track 2: defensive capability probe — only the very first page
+        // (sortCapability still 'unknown') is allowed to reinterpret a
+        // request failure as "this endpoint rejects sort/search_after"; once
+        // capability is known, a fetch failure is a real error and must
+        // propagate exactly as it always has.
+        if (sortCapability === 'unknown' && pageRequest.sort) {
+          logger.warn('OC endpoint rejected sort/search_after; falling back to unsorted paging for this run', {
+            syncKey, error: error?.message || String(error),
+          });
+          sortCapability = 'unsupported';
+          searchAfterCapability = 'unsupported';
+          delete pageRequest.sort;
+          delete pageRequest.searchAfter;
+          payload = await fetchPage(pageRequest);
+        } else {
+          throw error;
+        }
+      }
       const docs = extractHits(payload);
       if (apiTotal === null) apiTotal = payload?.data?.hits?.total ?? null;
       if (!docs.length) {
         upstreamExhausted = true;
         break;
+      }
+
+      // #17 Track 1: overlap/skip detector, a standing safety net regardless
+      // of whether Track 2's sort/search_after ends up usable — logs (does
+      // not fail) when a page returns a doc id already seen this pass, the
+      // exact silent-skip/duplicate symptom unstable deep pagination causes.
+      for (const raw of docs) {
+        const rawId = String(raw?.id ?? raw?._id ?? raw?.identifier ?? '').trim();
+        if (!rawId) continue;
+        if (seenDocIdsThisPass.has(rawId)) {
+          duplicateDocIdsThisPass += 1;
+          logger.warn('OC scan returned a doc id already seen this pass (possible unstable paging)', {
+            syncKey, docId: rawId, from,
+          });
+        } else {
+          seenDocIdsThisPass.add(rawId);
+        }
+      }
+
+      // #17 Track 2: only trust search_after once a hit has actually
+      // round-tripped a sort cursor value — the endpoint may accept `sort`
+      // syntactically without ever honoring or echoing it, which would make
+      // search_after silently wrong rather than merely absent. Until/unless
+      // confirmed, this stays on sorted `from` paging (still a real stability
+      // improvement over no sort at all).
+      if (sortCapability === 'sorted' && searchAfterCapability === 'unknown') {
+        searchAfterCapability = docs[docs.length - 1]?.__oc_sort !== undefined ? 'supported' : 'unsupported';
+      }
+      if (searchAfterCapability === 'supported') {
+        const lastSort = docs[docs.length - 1]?.__oc_sort;
+        if (lastSort !== undefined) searchAfterCursor = lastSort;
       }
 
       const batch = docs.slice(0, Math.max(0, source.maxRecords - totalSeen)).map((raw) => {
