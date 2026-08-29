@@ -503,6 +503,53 @@
                     </div>
                   </fieldset>
                   <fieldset class="settings-section">
+                    <legend>Content Processing</legend>
+                    <div class="settings-grid">
+                      <label class="full">
+                        <span>Content mode</span>
+                        <select id="importContentMode">
+                          <option value="metadata_only" selected>Metadata only — do not retrieve document content</option>
+                          <option value="full_text_only">Extracted full text only — never request the original PDF</option>
+                          <option value="pdf_stream">Stream PDF — parse in ephemeral storage, then delete</option>
+                          <option value="pdf_cache">Cache PDF — retain the original PDF</option>
+                        </select>
+                      </label>
+                      <label class="full">
+                        <span>If requested content is unavailable</span>
+                        <select id="importContentFallback">
+                          <option value="fail_document" selected>Fail this document</option>
+                          <option value="full_text">Use extracted full text (PDF modes only)</option>
+                          <option value="metadata_only">Keep metadata only</option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>Maximum bytes per document</span>
+                        <input id="importMaxContentBytes" type="number" min="1024" max="209715200" step="1024" value="209715200" />
+                      </label>
+                      <label>
+                        <span>Concurrent documents</span>
+                        <input id="importContentConcurrency" type="number" min="1" max="8" step="1" value="1" />
+                      </label>
+                      <label>
+                        <span>Repository requests per minute</span>
+                        <input id="importContentRateLimit" type="number" min="0" max="600" step="1" value="0" />
+                      </label>
+                      <label class="checkbox-row">
+                        <input id="importExtractCommittee" type="checkbox" checked />
+                        <span>Extract committee data</span>
+                      </label>
+                      <label class="checkbox-row">
+                        <input id="importExtractCitations" type="checkbox" />
+                        <span>Declare citation-extraction eligibility</span>
+                      </label>
+                      <label class="checkbox-row">
+                        <input id="importRunConcepts" type="checkbox" checked />
+                        <span>Declare PatternRank eligibility</span>
+                      </label>
+                    </div>
+                    <p class="meta">A rate of 0 uses only the deployment-wide limiter. Citation and concept toggles are stored intent for a later eligibility-projection step; current scheduled corpus jobs do not consume them. The complete policy is snapshotted when a job starts.</p>
+                  </fieldset>
+                  <fieldset class="settings-section">
                     <legend>Rule</legend>
                     <div class="settings-grid">
                       <label class="full">
@@ -559,8 +606,8 @@
                         <span class="import-action-meta">Fast</span>
                       </button>
                       <button type="button" id="syncMissingPdfsRuleBtn" class="import-action-card primary">
-                        <span class="import-action-title">Import + Analyze PDFs</span>
-                        <span class="import-action-meta">Full text, people, citations</span>
+                        <span class="import-action-title">Import + Enrich Using Rule Policy</span>
+                        <span class="import-action-meta">Content handling follows each saved rule</span>
                       </button>
                     </div>
                     <div class="import-maintenance-actions" aria-label="Maintenance actions">
@@ -650,7 +697,7 @@
                     <div class="action-block">
                       <h3>Refresh Data</h3>
                       <div class="action-group">
-                        <button type="button" id="rebuildConceptsBtn" class="btn ghost">Rebuild Concept Dictionary</button>
+                        <button type="button" id="rebuildConceptsBtn" class="btn ghost">Process Next Concept Partition</button>
                         <button type="button" id="recomputeThemesBtn" class="btn ghost">Recompute Stored Themes</button>
                       </div>
                     </div>
@@ -833,7 +880,7 @@
               <div class="actions" style="margin:0.5rem 0">
                 <button id="refreshCacheBtn" class="btn ghost btn-sm">Refresh Cache</button>
                 <button id="reparseAllBtn" class="btn ghost btn-sm">Reparse Documents</button>
-                <button id="reparseCitationsBtn" class="btn ghost btn-sm">Re-extract Citations</button>
+                <button id="reparseCitationsBtn" class="btn ghost btn-sm">Extract Pending Citations</button>
               </div>
               <div class="table-wrap">
                 <table>

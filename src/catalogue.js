@@ -531,6 +531,7 @@ export async function lookupCitationBatch(citationTexts, {
  */
 export async function runPendingCatalogueLookups({
   pageSize = 200,
+  scope = null,
   signal,
   lookupBatch = lookupCitationBatch,
   isYazAvailable = checkYazAvailability,
@@ -562,7 +563,11 @@ export async function runPendingCatalogueLookups({
   // Process in pages until no pending citations remain
   while (true) {
     throwIfAborted(signal);
-    const pending = await listPendingLookups(pageSize);
+    const pending = await listPendingLookups({
+      limit: pageSize,
+      syncKey: scope?.syncKey || null,
+      filters: scope?.filters || scope || {},
+    });
     if (!pending.length) break;
     pageNumber += 1;
     await onProgress?.({

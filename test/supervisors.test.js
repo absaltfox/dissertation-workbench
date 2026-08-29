@@ -7,6 +7,11 @@ test('supervisorNameKey keeps middle initials', () => {
   assert.equal(supervisorNameKey('Thomas Sork'), 'thomas sork');
 });
 
+test('supervisorNameKey preserves Unicode letters', () => {
+  assert.equal(supervisorNameKey('王小明'), '王小明');
+  assert.equal(supervisorNameKey('Élodie 王'), 'elodie 王');
+});
+
 test('namesCompatible handles middle initials correctly', () => {
   // Same first/last, different middle initials -> incompatible (prevents false merger)
   assert.equal(namesCompatible('thomas j sork', 'thomas b sork'), false);

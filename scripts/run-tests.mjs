@@ -18,6 +18,7 @@ const child = spawn(process.execPath, ['--test', ...process.argv.slice(2)], {
     SQLITE_PATH: path.join(dataDir, 'metrics.sqlite'),
     TURSO_DATABASE_URL: '',
     SKIP_LOCAL_ENV: '1',
+    ALLOW_ORIGINAL_PDF_RETRIEVAL: '1',
   },
 });
 

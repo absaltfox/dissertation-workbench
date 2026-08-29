@@ -346,4 +346,20 @@ test('workbench people list is paged and person detail loads relationships on de
       ['wb-doc-4', ['University Examiner']],
     ]
   );
+
+  const roleFiltered = await request(app)
+    .get('/api/workbench/people?maxRecords=10&q=alex&role=University%20Examiner')
+    .expect('content-type', /application\/json/)
+    .expect(200);
+  assert.equal(roleFiltered.body.people.length, 1);
+  assert.equal(roleFiltered.body.people[0].docCount, 2);
+  assert.deepEqual(roleFiltered.body.people[0].roles.sort(), ['Supervisor', 'University Examiner']);
+
+  const pagedDetail = await request(app)
+    .get('/api/workbench/people/alex%20supervisor?maxRecords=10&limit=1&offset=0')
+    .expect('content-type', /application\/json/)
+    .expect(200);
+  assert.equal(pagedDetail.body.source.total, 2);
+  assert.equal(pagedDetail.body.source.hasMore, true);
+  assert.equal(pagedDetail.body.person.docs.length, 1);
 });

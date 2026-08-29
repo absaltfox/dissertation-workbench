@@ -77,16 +77,41 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
     res.status(200).json({ status });
   }));
 
-  router.post('/concepts/rebuild', asyncHandler(async (_req, res) => {
+  router.post('/concepts/rebuild', asyncHandler(async (req, res) => {
     const runningId = await hasRunningAdminJob('concept_rebuild');
     if (runningId) {
       res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
       return;
     }
+    const parseOptionalYear = (value) => {
+      if (value === undefined || value === null || String(value).trim() === '') return null;
+      const year = Number(value);
+      return Number.isInteger(year) && year >= 1000 && year <= 3000 ? year : Number.NaN;
+    };
+    const yearFrom = parseOptionalYear(req.body?.yearFrom);
+    const yearTo = parseOptionalYear(req.body?.yearTo);
+    if (Number.isNaN(yearFrom) || Number.isNaN(yearTo) || (yearFrom && yearTo && yearFrom > yearTo)) {
+      res.status(400).json({ error: 'yearFrom/yearTo must be valid years and yearFrom cannot exceed yearTo.' });
+      return;
+    }
+    const requestedScope = {
+      syncKey: String(req.body?.syncKey || '').trim().slice(0, 2000),
+      degree: String(req.body?.degree || '').trim().slice(0, 250),
+      program: String(req.body?.program || '').trim().slice(0, 250),
+      affiliation: String(req.body?.affiliation || '').trim().slice(0, 250),
+      yearFrom,
+      yearTo,
+    };
+    const scope = Object.fromEntries(Object.entries(requestedScope).filter(([, value]) => value !== '' && value !== null));
     const result = await createAndStartAdminWorkerJob({
       type: 'concept_rebuild',
-      label: 'PatternRank Concept Rebuild',
-      params: { method: 'patternrank' },
+      label: 'Incremental PatternRank Partition',
+      params: {
+        method: 'patternrank_incremental',
+        scope: Object.keys(scope).length ? scope : null,
+        priority: Math.max(-1000, Math.min(1000, Number(req.body?.priority) || 0)),
+        force: req.body?.force === true,
+      },
     });
     clearMetricsCache();
     res.status(202).json({ ok: true, started: true, ...result });
@@ -218,7 +243,7 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
     res.status(202).json({ ok: true, started: true, ...result });
   }));
 
-  router.post('/reparse-citations', asyncHandler(async (_req, res) => {
+  router.post('/reparse-citations', asyncHandler(async (req, res) => {
     const runningId = await hasRunningAdminJob('reparse_citations');
     if (runningId) {
       res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
@@ -226,8 +251,19 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
     }
     const result = await createAndStartAdminWorkerJob({
       type: 'reparse_citations',
-      label: 'Re-extract Cached PDF Citations',
-      params: {},
+      label: 'Extract Pending Citations',
+      params: {
+        pageSize: Math.max(1, Math.min(250, Number(req.body?.pageSize) || 50)),
+        maxDocuments: Math.max(1, Math.min(5000, Number(req.body?.maxDocuments) || 1000)),
+        scope: {
+          syncKey: String(req.body?.syncKey || '').trim().slice(0, 2000) || null,
+          filters: {
+            degree: String(req.body?.degree || '').trim().slice(0, 250),
+            program: String(req.body?.program || '').trim().slice(0, 250),
+            affiliation: String(req.body?.affiliation || '').trim().slice(0, 250),
+          },
+        },
+      },
     });
     clearMetricsCache();
     res.status(202).json({ ok: true, started: true, ...result });

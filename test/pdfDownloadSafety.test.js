@@ -44,6 +44,7 @@ test.before(async () => {
   _setDownloadSafetyOptionsForTests = pdf._setDownloadSafetyOptionsForTests;
   _setDownloadSafetyOptionsForTests({
     resolveHost: async () => [{ address: '142.103.96.1' }],
+    allowOriginalPdfRetrieval: true,
   });
   ({ closeDb } = await import('../src/db.js'));
 });
@@ -70,6 +71,25 @@ function mockBitstreamFetch(retrieveResponse) {
     throw new Error(`Unexpected fetch: ${url}`);
   };
 }
+
+test('deployment policy blocks original PDF retrieval before any network request', async () => {
+  let requested = false;
+  globalThis.fetch = async () => {
+    requested = true;
+    throw new Error('network must not be called');
+  };
+  _setDownloadSafetyOptionsForTests({ allowOriginalPdfRetrieval: false });
+  try {
+    const result = await fetchPdfForDocument(doc);
+    assert.equal(result.policyBlocked, true);
+    assert.equal(requested, false);
+  } finally {
+    _setDownloadSafetyOptionsForTests({
+      resolveHost: async () => [{ address: '142.103.96.1' }],
+      allowOriginalPdfRetrieval: true,
+    });
+  }
+});
 
 test('block pages served as PDFs are detected and reported as blocked', async () => {
   mockBitstreamFetch((url) => fakeResponse({

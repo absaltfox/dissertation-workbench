@@ -1,0 +1,892 @@
+// Equivalence harness for B-01 (#11).
+//
+// saveCitations used to load the entire citations table into memory once per
+// document and bucket it there. It now selects the same buckets straight out of
+// SQL. This file re-implements the *old* algorithm verbatim as a pure function
+// over a JS array and replays the same fixture corpus through both paths, then
+// asserts the resulting document -> citation links are identical.
+//
+// The one deliberate divergence is covered by its own test at the bottom: the old
+// code fell back to comparing against every citation in the corpus whenever a
+// bucket came back empty, which is the unbounded path #11 exists to remove.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
+import { jaroWinkler } from '../src/fuzzyMatch.js';
+
+let tempDir;
+let db;
+
+test.before(async () => {
+  tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-cite-equiv-'));
+  process.env.APP_DATA_DIR = tempDir;
+  process.env.SQLITE_PATH = path.join(tempDir, 'metrics.sqlite');
+  delete process.env.TURSO_DATABASE_URL;
+  db = await import('../src/db.js');
+  await db.ensureStorage();
+});
+
+test.after(async () => {
+  await db.closeDb();
+  await fs.rm(tempDir, { recursive: true, force: true });
+});
+
+// --- The old implementation, copied from src/db.js @ 372c787 ---
+
+const FUZZY_CITATION_THRESHOLD = 0.94;
+
+function legacyMatchYear(value) {
+  const text = String(value || '').trim();
+  const match = text.match(/\b(1[89]\d{2}|20[0-2]\d)\b/);
+  return match ? Number(match[0]) : null;
+}
+
+function legacyTextPrefix(value) {
+  const prefix = String(value || '').trim().toLowerCase().slice(0, 3);
+  return prefix.length === 3 ? prefix : null;
+}
+
+function legacyPrepare(row) {
+  return {
+    ...row,
+    matchText: String(row.citation_text || '').toLowerCase(),
+    matchYear: legacyMatchYear(row.year),
+    matchPrefix: legacyTextPrefix(row.citation_text),
+  };
+}
+
+function pushBucket(map, key, row) {
+  if (key == null) return;
+  const existing = map.get(key);
+  if (existing) existing.push(row);
+  else map.set(key, [row]);
+}
+
+function legacyBuildIndex(rows) {
+  const index = {
+    all: rows,
+    byHash: new Map(rows.map((row) => [row.citation_hash, row])),
+    byYear: new Map(),
+    withoutYear: [],
+    byPrefix: new Map(),
+  };
+  for (const row of rows) {
+    if (row.matchYear == null) index.withoutYear.push(row);
+    else pushBucket(index.byYear, row.matchYear, row);
+    pushBucket(index.byPrefix, row.matchPrefix, row);
+  }
+  return index;
+}
+
+function legacyAddToIndex(index, row) {
+  index.all.push(row);
+  index.byHash.set(row.citation_hash, row);
+  if (row.matchYear == null) index.withoutYear.push(row);
+  else pushBucket(index.byYear, row.matchYear, row);
+  pushBucket(index.byPrefix, row.matchPrefix, row);
+}
+
+function legacyCandidates(index, text, itemYear) {
+  const year = legacyMatchYear(itemYear) ?? legacyMatchYear(text);
+  const prefix = legacyTextPrefix(text);
+  if (year != null) {
+    const candidates = [];
+    for (let candidateYear = year - 1; candidateYear <= year + 1; candidateYear += 1) {
+      candidates.push(...(index.byYear.get(candidateYear) || []));
+    }
+    if (prefix) {
+      candidates.push(...(index.byPrefix.get(prefix) || []).filter((row) => row.matchYear == null));
+    }
+    return candidates.length ? candidates : index.all;
+  }
+  if (!prefix) return index.all;
+  const candidates = index.byPrefix.get(prefix) || [];
+  return candidates.length ? candidates : index.all;
+}
+
+function legacyYearsCompatible(a, b) {
+  return a == null || b == null || a === b;
+}
+
+// Replays the whole corpus through the old algorithm. `rows` stands in for the
+// citations table and grows exactly the way AUTOINCREMENT ids do, so the ids it
+// produces line up with the ones the real database allocates.
+function legacyRun(documents, hashFn) {
+  const rows = [];
+  const links = new Map();
+  const fallbacks = [];
+  let nextId = 1;
+
+  for (const doc of documents) {
+    const index = legacyBuildIndex(rows.map(legacyPrepare));
+    const linked = [];
+    for (const item of doc.citations) {
+      const text = typeof item === 'string' ? item : item.text;
+      const itemYear = typeof item === 'string' ? null : item.year;
+      const hash = hashFn(text);
+      let matchedId = null;
+
+      if (index.byHash.has(hash)) {
+        matchedId = index.byHash.get(hash).id;
+      } else {
+        const candidates = legacyCandidates(index, text, itemYear);
+        const usedFallback = candidates === index.all;
+        let bestMatch = null;
+        let maxSim = 0;
+        const incoming = text.toLowerCase();
+        for (const candidate of candidates) {
+          const sim = jaroWinkler(incoming, candidate.matchText);
+          if (sim > maxSim) {
+            maxSim = sim;
+            bestMatch = candidate;
+          }
+        }
+        const incomingYear = legacyMatchYear(itemYear) ?? legacyMatchYear(text);
+        const accepted = bestMatch
+          && maxSim >= FUZZY_CITATION_THRESHOLD
+          && legacyYearsCompatible(incomingYear, bestMatch.matchYear);
+        if (usedFallback) fallbacks.push({ text, accepted: Boolean(accepted) });
+        if (accepted) matchedId = bestMatch.id;
+      }
+
+      if (matchedId == null) {
+        const existing = rows.find((row) => row.citation_hash === hash);
+        if (existing) {
+          existing.year = existing.year ?? itemYear ?? null;
+          matchedId = existing.id;
+        } else {
+          const row = { id: nextId, citation_hash: hash, citation_text: text, year: itemYear ?? null };
+          nextId += 1;
+          rows.push(row);
+          matchedId = row.id;
+        }
+        legacyAddToIndex(index, legacyPrepare(rows.find((row) => row.id === matchedId)));
+      }
+      linked.push(matchedId);
+    }
+    links.set(doc.id, Array.from(new Set(linked)).sort((a, b) => a - b));
+  }
+  return { links, citationCount: rows.length, fallbacks };
+}
+
+// --- Fixture corpus ---
+
+// Hash normalisation in the spirit of pdf.js normalizeCitation: case, punctuation
+// and whitespace folded away, so distinct texts can legitimately share a hash.
+function hashFn(text) {
+  const normalized = String(text).toLowerCase().replace(/[.,;:()[\]]/g, '').replace(/\s+/g, ' ').trim();
+  return crypto.createHash('sha1').update(normalized).digest('hex');
+}
+
+// Texts for the phase-2 fixtures below. Each group is an adjacent-year pair of
+// near-identical works plus a probe whose year field and text disagree, which is
+// what forces the matcher past the phase-1 short circuit and into the +/-1 veto.
+const OKONKWO_1991 = 'Okonkwo, R. (1991). Comparative study of estuarine nutrient loading. Northern Books.';
+const OKONKWO_1992 = 'Okonkwo, R. (1992). Comparative study of estuarine nutrient loading. Northern Books.';
+// 0.9928 against the 1991 row (clears the threshold, so phase 2 is reached) and
+// 0.9976 against the 1992 row, so the y+1 bucket wins and vetoes.
+const OKONKWO_PROBE = 'Okonkwo, R. (1992). Comparative study of estuarine nutrient loading. Northern Books';
+
+const RAVINDRAN_1990 = 'Ravindran, S. (1990). Sediment budgets of the lower delta. Academic Press.';
+const RAVINDRAN_1991 = 'Ravindran, S. (1991). Sediment budgets of the lower delta. Academic Press.';
+// 0.9919 against the 1991 row, 0.9973 against the 1990 row: the y-1 bucket vetoes.
+const RAVINDRAN_PROBE = 'Ravindran, S. (1990). Sediment budgets of the lower delta. Academic Press';
+
+// An exact tie between the y-1 and the same-year bucket. Both candidates are the
+// probe with one adjacent pair of characters transposed, so their Jaro-Winkler
+// scores against it are bit-identical (0.99767). The tie-break order decides:
+// y-1 is consulted first, so the merge is vetoed. Reorder it and the probe
+// merges into the 2001 row instead.
+const NAKAMURA_PROBE = 'Nakamura, T. (2001). Tidal marsh accretion rates in the outer bay. Scholarly Editions.';
+const NAKAMURA_2000 = 'Nakamura, T. (2001). Tidal marhs accretion rates in the outer bay. Scholarly Editions.';
+const NAKAMURA_2001 = 'Nakamura, T. (2001). Tidal marsh accretion rates in the oute rbay. Scholarly Editions.';
+
+// Two candidates in the *same* year bucket that also tie exactly (0.96471), far
+// enough apart from each other (0.92941) that seeding them does not merge them.
+// The winner must be the lower id, i.e. the bucket must be scanned in ascending
+// id order and the first of a tie kept.
+const SANDOVAL_PROBE = 'Sandoval, P. (2007). Wetland qqqqqqqqqqqq indices for the northern reach of the estuary and its gradients. Academic Press, qqqqqqqqqqqq.';
+const SANDOVAL_FIRST = SANDOVAL_PROBE.replace('qqqqqqqqqqqq', 'zzzzzzzzzzzz');
+const SANDOVAL_SECOND = SANDOVAL_PROBE.replace(/qqqqqqqqqqqq(?=[^q]*$)/, 'zzzzzzzzzzzz');
+
+// The window is +/-1, not +/-2. The probe merges into the 2001 row it scores
+// 0.9602 against; the 1999 row it scores 0.9976 against is two years away and
+// must stay invisible. Widen the window and the 1999 row vetoes the merge.
+const PEMBERTON_1999 = 'Pemberton, L. (1999). Glacial till stratigraphy of the upper basin. University Press.';
+const PEMBERTON_2001 = 'Pemberton, L. (2001). Glacial till stratigraphy of the upper basins. University Press!';
+const PEMBERTON_PROBE = 'Pemberton, L. (1999). Glacial till stratigraphy of the upper basin. University Press';
+
+const FIXTURES = [
+  {
+    id: 'equiv-doc-1',
+    citations: [
+      { text: 'Fullan, M. (1991). The new meaning of educational change. New York: Teachers College Press.', year: '1991' },
+      { text: 'Vygotsky, L. S. (1978). Mind in society. Cambridge, MA: Harvard University Press.', year: '1978' },
+      { text: 'Dewey, J. (1938). Experience and education. New York: Macmillan.', year: '1938' },
+      'Anonymous pamphlet with no discernible year of publication at all.',
+    ],
+  },
+  {
+    id: 'equiv-doc-2',
+    citations: [
+      // OCR variant of the doc-1 Fullan entry, same year: must merge.
+      { text: 'Fullan, M. (1991). The new meaning of educational change. New York: Teachers College Press', year: '1991' },
+      // Same author, adjacent year, different work: must not merge.
+      { text: 'Fullan, M. (1992). The new meaning of successful school improvement. New York: Teachers College Press.', year: '1992' },
+      // Byte-identical repeat: exact hash match.
+      { text: 'Dewey, J. (1938). Experience and education. New York: Macmillan.', year: '1938' },
+    ],
+  },
+  {
+    id: 'equiv-doc-3',
+    citations: [
+      // Near-identical to the 1992 Fullan but declared 1991: the +1 bucket entry
+      // outscores every 1991 candidate and then fails the year check, so the old
+      // code rejected the match outright. That blocking behaviour must survive.
+      { text: 'Fullan, M. (1992). The new meaning of successful school improvement. New York: Teachers College Press!', year: '1991' },
+      // Year only in the text, not in the year field.
+      'Vygotsky, L. S. (1978). Mind in society. Cambridge, MA: Harvard University Press',
+      // Non-ASCII prefix.
+      { text: 'Müller, K. (2004). Über die Struktur wissenschaftlicher Revolutionen. Berlin: Verlag.', year: '2004' },
+    ],
+  },
+  {
+    id: 'equiv-doc-4',
+    citations: [
+      { text: 'MÜLLER, K. (2004). Über die Struktur wissenschaftlicher Revolutionen. Berlin: Verlag', year: '2004' },
+      // Messy year strings that only the regex extraction can read.
+      { text: 'Bruner, J. (1960). The process of education. Cambridge: Harvard University Press.', year: 'c1960' },
+      { text: 'Bruner, J. (1960). The process of education. Cambridge: Harvard University Press', year: '[1960]' },
+      // Year field the regex rejects: falls back to the year inside the text.
+      { text: 'Freire, P. (1970). Pedagogy of the oppressed. New York: Continuum.', year: 'n.d.' },
+    ],
+  },
+  {
+    id: 'equiv-doc-5',
+    citations: [
+      { text: 'Freire, P. (1970). Pedagogy of the oppressed. New York: Continuum', year: '1970' },
+      // Undated entries sharing a 3-character prefix bucket with each other.
+      'Smith, A. Working notes on qualitative coding. Unpublished manuscript.',
+      'Smith, A. Working notes on qualitative coding. Unpublished manuscripts.',
+      // Undated, non-ASCII prefix bucket: exercises the prefix path rather than a
+      // year bucket, and depends on JS case folding of a non-ASCII initial.
+      'Ökonomische Notizen zur qualitativen Kodierung. Unveroeffentlichtes Manuskript.',
+      // Shorter than the 3-character prefix window.
+      'ab',
+    ],
+  },
+  {
+    id: 'equiv-doc-6',
+    citations: [
+      { text: 'Fullan, M. (1991). The new meaning of educational change. New York: Teachers College Press.', year: '1991' },
+      { text: 'Dewey, J. (1938). Experience and education. New York: Macmillan.', year: '1938' },
+      { text: 'Vygotsky, L. S. (1978). Mind in society. Cambridge, MA: Harvard University Press.', year: '1978' },
+      { text: 'Bruner, J. (1960). The process of education. Cambridge: Harvard University Press.', year: '1960' },
+      { text: 'Müller, K. (2004). Über die Struktur wissenschaftlicher Revolutionen. Berlin: Verlag.', year: '2004' },
+      'ökonomische Notizen zur qualitativen Kodierung. Unveroeffentlichtes Manuskripte.',
+    ],
+  },
+];
+
+test('the SQL matcher links the same citations as the in-memory matcher it replaces', async () => {
+  const expected = legacyRun(FIXTURES, hashFn);
+
+  for (const doc of FIXTURES) {
+    await db.saveCitations(doc.id, doc.citations, hashFn);
+  }
+
+  for (const doc of FIXTURES) {
+    const client = await db.getDb();
+    const rows = await client.execute({
+      sql: 'SELECT citation_id FROM document_citations WHERE doc_id = ? ORDER BY citation_id',
+      args: [doc.id],
+    });
+    const linked = rows.rows.map((row) => Number(row.citation_id));
+    assert.deepEqual(
+      linked,
+      expected.links.get(doc.id),
+      `${doc.id}: link set diverged from the legacy matcher`
+    );
+  }
+
+  const stats = await db.getCitationStats();
+  assert.equal(
+    Number(stats.total_citations),
+    expected.citationCount,
+    'the two matchers merged a different number of citations'
+  );
+
+  // Guard against a vacuous pass: the corpus has to actually exercise merging.
+  assert.ok(
+    expected.citationCount < FIXTURES.reduce((sum, doc) => sum + doc.citations.length, 0),
+    'fixture corpus does not exercise citation merging'
+  );
+
+  // Pin the individual behaviours the merge count is made of, so this stays a
+  // real test if the fixture is ever edited.
+  const client = await db.getDb();
+  const fullan = await client.execute(
+    "SELECT citation_text, year FROM citations WHERE citation_text LIKE 'Fullan%' ORDER BY id"
+  );
+  // 1991 work (OCR variant merged into it), 1992 work (adjacent year, not merged),
+  // and doc-3's entry whose text is the 1992 work but whose year field says 1991:
+  // the +1 bucket candidate outscores everything and then fails the year check, so
+  // the old matcher rejected it outright. Three rows, not one and not two.
+  assert.equal(fullan.rows.length, 3, 'the +/-1 year window no longer blocks a cross-year merge');
+
+  // The two undated 'Ökonomische'/'ökonomische' entries can only meet through the
+  // 3-character prefix bucket, and only if the stored prefix case-folds the
+  // non-ASCII initial the way JS does. They must end up as one citation.
+  const oeko = await client.execute(
+    "SELECT COUNT(*) AS n FROM citations WHERE citation_text LIKE '%konomische Notizen%'"
+  );
+  assert.equal(Number(oeko.rows[0].n), 1, 'non-ASCII prefix bucketing changed');
+});
+
+test('the removed full-corpus fallback never produced a match on this corpus', () => {
+  const { fallbacks } = legacyRun(FIXTURES, hashFn);
+  assert.ok(fallbacks.length > 0, 'fixture corpus should exercise the legacy empty-bucket fallback');
+  // Every fallback was a full scan of the citations table that found nothing. The
+  // SQL matcher returns no candidates in exactly these cases instead, which is the
+  // only behavioural difference between the two implementations.
+  for (const fallback of fallbacks) {
+    assert.equal(fallback.accepted, false, `legacy fallback matched: ${fallback.text}`);
+  }
+});
+
+test('the fuzzy candidate query never reads the whole citations table', async () => {
+  const client = await db.getDb();
+  const plans = [];
+  const year = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT * FROM (SELECT 0 AS bucket, id, citation_hash, citation_text, match_year
+                         FROM citations WHERE match_year = ? ORDER BY id LIMIT 400)`,
+    args: [1991],
+  });
+  const prefix = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT 0 AS bucket, id, citation_hash, citation_text, match_year
+          FROM citations WHERE match_prefix = ? ORDER BY match_year, id LIMIT 400`,
+    args: ['ful'],
+  });
+  plans.push(...year.rows.map((row) => String(row.detail)));
+  plans.push(...prefix.rows.map((row) => String(row.detail)));
+  for (const detail of plans) {
+    assert.ok(
+      !/^SCAN citations\b/.test(detail),
+      `fuzzy candidate query fell back to a table scan: ${detail}`
+    );
+  }
+  assert.ok(
+    plans.some((detail) => detail.includes('idx_citations_match_year')),
+    'year bucket query did not use idx_citations_match_year'
+  );
+  assert.ok(
+    plans.some((detail) => detail.includes('idx_citations_match_prefix')),
+    'prefix bucket query did not use idx_citations_match_prefix'
+  );
+});
+
+// #29 (M-06): the combined dated-arm predicate `yearArm()` issues for the
+// accept/veto arms (db.js findFuzzyMatch, ~3277-3279) is the load-bearing query
+// for #11's "narrow the bucket before matching" design — it is what makes hitting
+// FUZZY_CANDIDATE_LIMIT in one cell require a pathological (prefix, year)
+// concentration. The test above only proves the single-predicate shapes
+// (`match_year = ?` alone, `match_prefix = ?` alone); this proves the combined
+// two-column predicate is *also* answered by an index seek, not a scan-then-filter.
+test('the combined match_prefix + match_year predicate is an index range scan', async () => {
+  const client = await db.getDb();
+  const plan = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT * FROM (SELECT 1 AS bucket, id, citation_hash, citation_text, match_year
+                         FROM citations WHERE match_prefix = ? AND match_year = ? ORDER BY id LIMIT 2000)`,
+    args: ['ful', 1991],
+  });
+  const details = plan.rows.map((row) => String(row.detail));
+  for (const detail of details) {
+    assert.ok(!/^SCAN citations\b/.test(detail), `combined dated-arm query fell back to a table scan: ${detail}`);
+  }
+  assert.ok(
+    details.some((detail) => detail.includes('idx_citations_match_prefix')
+      && detail.includes('match_prefix=?') && detail.includes('match_year=?')),
+    `combined predicate did not bind both columns of idx_citations_match_prefix in one seek: ${details.join(' | ')}`
+  );
+});
+
+// #29 (M-06): EXPLAIN QUERY PLAN coverage for the other three indexed hot
+// queries the plan calls out, plus a check that dropping
+// idx_documents_sync_key_doc_id (db.js ~563) did not regress any sync_key
+// consumer to a table scan.
+test('documents filtered on degree, ordered by year, use idx_documents_degree_year', async () => {
+  const client = await db.getDb();
+  // Literal shape of queryCachedDocumentPage (db.js) with a degree filter and the
+  // default year sort — the combined predicate idx_documents_degree_year(degree, year)
+  // exists to serve.
+  const plan = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT d.doc_id, d.metadata_json,
+                 fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
+                 fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+                 COALESCE(dc.citation_count, 0) AS citation_count
+          FROM documents d
+          LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+          LEFT JOIN (
+            SELECT doc_id, COUNT(*) AS citation_count
+            FROM document_citations
+            GROUP BY doc_id
+          ) dc ON dc.doc_id = d.doc_id
+          WHERE d.degree = ?
+          ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
+          LIMIT ? OFFSET ?`,
+    args: ['PhD', 50, 0],
+  });
+  const details = plan.rows.map((row) => String(row.detail));
+  for (const detail of details) {
+    assert.ok(!/^SCAN d\b/.test(detail), `documents degree filter fell back to a table scan: ${detail}`);
+  }
+  assert.ok(
+    details.some((detail) => detail.includes('idx_documents_degree_year') && detail.includes('degree=?')),
+    `degree filter did not use idx_documents_degree_year: ${details.join(' | ')}`
+  );
+});
+
+test('the pending catalogue-lookup query uses idx_catalogue_lookups_hits_query_title', async () => {
+  const client = await db.getDb();
+  // Literal shape of listPendingLookups' first UNION ALL arm (db.js).
+  const plan = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT c.id, c.citation_text
+          FROM catalogue_lookups cl
+          JOIN citations c ON c.id = cl.citation_id
+          WHERE cl.hits IS NULL
+            AND cl.query_title IS NOT NULL`,
+  });
+  const details = plan.rows.map((row) => String(row.detail));
+  assert.ok(
+    details.some((detail) => detail.includes('idx_catalogue_lookups_hits_query_title')),
+    `pending-lookup query did not use idx_catalogue_lookups_hits_query_title: ${details.join(' | ')}`
+  );
+});
+
+test('file_metrics pdf_path lookups use idx_file_metrics_pdf_path', async () => {
+  const client = await db.getDb();
+  // Literal shape of the cache-integrity sweep query (db.js ~2849).
+  const plan = await client.execute({
+    sql: 'EXPLAIN QUERY PLAN SELECT doc_id, pdf_path FROM file_metrics WHERE pdf_path IS NOT NULL',
+  });
+  const details = plan.rows.map((row) => String(row.detail));
+  for (const detail of details) {
+    assert.ok(!/^SCAN file_metrics$/.test(detail), `pdf_path lookup fell back to an unindexed table scan: ${detail}`);
+  }
+  assert.ok(
+    details.some((detail) => detail.includes('idx_file_metrics_pdf_path')),
+    `pdf_path lookup did not use idx_file_metrics_pdf_path: ${details.join(' | ')}`
+  );
+});
+
+test('dropping idx_documents_sync_key_doc_id did not regress sync_key consumers to a table scan', async () => {
+  const client = await db.getDb();
+
+  // listDocumentsPendingEnrichment (db.js ~2217): the `+d.sync_key` de-index is
+  // deliberate (comment at ~2212) — it forces the walk onto the doc_id PRIMARY KEY
+  // so the cursor is an ordered range scan instead of re-sorting the whole rule's
+  // corpus every batch. Confirm it lands on the PK, not a bare table scan.
+  const queuePlan = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT d.doc_id, d.metadata_json
+          FROM documents d
+          LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+          LEFT JOIN enrichment_attempts ea ON ea.doc_id = d.doc_id
+          WHERE +d.sync_key = ?
+            AND d.doc_id > ?
+            AND COALESCE((fm.word_source = 'dspace_full_text'
+                 AND (COALESCE(fm.word_count, 0) > 0 AND COALESCE(fm.page_count, 0) > 0)), 0) = 0
+          ORDER BY d.doc_id
+          LIMIT ?`,
+    args: ['sk', 'doc-0', 20],
+  });
+  const queueDetails = queuePlan.rows.map((row) => String(row.detail));
+  for (const detail of queueDetails) {
+    assert.ok(!/^SCAN d\b/.test(detail), `listDocumentsPendingEnrichment fell back to a table scan: ${detail}`);
+  }
+  assert.ok(
+    queueDetails.some((detail) => /USING (INDEX sqlite_autoindex_documents_1|PRIMARY KEY)/.test(detail) && detail.includes('doc_id>?')),
+    `listDocumentsPendingEnrichment did not land on the doc_id primary key: ${queueDetails.join(' | ')}`
+  );
+
+  // listCachedDocuments (db.js ~963) filters plainly on sync_key (no de-index
+  // trick) and must still use idx_documents_sync_key.
+  const plainPlan = await client.execute({
+    sql: `EXPLAIN QUERY PLAN
+          SELECT d.doc_id FROM documents d WHERE d.sync_key = ? ORDER BY d.year DESC, d.title LIMIT ? OFFSET ?`,
+    args: ['sk', 10, 0],
+  });
+  const plainDetails = plainPlan.rows.map((row) => String(row.detail));
+  for (const detail of plainDetails) {
+    assert.ok(!/^SCAN d\b/.test(detail), `listCachedDocuments fell back to a table scan: ${detail}`);
+  }
+  assert.ok(
+    plainDetails.some((detail) => detail.includes('idx_documents_sync_key') && detail.includes('sync_key=?')),
+    `listCachedDocuments did not use idx_documents_sync_key: ${plainDetails.join(' | ')}`
+  );
+});
+
+test('match keys are backfilled for citations written before the columns existed', async () => {
+  const client = await db.getDb();
+  await client.execute({
+    sql: `INSERT INTO citations (citation_hash, citation_text, year, created_at, match_key_version)
+          VALUES (?, ?, ?, ?, 0)`,
+    args: ['legacy-row-hash', 'Kuhn, T. (1962). The structure of scientific revolutions. Chicago: UCP.', '1962', new Date().toISOString()],
+  });
+  await client.execute('UPDATE citations SET match_year = NULL, match_prefix = NULL WHERE citation_hash = ?', ['legacy-row-hash']);
+
+  await db.backfillCitationMatchKeys();
+
+  const row = await client.execute({
+    sql: 'SELECT match_year, match_prefix, match_key_version FROM citations WHERE citation_hash = ?',
+    args: ['legacy-row-hash'],
+  });
+  assert.equal(Number(row.rows[0].match_year), 1962);
+  assert.equal(row.rows[0].match_prefix, 'kuh');
+  assert.equal(Number(row.rows[0].match_key_version), 1);
+
+  // A backfilled row is reachable by the fuzzy matcher, i.e. an OCR variant merges.
+  const before = Number((await db.getCitationStats()).total_citations);
+  await db.saveCitations('equiv-doc-backfill', [
+    { text: 'Kuhn, T. (1962). The structure of scientific revolutions. Chicago: UCP', year: '1962' },
+  ], (text) => `unmatched-${text}`);
+  const after = Number((await db.getCitationStats()).total_citations);
+  assert.equal(after, before, 'backfilled citation was not reachable as a fuzzy candidate');
+});
+
+// A generated corpus, deliberately dense with near-duplicates so the similarity
+// pre-filter, the bucket ordering and the year-window blocking all get exercised
+// hundreds of times rather than once each.
+function generatedCorpus() {
+  const surnames = ['Abbott', 'Ãbaco', 'Beauchamp', 'Cardoso', 'Delacroix', 'Ekwueme', 'Fitzgerald',
+    'Grigoryan', 'Hidalgo', 'Ishikawa', 'Jankowski', 'Kowalczyk', 'Lindqvist', 'Mbeki', 'Novotný',
+    'Oyelaran', 'Papadopoulos', 'Quintero', 'Rasmussen', 'Sørensen', 'Thibodeaux', 'Ueda', 'Vasquez',
+    'Wojciechowski', 'Xu', 'Yamashita', 'Zeitlin'];
+  const topics = ['coastal sediment transport', 'reflexive ethnographic practice', 'lattice gauge models',
+    'urban water governance', 'phonetic drift in bilinguals', 'catalytic surface chemistry',
+    'archival silence and memory', 'stochastic volatility estimation', 'peri-urban land tenure',
+    'immunological tolerance', 'medieval marginalia', 'polymer crystallisation kinetics'];
+  const presses = ['Academic Press', 'University Press', 'Scholarly Editions', 'Northern Books'];
+
+  const documents = [];
+  let counter = 0;
+  for (let d = 0; d < 40; d += 1) {
+    const citations = [];
+    for (let c = 0; c < 12; c += 1) {
+      counter += 1;
+      const n = (d * 12 + c);
+      const surnameIndex = (n * 7) % surnames.length;
+      const topic = topics[(n * 5) % topics.length];
+      const press = presses[n % presses.length];
+      const year = 1962 + ((n * 3) % 55);
+      const base = `${surnames[surnameIndex]}, ${'ABCDEFG'[n % 7]}. (${year}). Studies in ${topic}. ${press}.`;
+      // Cycle through the shapes that make matching interesting.
+      switch (n % 6) {
+        case 0:
+          citations.push({ text: base, year: String(year) });
+          break;
+        case 1:
+          // OCR variant of the previous document's entry: trailing period dropped.
+          citations.push({ text: base.slice(0, -1), year: String(year) });
+          break;
+        case 2:
+          // Same work claimed one year later: the year window must keep them apart.
+          citations.push({ text: base, year: String(year + 1) });
+          break;
+        case 3:
+          // Year only in the text.
+          citations.push(base);
+          break;
+        case 4:
+          // Undated entry, so only the prefix bucket can reach it.
+          citations.push(`${surnames[surnameIndex]}, ${'ABCDEFG'[n % 7]}. Studies in ${topic}. Unpublished.`);
+          break;
+        default:
+          citations.push({ text: `${base} Reprinted ${counter}.`, year: `c${year}` });
+          break;
+      }
+    }
+    documents.push({ id: `gen-doc-${d}`, citations });
+  }
+  return documents;
+}
+
+// --- Phase 1 / #11: wire the five phase-2 fixture groups into a real save/match
+// run (defect 2). These groups were declared above and never referenced, so the
+// ±1 veto / tie-break branches they were built to exercise fired zero times.
+//
+// Critical: the production hash normalizeCitation (src/pdf.js) strips periods
+// before hashing, so the three trailing-period-only pairs (OKONKWO_1992/PROBE,
+// RAVINDRAN_1990/PROBE, PEMBERTON_1999/PROBE) hash-collide under it and would
+// resolve via the exact-hash short-circuit, never reaching findFuzzyMatch. This
+// test uses a pass-through hashFn (distinct text -> distinct hash) so the probes
+// actually reach phase-2 fuzzy logic. The file-level `hashFn` above also folds
+// punctuation and MUST NOT be used here for the same reason.
+const passthroughHash = (text) => `fixture|${text}`;
+
+// Each group: the two "established" rows to seed (text + the year field they are
+// stored under), the probe (text + a year field that deliberately disagrees with
+// the year printed in its text, which is what forces the matcher past phase 1),
+// and the outcome its comment documents. `mergeSeed` is the index of the seed the
+// probe must merge into, or null when the probe must land as a new citation.
+const PHASE2_GROUPS = [
+  {
+    name: 'OKONKWO',
+    seeds: [[OKONKWO_1991, '1991'], [OKONKWO_1992, '1992']],
+    probe: [OKONKWO_PROBE, '1991'],
+    // Probe year 1991: the 1991 row is same-year (0.9928), the 1992 row is in the
+    // y+1 bucket (0.9976) and outscores it, so the ±1 veto fires -> new citation.
+    event: 'veto:after',
+    mergeSeed: null,
+  },
+  {
+    name: 'RAVINDRAN',
+    seeds: [[RAVINDRAN_1990, '1990'], [RAVINDRAN_1991, '1991']],
+    probe: [RAVINDRAN_PROBE, '1991'],
+    // Probe year 1991: the 1990 row is in the y-1 bucket (0.9973) and outscores
+    // the same-year 1991 row (0.9919), so the veto fires -> new citation.
+    event: 'veto:before',
+    mergeSeed: null,
+  },
+  {
+    name: 'NAKAMURA',
+    seeds: [[NAKAMURA_2000, '2000'], [NAKAMURA_2001, '2001']],
+    probe: [NAKAMURA_PROBE, '2001'],
+    // Exact tie (0.99767) between the y-1 (2000) and same-year (2001) buckets.
+    // y-1 is consulted first, so the tie-break vetoes -> new citation.
+    event: 'veto:before',
+    mergeSeed: null,
+  },
+  {
+    name: 'SANDOVAL',
+    seeds: [[SANDOVAL_FIRST, '2007'], [SANDOVAL_SECOND, '2007']],
+    probe: [SANDOVAL_PROBE, '2007'],
+    // Both candidates tie exactly (0.96471) in the same 2007 bucket; the bucket is
+    // scanned in ascending id order and the first of a tie kept, so the probe
+    // merges into the lower-id seed.
+    event: 'merge:same-year',
+    mergeSeed: 0,
+  },
+  {
+    name: 'PEMBERTON',
+    seeds: [[PEMBERTON_1999, '1999'], [PEMBERTON_2001, '2001']],
+    probe: [PEMBERTON_PROBE, '2001'],
+    // Probe year 2001: it merges into the 2001 row it scores 0.9602 against; the
+    // 1999 row it scores 0.9976 against is two years away, outside the ±1 window,
+    // so it is invisible and does not veto.
+    event: 'merge:same-year',
+    mergeSeed: 1,
+  },
+];
+
+test('the five phase-2 fixture groups reach the +/-1 veto / tie-break logic and resolve as documented', async () => {
+  const client = await db.getDb();
+
+  const totalCitations = async () =>
+    Number((await db.getCitationStats()).total_citations);
+  const linkedId = async (docId) => {
+    const rows = await client.execute({
+      sql: 'SELECT citation_id FROM document_citations WHERE doc_id = ? ORDER BY citation_id',
+      args: [docId],
+    });
+    return rows.rows.map((row) => Number(row.citation_id));
+  };
+
+  // Every group must be individually shown to reach phase 2 for its own probe,
+  // and the three veto groups must be individually shown to fire the veto — a
+  // per-group check, never ">=1 somewhere across the suite".
+  const reachedPhase2 = {};
+  const firedEvent = {};
+
+  for (const group of PHASE2_GROUPS) {
+    // The trailing-period-only pairs must have distinct pass-through hashes here
+    // (they collide under normalizeCitation); pin that so the seam can't rot.
+    for (const [text] of group.seeds) {
+      assert.notEqual(
+        passthroughHash(text),
+        passthroughHash(group.probe[0]),
+        `${group.name}: seed and probe hash-collide even under the pass-through hash`
+      );
+    }
+
+    const seedIds = [];
+    for (let i = 0; i < group.seeds.length; i += 1) {
+      const [text, year] = group.seeds[i];
+      const docId = `phase2-${group.name}-seed-${i}`;
+      const ids = await db.saveCitations(docId, [{ text, year }], passthroughHash);
+      seedIds.push(ids[0]);
+    }
+    // Seeds are distinct works; they must not have merged into one another.
+    assert.equal(
+      new Set(seedIds).size,
+      group.seeds.length,
+      `${group.name}: seed rows merged into each other before the probe ran`
+    );
+
+    const before = await totalCitations();
+    const events = [];
+    const probeDoc = `phase2-${group.name}-probe`;
+    const probeIds = await db.saveCitations(
+      probeDoc,
+      [{ text: group.probe[0], year: group.probe[1] }],
+      passthroughHash,
+      { matchObserver: (event) => events.push(event) }
+    );
+    const after = await totalCitations();
+
+    reachedPhase2[group.name] = events.includes('phase2:adjacent');
+    firedEvent[group.name] = events;
+
+    // (1) Phase-2 reach, proven per group. Without the pass-through hash the
+    // trailing-period probes short-circuit here and this is false.
+    assert.ok(
+      reachedPhase2[group.name],
+      `${group.name}: probe did not reach phase-2 fuzzy logic (events: ${JSON.stringify(events)})`
+    );
+    // (2) The specific decision branch its comment documents fired.
+    assert.ok(
+      events.includes(group.event),
+      `${group.name}: expected branch ${group.event}, got ${JSON.stringify(events)}`
+    );
+
+    // (3) The database outcome the comment documents.
+    if (group.mergeSeed == null) {
+      assert.equal(after, before + 1, `${group.name}: probe should have created a new citation`);
+      assert.ok(
+        !seedIds.includes(probeIds[0]),
+        `${group.name}: probe merged into a seed instead of landing as new`
+      );
+    } else {
+      assert.equal(after, before, `${group.name}: probe should have merged, not created a new row`);
+      assert.equal(
+        probeIds[0],
+        seedIds[group.mergeSeed],
+        `${group.name}: probe merged into the wrong seed`
+      );
+    }
+  }
+
+  // Per-group phase-2 reach, asserted as a set so a regression that silently
+  // short-circuits one group cannot hide behind the others.
+  assert.deepEqual(
+    reachedPhase2,
+    { OKONKWO: true, RAVINDRAN: true, NAKAMURA: true, SANDOVAL: true, PEMBERTON: true },
+    'not every fixture group reached phase-2 fuzzy logic'
+  );
+  // The three groups whose comment says the ±1 veto fires must each show it.
+  for (const name of ['OKONKWO', 'RAVINDRAN', 'NAKAMURA']) {
+    assert.ok(
+      firedEvent[name].some((event) => event.startsWith('veto:')),
+      `${name}: the +/-1 veto branch never fired`
+    );
+  }
+});
+
+// --- Phase 1 / #11 (1d): pin the prefix-narrowing trade-off ---
+//
+// "Deliberate difference 2" narrows the dated arms on the incoming citation's
+// 3-character prefix as well as its year. Two otherwise-identical, same-year
+// citations that differ only in their first three characters (e.g. an OCR-misread
+// initial letter) therefore fall into different prefix buckets and are NOT
+// compared, so the second lands as a new citation rather than merging. This is a
+// genuine behaviour change from the pre-Phase-A matcher; pin it so the accepted
+// trade-off is locked by a test rather than left implicit.
+test('prefix narrowing keeps two same-year citations that differ only in their first 3 chars apart', async () => {
+  const base = 'nnnn, Q. (2011). Distinctive monograph on the prefix-narrowing trade-off. Solitary Press.';
+  // Differ only in the first three characters ("nnn" vs "mmm"): same year, same
+  // everything else. Under the old whole-year-bucket matcher these would merge;
+  // under prefix narrowing they must not.
+  const seedText = base;
+  const ocrText = `mmm${base.slice(3)}`;
+  const uniqueHash = (text) => `prefixpin|${text}`;
+
+  const before = Number((await db.getCitationStats()).total_citations);
+  const seedIds = await db.saveCitations('prefix-pin-seed', [{ text: seedText, year: '2011' }], uniqueHash);
+  const events = [];
+  const ocrIds = await db.saveCitations(
+    'prefix-pin-ocr',
+    [{ text: ocrText, year: '2011' }],
+    uniqueHash,
+    { matchObserver: (event) => events.push(event) }
+  );
+  const after = Number((await db.getCitationStats()).total_citations);
+
+  assert.equal(after, before + 2, 'prefix narrowing no longer keeps different-prefix citations apart');
+  assert.notEqual(ocrIds[0], seedIds[0], 'the different-prefix citation merged despite prefix narrowing');
+  // The candidate bucket for the OCR row never contained the seed, so no
+  // acceptable candidate cleared the threshold and phase 2 was never reached.
+  assert.ok(
+    !events.includes('phase2:adjacent'),
+    'a different-prefix citation reached phase 2, so it was not prefix-narrowed'
+  );
+});
+
+test('equivalence holds across a dense generated corpus', async () => {
+  const corpus = generatedCorpus();
+  const generatedHash = (text) => hashFn(`gen|${text}`);
+  const expected = legacyRun(corpus, generatedHash);
+
+  for (const doc of corpus) {
+    await db.saveCitations(doc.id, doc.citations, generatedHash);
+  }
+
+  const client = await db.getDb();
+  let compared = 0;
+  for (const doc of corpus) {
+    const rows = await client.execute({
+      sql: 'SELECT citation_id FROM document_citations WHERE doc_id = ? ORDER BY citation_id',
+      args: [doc.id],
+    });
+    const linked = rows.rows.map((row) => Number(row.citation_id));
+    const legacy = expected.links.get(doc.id);
+    // Legacy ids are simulated from an empty table; this corpus runs after the
+    // fixture corpus above, so compare the shape of the merge rather than raw ids.
+    assert.equal(linked.length, legacy.length, `${doc.id}: merged a different number of citations`);
+    compared += linked.length;
+  }
+  assert.ok(compared > 300, 'generated corpus is too small to be meaningful');
+  const totalCitations = corpus.reduce((sum, doc) => sum + doc.citations.length, 0);
+  assert.ok(
+    expected.citationCount < totalCitations * 0.9,
+    `generated corpus barely merges anything (${expected.citationCount} of ${totalCitations})`
+  );
+
+  // Same merge decisions, expressed as which citations documents came to share.
+  const legacyShared = new Map();
+  for (const [docId, ids] of expected.links) {
+    for (const id of ids) {
+      if (!legacyShared.has(id)) legacyShared.set(id, []);
+      legacyShared.get(id).push(docId);
+    }
+  }
+  const actualShared = new Map();
+  for (const doc of corpus) {
+    const rows = await client.execute({
+      sql: 'SELECT citation_id FROM document_citations WHERE doc_id = ? ORDER BY citation_id',
+      args: [doc.id],
+    });
+    for (const row of rows.rows) {
+      const id = Number(row.citation_id);
+      if (!actualShared.has(id)) actualShared.set(id, []);
+      actualShared.get(id).push(doc.id);
+    }
+  }
+  const signature = (map) => Array.from(map.values())
+    .map((docs) => docs.slice().sort().join(','))
+    .sort()
+    .join('|');
+  assert.equal(
+    signature(actualShared),
+    signature(legacyShared),
+    'the two matchers grouped documents around different citations'
+  );
+});

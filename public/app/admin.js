@@ -39,6 +39,14 @@ const {
   importRulesListEl,
   importRunScopeEl,
   importSourceEl,
+  importContentModeEl,
+  importContentFallbackEl,
+  importExtractCitationsEl,
+  importExtractCommitteeEl,
+  importRunConceptsEl,
+  importMaxContentBytesEl,
+  importContentConcurrencyEl,
+  importContentRateLimitEl,
   jobsStatusCardsEl,
   jobsTableEl,
   loginError,
@@ -639,8 +647,27 @@ function getImportRuleFormData() {
     affiliation: importAffiliationEl?.value.trim() || '',
     index: importIndexEl?.value.trim() || '',
     query: importQueryEl?.value.trim() || '',
-    source: importSourceEl?.value.trim() || document.getElementById('s-source')?.value.trim() || ''
+    source: importSourceEl?.value.trim() || document.getElementById('s-source')?.value.trim() || '',
+    contentMode: importContentModeEl?.value || 'metadata_only',
+    contentFallback: importContentFallbackEl?.value || 'fail_document',
+    extractCitations: Boolean(importExtractCitationsEl?.checked),
+    extractCommittee: importExtractCommitteeEl?.checked !== false,
+    runConcepts: importRunConceptsEl?.checked !== false,
+    maxContentBytes: Number(importMaxContentBytesEl?.value || 209715200),
+    contentConcurrency: Number(importContentConcurrencyEl?.value || 1),
+    contentRateLimit: Number(importContentRateLimitEl?.value || 0)
   };
+}
+
+const IMPORT_CONTENT_MODE_LABELS = {
+  metadata_only: 'Metadata only',
+  full_text_only: 'Extracted full text only',
+  pdf_stream: 'Stream PDF',
+  pdf_cache: 'Cache PDF',
+};
+
+function importContentModeLabel(mode) {
+  return IMPORT_CONTENT_MODE_LABELS[mode] || mode || IMPORT_CONTENT_MODE_LABELS.metadata_only;
 }
 
 function importRuleTerm(rule = getImportRuleFormData()) {
@@ -666,7 +693,11 @@ function summarizeImportRule(rule) {
     rule.program ? `Program: ${rule.program}` : '',
     rule.affiliation ? `Affiliation: ${rule.affiliation}` : ''
   ].filter(Boolean);
-  return parts.length ? parts.join(' · ') : 'No filters selected';
+  parts.push(`Content: ${importContentModeLabel(rule.contentMode)}`);
+  parts.push(`Fallback: ${(rule.contentFallback || 'fail_document').replaceAll('_', ' ')}`);
+  parts.push(`Concurrency: ${rule.contentConcurrency || 1}`);
+  if (rule.rollout?.status) parts.push(`Rollout: ${rule.rollout.status.replaceAll('_', ' ')}`);
+  return parts.join(' · ');
 }
 
 function renderImportRules() {
@@ -712,6 +743,14 @@ function setImportRuleForm(rule = {}) {
   importIndexEl.value = rule.index ?? document.getElementById('s-index')?.value ?? '';
   importQueryEl.value = rule.query ?? document.getElementById('s-query')?.value ?? '';
   importSourceEl.value = rule.source || document.getElementById('s-source')?.value || '';
+  importContentModeEl.value = rule.contentMode || 'metadata_only';
+  importContentFallbackEl.value = rule.contentFallback || 'fail_document';
+  importExtractCitationsEl.checked = Boolean(rule.extractCitations);
+  importExtractCommitteeEl.checked = rule.extractCommittee !== false;
+  importRunConceptsEl.checked = rule.runConcepts !== false;
+  importMaxContentBytesEl.value = rule.maxContentBytes || 209715200;
+  importContentConcurrencyEl.value = rule.contentConcurrency || 1;
+  importContentRateLimitEl.value = rule.contentRateLimit || 0;
   deleteImportRuleBtn.hidden = !rule.id;
   importRulePreviewEl.innerHTML = '';
   updateImportGeneratedTerm();
@@ -850,17 +889,47 @@ async function handleRunImportRules(mode, button) {
     import_all: 'Import metadata',
     sync_differences: 'Import new metadata',
     refresh_metadata: 'Refresh existing metadata',
-    sync_missing_pdfs: 'Import and analyze PDFs'
+    sync_missing_pdfs: 'Import and enrich using rule policy'
   };
-  if (!confirm(`${labels[mode]} for ${importScopeLabel()}?`)) return;
+  const selectedRules = state.importRules.filter((rule) => ruleIds.includes(rule.id));
+  const enrichingRules = selectedRules.filter((rule) => rule.contentMode !== 'metadata_only');
+  let rolloutPhase = null;
+  if (mode === 'sync_missing_pdfs' && enrichingRules.length) {
+    if (selectedRules.length !== 1) {
+      alert('Progressive enrichment runs one rule at a time so each cohort has an independent quality gate.');
+      return;
+    }
+    const rolloutState = selectedRules[0].rollout;
+    if (!rolloutState || rolloutState.status === 'invalidated') rolloutPhase = 'sample';
+    else if (rolloutState.status === 'awaiting_control') rolloutPhase = 'control';
+    else if (rolloutState.status === 'ready_for_cohort') rolloutPhase = 'cohort';
+    else if (rolloutState.status === 'blocked') rolloutPhase = rolloutState.evaluation?.phase;
+    if (!rolloutPhase) {
+      alert(`This rollout cannot start while it is ${rolloutState?.status || 'in an unknown state'}.`);
+      return;
+    }
+  }
+  const policyCounts = selectedRules.reduce((counts, rule) => {
+    const label = importContentModeLabel(rule.contentMode);
+    counts[label] = (counts[label] || 0) + 1;
+    return counts;
+  }, {});
+  const policySummary = mode === 'sync_missing_pdfs'
+    ? `\n\nContent policies:\n${Object.entries(policyCounts).map(([label, count]) => `- ${label}: ${count}`).join('\n')}`
+    : '';
+  const rolloutSummary = rolloutPhase
+    ? `\n\nProgressive enrichment phase: ${rolloutPhase}`
+    : '';
+  const originalPdfWarning = mode === 'sync_missing_pdfs'
+    && (rolloutPhase === 'control' || selectedRules.some((rule) => ['pdf_stream', 'pdf_cache'].includes(rule.contentMode)))
+    ? '\n\nWarning: this phase requests original PDFs. Confirming explicitly approves retrieval for this bounded run.'
+    : '';
+  if (!confirm(`${labels[mode]} for ${importScopeLabel()}?${policySummary}${rolloutSummary}${originalPdfWarning}`)) return;
 
   button.disabled = true;
   const originalHtml = button.innerHTML;
   button.innerHTML = '<span class="import-action-title">Running...</span>';
   try {
-    const downloadFiles = mode === 'sync_missing_pdfs'
-      ? '1'
-      : document.getElementById('s-downloadFiles')?.value || '0';
     const res = await fetch('/api/admin/import-rules/run', {
       method: 'POST',
       headers: jsonHeaders(),
@@ -868,10 +937,11 @@ async function handleRunImportRules(mode, button) {
         mode,
         scope,
         ruleIds,
+        rolloutPhase,
+        approveOriginalPdfControl: rolloutPhase === 'control',
         maxRecords: document.getElementById('s-maxRecords')?.value || '9999',
         pageSize: document.getElementById('s-pageSize')?.value || '20',
-        scanLimit: document.getElementById('s-scanLimit')?.value || '50000',
-        downloadFiles
+        scanLimit: document.getElementById('s-scanLimit')?.value || '50000'
       })
     });
     const data = await res.json();
@@ -1067,7 +1137,7 @@ async function loadConceptPipelineStatus() {
 async function handleRebuildConcepts() {
   if (!rebuildConceptsBtn) return;
   rebuildConceptsBtn.disabled = true;
-  rebuildConceptsBtn.textContent = 'Rebuilding...';
+  rebuildConceptsBtn.textContent = 'Processing...';
   try {
     const res = await fetch('/api/admin/concepts/rebuild', { method: 'POST', headers: csrfHeaders() });
     const data = await res.json();
@@ -1076,15 +1146,15 @@ async function handleRebuildConcepts() {
       return;
     }
     setStatus(data.alreadyRunning
-      ? `Concept rebuild is already running as job ${data.jobId}.`
-      : `Concept rebuild started as job ${data.jobId}.`);
+      ? `A concept partition is already processing as job ${data.jobId}.`
+      : `The next changed concept partition started as job ${data.jobId}.`);
     await loadJobs();
     await loadConceptPipelineStatus();
   } catch {
     alert('Connection error');
   } finally {
     rebuildConceptsBtn.disabled = false;
-    rebuildConceptsBtn.textContent = 'Rebuild Concept Dictionary';
+    rebuildConceptsBtn.textContent = 'Process Next Concept Partition';
   }
 }
 
@@ -1185,6 +1255,8 @@ function formatJobCounts(counts = {}) {
   if (counts.fuzzyMatches != null) parts.push(`${formatNum(counts.fuzzyMatches)} fuzzy`);
   if (counts.exactMatches != null) parts.push(`${formatNum(counts.exactMatches)} exact`);
   if (counts.newCitations != null) parts.push(`${formatNum(counts.newCitations)} new`);
+  if (counts.truncatedBuckets) parts.push(`${formatNum(counts.truncatedBuckets)} truncated buckets`);
+  if (counts.truncationBlockedMerges) parts.push(`${formatNum(counts.truncationBlockedMerges)} merges blocked by truncation`);
   if (counts.withCommittee != null) parts.push(`${formatNum(counts.withCommittee)} with committee`);
   if (counts.pages != null) parts.push(`${formatNum(counts.pages)} pages`);
   if (counts.words != null) parts.push(`${formatNum(counts.words)} words`);
@@ -1901,16 +1973,18 @@ async function handleReparseCitations() {
     const res = await fetch('/api/admin/reparse-citations', { method: 'POST', headers: csrfHeaders() });
     const data = await res.json();
     if (!res.ok) {
-      alert(data.error || 'Citation re-extraction failed');
+      alert(data.error || 'Citation extraction failed');
       return;
     }
-    setStatus(data.alreadyRunning ? 'A citation re-extraction worker is already running.' : 'Citation re-extraction worker started.');
+    setStatus(data.alreadyRunning
+      ? 'A cached-content citation extraction worker is already running.'
+      : 'Cached-content citation extraction started; catalogue resolution will remain separate.');
     await loadJobs();
   } catch {
     alert('Connection error');
   } finally {
     reparseCitationsBtn.disabled = false;
-    reparseCitationsBtn.textContent = 'Re-extract Citations';
+    reparseCitationsBtn.textContent = 'Extract Pending Citations';
   }
 }
 

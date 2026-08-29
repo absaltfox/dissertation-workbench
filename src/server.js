@@ -64,8 +64,8 @@ async function startConceptRebuildJob(trigger) {
   }
   const result = await createAndStartAdminWorkerJob({
     type: 'concept_rebuild',
-    label: trigger === 'scheduled' ? 'Scheduled PatternRank Concept Rebuild' : 'Startup PatternRank Concept Rebuild',
-    params: { method: 'patternrank', trigger },
+    label: trigger === 'scheduled' ? 'Scheduled PatternRank Partition' : 'Startup PatternRank Partition',
+    params: { method: 'patternrank_incremental', trigger },
   });
   logger.info('Concept rebuild job started', { trigger, jobId: result.jobId, runnerType: result.runnerType });
   return result;

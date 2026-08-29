@@ -5,17 +5,21 @@ import {
 } from '../config.js';
 import {
   applyCitationCountsToDocuments, applyCommitteeMembersToDocuments,
-  applyStoredFileMetricsToDocuments, getDocumentCacheStats, listCachedDocuments,
-  loadDocumentMetadata, loadDocumentTopics, loadTopics
+  applyStoredFileMetricsToDocuments, getDocumentCacheStats, getDocumentServingAnalytics, getDocumentServingSummary,
+  hasTopics, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics,
+  queryCachedDocumentPage, queryCitationDocumentPage, queryPeoplePage, queryPersonDetailPage,
+  queryRelatedDocuments, queryTopicDocumentPage
 } from '../db.js';
 import { authenticate } from '../auth.js';
 import { getConfiguredApiKey } from '../secrets.js';
 import { parseBooleanParam, parseNumberParam, validateMetricsParams } from '../validate.js';
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
 import { hasValidCsrf } from '../middleware/adminAuth.js';
-import { stripMiddleInitials, supervisorNameKey } from '../supervisors.js';
 
 const WORKBENCH_SLICE_TTL_MS = CACHE_TTL_MS;
+const ANALYTICS_DOCUMENT_SAMPLE_LIMIT = 100;
+const DETAILED_ANALYTICS_RECORD_LIMIT = 5000;
+const VISUALIZATION_DOCUMENT_LIMIT = 5000;
 
 function readRawMetricsParams(req) {
   return {
@@ -129,15 +133,6 @@ function filterDocuments(documents, filters = {}) {
   });
 }
 
-function facetValues(documents = []) {
-  const toSorted = (values) => Array.from(new Set(values.filter(Boolean))).sort();
-  return {
-    degree: toSorted(documents.map((doc) => doc.degree)),
-    program: toSorted(documents.map((doc) => doc.program)),
-    affiliation: toSorted(documents.flatMap((doc) => Array.isArray(doc.affiliation) ? doc.affiliation : [])),
-  };
-}
-
 function parseDocumentPageRequest(req) {
   const offset = Math.trunc(Math.max(0, parseNumberParam(getQueryValue(req, 'offset'), 0)));
   const requestedLimit = parseNumberParam(getQueryValue(req, 'limit'), 50);
@@ -175,133 +170,6 @@ function bootstrapDoc(doc) {
   };
 }
 
-function documentSortValue(doc, key) {
-  switch (key) {
-    case 'title': return String(doc.title || '').toLowerCase();
-    case 'author': return String(doc.author || '').toLowerCase();
-    case 'year': return Number(doc.year || 0);
-    case 'degree': return String(doc.degree || doc.type || '').toLowerCase();
-    case 'pages': return Number(doc.pages || 0);
-    case 'wordCount': return Number(doc.wordCount || 0);
-    default: return '';
-  }
-}
-
-function sortDocumentRows(documents = [], sortKey = '', sortDir = 'asc') {
-  if (!sortKey) return documents;
-  const dir = sortDir === 'desc' ? -1 : 1;
-  return [...documents].sort((a, b) => {
-    const av = documentSortValue(a, sortKey);
-    const bv = documentSortValue(b, sortKey);
-    if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * dir;
-    if (av < bv) return -1 * dir;
-    if (av > bv) return 1 * dir;
-    return 0;
-  });
-}
-
-function searchDocuments(documents = [], q = '') {
-  if (!q) return documents;
-  return documents.filter((doc) =>
-    String(doc.title || '').toLowerCase().includes(q) ||
-    String(doc.author || '').toLowerCase().includes(q) ||
-    (doc.supervisors || []).some((name) => String(name || '').toLowerCase().includes(q)) ||
-    String(doc.degree || '').toLowerCase().includes(q) ||
-    String(doc.program || '').toLowerCase().includes(q) ||
-    String(doc.year || '').includes(q)
-  );
-}
-
-function citationDoc(doc) {
-  return {
-    id: doc.id,
-    title: doc.title || '',
-    author: doc.author || '',
-    year: doc.year || null,
-    citationCount: doc.citationCount || 0,
-  };
-}
-
-function citationDocSortValue(doc, key) {
-  switch (key) {
-    case 'title': return String(doc.title || '').toLowerCase();
-    case 'author': return String(doc.author || '').toLowerCase();
-    case 'year': return Number(doc.year || 0);
-    case 'citationCount': return Number(doc.citationCount || 0);
-    default: return '';
-  }
-}
-
-function sortCitationDocs(documents = [], sortKey = 'citationCount', sortDir = 'desc') {
-  const dir = sortDir === 'asc' ? 1 : -1;
-  return [...documents].sort((a, b) => {
-    const av = citationDocSortValue(a, sortKey);
-    const bv = citationDocSortValue(b, sortKey);
-    if (typeof av === 'number' && typeof bv === 'number') return (av - bv) * dir || String(a.title || '').localeCompare(String(b.title || ''));
-    if (av < bv) return -1 * dir;
-    if (av > bv) return 1 * dir;
-    return 0;
-  });
-}
-
-function isValidPersonName(name) {
-  if (!name) return false;
-  const n = String(name || '').trim();
-  if (n.length < 3) return false;
-  const words = n.split(/\s+/);
-  if (words.length < 2) return false;
-  if (/^(University|UBC|SFU|Columbia|of\s|&\s|Research$)/i.test(n)) return false;
-  if (words.every((w) => w.replace(/\./g, '').length <= 2)) return false;
-  return true;
-}
-
-function mergeAffiliationNames(affiliations = []) {
-  return Array.from(new Set(affiliations.map((value) => String(value || '').trim()).filter(Boolean))).sort();
-}
-
-function buildTopicSummaryForDocs(docs = []) {
-  const topicCounts = new Map();
-  for (const doc of docs) {
-    if (doc.topicId == null) continue;
-    topicCounts.set(doc.topicId, (topicCounts.get(doc.topicId) || 0) + 1);
-  }
-  return Array.from(topicCounts.entries())
-    .map(([topicId, count]) => ({ topicId, count }))
-    .sort((a, b) => b.count - a.count);
-}
-
-function createPersonRowSeed(key, name) {
-  return {
-    key,
-    name,
-    roles: new Set(),
-    docs: [],
-    docRoles: new Map(),
-    affiliations: new Set(),
-    conceptMap: new Map(),
-    methMap: new Map(),
-    coSupervisors: new Set(),
-  };
-}
-
-function docRoleKey(doc) {
-  return doc.id || [doc.title, doc.author, doc.year].map((value) => String(value || '').trim()).join('|');
-}
-
-function addPersonDocument(person, doc, role) {
-  const key = docRoleKey(doc);
-  if (!key) return;
-  let roleSet = person.docRoles.get(key);
-  if (!roleSet) {
-    roleSet = new Set();
-    person.docRoles.set(key, roleSet);
-    person.docs.push(doc);
-    for (const concept of (doc.conceptTerms || [])) person.conceptMap.set(concept, (person.conceptMap.get(concept) || 0) + 1);
-    for (const methodology of (doc.methodologies || [])) person.methMap.set(methodology, (person.methMap.get(methodology) || 0) + 1);
-  }
-  roleSet.add(role || 'Committee Member');
-}
-
 const PERSON_ROLE_ORDER = [
   'Supervisor',
   'Co-Supervisor',
@@ -320,159 +188,26 @@ function sortPersonRoles(roles = []) {
   });
 }
 
-function buildRoleGroups(person) {
-  const docByKey = new Map(person.docs.map((doc) => [docRoleKey(doc), doc]));
-  return sortPersonRoles(person.roles).map((role) => ({
-    role,
-    docs: Array.from(person.docRoles.entries())
-      .filter(([, roleSet]) => roleSet.has(role))
-      .map(([key]) => docByKey.get(key))
-      .filter(Boolean),
-  })).filter((group) => group.docs.length);
-}
-
-function personKeyFor(name) {
-  const key = supervisorNameKey(name);
-  if (key) return stripMiddleInitials(key);
-  return String(name || '').toLowerCase().trim();
-}
-
-function buildPersonRows(documents = []) {
-  const people = new Map();
-
-  for (const doc of documents) {
-    for (const name of (doc.supervisors || [])) {
-      if (!isValidPersonName(name)) continue;
-      const key = personKeyFor(name);
-      if (!key) continue;
-      let person = people.get(key);
-      if (!person) {
-        person = createPersonRowSeed(key, name);
-        people.set(key, person);
-      } else if (String(name || '').length > String(person.name || '').length) {
-        person.name = name;
-      }
-      person.roles.add('Supervisor');
-      addPersonDocument(person, doc, 'Supervisor');
-      for (const other of (doc.supervisors || [])) {
-        const otherKey = personKeyFor(other);
-        if (otherKey && otherKey !== key) person.coSupervisors.add(other);
-      }
-    }
-
-    for (const member of (doc.committee || [])) {
-      const name = member.name;
-      if (!isValidPersonName(name)) continue;
-      const key = personKeyFor(name);
-      if (!key) continue;
-      let person = people.get(key);
-      if (!person) {
-        person = createPersonRowSeed(key, name);
-        people.set(key, person);
-      } else if (String(name || '').length > String(person.name || '').length) {
-        person.name = name;
-      }
-      const role = member.role || 'Committee Member';
-      person.roles.add(role);
-      if (member.affiliation) person.affiliations.add(member.affiliation);
-      addPersonDocument(person, doc, role);
-    }
-  }
-
-  return Array.from(people.values()).map((person) => {
-    const years = person.docs.map((doc) => doc.year).filter(Boolean).sort((a, b) => a - b);
-    const topConcepts = Array.from(person.conceptMap.entries())
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 12)
-      .map(([term, count]) => ({ term, count }));
-    const methodologies = Array.from(person.methMap.entries())
-      .sort((a, b) => b[1] - a[1])
-      .map(([methodology, count]) => ({ methodology, count }));
-    return {
-      key: person.key,
-      name: person.name,
-      roles: sortPersonRoles(person.roles),
-      docCount: person.docs.length,
-      docs: person.docs,
-      docRoles: person.docRoles,
-      roleGroups: buildRoleGroups(person),
-      affiliations: mergeAffiliationNames(Array.from(person.affiliations)),
-      yearRange: years.length ? `${years[0]}\u2013${years[years.length - 1]}` : '\u2013',
-      yearMin: years[0] || 9999,
-      topConcepts,
-      methodologies,
-      coSupervisors: Array.from(person.coSupervisors),
-      topicSummary: buildTopicSummaryForDocs(person.docs),
-    };
-  });
-}
-
-function personListRow(person) {
-  return {
-    key: person.key,
-    name: person.name,
-    roles: person.roles,
-    docCount: person.docCount,
-    affiliations: person.affiliations,
-    yearRange: person.yearRange,
-    yearMin: person.yearMin,
-  };
-}
-
-function personDetailRow(person) {
-  const detailDocForPerson = (doc) => ({
+function personDetailPageRow(person, documents) {
+  const docs = documents.map((doc) => ({
     ...bootstrapDoc(doc),
     themes: doc.themes || [],
     conceptTerms: doc.conceptTerms || [],
     methodologies: doc.methodologies || [],
     topicId: doc.topicId ?? null,
     topicProbability: doc.topicProbability ?? null,
-    personRoles: Array.from(person.docRoles?.get(docRoleKey(doc)) || []),
-  });
-
+    personRoles: sortPersonRoles(doc.personRoles || []),
+  }));
+  const roles = sortPersonRoles(person.roles || []);
   return {
-    ...personListRow(person),
-    topConcepts: person.topConcepts,
-    methodologies: person.methodologies,
-    coSupervisors: person.coSupervisors,
-    topicSummary: person.topicSummary,
-    docs: person.docs.map(detailDocForPerson),
-    roleGroups: (person.roleGroups || []).map((group) => ({
-      role: group.role,
-      docs: group.docs.map(detailDocForPerson),
-    })),
+    ...person,
+    roles,
+    docs,
+    roleGroups: roles.map((role) => ({
+      role,
+      docs: docs.filter((doc) => doc.personRoles.includes(role)),
+    })).filter((group) => group.docs.length),
   };
-}
-
-function searchPeople(people = [], q = '') {
-  if (!q) return people;
-  return people.filter((person) =>
-    String(person.name || '').toLowerCase().includes(q) ||
-    (person.roles || []).some((role) => String(role || '').toLowerCase().includes(q)) ||
-    (person.affiliations || []).some((affiliation) => String(affiliation || '').toLowerCase().includes(q))
-  );
-}
-
-function personSortValue(person, key) {
-  switch (key) {
-    case 'name': return String(person.name || '').toLowerCase();
-    case 'docCount': return Number(person.docCount || 0);
-    case 'roles': return (person.roles || []).join(', ').toLowerCase();
-    case 'years': return Number(person.yearMin || 9999);
-    default: return '';
-  }
-}
-
-function sortPeople(people = [], sortKey = 'docCount', sortDir = 'desc') {
-  const dir = sortDir === 'asc' ? 1 : -1;
-  return [...people].sort((a, b) => {
-    const av = personSortValue(a, sortKey);
-    const bv = personSortValue(b, sortKey);
-    if (typeof av === 'number' && typeof bv === 'number') return (av - bv || String(a.name || '').localeCompare(String(b.name || ''))) * dir;
-    if (av < bv) return -1 * dir;
-    if (av > bv) return 1 * dir;
-    return 0;
-  });
 }
 
 function analyticsDoc(doc) {
@@ -519,30 +254,6 @@ function detailDoc(doc, related = [], topic = null) {
   };
 }
 
-function relatedDocumentsFor(doc, allDocs, limit = 6) {
-  const terms = new Set([...(doc.themes || []), ...(doc.conceptTerms || [])].map((value) => String(value || '').toLowerCase()));
-  if (!terms.size) return [];
-  return (allDocs || [])
-    .filter((candidate) => candidate.id !== doc.id)
-    .map((candidate) => {
-      const candidateTerms = [...(candidate.themes || []), ...(candidate.conceptTerms || [])]
-        .map((value) => String(value || '').toLowerCase());
-      const overlap = candidateTerms.filter((term) => terms.has(term)).length;
-      return { candidate, overlap };
-    })
-    .filter((entry) => entry.overlap > 0)
-    .sort((a, b) => b.overlap - a.overlap || (b.candidate.year || 0) - (a.candidate.year || 0))
-    .slice(0, limit)
-    .map(({ candidate, overlap }) => ({
-      id: candidate.id,
-      title: candidate.title || '',
-      author: candidate.author || '',
-      year: candidate.year || null,
-      degree: candidate.degree || '',
-      overlap,
-    }));
-}
-
 function analyticsSlice(payload) {
   return {
     generatedAt: payload.generatedAt,
@@ -567,6 +278,7 @@ function analyticsSlice(payload) {
 function visualizationSlice(payload) {
   return {
     generatedAt: payload.generatedAt,
+    source: payload.source,
     topicData: payload.topicData,
     supervisorNetwork: payload.supervisorNetwork,
     citationCooccurrence: payload.citationCooccurrence,
@@ -609,35 +321,16 @@ async function documentCacheForParams(params, loadSyncModule) {
 
 async function documentPageForParams(params, loadSyncModule, pageRequest, filters = {}) {
   const documentCache = await documentCacheForParams(params, loadSyncModule);
-  const needsFullPass = Boolean(
-    pageRequest.q ||
-    pageRequest.sortKey ||
-    filters.degree ||
-    filters.program ||
-    filters.affiliation
-  );
-  const documents = await listCachedDocuments({
+  const page = await queryCachedDocumentPage({
     syncKey: documentCache.syncKey,
-    limit: needsFullPass ? null : pageRequest.limit,
-    offset: needsFullPass ? 0 : pageRequest.offset,
+    filters,
+    q: pageRequest.q,
+    sortKey: pageRequest.sortKey,
+    sortDir: pageRequest.sortDir,
+    limit: pageRequest.limit,
+    offset: pageRequest.offset,
   });
-
-  let rows = documents;
-  if (needsFullPass) {
-    rows = filterDocuments(rows, filters);
-    rows = searchDocuments(rows, pageRequest.q);
-    rows = sortDocumentRows(rows, pageRequest.sortKey, pageRequest.sortDir);
-  }
-
-  const total = needsFullPass
-    ? rows.length
-    : (documentCache.recordsAvailable || rows.length);
-  const pageRows = needsFullPass
-    ? rows.slice(pageRequest.offset, pageRequest.offset + pageRequest.limit)
-    : rows;
-
-  await applyCitationCountsToDocuments(pageRows);
-  await applyCommitteeMembersToDocuments(pageRows);
+  await applyCommitteeMembersToDocuments(page.documents);
 
   return {
     generatedAt: new Date().toISOString(),
@@ -645,10 +338,10 @@ async function documentPageForParams(params, loadSyncModule, pageRequest, filter
       documentCache,
       offset: pageRequest.offset,
       limit: pageRequest.limit,
-      total,
-      hasMore: pageRequest.offset + pageRows.length < total,
+      total: page.total,
+      hasMore: pageRequest.offset + page.documents.length < page.total,
     },
-    documents: pageRows.map(bootstrapDoc),
+    documents: page.documents.map(bootstrapDoc),
   };
 }
 
@@ -672,8 +365,8 @@ async function metricRecordsForParams(params, loadSyncModule) {
 }
 
 export async function buildWorkbenchBootstrapPayload(params, loadSyncModule) {
-  const { documents, documentCache } = await cachedDocumentsForParams(params, loadSyncModule);
-  const rows = documents.map(bootstrapDoc);
+  const documentCache = await documentCacheForParams(params, loadSyncModule);
+  const aggregate = await getDocumentServingSummary({ syncKey: documentCache.syncKey });
   return {
     generatedAt: new Date().toISOString(),
     source: {
@@ -692,10 +385,10 @@ export async function buildWorkbenchBootstrapPayload(params, loadSyncModule) {
       },
     },
     summary: {
-      documents: rows.length,
-      supervisors: new Set(rows.flatMap((doc) => doc.supervisors || []).map((name) => String(name || '').toLowerCase()).filter(Boolean)).size,
+      documents: aggregate.documents,
+      supervisors: aggregate.supervisors,
     },
-    facets: facetValues(rows),
+    facets: aggregate.facets,
     documents: [],
   };
 }
@@ -813,15 +506,8 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       const topicInfo = doc.topicId == null
         ? null
         : topics.find((item) => item.topicId === doc.topicId) || null;
-      const { documents } = await cachedDocumentsForParams(params, loadSyncModule);
-      enrichDocumentSignals(documents);
-      const corpusDoc = documents.find((item) => item.id === doc.id);
-      for (const field of ['themes', 'conceptTerms', 'methodologies']) {
-        if (Array.isArray(corpusDoc?.[field]) && corpusDoc[field].length) {
-          doc[field] = corpusDoc[field];
-        }
-      }
-      const related = relatedDocumentsFor(doc, documents);
+      const documentCache = await documentCacheForParams(params, loadSyncModule);
+      const related = await queryRelatedDocuments(doc, { syncKey: documentCache.syncKey });
       return { document: detailDoc(doc, related, topicInfo) };
     });
     if (!payload) {
@@ -837,12 +523,41 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const filters = activeFilters(req);
     const key = `workbench:analytics:${sourceCacheKey(params)}:${JSON.stringify(filters)}`;
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
-      const { records, sourceMeta, subjectLimit } = await metricRecordsForParams(params, loadSyncModule);
-      const filtered = filterDocuments(records, filters);
-      const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit, {
-        persistRun: params.isAdminRequest && params.refresh,
+      const documentCache = await documentCacheForParams(params, loadSyncModule);
+      if (documentCache.recordsAvailable <= DETAILED_ANALYTICS_RECORD_LIMIT) {
+        const { records, sourceMeta, subjectLimit } = await metricRecordsForParams(params, loadSyncModule);
+        const filtered = filterDocuments(records, filters);
+        const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit, {
+          persistRun: params.isAdminRequest && params.refresh,
+        });
+        return analyticsSlice(full);
+      }
+      const aggregate = await getDocumentServingAnalytics({
+        syncKey: documentCache.syncKey,
+        filters,
+        subjectLimit: params.subjectLimit,
       });
-      return analyticsSlice(full);
+      const documentSample = await queryCachedDocumentPage({
+        syncKey: documentCache.syncKey,
+        filters,
+        limit: ANALYTICS_DOCUMENT_SAMPLE_LIMIT,
+        offset: 0,
+      });
+      return {
+        generatedAt: new Date().toISOString(),
+        source: {
+          documentCache,
+          filters,
+          aggregateSource: 'database',
+          documentsAvailable: documentSample.total,
+          documentsReturned: documentSample.documents.length,
+          documentsTruncated: documentSample.total > documentSample.documents.length,
+          detailedAnalyticsRecordLimit: DETAILED_ANALYTICS_RECORD_LIMIT,
+          readOnlyFileEnrichment: true,
+        },
+        ...aggregate,
+        documents: documentSample.documents.map(analyticsDoc),
+      };
     });
     res.status(200).json(payload);
   }));
@@ -853,9 +568,34 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const filters = activeFilters(req);
     const key = `workbench:visualizations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`;
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
-      const { records, sourceMeta, subjectLimit } = await metricRecordsForParams(params, loadSyncModule);
-      const filtered = filterDocuments(records, filters);
-      const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit, {
+      if (!await hasTopics()) {
+        return {
+          generatedAt: new Date().toISOString(),
+          topicData: null,
+          supervisorNetwork: { nodes: [], edges: [] },
+          citationCooccurrence: { nodes: [], edges: [] },
+          methodologyTopicMatrix: { methodologies: [], topics: [], matrix: [] },
+          documents: [],
+        };
+      }
+      const documentCache = await documentCacheForParams(params, loadSyncModule);
+      const page = await queryTopicDocumentPage({
+        syncKey: documentCache.syncKey,
+        filters,
+        limit: VISUALIZATION_DOCUMENT_LIMIT,
+        offset: 0,
+      });
+      const sourceMeta = {
+        documentCache,
+        filters,
+        aggregateSource: 'bounded-topic-document-page',
+        documentsAvailable: page.total,
+        documentsReturned: page.documents.length,
+        documentsTruncated: page.total > page.documents.length,
+        visualizationDocumentLimit: VISUALIZATION_DOCUMENT_LIMIT,
+        readOnlyFileEnrichment: true,
+      };
+      const full = await buildMetricsPayloadFromRecords(page.documents, sourceMeta, params.subjectLimit, {
         persistRun: params.isAdminRequest && params.refresh,
       });
       return visualizationSlice(full);
@@ -870,23 +610,26 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const pageRequest = parsePagedRequest(req, 'docCount', 'desc');
     const key = `workbench:people:${sourceCacheKey(params)}:${JSON.stringify(filters)}:${JSON.stringify(pageRequest)}`;
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
-      const { records } = await metricRecordsForParams(params, loadSyncModule);
-      const filtered = filterDocuments(records, filters);
-      let people = buildPersonRows(filtered);
-      if (pageRequest.role) people = people.filter((person) => person.roles.includes(pageRequest.role));
-      people = searchPeople(people, pageRequest.q);
-      people = sortPeople(people, pageRequest.sortKey, pageRequest.sortDir);
-      const total = people.length;
-      const pageRows = people.slice(pageRequest.offset, pageRequest.offset + pageRequest.limit);
+      const documentCache = await documentCacheForParams(params, loadSyncModule);
+      const page = await queryPeoplePage({
+        syncKey: documentCache.syncKey,
+        filters,
+        q: pageRequest.q,
+        role: pageRequest.role,
+        sortKey: pageRequest.sortKey,
+        sortDir: pageRequest.sortDir,
+        limit: pageRequest.limit,
+        offset: pageRequest.offset,
+      });
       return {
         generatedAt: new Date().toISOString(),
         source: {
-          total,
+          total: page.total,
           offset: pageRequest.offset,
           limit: pageRequest.limit,
-          hasMore: pageRequest.offset + pageRows.length < total,
+          hasMore: pageRequest.offset + page.people.length < page.total,
         },
-        people: pageRows.map(personListRow),
+        people: page.people,
       };
     });
     res.status(200).json(payload);
@@ -897,14 +640,28 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     if (!params) return;
     const filters = activeFilters(req);
     const personKey = String(req.params.personKey || '').toLowerCase().trim();
-    const key = `workbench:people:detail:${sourceCacheKey(params)}:${JSON.stringify(filters)}:${personKey}`;
+    const pageRequest = parsePagedRequest(req, 'year', 'desc');
+    const key = `workbench:people:detail:${sourceCacheKey(params)}:${JSON.stringify(filters)}:${personKey}:${JSON.stringify(pageRequest)}`;
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
-      const { records } = await metricRecordsForParams(params, loadSyncModule);
-      const filtered = filterDocuments(records, filters);
-      const person = buildPersonRows(filtered).find((row) => row.key === personKey);
+      const documentCache = await documentCacheForParams(params, loadSyncModule);
+      const page = await queryPersonDetailPage({
+        personKey,
+        syncKey: documentCache.syncKey,
+        filters,
+        limit: pageRequest.limit,
+        offset: pageRequest.offset,
+      });
+      if (!page) return { person: null };
+      enrichDocumentSignals(page.documents);
       return {
         generatedAt: new Date().toISOString(),
-        person: person ? personDetailRow(person) : null,
+        source: {
+          total: page.person.docCount,
+          offset: pageRequest.offset,
+          limit: pageRequest.limit,
+          hasMore: pageRequest.offset + page.documents.length < page.person.docCount,
+        },
+        person: personDetailPageRow(page.person, page.documents),
       };
     });
     if (!payload.person) {
@@ -921,25 +678,26 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     const pageRequest = parsePagedRequest(req, 'citationCount', 'desc');
     const key = `workbench:citations:${sourceCacheKey(params)}:${JSON.stringify(filters)}:${JSON.stringify(pageRequest)}`;
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
-      const { documents } = await cachedDocumentsForParams(params, loadSyncModule);
-      await applyCitationCountsToDocuments(documents);
-      await applyCommitteeMembersToDocuments(documents);
-      let rows = filterDocuments(documents, filters);
-      rows = searchDocuments(rows, pageRequest.q);
-      rows = sortCitationDocs(rows, pageRequest.sortKey, pageRequest.sortDir || 'desc');
-      const total = rows.length;
-      const withCitations = rows.filter((doc) => (doc.citationCount || 0) > 0).length;
-      const pageRows = rows.slice(pageRequest.offset, pageRequest.offset + pageRequest.limit);
+      const documentCache = await documentCacheForParams(params, loadSyncModule);
+      const page = await queryCitationDocumentPage({
+        syncKey: documentCache.syncKey,
+        filters,
+        q: pageRequest.q,
+        sortKey: pageRequest.sortKey,
+        sortDir: pageRequest.sortDir,
+        limit: pageRequest.limit,
+        offset: pageRequest.offset,
+      });
       return {
         generatedAt: new Date().toISOString(),
         source: {
-          total,
-          withCitations,
+          total: page.total,
+          withCitations: page.withCitations,
           offset: pageRequest.offset,
           limit: pageRequest.limit,
-          hasMore: pageRequest.offset + pageRows.length < total,
+          hasMore: pageRequest.offset + page.documents.length < page.total,
         },
-        documents: pageRows.map(citationDoc),
+        documents: page.documents,
       };
     });
     res.status(200).json(payload);
@@ -1032,6 +790,8 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       const cacheStats = hasExactSyncCache ? syncCacheStats : await getDocumentCacheStats();
       const cachedDocuments = await listCachedDocuments({
         syncKey: hasExactSyncCache ? syncKey : null,
+        limit: effectiveMaxRecords,
+        offset: 0,
       });
       const payload = await collectMetrics({
         ...sourceOptions,
