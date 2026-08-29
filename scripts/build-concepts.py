@@ -1162,13 +1162,18 @@ def discover_partition(client, requested_scope=None, priority=0, force=False):
                 raise ValueError(message)
             if existing and int(existing["enabled"] or 0) == 1 and int(existing["artifact_version"] or 0) > 0:
                 publication_changed = True
+            # source_updated_at is deliberately NOT part of this comparison: it is
+            # informational only (see the dirty check below, #22) and including it
+            # here would write on every pass a routine metadata refresh bumps
+            # documents.updated_at, even with the cohort's status/count/fingerprint
+            # genuinely unchanged -- defeating the "unchanged rerun is a no-op"
+            # guarantee for exactly the case it exists to cover.
             unchanged = (
                 existing is not None
                 and existing["scope_json"] == scope_json
                 and int(existing["enabled"] or 0) == 0
                 and existing["status"] == "blocked"
                 and int(existing["source_document_count"] or 0) == count
-                and str(existing["source_updated_at"] or "") == str(cohort["sourceUpdatedAt"] or "")
                 and str(existing["error"] or "") == message
             )
             if not unchanged:
@@ -1187,6 +1192,10 @@ def discover_partition(client, requested_scope=None, priority=0, force=False):
         effective_priority = max(int(existing["priority"] or 0), int(priority)) if existing else int(priority)
         effective_enabled = 0 if explicit_scope else 1
         effective_status = "pending" if dirty else "complete"
+        # source_updated_at is deliberately NOT part of this comparison -- see the
+        # matching note on the blocked-cohort branch above. It is still persisted
+        # (below) whenever some *other* field changes, so it is never wildly
+        # stale; it just isn't, on its own, a reason to write.
         unchanged = (
             existing is not None
             and existing["scope_json"] == scope_json
@@ -1194,7 +1203,6 @@ def discover_partition(client, requested_scope=None, priority=0, force=False):
             and int(existing["enabled"] or 0) == effective_enabled
             and existing["status"] == effective_status
             and int(existing["source_document_count"] or 0) == count
-            and str(existing["source_updated_at"] or "") == str(cohort["sourceUpdatedAt"] or "")
             and str(existing["content_fingerprint"] or "") == str(cohort["fingerprint"] or "")
         )
         if not unchanged:
