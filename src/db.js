@@ -3661,6 +3661,79 @@ export async function listPendingCitationExtractions({
   ]);
 }
 
+// Selection for the re-streaming citation scan job. Unlike
+// `listPendingCitationExtractions`, this deliberately requires NO cached bytes
+// (the scan re-streams the PDF) and EXCLUDES documents with a recorded failure,
+// so a nightly run never retries known-bad documents forever. A document
+// qualifies when it (1) recorded a successful streamed content download at
+// import (`content_source = 'streamed_pdf'` with a checksum), (2) has no
+// citations yet — neither a completed extraction row for the current parser
+// version nor any `document_citations` rows — and (3) has no failed extraction
+// row for the current parser version, unless `retryFailures` is set. A
+// parser-version bump re-opens both completed and failed rows because the
+// version no longer matches.
+export async function listPendingCitationScans({
+  limit = 50, afterDocId = '', syncKey = null, filters: requestedFilters = {},
+  parserVersion = 'citation-v1', retryFailures = false,
+} = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  const version = String(parserVersion || 'citation-v1');
+  const failureExclusion = retryFailures
+    ? ''
+    : "AND NOT (COALESCE(ces.status, '') = 'failed' AND COALESCE(ces.parser_version, '') = ?)";
+  const args = [...filters.args, String(afterDocId || ''), version];
+  if (!retryFailures) args.push(version);
+  args.push(Math.max(1, Math.min(1000, Number(limit) || 50)));
+  return all(`
+    SELECT d.doc_id, d.metadata_json,
+           COALESCE(fm.content_checksum, fm.updated_at, '') AS content_checksum,
+           fm.content_source
+    FROM documents d
+    JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN citation_extraction_state ces ON ces.doc_id = d.doc_id
+    ${filters.where}
+    ${qualifier} d.doc_id > ?
+      AND fm.content_source = 'streamed_pdf'
+      AND COALESCE(fm.content_checksum, '') <> ''
+      AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = d.doc_id)
+      AND NOT (COALESCE(ces.status, '') = 'completed' AND COALESCE(ces.parser_version, '') = ?)
+      ${failureExclusion}
+    ORDER BY d.doc_id
+    LIMIT ?
+  `, args);
+}
+
+// Corpus-wide count of documents the citation scan would still process, for the
+// preview affordance and the schedule status card. Mirrors the selection above
+// without the cursor or limit.
+export async function countPendingCitationScans({
+  syncKey = null, filters: requestedFilters = {},
+  parserVersion = 'citation-v1', retryFailures = false,
+} = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  const version = String(parserVersion || 'citation-v1');
+  const failureExclusion = retryFailures
+    ? ''
+    : "AND NOT (COALESCE(ces.status, '') = 'failed' AND COALESCE(ces.parser_version, '') = ?)";
+  const args = [...filters.args, version];
+  if (!retryFailures) args.push(version);
+  const row = await get(`
+    SELECT COUNT(*) AS total
+    FROM documents d
+    JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN citation_extraction_state ces ON ces.doc_id = d.doc_id
+    ${filters.where}
+    ${qualifier} fm.content_source = 'streamed_pdf'
+      AND COALESCE(fm.content_checksum, '') <> ''
+      AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = d.doc_id)
+      AND NOT (COALESCE(ces.status, '') = 'completed' AND COALESCE(ces.parser_version, '') = ?)
+      ${failureExclusion}
+  `, args);
+  return Number(row?.total || 0);
+}
+
 export async function saveCitationExtractionState(docId, {
   contentChecksum = null, parserVersion = 'citation-v1', status = 'completed',
   citationCount = 0, error = null,

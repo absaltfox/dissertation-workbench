@@ -119,6 +119,17 @@ export const CATALOGUE_LOOKUP_ENABLED = process.env.CATALOGUE_LOOKUP_ENABLED
   : true;
 export const CATALOGUE_LOOKUP_PAGE_SIZE = Number(process.env.CATALOGUE_LOOKUP_PAGE_SIZE || 200);
 export const CATALOGUE_LOOKUP_BATCH_SIZE = Number(process.env.CATALOGUE_LOOKUP_BATCH_SIZE || 1);
+// Nightly re-streaming citation scan. Off by default; staggered an hour after the
+// 2:00 concept rebuild so the two never contend for the single worker.
+export const CITATION_SCAN_NIGHTLY_ENABLED = /^(1|true|yes)$/i.test(
+  process.env.CITATION_SCAN_NIGHTLY_ENABLED || ''
+);
+export const CITATION_SCAN_NIGHTLY_HOUR_LOCAL = (() => {
+  const parsed = Number(process.env.CITATION_SCAN_NIGHTLY_HOUR_LOCAL);
+  return Number.isInteger(parsed) && parsed >= 0 && parsed <= 23 ? parsed : 3;
+})();
+export const CITATION_SCAN_PAGE_SIZE = Number(process.env.CITATION_SCAN_PAGE_SIZE || 50);
+export const CITATION_SCAN_MAX_DOCUMENTS = Number(process.env.CITATION_SCAN_MAX_DOCUMENTS || 1000);
 export const YAZ_CLIENT_TIMEOUT_MS = Number(process.env.YAZ_CLIENT_TIMEOUT_MS || 15_000);
 export const YAZ_CLIENT_BATCH_BASE_TIMEOUT_MS = Number(process.env.YAZ_CLIENT_BATCH_BASE_TIMEOUT_MS || 30_000);
 export const YAZ_CLIENT_BATCH_ITEM_TIMEOUT_MS = Number(process.env.YAZ_CLIENT_BATCH_ITEM_TIMEOUT_MS || 2_000);

@@ -172,6 +172,13 @@ const refreshJobsBtn = document.getElementById('refreshJobsBtn');
 const catalogueLookupLimitEl = document.getElementById('catalogueLookupLimit');
 const previewCatalogueLookupsBtn = document.getElementById('previewCatalogueLookupsBtn');
 const runCatalogueLookupsBtn = document.getElementById('runCatalogueLookupsBtn');
+const citationScanPageSizeEl = document.getElementById('citationScanPageSize');
+const citationScanMaxDocumentsEl = document.getElementById('citationScanMaxDocuments');
+const citationScanRetryFailuresEl = document.getElementById('citationScanRetryFailures');
+const previewCitationScanBtn = document.getElementById('previewCitationScanBtn');
+const runCitationScanBtn = document.getElementById('runCitationScanBtn');
+const citationScanPreviewEl = document.getElementById('citationScanPreview');
+const citationScanStatusEl = document.getElementById('citationScanStatus');
 const runBertopicBtn = document.getElementById('runBertopicBtn');
 const refreshTopicLabelsBtn = document.getElementById('refreshTopicLabelsBtn');
 const regenerateTopicLabelsBtn = document.getElementById('regenerateTopicLabelsBtn');
@@ -902,6 +909,13 @@ const dom = {
   catalogueLookupLimitEl,
   previewCatalogueLookupsBtn,
   runCatalogueLookupsBtn,
+  citationScanPageSizeEl,
+  citationScanMaxDocumentsEl,
+  citationScanRetryFailuresEl,
+  previewCitationScanBtn,
+  runCitationScanBtn,
+  citationScanPreviewEl,
+  citationScanStatusEl,
   runBertopicBtn,
   refreshTopicLabelsBtn,
   regenerateTopicLabelsBtn,

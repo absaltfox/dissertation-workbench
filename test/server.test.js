@@ -4,11 +4,13 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import request from 'supertest';
-import { app } from '../src/server.js';
+import { app, msUntilNextDailyHour, startCitationScanJob } from '../src/server.js';
 import { createSession, destroySession, getSessionCsrfToken } from '../src/auth.js';
 import { getConceptPipelineStatus } from '../src/conceptsPipeline.js';
+import { CITATION_SCAN_NIGHTLY_ENABLED } from '../src/config.js';
 import {
-  closeDb, createAdminJob, finishAdminJob, hashAdminJobToken, saveCitations,
+  closeDb, createAdminJob, finishAdminJob, hashAdminJobToken, hasRunningAdminJob, saveCitations,
+  countPendingCitationScans, saveCitationExtractionState,
   finishEnrichmentRolloutPhase, importRuleRevision, saveCommitteeMembers, saveDocumentMetadata,
   saveFileMetric, saveImportRule, startEnrichmentRolloutPhase
 } from '../src/db.js';
@@ -100,6 +102,105 @@ test('import rule routes reject unauthenticated requests', async () => {
     .send({ limit: 1, dryRun: true })
     .expect('content-type', /application\/json/)
     .expect(401);
+
+  // Public/unauthenticated reads must start no citation-scan work.
+  await request(app)
+    .post('/api/admin/jobs/citation-scan')
+    .send({ dryRun: true })
+    .expect('content-type', /application\/json/)
+    .expect(401);
+});
+
+test('daily scheduler boundary math counts the milliseconds to the next local hour', () => {
+  // Both fixtures are wall-clock local, so the arithmetic is timezone-independent.
+  const beforeHour = new Date(2026, 0, 1, 1, 0, 0);
+  assert.equal(msUntilNextDailyHour(3, beforeHour), 2 * 60 * 60 * 1000);
+  const afterHour = new Date(2026, 0, 1, 4, 0, 0);
+  assert.equal(msUntilNextDailyHour(3, afterHour), 23 * 60 * 60 * 1000);
+  // Exactly at the hour rolls forward a full day rather than firing immediately.
+  const atHour = new Date(2026, 0, 1, 3, 0, 0);
+  assert.equal(msUntilNextDailyHour(3, atHour), 24 * 60 * 60 * 1000);
+});
+
+test('nightly citation scan is disabled by default', () => {
+  assert.equal(CITATION_SCAN_NIGHTLY_ENABLED, false);
+});
+
+test('citation scan never overlaps an active run (route and scheduler share the guard)', async () => {
+  const runningJobId = await createAdminJob({
+    type: 'citation_scan', label: 'Existing Citation Scan', params: {}, runnerType: 'local',
+  });
+  const token = createSession('admin');
+  try {
+    // Scheduler-side guard: startCitationScanJob short-circuits without spawning.
+    const scheduled = await startCitationScanJob('scheduled');
+    assert.equal(scheduled.alreadyRunning, true);
+    assert.equal(scheduled.jobId, runningJobId);
+
+    // Route-side guard: 202 + the running job id, no new job.
+    const res = await request(app)
+      .post('/api/admin/jobs/citation-scan')
+      .set('Cookie', `session=${token}`)
+      .set('x-csrf-token', getSessionCsrfToken(token))
+      .send({})
+      .expect('content-type', /application\/json/)
+      .expect(202);
+    assert.equal(res.body.alreadyRunning, true);
+    assert.equal(res.body.jobId, runningJobId);
+  } finally {
+    await finishAdminJob(runningJobId, { status: 'completed', runnerState: 'completed' });
+    destroySession(token);
+  }
+});
+
+test('citation scan preview counts pending documents and honors retryFailures without starting a job', async () => {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const degree = `Scan Route ${suffix}`;
+  const pendingId = `route-scan-pending-${suffix}`;
+  const failedId = `route-scan-failed-${suffix}`;
+  for (const id of [pendingId, failedId]) {
+    await saveDocumentMetadata({
+      id, title: 'Route scan fixture', degree,
+      originalRecordUrl: `https://circle.library.ubc.ca/rest/handle/2429/${id}`, supervisors: [],
+    });
+    await saveFileMetric(id, {
+      status: 'streamed', contentSource: 'streamed_pdf', contentChecksum: 'route-scan-v1',
+      wordCount: 100, pageCount: 3, wordSource: 'streamed_pdf_text', pageSource: 'streamed_pdf',
+    });
+  }
+  // The production parser version is what the route counts against.
+  await saveCitationExtractionState(failedId, {
+    contentChecksum: 'route-scan-v1', parserVersion: 'citation-v2', status: 'failed', citationCount: 0, error: 'x',
+  });
+
+  const token = createSession('admin');
+  try {
+    const csrf = getSessionCsrfToken(token);
+    const runningBefore = await hasRunningAdminJob('citation_scan');
+
+    const normal = await request(app)
+      .post('/api/admin/jobs/citation-scan')
+      .set('Cookie', `session=${token}`).set('x-csrf-token', csrf)
+      .send({ dryRun: true, degree })
+      .expect(200);
+    assert.equal(normal.body.dryRun, true);
+    assert.equal(normal.body.total, 1); // only the un-failed streamable doc
+
+    const retry = await request(app)
+      .post('/api/admin/jobs/citation-scan')
+      .set('Cookie', `session=${token}`).set('x-csrf-token', csrf)
+      .send({ dryRun: true, retryFailures: true, degree })
+      .expect(200);
+    assert.equal(retry.body.total, 2); // failed doc re-opened
+
+    // Cross-check the count helper directly.
+    assert.equal(await countPendingCitationScans({ filters: { degree }, parserVersion: 'citation-v2' }), 1);
+    // The preview started nothing.
+    const runningAfter = await hasRunningAdminJob('citation_scan');
+    assert.equal(runningAfter, runningBefore);
+  } finally {
+    destroySession(token);
+  }
 });
 
 test('authenticated mutations require a valid CSRF token', async () => {

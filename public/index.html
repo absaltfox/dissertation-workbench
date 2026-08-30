@@ -705,6 +705,7 @@
                   <div class="settings-status-grid" aria-live="polite">
                     <div id="documentSyncStatus" class="settings-status-card"></div>
                     <div id="conceptPipelineStatus" class="settings-status-card"></div>
+                    <div id="citationScanStatus" class="settings-status-card"></div>
                   </div>
                 </fieldset>
               </form>
@@ -731,6 +732,27 @@
                     <button type="button" id="runCatalogueLookupsBtn" class="btn">Run Pending Lookups</button>
                   </div>
                   <div id="catalogueLookupPreview" class="import-preview" aria-live="polite"></div>
+                </fieldset>
+                <fieldset class="settings-section">
+                  <legend>Citation Scan</legend>
+                  <p class="meta">Re-stream each document's PDF (nothing cached) to extract and dedup citations for documents that do not yet have any and have not previously failed.</p>
+                  <label>
+                    <span>Batch Size</span>
+                    <input id="citationScanPageSize" type="number" min="1" max="250" value="50" />
+                  </label>
+                  <label>
+                    <span>Max Documents</span>
+                    <input id="citationScanMaxDocuments" type="number" min="1" max="5000" value="1000" />
+                  </label>
+                  <label class="checkbox-row">
+                    <input id="citationScanRetryFailures" type="checkbox" />
+                    <span>Retry previous failures</span>
+                  </label>
+                  <div class="settings-actions row-actions">
+                    <button type="button" id="previewCitationScanBtn" class="btn ghost">Preview Pending</button>
+                    <button type="button" id="runCitationScanBtn" class="btn">Run Citation Scan</button>
+                  </div>
+                  <div id="citationScanPreview" class="import-preview" aria-live="polite"></div>
                 </fieldset>
                 <fieldset class="settings-section">
                   <legend>Topic Modeling</legend>

@@ -14,11 +14,13 @@ let cancelAdminWorkerJob;
 let CatalogueLookupCancelledError;
 let WorkerArtifactClient;
 let runImportPdfAdminJob;
+let startCitationScanContinuation;
 let runThemeRecomputeAdminJob;
 let runCatalogueLookupJob;
 let runPendingCatalogueLookups;
 let analyzeDocumentFile;
 let extractAndSaveParsedData;
+let _setDownloadSafetyOptionsForTests;
 let appendAdminJobLog;
 let claimAdminJob;
 let clearAllCitations;
@@ -39,6 +41,8 @@ let loadCatalogueLookup;
 let loadStoredFileMetric;
 let listPendingLookups;
 let listPendingCitationExtractions;
+let listPendingCitationScans;
+let countPendingCitationScans;
 let countPendingLookups;
 let publishPassingTopicLabels;
 let saveDocumentMetadata;
@@ -79,6 +83,42 @@ async function writeTextPdf(filePath, lines) {
   await fs.writeFile(filePath, body, 'binary');
 }
 
+// Build a real, parseable PDF in memory (via writeTextPdf) so a mocked cIRcle
+// stream can return its bytes to the pdf_stream analysis path.
+async function buildTextPdfBytes(lines) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-scan-pdf-'));
+  const file = path.join(dir, 'fixture.pdf');
+  try {
+    await writeTextPdf(file, lines);
+    return await fs.readFile(file);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+}
+
+// A global-fetch replacement that answers the cIRcle REST handle + bitstream
+// retrieve for a given document with either PDF bytes (streaming success) or a
+// non-PDF body (streaming failure).
+function makeCircleStreamFetch(handles) {
+  return async (input) => {
+    const url = String(input);
+    for (const handle of handles) {
+      if (url.includes(handle.handlePart)) {
+        return new Response(JSON.stringify({
+          id: handle.recordId,
+          bitstreams: [{ id: handle.bitstreamId, bundleName: 'ORIGINAL', mimeType: 'application/pdf', name: 'doc.pdf' }],
+        }), { headers: { 'content-type': 'application/json' } });
+      }
+      if (url.includes(`/rest/bitstreams/${handle.bitstreamId}/retrieve`)) {
+        return new Response(handle.body, {
+          headers: { 'content-type': handle.contentType || 'application/pdf' },
+        });
+      }
+    }
+    throw new Error(`Unexpected request: ${url}`);
+  };
+}
+
 async function waitFor(predicate, timeoutMs = 1000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -101,10 +141,9 @@ test.before(async () => {
   ({ cancelInProcessAdminJob, runCatalogueLookupJob } = await import('../src/services/adminJobs.js'));
   ({ CatalogueLookupCancelledError, runPendingCatalogueLookups } = await import('../src/catalogue.js'));
   ({ WorkerArtifactClient } = await import('../src/workerArtifacts.js'));
-  ({ runImportPdfAdminJob } = await import('../src/services/importPdfJobRunner.js'));
+  ({ runImportPdfAdminJob, startCitationScanContinuation } = await import('../src/services/importPdfJobRunner.js'));
   ({ runThemeRecomputeAdminJob } = await import('../src/services/themeJobRunner.js'));
-  ({ analyzeDocumentFile, extractAndSaveParsedData } = await import('../src/pdf.js'));
-  const { _setDownloadSafetyOptionsForTests } = await import('../src/pdf.js');
+  ({ analyzeDocumentFile, extractAndSaveParsedData, _setDownloadSafetyOptionsForTests } = await import('../src/pdf.js'));
   _setDownloadSafetyOptionsForTests({ resolveHost: async () => [{ address: '142.103.96.1' }] });
   ({
     appendAdminJobLog,
@@ -126,6 +165,8 @@ test.before(async () => {
     loadStoredFileMetric,
     listPendingLookups,
     listPendingCitationExtractions,
+    listPendingCitationScans,
+    countPendingCitationScans,
     countPendingLookups,
     publishPassingTopicLabels,
     saveDocumentMetadata,
@@ -1703,4 +1744,214 @@ print(json.dumps({"few": run(few), "many": run(many)}, sort_keys=True))
   assert.equal(many.telemetry.extensionHubsSkipped, 1);
   assert.equal(many.telemetry.extensionEdgesSkipped, 7);
   assert.equal(many.telemetry.extensionFanInLimit, 2);
+});
+
+// --- Citation scan (re-streaming) job ---
+
+async function seedStreamableDoc(id, { degree = null, syncKey = null, checksum = 'scan-checksum-v1' } = {}) {
+  await saveDocumentMetadata({
+    id,
+    title: `Citation Scan Fixture ${id}`,
+    author: 'Scan Tester',
+    degree: degree || undefined,
+    originalRecordUrl: `https://circle.library.ubc.ca/rest/handle/2429/${id}`,
+    supervisors: [],
+  }, syncKey ? { syncKey } : {});
+  await saveFileMetric(id, {
+    status: 'streamed',
+    contentSource: 'streamed_pdf',
+    contentChecksum: checksum,
+    wordCount: 500,
+    pageCount: 10,
+    wordSource: 'streamed_pdf_text',
+    pageSource: 'streamed_pdf',
+  });
+}
+
+test('citation scan selection includes streamable un-scanned docs and excludes completed, failed, and non-streamable ones', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const degree = `Scan Degree ${suffix}`;
+  const pending = `scan-pending-${suffix}`;
+  const completed = `scan-completed-${suffix}`;
+  const failedDoc = `scan-failed-${suffix}`;
+  const hasCitations = `scan-hascites-${suffix}`;
+  const notStreamable = `scan-fulltext-${suffix}`;
+  const parserVersion = `scan-test-${suffix}`;
+
+  for (const id of [pending, completed, failedDoc, hasCitations]) {
+    await seedStreamableDoc(id, { degree });
+  }
+  // A full-text-only import is not a streamable PDF source.
+  await saveDocumentMetadata({ id: notStreamable, title: 'Full text only', degree, supervisors: [] });
+  await saveFileMetric(notStreamable, {
+    status: 'full_text', fullTextPath: `/cached/${notStreamable}.txt`, contentChecksum: 'ft-v1',
+  });
+
+  await saveCitationExtractionState(completed, {
+    contentChecksum: 'scan-checksum-v1', parserVersion, status: 'completed', citationCount: 4,
+  });
+  await saveCitationExtractionState(failedDoc, {
+    contentChecksum: 'scan-checksum-v1', parserVersion, status: 'failed', citationCount: 0, error: 'boom',
+  });
+  await saveCitations(hasCitations, [{ text: `Already, C. (2020). Extracted. ${suffix}` }], (t) => `hascites-${suffix}-${t}`);
+
+  const ids = async (opts) => (await listPendingCitationScans({
+    limit: 50, filters: { degree }, parserVersion, ...opts,
+  })).map((row) => row.doc_id).sort();
+
+  // Default run: only the pending doc qualifies.
+  assert.deepEqual(await ids(), [pending]);
+  assert.equal(await countPendingCitationScans({ filters: { degree }, parserVersion }), 1);
+
+  // retryFailures re-opens the previously failed doc.
+  assert.deepEqual(await ids({ retryFailures: true }), [failedDoc, pending].sort());
+
+  // A parser-version bump re-opens both the completed and the previously failed
+  // doc (their old-version rows no longer match); the doc that already has
+  // citation rows stays excluded.
+  const bumped = await listPendingCitationScans({ limit: 50, filters: { degree }, parserVersion: `${parserVersion}-next` });
+  assert.deepEqual(bumped.map((r) => r.doc_id).sort(), [completed, failedDoc, pending].sort());
+});
+
+test('citation scan streams per document: success writes citations + completed state and no catalogue lookup; a failure is counted without failing the batch', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const degree = `Scan Run ${suffix}`;
+  // doc_id order drives processing: the failing doc sorts first so we prove the
+  // batch continues to the succeeding doc after a per-document failure.
+  const failId = `scan-a-fail-${suffix}`;
+  const okId = `scan-b-ok-${suffix}`;
+  await seedStreamableDoc(failId, { degree });
+  await seedStreamableDoc(okId, { degree });
+
+  const pdfBytes = await buildTextPdfBytes([
+    'Introduction to the study',
+    'REFERENCES',
+    'Smith, J. (2020). Teaching schools with care. Education Press.',
+  ]);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = makeCircleStreamFetch([
+    { handlePart: `/handle/2429/${failId}`, recordId: 1, bitstreamId: 9001, body: '<html>not a pdf</html>', contentType: 'text/html' },
+    { handlePart: `/handle/2429/${okId}`, recordId: 2, bitstreamId: 9002, body: pdfBytes, contentType: 'application/pdf' },
+  ]);
+  _setDownloadSafetyOptionsForTests({ allowOriginalPdfRetrieval: true, resolveHost: async () => [{ address: '142.103.96.1' }] });
+
+  try {
+    const jobId = await createAdminJob({
+      type: 'citation_scan', label: 'Citation Scan Test',
+      params: { scope: { filters: { degree } }, pageSize: 10, maxDocuments: 10 }, runnerType: 'local',
+    });
+    const result = await runImportPdfAdminJob(await getAdminJob(jobId));
+
+    assert.equal(result.processed, 1);
+    assert.equal(result.failed, 1);
+    assert.equal(result.ok, false);
+    assert.equal(result.resolutionQueued, false);
+
+    // Success doc: citations written, completed state, no catalogue lookup, no cached bytes.
+    const okCitations = await loadDocumentCitations(okId);
+    assert.equal(okCitations.length > 0, true);
+    const okMetric = await loadStoredFileMetric(okId);
+    assert.equal(okMetric.content_source, 'streamed_pdf');
+    assert.equal(okMetric.pdf_path, null);
+    assert.equal(okMetric.full_text_path, null);
+    const db = await getDb();
+    const lookupRow = await db.execute({
+      sql: 'SELECT COUNT(*) AS n FROM catalogue_lookups cl JOIN document_citations dc ON dc.citation_id = cl.citation_id WHERE dc.doc_id = ?',
+      args: [okId],
+    });
+    assert.equal(Number(lookupRow.rows[0].n), 0);
+
+    // Failure doc: failed state recorded, no citations.
+    assert.equal((await loadDocumentCitations(failId)).length, 0);
+    const failState = await db.execute({
+      sql: 'SELECT status FROM citation_extraction_state WHERE doc_id = ?', args: [failId],
+    });
+    assert.equal(failState.rows[0].status, 'failed');
+
+    const job = await getAdminJob(jobId);
+    assert.equal(job.status, 'failed');
+    assert.match(job.log, /Citation scan finished/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    _setDownloadSafetyOptionsForTests({ resolveHost: async () => [{ address: '142.103.96.1' }] });
+  }
+});
+
+test('citation scan continuation drains a multi-batch backlog with O(1) params_json and honors caps', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const degree = `Scan Drain ${suffix}`;
+  const total = 5;
+  const docIds = [];
+  const handles = [];
+  const pdfBytes = await buildTextPdfBytes([
+    'Body text',
+    'REFERENCES',
+    'Doe, A. (2019). A drained citation. Press.',
+  ]);
+  for (let i = 0; i < total; i += 1) {
+    const id = `scan-drain-${suffix}-${String(i).padStart(2, '0')}`;
+    docIds.push(id);
+    await seedStreamableDoc(id, { degree });
+    handles.push({ handlePart: `/handle/2429/${id}`, recordId: i + 1, bitstreamId: 8000 + i, body: pdfBytes, contentType: 'application/pdf' });
+  }
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = makeCircleStreamFetch(handles);
+  _setDownloadSafetyOptionsForTests({ allowOriginalPdfRetrieval: true, resolveHost: async () => [{ address: '142.103.96.1' }] });
+
+  try {
+    // Drive the durable-cursor chain in-process. autoContinue is deliberately
+    // NOT set on the runner's params (that would spawn a real worker); instead
+    // the seam-produced continuation params are fed back as the next batch, which
+    // is exactly what the worker chain does across runs.
+    const seededParams = { scope: { filters: { degree } }, pageSize: 2, maxDocuments: 2 };
+    let params = seededParams;
+    const continuationKeySets = [];
+    let scanned = 0;
+    let batches = 0;
+    let guard = 0;
+    for (;;) {
+      if (guard++ > 20) throw new Error('drain did not terminate');
+      const jobId = await createAdminJob({ type: 'citation_scan', label: 'Drain', params, runnerType: 'local' });
+      // eslint-disable-next-line no-await-in-loop
+      const result = await runImportPdfAdminJob(await getAdminJob(jobId));
+      batches += 1;
+      scanned += result.processed;
+      // The per-run cap is honored: never more than maxDocuments scanned per batch.
+      assert.ok(result.processed + result.failed <= 2, 'batch exceeded the maxDocuments cap');
+      if (!result.batchLimitReached) break;
+      // Build the next batch exactly as the production continuation would, via the
+      // seam. autoContinue is added only so the gate fires for this offline check;
+      // the returned params carry only a fixed-width cursor forward (O(1)).
+      let nextParams = null;
+      // eslint-disable-next-line no-await-in-loop
+      await startCitationScanContinuation({ id: jobId, params: { ...params, autoContinue: true } }, result, null, {
+        createContinuationJob: async (payload) => { nextParams = payload.params; return { jobId: jobId + 1 }; },
+      });
+      assert.ok(nextParams, 'expected a continuation to be scheduled while backlog remained');
+      assert.equal(Array.isArray(nextParams.scannedIds), false);
+      continuationKeySets.push(Object.keys(nextParams).sort().join(','));
+      // Drop autoContinue before running so the runner never spawns a real worker.
+      const { autoContinue, ...runnerParams } = nextParams;
+      params = runnerParams;
+    }
+
+    assert.equal(scanned, total, 'every backlog document was scanned across batches');
+    assert.ok(batches >= 3, 'expected the capped backlog to span multiple batches');
+    for (const id of docIds) {
+      // eslint-disable-next-line no-await-in-loop
+      assert.equal((await loadDocumentCitations(id)).length > 0, true);
+    }
+    // Every continuation carries the same bounded set of params keys -- nothing accumulates.
+    assert.ok(continuationKeySets.length >= 2, 'expected multiple capped continuations');
+    assert.ok(continuationKeySets.every((keys) => keys === continuationKeySets[0]),
+      `continuation params keys drifted: ${continuationKeySets.join(' | ')}`);
+    assert.equal(await countPendingCitationScans({ filters: { degree }, parserVersion: 'citation-v2' }), 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    _setDownloadSafetyOptionsForTests({ resolveHost: async () => [{ address: '142.103.96.1' }] });
+  }
 });

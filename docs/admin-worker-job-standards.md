@@ -170,6 +170,20 @@ The bulk citation-extraction job:
 
 The catalogue job may use the same corpus scope. It processes globally deduplicated citations, prioritizes citations linked by the most documents, and retains the configured lookup batch and rate boundaries. Operators must start it explicitly after extraction quality is acceptable.
 
+### Re-streaming Citation Scan
+
+Because streamed imports cache no PDF or full text, the bulk extraction path above cannot reach documents imported in `pdf_stream` mode — there are no cached bytes to read. The `citation_scan` job fills that gap by re-streaming the original PDF at scan time. This is the one deliberate new download path; it is accepted, rate-limited, and bounded.
+
+The scan selects a bounded, optionally scoped page of documents that:
+
+- recorded a successful streamed content download at import (`file_metrics.content_source = 'streamed_pdf'` with a content checksum);
+- have no citations yet — neither a `completed` extraction row for the current parser version nor any `document_citations` rows; and
+- have no `failed` extraction row for the current parser version.
+
+Failures are deliberately excluded so the nightly run never retries known-bad documents forever; only an explicit `retryFailures` run reconsiders them. A parser-version bump re-opens both completed and failed rows because the version no longer matches.
+
+For each selected document the job re-streams and parses the PDF through the standard `pdf_stream` path — subject to the same `PDF_DOWNLOAD_RATE_PER_MIN` limiter and Streamed Content Contract (temp directory per document, removed in `finally`, orphan cleanup on process start) — extracts and dedups citations, and never writes `pdf_path` or `full_text_path`. It records `completed` or `failed` state per document before advancing its cursor, counts a per-document failure without failing the whole batch, and starts no catalogue resolution. When the per-run cap is reached with documents still pending, a durable-cursor continuation drains the backlog across runs while `params_json` stays O(1) per batch. The nightly scheduler (`CITATION_SCAN_NIGHTLY_ENABLED`, `CITATION_SCAN_NIGHTLY_HOUR_LOCAL`) is staggered from the concept rebuild and guarded against overlapping itself.
+
 ## Stored Theme Recompute Standard
 
 Theme terms should be assigned when each document is processed and stored durably on the document metadata record. Public analytics reads should consume stored themes, not recompute theme terms on every request.
