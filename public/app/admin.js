@@ -18,6 +18,15 @@ const {
   cacheFilterEl,
   catalogueLookupLimitEl,
   catalogueLookupPreviewEl,
+  citationScanPageSizeEl,
+  citationScanMaxDocumentsEl,
+  citationScanRetryFailuresEl,
+  citationScanAutoContinueEl,
+  citationScanReprocessEl,
+  previewCitationScanBtn,
+  runCitationScanBtn,
+  citationScanPreviewEl,
+  citationScanStatusEl,
   conceptPipelineStatusEl,
   confirmOwnMfaBtn,
   createUserError,
@@ -176,6 +185,8 @@ function initAdmin() {
   refreshJobsBtn?.addEventListener('click', loadJobs);
   previewCatalogueLookupsBtn?.addEventListener('click', handlePreviewCatalogueLookups);
   runCatalogueLookupsBtn?.addEventListener('click', handleRunCatalogueLookups);
+  previewCitationScanBtn?.addEventListener('click', handlePreviewCitationScan);
+  runCitationScanBtn?.addEventListener('click', handleRunCitationScan);
   runBertopicBtn?.addEventListener('click', handleRunBertopic);
   refreshTopicLabelsBtn?.addEventListener('click', loadTopicLabels);
   regenerateTopicLabelsBtn?.addEventListener('click', () => handleRegenerateTopicLabels());
@@ -1215,6 +1226,9 @@ function summarizeJobResult(job) {
   if (job.type === 'reparse_citations') {
     return `${formatNum(result.processed || 0)} processed, ${formatNum(result.citations || 0)} citations`;
   }
+  if (job.type === 'citation_scan') {
+    return `${formatNum(result.processed || 0)} scanned, ${formatNum(result.citations || 0)} citations, ${formatNum(result.failed || 0)} failed`;
+  }
   if (job.type === 'reparse_committee') {
     return `${formatNum(result.processed || 0)} processed, ${formatNum(result.withCommittee || 0)} with committee`;
   }
@@ -1287,11 +1301,38 @@ function renderJobProgress(job) {
   `;
 }
 
+function renderCitationScanStatus(status) {
+  if (!citationScanStatusEl) return;
+  if (!status) {
+    citationScanStatusEl.innerHTML = `
+      <p class="settings-status-title">Citation Scan</p>
+      <p class="settings-status-main">Status unavailable</p>
+    `;
+    return;
+  }
+  const scheduleLine = status.enabled
+    ? `Scheduled daily at ${String(status.hourLocal).padStart(2, '0')}:00 · next ${escapeHtml(formatJobDate(status.nextRun))}`
+    : 'Nightly schedule disabled';
+  const lastRun = status.lastRun
+    ? `Last run ${escapeHtml(status.lastRun.status || 'unknown')} ${escapeHtml(formatJobDate(status.lastRun.finishedAt || status.lastRun.startedAt))}`
+    : 'No citation scan has run yet';
+  const pendingLine = status.pendingCount != null && Number.isFinite(Number(status.pendingCount))
+    ? `${formatNum(Number(status.pendingCount))} pending`
+    : 'Preview pending to calculate';
+  citationScanStatusEl.innerHTML = `
+    <p class="settings-status-title">Citation Scan</p>
+    <p class="settings-status-main">${pendingLine}</p>
+    <p class="settings-status-detail">${escapeHtml(scheduleLine)}</p>
+    <p class="settings-status-detail">${lastRun}</p>
+  `;
+}
+
 function renderJobs(data = {}) {
   const catalogue = data.catalogueStats || {};
   const topic = data.topicStatus || {};
   const docSync = data.documentSyncStatus || {};
   const concept = data.conceptStatus || {};
+  renderCitationScanStatus(data.citationScanStatus);
   if (jobsStatusCardsEl) {
     jobsStatusCardsEl.innerHTML = `
       <div class="settings-status-card">
@@ -1765,6 +1806,70 @@ async function handleRunCatalogueLookups() {
   } finally {
     runCatalogueLookupsBtn.disabled = false;
     runCatalogueLookupsBtn.textContent = 'Run Pending Lookups';
+  }
+}
+
+function citationScanBody(extra = {}) {
+  return {
+    pageSize: citationScanPageSizeEl?.value || '50',
+    maxDocuments: citationScanMaxDocumentsEl?.value || '1000',
+    retryFailures: Boolean(citationScanRetryFailuresEl?.checked),
+    autoContinue: Boolean(citationScanAutoContinueEl?.checked),
+    reprocess: Boolean(citationScanReprocessEl?.checked),
+    ...extra,
+  };
+}
+
+async function handlePreviewCitationScan() {
+  if (!citationScanPreviewEl) return;
+  previewCitationScanBtn.disabled = true;
+  citationScanPreviewEl.innerHTML = '<p class="meta">Checking pending documents...</p>';
+  try {
+    const res = await fetch('/api/admin/jobs/citation-scan', {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify(citationScanBody({ dryRun: true })),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      citationScanPreviewEl.innerHTML = `<p class="form-error">${escapeHtml(data.error || 'Preview failed.')}</p>`;
+      return;
+    }
+    const scope = data.reprocess
+      ? ' (forced reprocess of all in-scope documents)'
+      : data.retryFailures ? ' (including previous failures)' : '';
+    citationScanPreviewEl.innerHTML = `
+      <p class="settings-status-main">${formatNum(data.total || 0)} document${data.total === 1 ? '' : 's'} pending${escapeHtml(scope)}</p>
+      <p class="meta">Each will be re-streamed once; nothing is cached.</p>
+    `;
+  } catch {
+    citationScanPreviewEl.innerHTML = '<p class="form-error">Connection error.</p>';
+  } finally {
+    previewCitationScanBtn.disabled = false;
+  }
+}
+
+async function handleRunCitationScan() {
+  runCitationScanBtn.disabled = true;
+  runCitationScanBtn.textContent = 'Starting...';
+  try {
+    const res = await fetch('/api/admin/jobs/citation-scan', {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify(citationScanBody()),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert(data.error || 'Citation scan job failed to start.');
+      return;
+    }
+    setStatus(data.alreadyRunning ? 'Citation scan is already running.' : 'Citation scan started.');
+    await loadJobs();
+  } catch {
+    alert('Connection error');
+  } finally {
+    runCitationScanBtn.disabled = false;
+    runCitationScanBtn.textContent = 'Run Citation Scan';
   }
 }
 

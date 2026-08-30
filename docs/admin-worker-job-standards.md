@@ -170,6 +170,20 @@ The bulk citation-extraction job:
 
 The catalogue job may use the same corpus scope. It processes globally deduplicated citations, prioritizes citations linked by the most documents, and retains the configured lookup batch and rate boundaries. Operators must start it explicitly after extraction quality is acceptable.
 
+### Re-streaming Citation Scan
+
+Because streamed imports cache no PDF or full text, the bulk extraction path above cannot reach documents imported in `pdf_stream` mode — there are no cached bytes to read. The `citation_scan` job fills that gap by re-streaming the original PDF at scan time. This is the one deliberate new download path; it is accepted, rate-limited, and bounded.
+
+The scan selects a bounded, optionally scoped page of documents that:
+
+- recorded a successful streamed content download at import (`file_metrics.content_source = 'streamed_pdf'` with a content checksum);
+- have no terminal citation record — neither a `completed` extraction row nor any `document_citations` rows; and
+- have no `failed` extraction row.
+
+Selection is parser-version-independent: it tests only whether a terminal state exists, not which parser version produced it. Failures are deliberately excluded so the nightly run never retries known-bad documents forever; only an explicit `retryFailures` run reconsiders them. A failed state takes precedence over legacy partial citation links during an explicit retry. Scanning is once-per-document: a scanned document (any `document_citations` rows, or a `completed` row — including a successful scan that found zero citations) is never reselected automatically, and a parser/GROBID version upgrade changes nothing about selection. Reprocessing happens only through an explicit forced `reprocess` run, which drops every gate and re-scans all streamable in-scope documents, replacing their citations. Citation rows are staged first and the document's links are swapped transactionally, so a failed attempt preserves the previous known-good bibliography. An operator may also pass `autoContinue` to chain batches and drain the whole backlog in one run; the nightly run stays a single bounded page.
+
+For each selected document the job re-streams and parses the PDF through the standard `pdf_stream` path — subject to the same `PDF_DOWNLOAD_RATE_PER_MIN` limiter and Streamed Content Contract (temp directory per document, removed in `finally`, orphan cleanup on process start) — extracts and dedups citations, and never writes `pdf_path` or `full_text_path`. It records `completed` or `failed` state per document before advancing its cursor, counts a per-document failure without failing the whole batch, and starts no catalogue resolution. When the per-run cap is reached with documents still pending, a durable-cursor continuation drains the backlog across runs while `params_json` stays O(1) per batch. The nightly scheduler (`CITATION_SCAN_NIGHTLY_ENABLED`, `CITATION_SCAN_NIGHTLY_HOUR_LOCAL`) is staggered from the concept rebuild and guarded against overlapping itself.
+
 ## Stored Theme Recompute Standard
 
 Theme terms should be assigned when each document is processed and stored durably on the document metadata record. Public analytics reads should consume stored themes, not recompute theme terms on every request.

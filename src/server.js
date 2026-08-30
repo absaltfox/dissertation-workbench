@@ -3,7 +3,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   PORT, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT, EXPOSE_ERROR_DETAILS,
-  DEFAULT_TERM, DEFAULT_SOURCE, TRUST_PROXY, WORKBENCH_CACHE_REFRESH_MS, validateRuntimeSecrets
+  DEFAULT_TERM, DEFAULT_SOURCE, TRUST_PROXY, WORKBENCH_CACHE_REFRESH_MS,
+  CITATION_SCAN_NIGHTLY_ENABLED, CITATION_SCAN_NIGHTLY_HOUR_LOCAL, validateRuntimeSecrets
 } from './config.js';
 import {
   checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb, hasRunningAdminJob
@@ -13,6 +14,10 @@ import { createBoundedCache } from './boundedCache.js';
 import { getConceptPipelineStatus } from './conceptsPipeline.js';
 import { createAndStartAdminWorkerJob } from './services/adminWorker.js';
 import { logger } from './logger.js';
+import {
+  msUntilNextDailyHour,
+  scheduleDaily as scheduleDailyTimer,
+} from './dailyScheduler.js';
 import { getConfiguredApiKey } from './secrets.js';
 import { getTrustedClientIp } from './requestSecurity.js';
 import { applyCompression, applySecurityHeaders } from './middleware/http.js';
@@ -38,6 +43,7 @@ const publicDir = path.join(__dirname, '..', 'public');
 const metricsCache = createBoundedCache(300);
 const metricsInflight = new Map();
 let stopDailyConceptScheduler = null;
+let stopDailyCitationScanScheduler = null;
 let stopWorkbenchCacheWarmup = null;
 const DAILY_CONCEPT_REBUILD_HOUR_LOCAL = 2;
 
@@ -48,12 +54,15 @@ async function loadSyncModule() {
   return import('./sync.js');
 }
 
-function msUntilNextDailyConceptRebuild() {
-  const now = new Date();
-  const next = new Date(now);
-  next.setHours(DAILY_CONCEPT_REBUILD_HOUR_LOCAL, 0, 0, 0);
-  if (next <= now) next.setDate(next.getDate() + 1);
-  return next.getTime() - now.getTime();
+export { msUntilNextDailyHour };
+
+export function scheduleDaily(hourLocal, fn, options = {}) {
+  return scheduleDailyTimer(hourLocal, fn, {
+    ...options,
+    onError: options.onError || ((error, label) => {
+      logger.error(`Scheduled ${label} failed to start`, { error: error?.message || String(error) });
+    }),
+  });
 }
 
 async function startConceptRebuildJob(trigger) {
@@ -72,18 +81,30 @@ async function startConceptRebuildJob(trigger) {
 }
 
 function scheduleDailyConceptRebuildJob() {
-  let timer = null;
-  const scheduleNext = () => {
-    timer = setTimeout(() => {
-      startConceptRebuildJob('scheduled')
-        .catch((error) => logger.error('Scheduled concept rebuild job failed to start', { error: error?.message || String(error) }))
-        .finally(scheduleNext);
-    }, msUntilNextDailyConceptRebuild());
-  };
-  scheduleNext();
-  return () => {
-    if (timer) clearTimeout(timer);
-  };
+  return scheduleDaily(DAILY_CONCEPT_REBUILD_HOUR_LOCAL, () => (
+    startConceptRebuildJob('scheduled')
+  ), { label: 'concept rebuild job' });
+}
+
+export async function startCitationScanJob(trigger) {
+  const runningId = await hasRunningAdminJob('citation_scan');
+  if (runningId) {
+    logger.info('Citation scan job already running', { trigger, jobId: runningId });
+    return { alreadyRunning: true, jobId: runningId };
+  }
+  const result = await createAndStartAdminWorkerJob({
+    type: 'citation_scan',
+    label: trigger === 'scheduled' ? 'Scheduled Citation Scan' : 'Citation Scan',
+    params: { trigger, retryFailures: false },
+  });
+  logger.info('Citation scan job started', { trigger, jobId: result.jobId, runnerType: result.runnerType });
+  return result;
+}
+
+function scheduleDailyCitationScanJob() {
+  return scheduleDaily(CITATION_SCAN_NIGHTLY_HOUR_LOCAL, () => (
+    startCitationScanJob('scheduled')
+  ), { label: 'citation scan job' });
 }
 
 // --- Request helpers ---
@@ -224,6 +245,10 @@ export async function start() {
 
   stopDailyConceptScheduler = scheduleDailyConceptRebuildJob();
   logger.info('Scheduled daily concept rebuild job', { hourLocal: DAILY_CONCEPT_REBUILD_HOUR_LOCAL });
+  if (CITATION_SCAN_NIGHTLY_ENABLED) {
+    stopDailyCitationScanScheduler = scheduleDailyCitationScanJob();
+    logger.info('Scheduled daily citation scan job', { hourLocal: CITATION_SCAN_NIGHTLY_HOUR_LOCAL });
+  }
   const conceptStatus = await getConceptPipelineStatus();
   if (!conceptStatus?.lastSuccessAt) {
     startConceptRebuildJob('startup').catch((error) => {
@@ -241,6 +266,10 @@ export async function start() {
     if (stopDailyConceptScheduler) {
       stopDailyConceptScheduler();
       stopDailyConceptScheduler = null;
+    }
+    if (stopDailyCitationScanScheduler) {
+      stopDailyCitationScanScheduler();
+      stopDailyCitationScanScheduler = null;
     }
     if (stopWorkbenchCacheWarmup) {
       stopWorkbenchCacheWarmup();
