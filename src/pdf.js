@@ -2170,7 +2170,8 @@ async function loadStoredParsedData(doc) {
 export async function analyzeDocumentFile(doc, options) {
   const {
     downloadFiles, forceDownload, recomputeFromCache, artifactClient = null, onProgress = null,
-    extractCommittee = true, extractCitations = false, onContentRequest = null,
+    extractCommittee = true, extractCitations = false, strictCitationErrors = false,
+    onContentRequest = null,
     contentMode = downloadFiles ? 'pdf_cache' : 'full_text_only',
     // Import rules always pass an explicit snapshot. The null case preserves
     // historical behaviour for direct/manual callers during the migration.
@@ -2302,7 +2303,7 @@ export async function analyzeDocumentFile(doc, options) {
           ...requestMetricFields(requestStats),
         });
         await extractAndSaveParsedData(doc, analysis.fullText, streamed.path, {
-          onProgress, extractCommittee, extractCitations
+          onProgress, extractCommittee, extractCitations, strictCitationErrors
         });
         await onProgress?.({
           phase: 'pdf_analysis',
@@ -2318,6 +2319,13 @@ export async function analyzeDocumentFile(doc, options) {
         });
         return;
       } catch (error) {
+        // Known cosmetic side-effect: when the stream itself succeeded but strict
+        // citation extraction threw (citation_scan), this drops through to the
+        // fallback below and persists status 'stream_failed' even though the
+        // download was fine. It does not affect citation-scan selection —
+        // `content_source` is preserved, so `retryFailures`/parser-version still
+        // work — and the scan runner's own `downloadStatus !== 'streamed'` check
+        // correctly counts it as a per-document failure.
         doc.downloadError = error instanceof Error ? error.message : String(error);
       } finally {
         await streamed.cleanup();

@@ -1,15 +1,28 @@
 import { Router } from 'express';
 import {
-  countPendingLookups, createAdminJob, getCatalogueLookupStats, getTopicBuildStatus,
-  hasRunningAdminJob, listAdminJobs, listPendingLookups, listRecentSyncRuns
+  countPendingCitationScans, countPendingLookups, createAdminJob, getCatalogueLookupStats,
+  getTopicBuildStatus, hasRunningAdminJob, listAdminJobs, listPendingLookups, listRecentSyncRuns
 } from '../db.js';
-import { ADMIN_WORKER_TIMEOUT_MS } from '../config.js';
+import {
+  ADMIN_WORKER_TIMEOUT_MS, CITATION_SCAN_MAX_DOCUMENTS,
+  CITATION_SCAN_NIGHTLY_ENABLED, CITATION_SCAN_NIGHTLY_HOUR_LOCAL, CITATION_SCAN_PAGE_SIZE
+} from '../config.js';
 import { extractSearchTerms } from '../catalogue.js';
 import { getConceptPipelineStatus } from '../conceptsPipeline.js';
 import { parseBooleanParam, parseNumberParam } from '../validate.js';
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
 import { cancelInProcessAdminJob, runCatalogueLookupJob } from '../services/adminJobs.js';
 import { cancelAdminWorkerJob, createAndStartAdminWorkerJob } from '../services/adminWorker.js';
+
+// Next local occurrence of `hourLocal`:00 as an ISO string (mirrors the daily
+// scheduler math in server.js) for the read-only schedule status card.
+function nextDailyRunIso(hourLocal) {
+  const now = new Date();
+  const next = new Date(now);
+  next.setHours(hourLocal, 0, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
+  return next.toISOString();
+}
 
 /**
  * Creates admin job orchestration endpoints.
@@ -32,14 +45,28 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
 
   router.get('/jobs', asyncHandler(async (_req, res) => {
     const { getDocumentSyncStatus } = await loadSyncModule();
-    const [jobs, syncRuns, catalogueStats, topicStatus, documentSyncStatus, conceptStatus] = await Promise.all([
+    const [jobs, syncRuns, catalogueStats, topicStatus, documentSyncStatus, conceptStatus, citationScanPending] = await Promise.all([
       listAdminJobs(25),
       listRecentSyncRuns(25),
       getCatalogueLookupStats(),
       getTopicBuildStatus(),
       getDocumentSyncStatus(),
       getConceptPipelineStatus(),
+      countPendingCitationScans({}),
     ]);
+    // Read-only schedule state for the Citation Scan status card, mirroring how
+    // conceptStatus feeds the concept card. lastRun comes from the most recent
+    // citation_scan admin job in the fetched window.
+    const lastCitationScan = jobs.find((job) => job.type === 'citation_scan') || null;
+    const citationScanStatus = {
+      enabled: CITATION_SCAN_NIGHTLY_ENABLED,
+      hourLocal: CITATION_SCAN_NIGHTLY_HOUR_LOCAL,
+      lastRun: lastCitationScan
+        ? { status: lastCitationScan.status, startedAt: lastCitationScan.startedAt, finishedAt: lastCitationScan.finishedAt }
+        : null,
+      nextRun: CITATION_SCAN_NIGHTLY_ENABLED ? nextDailyRunIso(CITATION_SCAN_NIGHTLY_HOUR_LOCAL) : null,
+      pendingCount: citationScanPending,
+    };
     res.status(200).json({
       jobs,
       syncRuns,
@@ -47,6 +74,7 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
       topicStatus,
       documentSyncStatus,
       conceptStatus,
+      citationScanStatus,
     });
   }));
 
@@ -88,6 +116,52 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
     // Run out-of-band so catalogue lookups do not hold the HTTP connection open.
     runCatalogueLookupJob(jobId, limit, { scope });
     res.status(202).json({ ok: true, started: true, jobId });
+  }));
+
+  router.post('/jobs/citation-scan', asyncHandler(async (req, res) => {
+    const body = req.body || {};
+    // Forced reprocess re-scans already-scanned documents (implies retryFailures);
+    // autoContinue chains batches so one on-demand run drains the whole backlog.
+    // The nightly scheduled fire sets neither.
+    const reprocess = parseBooleanParam(body.reprocess, false);
+    const retryFailures = reprocess || parseBooleanParam(body.retryFailures, false);
+    const autoContinue = parseBooleanParam(body.autoContinue, false);
+    const scope = citationScope(body);
+
+    // Preview affordance: count the documents that currently qualify. Starts no
+    // work — like the catalogue-lookup dry run.
+    const dryRun = parseBooleanParam(body.dryRun ?? getQueryValue(req, 'dryRun'), false);
+    if (dryRun) {
+      const total = await countPendingCitationScans({
+        syncKey: scope.syncKey,
+        filters: scope.filters,
+        retryFailures,
+        reprocess,
+      });
+      res.status(200).json({ ok: true, dryRun: true, total, retryFailures, reprocess });
+      return;
+    }
+
+    const runningId = await hasRunningAdminJob('citation_scan');
+    if (runningId) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
+      return;
+    }
+    const result = await createAndStartAdminWorkerJob({
+      type: 'citation_scan',
+      label: 'Citation Scan',
+      params: {
+        trigger: 'manual',
+        pageSize: Math.max(1, Math.min(250, Number(body.pageSize) || CITATION_SCAN_PAGE_SIZE)),
+        maxDocuments: Math.max(1, Math.min(5000, Number(body.maxDocuments) || CITATION_SCAN_MAX_DOCUMENTS)),
+        retryFailures,
+        reprocess,
+        autoContinue,
+        scope,
+      },
+    });
+    clearMetricsCache();
+    res.status(202).json({ ok: true, started: true, ...result });
   }));
 
   router.post('/jobs/bertopic', asyncHandler(async (_req, res) => {

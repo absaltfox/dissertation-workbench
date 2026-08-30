@@ -589,6 +589,9 @@ async function ensureSchema(client) {
   // checkCacheIntegrity reads only these two columns, so a partial covering index
   // turns its full table scan into an index scan over cached PDFs alone.
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_file_metrics_pdf_path ON file_metrics(doc_id, pdf_path) WHERE pdf_path IS NOT NULL');
+  // The citation scan selects streamable sources only; a partial index over the
+  // streamed_pdf rows keeps its scan bounded to that (shrinking) subset.
+  await tryExec(client, "CREATE INDEX IF NOT EXISTS idx_file_metrics_content_source ON file_metrics(content_source) WHERE content_source = 'streamed_pdf'");
   // scope_where() in build-concepts.py filters every automatic partition by
   // degree plus a year range on each PatternRank run.
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree_year ON documents(degree, year)');
@@ -3659,6 +3662,94 @@ export async function listPendingCitationExtractions({
     String(parserVersion || 'citation-v1'),
     Math.max(1, Math.min(1000, Number(limit) || 100)),
   ]);
+}
+
+// Selection gate shared by `listPendingCitationScans` and
+// `countPendingCitationScans`, factored out so the two never drift. Returns just
+// an SQL fragment (appended after the `content_source`/checksum requirement);
+// every clause is a literal comparison against the 1:1 `ces` row, so the gate
+// binds no args of its own.
+//
+// Scan-once, and parser-version-independent by design. A document that has a
+// terminal citation record — any `document_citations` rows, or a `completed`
+// state row, or a `failed` state row — is NOT reselected automatically, and a
+// citation-parser/GROBID version bump changes nothing about selection. The only
+// ways to reconsider a document are the explicit UI options: `retryFailures`
+// drops the failed exclusion (re-attempt known-bad documents), and `reprocess`
+// drops every gate so all streamable in-scope documents are reselected — its
+// re-extraction safely replaces existing citations (reextractDocumentCitations →
+// replaceDocumentCitationLinks), so no manual clearing is needed. `reprocess`
+// implies `retryFailures`. This keeps a parser upgrade from silently
+// re-downloading the corpus; a deliberate `reprocess` run is the one path that
+// re-scans already-scanned documents.
+function citationScanGate({ retryFailures = false, reprocess = false }) {
+  if (reprocess) return '';
+  const clauses = [
+    "AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = d.doc_id)",
+    "AND COALESCE(ces.status, '') <> 'completed'",
+  ];
+  if (!retryFailures) {
+    clauses.push("AND COALESCE(ces.status, '') <> 'failed'");
+  }
+  return clauses.join('\n      ');
+}
+
+// Selection for the re-streaming citation scan job. Unlike
+// `listPendingCitationExtractions`, this deliberately requires NO cached bytes
+// (the scan re-streams the PDF). A document qualifies when it recorded a
+// successful streamed content download at import (`content_source =
+// 'streamed_pdf'` with a checksum) and passes the scan-once gates above (unless
+// `reprocess` forces every streamable in-scope document to be reselected).
+export async function listPendingCitationScans({
+  limit = 50, afterDocId = '', syncKey = null, filters: requestedFilters = {},
+  retryFailures = false, reprocess = false,
+} = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  const gateSql = citationScanGate({ retryFailures, reprocess });
+  const args = [
+    ...filters.args,
+    String(afterDocId || ''),
+    Math.max(1, Math.min(1000, Number(limit) || 50)),
+  ];
+  return all(`
+    SELECT d.doc_id, d.metadata_json,
+           COALESCE(fm.content_checksum, fm.updated_at, '') AS content_checksum,
+           fm.content_source
+    FROM documents d
+    JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN citation_extraction_state ces ON ces.doc_id = d.doc_id
+    ${filters.where}
+    ${qualifier} d.doc_id > ?
+      AND fm.content_source = 'streamed_pdf'
+      AND COALESCE(fm.content_checksum, '') <> ''
+      ${gateSql}
+    ORDER BY d.doc_id
+    LIMIT ?
+  `, args);
+}
+
+// Corpus-wide count of documents the citation scan would process, for the
+// preview affordance and the schedule status card. Mirrors the selection above
+// without the cursor or limit.
+export async function countPendingCitationScans({
+  syncKey = null, filters: requestedFilters = {},
+  retryFailures = false, reprocess = false,
+} = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  const gateSql = citationScanGate({ retryFailures, reprocess });
+  const row = await get(`
+    SELECT COUNT(*) AS total
+    FROM documents d
+    JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN citation_extraction_state ces ON ces.doc_id = d.doc_id
+    ${filters.where}
+    ${qualifier} fm.content_source = 'streamed_pdf'
+      AND COALESCE(fm.content_checksum, '') <> ''
+      ${gateSql}
+  `, filters.args);
+  return Number(row?.total || 0);
 }
 
 export async function saveCitationExtractionState(docId, {
