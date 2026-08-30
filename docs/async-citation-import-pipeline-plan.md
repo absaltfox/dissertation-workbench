@@ -52,11 +52,15 @@ Pick a bounded page of documents that:
 1. have a streamable source (a resolvable repository PDF/full-text URL — the same
    `documents` + `file_metrics` rows that recorded a successful content download
    during import); **and**
-2. do **not** already have citations — no `citation_extraction_state` row with
-   `status = 'completed'` for the current parser version, and no
-   `document_citations` rows; **and**
+2. have **no terminal citation record** — no `document_citations` rows and no
+   `citation_extraction_state` row with `status = 'completed'` (a successful scan,
+   even one that found zero citations, is done); **and**
 3. have **no previously recorded failure** — no `citation_extraction_state` row
-   with `status = 'failed'` for the current parser version.
+   with `status = 'failed'`.
+
+Selection is **parser-version-independent**: the gates test only the presence of
+a terminal state, not which parser version produced it, so a parser/GROBID
+upgrade never re-selects a scanned document on its own.
 
 This is a **new** selection query — deliberately *not*
 `listPendingCitationExtractions`, which requires cached `pdf_path`/`full_text_path`
@@ -193,9 +197,10 @@ decoupled per `docs/admin-worker-job-standards.md`; this plan does not chain the
 ## Tests
 
 - **Selection:** includes a streamable doc with no citations and no failure;
-  excludes a scanned (citation-bearing) doc — and keeps excluding it after a
-  parser-version bump (scan-once); excludes a previously failed doc unless
-  `retryFailures`; `reprocess` re-includes an already-scanned doc.
+  excludes a scanned doc (both a citation-bearing one and a `completed` scan that
+  found zero citations, on the completed-state gate alone — scan-once is
+  version-independent); excludes a previously failed doc unless `retryFailures`;
+  `reprocess` re-includes every already-scanned doc.
 - **Per-document:** a successful scan writes `document_citations` and a
   `completed` state and issues no catalogue lookup; a parse failure writes a
   `failed` state, is counted, and does not fail the batch.

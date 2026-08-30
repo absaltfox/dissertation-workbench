@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createClient } from '@libsql/client';
-import { SQLITE_PATH, PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL, CITATION_PARSER_VERSION } from './config.js';
+import { SQLITE_PATH, PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL } from './config.js';
 import { logger } from './logger.js';
 import { dedupeSupervisorNames, normalizePersonName, stripMiddleInitials, supervisorNameKey } from './supervisors.js';
 import { encryptMfaSecret, decryptMfaSecret } from './secretCrypto.js';
@@ -3664,35 +3664,34 @@ export async function listPendingCitationExtractions({
   ]);
 }
 
-// Selection gates shared by `listPendingCitationScans` and
-// `countPendingCitationScans`, factored out so the two never drift. Returns the
-// SQL fragment (to append after `content_source`/checksum requirement) and its
-// bound args.
+// Selection gate shared by `listPendingCitationScans` and
+// `countPendingCitationScans`, factored out so the two never drift. Returns just
+// an SQL fragment (appended after the `content_source`/checksum requirement);
+// every clause is a literal comparison against the 1:1 `ces` row, so the gate
+// binds no args of its own.
 //
-// Scan-once by default: a document that has been scanned — it has
-// `document_citations` rows, or a `completed` state row for the current parser
-// version — is done and is NOT reselected automatically, INCLUDING after a
-// parser-version bump. Reprocessing a completed document is only ever an explicit
-// forced run (`reprocess: true`). A recorded failure for the current parser
-// version is likewise excluded unless `retryFailures` (or `reprocess`) is set, so
-// a nightly run never retries known-bad documents forever.
-//
-// When `reprocess` is true every gate is dropped: all streamable in-scope
-// documents are selected and re-extraction safely replaces their existing
-// citations (reextractDocumentCitations → replaceDocumentCitationLinks), so no
-// manual clearing is needed. `reprocess` implies `retryFailures`.
-function citationScanGate({ version, retryFailures = false, reprocess = false }) {
-  if (reprocess) return { sql: '', args: [] };
+// Scan-once, and parser-version-independent by design. A document that has a
+// terminal citation record — any `document_citations` rows, or a `completed`
+// state row, or a `failed` state row — is NOT reselected automatically, and a
+// citation-parser/GROBID version bump changes nothing about selection. The only
+// ways to reconsider a document are the explicit UI options: `retryFailures`
+// drops the failed exclusion (re-attempt known-bad documents), and `reprocess`
+// drops every gate so all streamable in-scope documents are reselected — its
+// re-extraction safely replaces existing citations (reextractDocumentCitations →
+// replaceDocumentCitationLinks), so no manual clearing is needed. `reprocess`
+// implies `retryFailures`. This keeps a parser upgrade from silently
+// re-downloading the corpus; a deliberate `reprocess` run is the one path that
+// re-scans already-scanned documents.
+function citationScanGate({ retryFailures = false, reprocess = false }) {
+  if (reprocess) return '';
   const clauses = [
     "AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = d.doc_id)",
-    "AND NOT (COALESCE(ces.status, '') = 'completed' AND COALESCE(ces.parser_version, '') = ?)",
+    "AND COALESCE(ces.status, '') <> 'completed'",
   ];
-  const args = [version];
   if (!retryFailures) {
-    clauses.push("AND NOT (COALESCE(ces.status, '') = 'failed' AND COALESCE(ces.parser_version, '') = ?)");
-    args.push(version);
+    clauses.push("AND COALESCE(ces.status, '') <> 'failed'");
   }
-  return { sql: clauses.join('\n      '), args };
+  return clauses.join('\n      ');
 }
 
 // Selection for the re-streaming citation scan job. Unlike
@@ -3703,16 +3702,14 @@ function citationScanGate({ version, retryFailures = false, reprocess = false })
 // `reprocess` forces every streamable in-scope document to be reselected).
 export async function listPendingCitationScans({
   limit = 50, afterDocId = '', syncKey = null, filters: requestedFilters = {},
-  parserVersion = CITATION_PARSER_VERSION, retryFailures = false, reprocess = false,
+  retryFailures = false, reprocess = false,
 } = {}) {
   const filters = documentServingFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
-  const version = String(parserVersion || CITATION_PARSER_VERSION);
-  const gate = citationScanGate({ version, retryFailures, reprocess });
+  const gateSql = citationScanGate({ retryFailures, reprocess });
   const args = [
     ...filters.args,
     String(afterDocId || ''),
-    ...gate.args,
     Math.max(1, Math.min(1000, Number(limit) || 50)),
   ];
   return all(`
@@ -3726,7 +3723,7 @@ export async function listPendingCitationScans({
     ${qualifier} d.doc_id > ?
       AND fm.content_source = 'streamed_pdf'
       AND COALESCE(fm.content_checksum, '') <> ''
-      ${gate.sql}
+      ${gateSql}
     ORDER BY d.doc_id
     LIMIT ?
   `, args);
@@ -3737,13 +3734,11 @@ export async function listPendingCitationScans({
 // without the cursor or limit.
 export async function countPendingCitationScans({
   syncKey = null, filters: requestedFilters = {},
-  parserVersion = CITATION_PARSER_VERSION, retryFailures = false, reprocess = false,
+  retryFailures = false, reprocess = false,
 } = {}) {
   const filters = documentServingFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
-  const version = String(parserVersion || CITATION_PARSER_VERSION);
-  const gate = citationScanGate({ version, retryFailures, reprocess });
-  const args = [...filters.args, ...gate.args];
+  const gateSql = citationScanGate({ retryFailures, reprocess });
   const row = await get(`
     SELECT COUNT(*) AS total
     FROM documents d
@@ -3752,8 +3747,8 @@ export async function countPendingCitationScans({
     ${filters.where}
     ${qualifier} fm.content_source = 'streamed_pdf'
       AND COALESCE(fm.content_checksum, '') <> ''
-      ${gate.sql}
-  `, args);
+      ${gateSql}
+  `, filters.args);
   return Number(row?.total || 0);
 }
 

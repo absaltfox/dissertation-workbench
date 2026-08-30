@@ -130,10 +130,13 @@ export const CITATION_SCAN_NIGHTLY_HOUR_LOCAL = (() => {
 })();
 export const CITATION_SCAN_PAGE_SIZE = Number(process.env.CITATION_SCAN_PAGE_SIZE || 50);
 export const CITATION_SCAN_MAX_DOCUMENTS = Number(process.env.CITATION_SCAN_MAX_DOCUMENTS || 1000);
-// Citation parser/pipeline version. Bumping it does NOT auto-reprocess already
-// scanned documents (scan-once by default); reprocessing is only ever an explicit
-// forced run. Kept here so the db selection, the job runner, and the admin route
-// share one source of truth without pulling in the PDF/GROBID module graph.
+// Citation parser/pipeline version, stamped onto each `citation_extraction_state`
+// row so the recorded provenance says which parser produced a scan. It does NOT
+// gate the citation-scan selection: scanning is once-per-document and
+// version-independent, so bumping this never auto-reprocesses already-scanned
+// documents — an explicit forced `reprocess` run is the only re-scan path. Kept
+// here so the job runner and any other consumer share one source of truth without
+// pulling in the PDF/GROBID module graph.
 export const CITATION_PARSER_VERSION = 'citation-v2';
 export const YAZ_CLIENT_TIMEOUT_MS = Number(process.env.YAZ_CLIENT_TIMEOUT_MS || 15_000);
 export const YAZ_CLIENT_BATCH_BASE_TIMEOUT_MS = Number(process.env.YAZ_CLIENT_BATCH_BASE_TIMEOUT_MS || 30_000);

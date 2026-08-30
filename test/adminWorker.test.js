@@ -1774,12 +1774,12 @@ test('citation scan selection includes streamable un-scanned docs and excludes c
   const degree = `Scan Degree ${suffix}`;
   const pending = `scan-pending-${suffix}`;
   const completed = `scan-completed-${suffix}`;
+  const zeroCiteCompleted = `scan-zerocite-${suffix}`;
   const failedDoc = `scan-failed-${suffix}`;
   const hasCitations = `scan-hascites-${suffix}`;
   const notStreamable = `scan-fulltext-${suffix}`;
-  const parserVersion = `scan-test-${suffix}`;
 
-  for (const id of [pending, completed, failedDoc, hasCitations]) {
+  for (const id of [pending, completed, zeroCiteCompleted, failedDoc, hasCitations]) {
     await seedStreamableDoc(id, { degree });
   }
   // A full-text-only import is not a streamable PDF source.
@@ -1791,37 +1791,39 @@ test('citation scan selection includes streamable un-scanned docs and excludes c
   // A real post-scan shape: the completed doc has BOTH a completed state row and
   // actual citation rows (this is what a successful scan leaves behind).
   await saveCitationExtractionState(completed, {
-    contentChecksum: 'scan-checksum-v1', parserVersion, status: 'completed', citationCount: 4,
+    contentChecksum: 'scan-checksum-v1', parserVersion: 'citation-v2', status: 'completed', citationCount: 4,
   });
   await saveCitations(completed, [{ text: `Done, D. (2019). Scanned. ${suffix}` }], (t) => `completed-${suffix}-${t}`);
+  // A successful scan that found ZERO citations: a completed state row and NO
+  // citation rows. Selection must exclude it on the completed-state gate alone
+  // (there are no citation rows to fall back on), independent of parser version.
+  await saveCitationExtractionState(zeroCiteCompleted, {
+    contentChecksum: 'scan-checksum-v1', parserVersion: 'citation-v1', status: 'completed', citationCount: 0,
+  });
   await saveCitationExtractionState(failedDoc, {
-    contentChecksum: 'scan-checksum-v1', parserVersion, status: 'failed', citationCount: 0, error: 'boom',
+    contentChecksum: 'scan-checksum-v1', parserVersion: 'citation-v1', status: 'failed', citationCount: 0, error: 'boom',
   });
   await saveCitations(hasCitations, [{ text: `Already, C. (2020). Extracted. ${suffix}` }], (t) => `hascites-${suffix}-${t}`);
 
   const ids = async (opts) => (await listPendingCitationScans({
-    limit: 50, filters: { degree }, parserVersion, ...opts,
+    limit: 50, filters: { degree }, ...opts,
   })).map((row) => row.doc_id).sort();
 
-  // Default run: only the pending doc qualifies.
+  // Default run: only the pending doc qualifies. The zero-citation completed doc
+  // is excluded by the completed-state gate, not by any citation rows, and stays
+  // excluded regardless of the parser version its old row carries (scan-once is
+  // version-independent — a parser bump never re-selects a scanned doc).
   assert.deepEqual(await ids(), [pending]);
-  assert.equal(await countPendingCitationScans({ filters: { degree }, parserVersion }), 1);
+  assert.equal(await countPendingCitationScans({ filters: { degree } }), 1);
 
-  // retryFailures re-opens the previously failed doc.
+  // retryFailures re-opens the previously failed doc only.
   assert.deepEqual(await ids({ retryFailures: true }), [failedDoc, pending].sort());
-
-  // Scan-once: a parser-version bump does NOT re-open a successfully scanned doc
-  // (`completed`/`hasCitations` keep their citation rows). It DOES re-open a doc
-  // whose only record is an old-version failure — a new parser may succeed where
-  // the old one failed.
-  const bumped = await listPendingCitationScans({ limit: 50, filters: { degree }, parserVersion: `${parserVersion}-next` });
-  assert.deepEqual(bumped.map((r) => r.doc_id).sort(), [failedDoc, pending].sort());
 
   // Forced reprocess drops every gate: all streamable in-scope docs are selected
   // (the non-streamable full-text doc is still excluded).
   assert.deepEqual(
     await ids({ reprocess: true }),
-    [completed, failedDoc, hasCitations, pending].sort()
+    [completed, zeroCiteCompleted, failedDoc, hasCitations, pending].sort()
   );
 });
 

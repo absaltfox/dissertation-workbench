@@ -4,7 +4,7 @@ import {
   getTopicBuildStatus, hasRunningAdminJob, listAdminJobs, listPendingLookups, listRecentSyncRuns
 } from '../db.js';
 import {
-  ADMIN_WORKER_TIMEOUT_MS, CITATION_PARSER_VERSION, CITATION_SCAN_MAX_DOCUMENTS,
+  ADMIN_WORKER_TIMEOUT_MS, CITATION_SCAN_MAX_DOCUMENTS,
   CITATION_SCAN_NIGHTLY_ENABLED, CITATION_SCAN_NIGHTLY_HOUR_LOCAL, CITATION_SCAN_PAGE_SIZE
 } from '../config.js';
 import { extractSearchTerms } from '../catalogue.js';
@@ -52,7 +52,7 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
       getTopicBuildStatus(),
       getDocumentSyncStatus(),
       getConceptPipelineStatus(),
-      countPendingCitationScans({ parserVersion: CITATION_PARSER_VERSION }),
+      countPendingCitationScans({}),
     ]);
     // Read-only schedule state for the Citation Scan status card, mirroring how
     // conceptStatus feeds the concept card. lastRun comes from the most recent
@@ -135,7 +135,6 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
       const total = await countPendingCitationScans({
         syncKey: scope.syncKey,
         filters: scope.filters,
-        parserVersion: CITATION_PARSER_VERSION,
         retryFailures,
         reprocess,
       });

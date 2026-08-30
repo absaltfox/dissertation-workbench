@@ -925,7 +925,6 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         afterDocId: cursor,
         syncKey: scope.syncKey || null,
         filters: scope.filters || scope,
-        parserVersion: CITATION_PARSER_VERSION,
         retryFailures,
         reprocess,
       });
@@ -993,7 +992,6 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         afterDocId: cursor,
         syncKey: scope.syncKey || null,
         filters: scope.filters || scope,
-        parserVersion: CITATION_PARSER_VERSION,
         retryFailures,
         reprocess,
       });
