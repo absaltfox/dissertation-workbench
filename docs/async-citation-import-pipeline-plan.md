@@ -62,9 +62,16 @@ This is a **new** selection query — deliberately *not*
 `listPendingCitationExtractions`, which requires cached `pdf_path`/`full_text_path`
 (none exist here) and *re-includes* failed rows. The new query requires no cached
 bytes and *excludes* failures so the nightly run does not retry known-bad
-documents forever. A parser-version bump naturally re-opens completed rows for a
-fresh scan; failures from the old version are likewise re-opened by the version
-change, not by status.
+documents forever.
+
+**Scan once by default.** A document that has been scanned — it has
+`document_citations` rows, or a `completed` state row — is done and is **never**
+reselected automatically, *including* after a citation-parser/GROBID version
+upgrade. Reprocessing a scanned document happens only through an explicit forced
+run (the `reprocess` control below), which drops every gate and re-scans all
+streamable in-scope documents, replacing their existing citations. This keeps a
+parser upgrade from silently re-downloading the whole corpus; a deliberate
+`reprocess` is the one path that does.
 
 ### Per-document work
 
@@ -111,9 +118,11 @@ stream + parse, not by corpus size.
   - Guard with `hasRunningAdminJob('citation_scan')` so a long night never
     overlaps itself.
 - **On demand:** `POST /api/admin/jobs/citation-scan` (202 + `jobId`) plus an
-  Admin Jobs button. Include an explicit `retryFailures: true` option so an
-  operator can deliberately re-attempt previously failed documents; the nightly
-  run never sets it.
+  Admin Jobs button, with three operator opt-ins the nightly run never sets:
+  `retryFailures` (also re-attempt previously failed documents), `reprocess`
+  (force re-scan of already-scanned documents; implies `retryFailures`), and
+  `autoContinue` (chain batches so one run drains the whole backlog instead of a
+  single page).
 
 ## UI controls
 
@@ -184,8 +193,9 @@ decoupled per `docs/admin-worker-job-standards.md`; this plan does not chain the
 ## Tests
 
 - **Selection:** includes a streamable doc with no citations and no failure;
-  excludes a completed doc; excludes a previously failed doc (unless
-  `retryFailures`); a parser-version bump re-opens a completed doc.
+  excludes a scanned (citation-bearing) doc — and keeps excluding it after a
+  parser-version bump (scan-once); excludes a previously failed doc unless
+  `retryFailures`; `reprocess` re-includes an already-scanned doc.
 - **Per-document:** a successful scan writes `document_citations` and a
   `completed` state and issues no catalogue lookup; a parse failure writes a
   `failed` state, is counted, and does not fail the batch.

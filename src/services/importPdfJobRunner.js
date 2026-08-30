@@ -13,7 +13,9 @@ import { getConfiguredApiKey } from '../secrets.js';
 import {
   contentModeEnrichesDocuments, importRuleToSyncOptions, validateImportRule
 } from '../importRules.js';
-import { CITATION_SCAN_MAX_DOCUMENTS, CITATION_SCAN_PAGE_SIZE, IMPORT_PDF_BATCH_SIZE } from '../config.js';
+import {
+  CITATION_PARSER_VERSION, CITATION_SCAN_MAX_DOCUMENTS, CITATION_SCAN_PAGE_SIZE, IMPORT_PDF_BATCH_SIZE
+} from '../config.js';
 import {
   ENRICHMENT_ROLLOUT_PHASES, evaluateEnrichmentRun
 } from './enrichmentRollout.js';
@@ -296,7 +298,9 @@ async function analyzePdfEntry(entry, artifactClient, {
   }
 }
 
-export const CITATION_PARSER_VERSION = 'citation-v2';
+// Re-exported from config so existing importers of this symbol keep working; the
+// single source of truth now lives in src/config.js.
+export { CITATION_PARSER_VERSION };
 
 async function loadCitationSource(entry, artifactClient, progress, counts = null) {
   if (entry.pdf_path) {
@@ -904,7 +908,11 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     const maxDocuments = Math.max(1, Math.min(5000, Number(params.maxDocuments) || CITATION_SCAN_MAX_DOCUMENTS));
     const pageSize = Math.min(maxDocuments, Math.max(1, Math.min(250, Number(params.pageSize) || CITATION_SCAN_PAGE_SIZE)));
     const scope = params.scope || {};
-    const retryFailures = Boolean(params.retryFailures);
+    // Forced reprocess re-selects every streamable in-scope document (dropping the
+    // scan-once gates) and implies retryFailures. The cursor still guarantees
+    // forward progress within a run, and re-extraction replaces existing citations.
+    const reprocess = Boolean(params.reprocess);
+    const retryFailures = reprocess || Boolean(params.retryFailures);
     let processed = 0;
     let failed = 0;
     let totalCitations = 0;
@@ -919,6 +927,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         filters: scope.filters || scope,
         parserVersion: CITATION_PARSER_VERSION,
         retryFailures,
+        reprocess,
       });
       if (!entries.length) break;
       for (const entry of entries) {
@@ -986,6 +995,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         filters: scope.filters || scope,
         parserVersion: CITATION_PARSER_VERSION,
         retryFailures,
+        reprocess,
       });
       reachedLimit = remaining.length > 0;
     }
@@ -998,6 +1008,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       cursor: cursor || null,
       batchLimitReached: reachedLimit,
       retryFailures,
+      reprocess,
       resolutionQueued: false,
     };
     const continuation = await startCitationScanContinuation(job, result, progress);

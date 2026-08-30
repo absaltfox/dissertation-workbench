@@ -175,6 +175,8 @@ const runCatalogueLookupsBtn = document.getElementById('runCatalogueLookupsBtn')
 const citationScanPageSizeEl = document.getElementById('citationScanPageSize');
 const citationScanMaxDocumentsEl = document.getElementById('citationScanMaxDocuments');
 const citationScanRetryFailuresEl = document.getElementById('citationScanRetryFailures');
+const citationScanAutoContinueEl = document.getElementById('citationScanAutoContinue');
+const citationScanReprocessEl = document.getElementById('citationScanReprocess');
 const previewCitationScanBtn = document.getElementById('previewCitationScanBtn');
 const runCitationScanBtn = document.getElementById('runCitationScanBtn');
 const citationScanPreviewEl = document.getElementById('citationScanPreview');
@@ -912,6 +914,8 @@ const dom = {
   citationScanPageSizeEl,
   citationScanMaxDocumentsEl,
   citationScanRetryFailuresEl,
+  citationScanAutoContinueEl,
+  citationScanReprocessEl,
   previewCitationScanBtn,
   runCitationScanBtn,
   citationScanPreviewEl,

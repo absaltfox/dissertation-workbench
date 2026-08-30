@@ -193,6 +193,20 @@ test('citation scan preview counts pending documents and honors retryFailures wi
       .expect(200);
     assert.equal(retry.body.total, 2); // failed doc re-opened
 
+    // Forced reprocess drops every gate: both streamable docs are selected, and
+    // the route echoes the flag so the operator sees it took effect.
+    const forced = await request(app)
+      .post('/api/admin/jobs/citation-scan')
+      .set('Cookie', `session=${token}`).set('x-csrf-token', csrf)
+      .send({ dryRun: true, reprocess: true, degree })
+      .expect(200);
+    assert.equal(forced.body.reprocess, true);
+    assert.equal(forced.body.total, 2);
+    assert.equal(
+      await countPendingCitationScans({ filters: { degree }, parserVersion: 'citation-v2', reprocess: true }),
+      2
+    );
+
     // Cross-check the count helper directly.
     assert.equal(await countPendingCitationScans({ filters: { degree }, parserVersion: 'citation-v2' }), 1);
     // The preview started nothing.

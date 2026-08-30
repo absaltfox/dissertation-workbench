@@ -4,12 +4,11 @@ import {
   getTopicBuildStatus, hasRunningAdminJob, listAdminJobs, listPendingLookups, listRecentSyncRuns
 } from '../db.js';
 import {
-  ADMIN_WORKER_TIMEOUT_MS, CITATION_SCAN_MAX_DOCUMENTS, CITATION_SCAN_NIGHTLY_ENABLED,
-  CITATION_SCAN_NIGHTLY_HOUR_LOCAL, CITATION_SCAN_PAGE_SIZE
+  ADMIN_WORKER_TIMEOUT_MS, CITATION_PARSER_VERSION, CITATION_SCAN_MAX_DOCUMENTS,
+  CITATION_SCAN_NIGHTLY_ENABLED, CITATION_SCAN_NIGHTLY_HOUR_LOCAL, CITATION_SCAN_PAGE_SIZE
 } from '../config.js';
 import { extractSearchTerms } from '../catalogue.js';
 import { getConceptPipelineStatus } from '../conceptsPipeline.js';
-import { CITATION_PARSER_VERSION } from '../services/importPdfJobRunner.js';
 import { parseBooleanParam, parseNumberParam } from '../validate.js';
 import { asyncHandler, getQueryValue } from '../middleware/http.js';
 import { cancelInProcessAdminJob, runCatalogueLookupJob } from '../services/adminJobs.js';
@@ -121,7 +120,12 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
 
   router.post('/jobs/citation-scan', asyncHandler(async (req, res) => {
     const body = req.body || {};
-    const retryFailures = parseBooleanParam(body.retryFailures, false);
+    // Forced reprocess re-scans already-scanned documents (implies retryFailures);
+    // autoContinue chains batches so one on-demand run drains the whole backlog.
+    // The nightly scheduled fire sets neither.
+    const reprocess = parseBooleanParam(body.reprocess, false);
+    const retryFailures = reprocess || parseBooleanParam(body.retryFailures, false);
+    const autoContinue = parseBooleanParam(body.autoContinue, false);
     const scope = citationScope(body);
 
     // Preview affordance: count the documents that currently qualify. Starts no
@@ -133,8 +137,9 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
         filters: scope.filters,
         parserVersion: CITATION_PARSER_VERSION,
         retryFailures,
+        reprocess,
       });
-      res.status(200).json({ ok: true, dryRun: true, total, retryFailures });
+      res.status(200).json({ ok: true, dryRun: true, total, retryFailures, reprocess });
       return;
     }
 
@@ -151,6 +156,8 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
         pageSize: Math.max(1, Math.min(250, Number(body.pageSize) || CITATION_SCAN_PAGE_SIZE)),
         maxDocuments: Math.max(1, Math.min(5000, Number(body.maxDocuments) || CITATION_SCAN_MAX_DOCUMENTS)),
         retryFailures,
+        reprocess,
+        autoContinue,
         scope,
       },
     });

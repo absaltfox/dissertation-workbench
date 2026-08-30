@@ -2319,6 +2319,13 @@ export async function analyzeDocumentFile(doc, options) {
         });
         return;
       } catch (error) {
+        // Known cosmetic side-effect: when the stream itself succeeded but strict
+        // citation extraction threw (citation_scan), this drops through to the
+        // fallback below and persists status 'stream_failed' even though the
+        // download was fine. It does not affect citation-scan selection —
+        // `content_source` is preserved, so `retryFailures`/parser-version still
+        // work — and the scan runner's own `downloadStatus !== 'streamed'` check
+        // correctly counts it as a per-document failure.
         doc.downloadError = error instanceof Error ? error.message : String(error);
       } finally {
         await streamed.cleanup();

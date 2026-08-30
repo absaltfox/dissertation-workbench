@@ -21,6 +21,8 @@ const {
   citationScanPageSizeEl,
   citationScanMaxDocumentsEl,
   citationScanRetryFailuresEl,
+  citationScanAutoContinueEl,
+  citationScanReprocessEl,
   previewCitationScanBtn,
   runCitationScanBtn,
   citationScanPreviewEl,
@@ -1809,6 +1811,8 @@ function citationScanBody(extra = {}) {
     pageSize: citationScanPageSizeEl?.value || '50',
     maxDocuments: citationScanMaxDocumentsEl?.value || '1000',
     retryFailures: Boolean(citationScanRetryFailuresEl?.checked),
+    autoContinue: Boolean(citationScanAutoContinueEl?.checked),
+    reprocess: Boolean(citationScanReprocessEl?.checked),
     ...extra,
   };
 }
@@ -1828,7 +1832,9 @@ async function handlePreviewCitationScan() {
       citationScanPreviewEl.innerHTML = `<p class="form-error">${escapeHtml(data.error || 'Preview failed.')}</p>`;
       return;
     }
-    const scope = data.retryFailures ? ' (including previous failures)' : '';
+    const scope = data.reprocess
+      ? ' (forced reprocess of all in-scope documents)'
+      : data.retryFailures ? ' (including previous failures)' : '';
     citationScanPreviewEl.innerHTML = `
       <p class="settings-status-main">${formatNum(data.total || 0)} document${data.total === 1 ? '' : 's'} pending${escapeHtml(scope)}</p>
       <p class="meta">Each will be re-streamed once; nothing is cached.</p>

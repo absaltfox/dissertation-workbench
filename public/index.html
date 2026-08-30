@@ -748,6 +748,14 @@
                     <input id="citationScanRetryFailures" type="checkbox" />
                     <span>Retry previous failures</span>
                   </label>
+                  <label class="checkbox-row">
+                    <input id="citationScanAutoContinue" type="checkbox" />
+                    <span>Process entire backlog (chained batches)</span>
+                  </label>
+                  <label class="checkbox-row">
+                    <input id="citationScanReprocess" type="checkbox" />
+                    <span>Reprocess already-scanned documents (force re-download)</span>
+                  </label>
                   <div class="settings-actions row-actions">
                     <button type="button" id="previewCitationScanBtn" class="btn ghost">Preview Pending</button>
                     <button type="button" id="runCitationScanBtn" class="btn">Run Citation Scan</button>

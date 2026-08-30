@@ -1788,9 +1788,12 @@ test('citation scan selection includes streamable un-scanned docs and excludes c
     status: 'full_text', fullTextPath: `/cached/${notStreamable}.txt`, contentChecksum: 'ft-v1',
   });
 
+  // A real post-scan shape: the completed doc has BOTH a completed state row and
+  // actual citation rows (this is what a successful scan leaves behind).
   await saveCitationExtractionState(completed, {
     contentChecksum: 'scan-checksum-v1', parserVersion, status: 'completed', citationCount: 4,
   });
+  await saveCitations(completed, [{ text: `Done, D. (2019). Scanned. ${suffix}` }], (t) => `completed-${suffix}-${t}`);
   await saveCitationExtractionState(failedDoc, {
     contentChecksum: 'scan-checksum-v1', parserVersion, status: 'failed', citationCount: 0, error: 'boom',
   });
@@ -1807,11 +1810,19 @@ test('citation scan selection includes streamable un-scanned docs and excludes c
   // retryFailures re-opens the previously failed doc.
   assert.deepEqual(await ids({ retryFailures: true }), [failedDoc, pending].sort());
 
-  // A parser-version bump re-opens both the completed and the previously failed
-  // doc (their old-version rows no longer match); the doc that already has
-  // citation rows stays excluded.
+  // Scan-once: a parser-version bump does NOT re-open a successfully scanned doc
+  // (`completed`/`hasCitations` keep their citation rows). It DOES re-open a doc
+  // whose only record is an old-version failure — a new parser may succeed where
+  // the old one failed.
   const bumped = await listPendingCitationScans({ limit: 50, filters: { degree }, parserVersion: `${parserVersion}-next` });
-  assert.deepEqual(bumped.map((r) => r.doc_id).sort(), [completed, failedDoc, pending].sort());
+  assert.deepEqual(bumped.map((r) => r.doc_id).sort(), [failedDoc, pending].sort());
+
+  // Forced reprocess drops every gate: all streamable in-scope docs are selected
+  // (the non-streamable full-text doc is still excluded).
+  assert.deepEqual(
+    await ids({ reprocess: true }),
+    [completed, failedDoc, hasCitations, pending].sort()
+  );
 });
 
 test('citation scan streams per document: success writes citations + completed state and no catalogue lookup; a failure is counted without failing the batch', async () => {
