@@ -1,9 +1,9 @@
 import {
   appendAdminJobLog, finishAdminJob, getDb, listFileMetrics, listImportRules,
-  listPendingCitationExtractions, loadCommitteeMembers, loadDocumentMetadata,
-  finishEnrichmentRolloutPhase, getEnrichmentRollout, listEnrichmentRolloutEvidence,
-  saveCitationExtractionState, saveEnrichmentRolloutEvidence, startEnrichmentRolloutPhase,
-  updateAdminJobProgress
+  listPendingCitationExtractions, listPendingCitationScans, loadCommitteeMembers,
+  loadDocumentMetadata, loadStoredFileMetric, finishEnrichmentRolloutPhase, getEnrichmentRollout,
+  listEnrichmentRolloutEvidence, saveCitationExtractionState, saveEnrichmentRolloutEvidence,
+  startEnrichmentRolloutPhase, updateAdminJobProgress
 } from '../db.js';
 import fs from 'node:fs/promises';
 import {
@@ -13,7 +13,9 @@ import { getConfiguredApiKey } from '../secrets.js';
 import {
   contentModeEnrichesDocuments, importRuleToSyncOptions, validateImportRule
 } from '../importRules.js';
-import { IMPORT_PDF_BATCH_SIZE } from '../config.js';
+import {
+  CITATION_PARSER_VERSION, CITATION_SCAN_MAX_DOCUMENTS, CITATION_SCAN_PAGE_SIZE, IMPORT_PDF_BATCH_SIZE
+} from '../config.js';
 import {
   ENRICHMENT_ROLLOUT_PHASES, evaluateEnrichmentRun
 } from './enrichmentRollout.js';
@@ -121,6 +123,65 @@ export async function startContinuationJob(job, result, progress, { createContin
     await progress?.({
       phase: 'continuation',
       label: 'Next PDF batch was not scheduled',
+      status: 'failed',
+      detail: message,
+    });
+    return { error: message };
+  }
+}
+
+// Citation-scan sibling of `startContinuationJob`. Same durable-cursor property:
+// the only progress carried into the next batch is one doc-id cursor, so
+// params_json stays the same size at batch 1000 as at batch 1 (#16) instead of
+// accumulating scanned ids. `createContinuationJob` is a test seam; production
+// takes the default (a real admin worker job). Gated on `params.autoContinue`
+// so the nightly scheduled run stays a single bounded page (the backlog drains
+// across nights), while an operator batch can chain through the whole backlog.
+export async function startCitationScanContinuation(job, result, progress, { createContinuationJob = null } = {}) {
+  const params = job.params || {};
+  if (!params.autoContinue) return null;
+  if (!result.batchLimitReached) return null;
+  // Failed documents are recorded and durably excluded from the next selection,
+  // so a batch that made any progress can still safely drain the healthy backlog.
+  if (Number(result.processed || 0) + Number(result.failed || 0) <= 0) return null;
+
+  const nextParams = {
+    ...params,
+    afterDocId: result.cursor || '',
+    continuationOf: params.continuationOf || job.id,
+    previousJobId: job.id,
+  };
+  await progress?.({
+    phase: 'continuation',
+    label: 'Scheduling next citation scan batch',
+    status: 'running',
+    counts: { processed: result.processed || 0 },
+  });
+
+  try {
+    const createJob = createContinuationJob || (async (payload) => {
+      const { createAndStartAdminWorkerJob } = await import('./adminWorker.js');
+      return createAndStartAdminWorkerJob(payload);
+    });
+    const next = await createJob({
+      type: 'citation_scan',
+      label: 'Citation Scan (continuation)',
+      params: nextParams,
+    });
+    await log(job.id, `Scheduled next citation scan batch as job ${next.jobId}.`);
+    await progress?.({
+      phase: 'continuation',
+      label: 'Scheduled next citation scan batch',
+      status: 'completed',
+      detail: `Job ${next.jobId}`,
+    });
+    return next;
+  } catch (error) {
+    const message = error?.message || String(error);
+    await log(job.id, `Could not schedule next citation scan batch: ${message}`);
+    await progress?.({
+      phase: 'continuation',
+      label: 'Next citation scan batch was not scheduled',
       status: 'failed',
       detail: message,
     });
@@ -237,7 +298,9 @@ async function analyzePdfEntry(entry, artifactClient, {
   }
 }
 
-const CITATION_PARSER_VERSION = 'citation-v2';
+// Re-exported from config so existing importers of this symbol keep working; the
+// single source of truth now lives in src/config.js.
+export { CITATION_PARSER_VERSION };
 
 async function loadCitationSource(entry, artifactClient, progress, counts = null) {
   if (entry.pdf_path) {
@@ -833,6 +896,141 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     await progress({
       phase: 'citation_extraction',
       label: 'Citation extraction',
+      status: failed ? 'failed' : 'completed',
+      counts: { processed, failed, citations: totalCitations, cursor, batchLimitReached: reachedLimit },
+    });
+    return result;
+  }
+
+  if (job.type === 'citation_scan') {
+    await log(job.id, 'Starting re-streaming citation scan (no caching).');
+    await progress({ phase: 'citation_scan', label: 'Scanning documents for citations', status: 'running' });
+    const maxDocuments = Math.max(1, Math.min(5000, Number(params.maxDocuments) || CITATION_SCAN_MAX_DOCUMENTS));
+    const pageSize = Math.min(maxDocuments, Math.max(1, Math.min(250, Number(params.pageSize) || CITATION_SCAN_PAGE_SIZE)));
+    const scope = params.scope || {};
+    // Forced reprocess re-selects every streamable in-scope document (dropping the
+    // scan-once gates) and implies retryFailures. The cursor still guarantees
+    // forward progress within a run, and re-extraction replaces existing citations.
+    const reprocess = Boolean(params.reprocess);
+    const retryFailures = reprocess || Boolean(params.retryFailures);
+    let processed = 0;
+    let failed = 0;
+    let totalCitations = 0;
+    // Durable cursor carried across continuation batches (params_json stays O(1)).
+    let cursor = String(params.afterDocId || '');
+    let reachedLimit = false;
+    while (processed + failed < maxDocuments) {
+      const entries = await listPendingCitationScans({
+        limit: Math.min(pageSize, maxDocuments - processed - failed),
+        afterDocId: cursor,
+        syncKey: scope.syncKey || null,
+        filters: scope.filters || scope,
+        retryFailures,
+        reprocess,
+      });
+      if (!entries.length) break;
+      for (const entry of entries) {
+        cursor = entry.doc_id;
+        let scannedContentChecksum = entry.content_checksum;
+        try {
+          await progress({
+            phase: 'citation_scan',
+            label: 'Scanning documents for citations',
+            detail: entry.doc_id,
+            status: 'running',
+            counts: { processed, failed, citations: totalCitations, cursor, maxDocuments },
+          });
+          const doc = await loadDocumentMetadata(entry.doc_id);
+          if (!doc) throw new Error('Document metadata not found for citation scan.');
+          // Re-stream the original PDF (rate-limited, temp file deleted after
+          // parse, nothing cached), extract and dedup citations. No committee,
+          // no catalogue resolution.
+          await analyzeDocumentFile(doc, {
+            contentMode: 'pdf_stream',
+            downloadFiles: true,
+            forceDownload: true,
+            recomputeFromCache: false,
+            extractCommittee: false,
+            extractCitations: true,
+            strictCitationErrors: true,
+            artifactClient,
+            onProgress: progress,
+          });
+          if (doc.downloadStatus !== 'streamed') {
+            throw new Error(doc.downloadError || `Streaming failed (${doc.downloadStatus || 'unknown'}).`);
+          }
+          const streamedMetric = await loadStoredFileMetric(entry.doc_id);
+          scannedContentChecksum = streamedMetric?.content_checksum || scannedContentChecksum;
+          processed += 1;
+          if (doc.citationCount) totalCitations += Number(doc.citationCount);
+          await saveCitationExtractionState(entry.doc_id, {
+            contentChecksum: scannedContentChecksum,
+            parserVersion: CITATION_PARSER_VERSION,
+            status: 'completed',
+            citationCount: doc.citationCount || 0,
+          });
+        } catch (error) {
+          failed += 1;
+          // The stream may have succeeded before strict citation extraction
+          // failed. Record the checksum of the bytes actually attempted rather
+          // than the stale checksum selected before the re-download.
+          const streamedMetric = await loadStoredFileMetric(entry.doc_id).catch(() => null);
+          scannedContentChecksum = streamedMetric?.content_checksum || scannedContentChecksum;
+          await saveCitationExtractionState(entry.doc_id, {
+            contentChecksum: scannedContentChecksum,
+            parserVersion: CITATION_PARSER_VERSION,
+            status: 'failed',
+            citationCount: 0,
+            error: error?.message || String(error),
+          });
+          await log(job.id, `Citation scan failed for ${entry.doc_id}: ${error?.message || String(error)}`);
+        }
+      }
+      await progress({
+        phase: 'citation_scan',
+        label: 'Scanning documents for citations',
+        status: 'running',
+        detail: `Checkpointed through ${cursor}`,
+        counts: { processed, failed, citations: totalCitations, cursor, maxDocuments },
+      });
+    }
+    if (processed + failed >= maxDocuments) {
+      const remaining = await listPendingCitationScans({
+        limit: 1,
+        afterDocId: cursor,
+        syncKey: scope.syncKey || null,
+        filters: scope.filters || scope,
+        retryFailures,
+        reprocess,
+      });
+      reachedLimit = remaining.length > 0;
+    }
+    const result = {
+      ok: failed === 0,
+      processed,
+      failed,
+      citations: totalCitations,
+      parserVersion: CITATION_PARSER_VERSION,
+      cursor: cursor || null,
+      batchLimitReached: reachedLimit,
+      retryFailures,
+      reprocess,
+      resolutionQueued: false,
+    };
+    const continuation = await startCitationScanContinuation(job, result, progress);
+    if (continuation?.jobId) result.nextJobId = continuation.jobId;
+    if (continuation?.error) result.continuationError = continuation.error;
+    clearMetricsCache?.();
+    await finishAdminJob(job.id, {
+      status: failed ? 'failed' : 'completed',
+      result,
+      error: failed ? `${failed} document(s) failed citation scan.` : null,
+      finishedAt: new Date().toISOString(),
+    });
+    await log(job.id, `Citation scan finished: ${processed} processed, ${failed} failed. Catalogue resolution was not started.`);
+    await progress({
+      phase: 'citation_scan',
+      label: 'Citation scan',
       status: failed ? 'failed' : 'completed',
       counts: { processed, failed, citations: totalCitations, cursor, batchLimitReached: reachedLimit },
     });

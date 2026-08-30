@@ -2170,7 +2170,8 @@ async function loadStoredParsedData(doc) {
 export async function analyzeDocumentFile(doc, options) {
   const {
     downloadFiles, forceDownload, recomputeFromCache, artifactClient = null, onProgress = null,
-    extractCommittee = true, extractCitations = false, onContentRequest = null,
+    extractCommittee = true, extractCitations = false, strictCitationErrors = false,
+    onContentRequest = null,
     contentMode = downloadFiles ? 'pdf_cache' : 'full_text_only',
     // Import rules always pass an explicit snapshot. The null case preserves
     // historical behaviour for direct/manual callers during the migration.
@@ -2302,7 +2303,7 @@ export async function analyzeDocumentFile(doc, options) {
           ...requestMetricFields(requestStats),
         });
         await extractAndSaveParsedData(doc, analysis.fullText, streamed.path, {
-          onProgress, extractCommittee, extractCitations
+          onProgress, extractCommittee, extractCitations, strictCitationErrors
         });
         await onProgress?.({
           phase: 'pdf_analysis',
@@ -2318,6 +2319,11 @@ export async function analyzeDocumentFile(doc, options) {
         });
         return;
       } catch (error) {
+        // Strict post-stream extraction failures belong to the citation job, not
+        // the download. Preserve the successfully persisted stream status and
+        // provenance, clean up the temp file in `finally`, and let the runner
+        // record a failed citation attempt.
+        if (strictCitationErrors && doc.downloadStatus === 'streamed') throw error;
         doc.downloadError = error instanceof Error ? error.message : String(error);
       } finally {
         await streamed.cleanup();

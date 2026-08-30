@@ -669,6 +669,17 @@ async function ensureSchema(client) {
   // checkCacheIntegrity reads only these two columns, so a partial covering index
   // turns its full table scan into an index scan over cached PDFs alone.
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_file_metrics_pdf_path ON file_metrics(doc_id, pdf_path) WHERE pdf_path IS NOT NULL');
+  // Cover the citation scan's streamable-source probe by doc id and checksum.
+  // The earlier content_source-only index stored the same constant in every row
+  // and did not shrink as scans completed, so it added little value.
+  await tryExec(client, 'DROP INDEX IF EXISTS idx_file_metrics_content_source');
+  await tryExec(client, `
+    CREATE INDEX IF NOT EXISTS idx_file_metrics_streamed_scan
+    ON file_metrics(doc_id, content_checksum)
+    WHERE content_source = 'streamed_pdf'
+      AND content_checksum IS NOT NULL
+      AND content_checksum <> ''
+  `);
   // scope_where() in build-concepts.py filters every automatic partition by
   // degree plus a year range on each PatternRank run.
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree_year ON documents(degree, year)');
@@ -3959,7 +3970,9 @@ async function upsertCitation(fields, hash, now) {
   return Number(row.id);
 }
 
-export async function saveCitations(docId, citations, hashFn, { onProgress = null, matchObserver = null } = {}) {
+export async function saveCitations(docId, citations, hashFn, {
+  onProgress = null, matchObserver = null, linkDocument = true,
+} = {}) {
   const now = new Date().toISOString();
 
   const items = citations.map((item) => {
@@ -4012,22 +4025,26 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
     if (matchedId) {
       if (matchedBy === 'exact') counts.exactMatches += 1;
       if (matchedBy === 'fuzzy') counts.fuzzyMatches += 1;
-      await run(`
-        INSERT INTO document_citations (doc_id, citation_id, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
-      `, [docId, matchedId, now]);
+      if (linkDocument) {
+        await run(`
+          INSERT INTO document_citations (doc_id, citation_id, updated_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
+        `, [docId, matchedId, now]);
+      }
       linkedIds.push(matchedId);
     } else {
       counts.newCitations += 1;
       const citationId = await upsertCitation(item, item.hash, now);
       if (citationId) {
         idByHash.set(item.hash, citationId);
-        await run(`
-          INSERT INTO document_citations (doc_id, citation_id, updated_at)
-          VALUES (?, ?, ?)
-          ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
-        `, [docId, citationId, now]);
+        if (linkDocument) {
+          await run(`
+            INSERT INTO document_citations (doc_id, citation_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
+          `, [docId, citationId, now]);
+        }
         linkedIds.push(citationId);
       }
     }
@@ -4091,14 +4108,17 @@ export async function loadDocsByCitation(citationId) {
   `, [citationId]);
 }
 
-// Re-extraction entry point: saves the new citation set, then prunes only the
-// links that no longer match, so catalogue lookups on surviving citations are
-// preserved. Replaces the old clearDocumentCitations + saveCitations pattern,
-// which destroyed catalogue lookups for citations that survived the reparse.
+// Re-extraction stages/deduplicates the complete citation set without publishing
+// document links, then swaps the link set in one transaction. If extraction or
+// matching fails, the previous known-good link set remains visible; a failed
+// attempt can never publish a partial bibliography.
 export async function reextractDocumentCitations(docId, citations, hashFn, options = {}) {
   let linkedIds = [];
   if (citations.length) {
-    linkedIds = await saveCitations(docId, citations, hashFn, options);
+    linkedIds = await saveCitations(docId, citations, hashFn, {
+      ...options,
+      linkDocument: false,
+    });
   }
   await replaceDocumentCitationLinks(docId, linkedIds);
   return linkedIds;
@@ -4108,15 +4128,76 @@ export async function replaceDocumentCitationLinks(docId, keepCitationIds = []) 
   const keep = new Set(
     (keepCitationIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
   );
+  const now = new Date().toISOString();
+  const client = await getDb();
   const existing = await all('SELECT citation_id FROM document_citations WHERE doc_id = ?', [docId]);
+  const existingIds = existing.map((row) => Number(row.citation_id));
   const stale = existing
     .map((row) => Number(row.citation_id))
     .filter((id) => !keep.has(id));
+  const statements = [];
+  for (const citationId of keep) {
+    statements.push({
+      sql: `
+          INSERT INTO document_citations (doc_id, citation_id, updated_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
+      `,
+      args: [docId, citationId, now],
+    });
+  }
   const chunkSize = 900;
   for (let i = 0; i < stale.length; i += chunkSize) {
     const chunk = stale.slice(i, i + chunkSize);
     const placeholders = chunk.map(() => '?').join(', ');
-    await run(`DELETE FROM document_citations WHERE doc_id = ? AND citation_id IN (${placeholders})`, [docId, ...chunk]);
+    statements.push({
+      sql: `DELETE FROM document_citations WHERE doc_id = ? AND citation_id IN (${placeholders})`,
+      args: [docId, ...chunk],
+    });
+  }
+  if (statements.length) {
+    if (!getDatabaseUrl().startsWith('file:')) {
+      // Production libSQL/Turso path: publish the complete link set atomically.
+      await client.batch(statements, 'write');
+    } else {
+      // The embedded sqlite adapter cannot commit a batch while a diagnostic
+      // result iterator (notably EXPLAIN QUERY PLAN in tests/admin tooling) is
+      // live on the same connection. Apply the idempotent set locally and restore
+      // the exact previous links if a statement fails.
+      try {
+        for (const statement of statements) {
+          // eslint-disable-next-line no-await-in-loop
+          await client.execute(statement);
+        }
+      } catch (error) {
+        try {
+          for (const citationId of existingIds) {
+            // eslint-disable-next-line no-await-in-loop
+            await client.execute({
+              sql: `
+                INSERT INTO document_citations (doc_id, citation_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
+              `,
+              args: [docId, citationId, now],
+            });
+          }
+          const placeholders = existingIds.map(() => '?').join(', ');
+          await client.execute({
+            sql: existingIds.length
+              ? `DELETE FROM document_citations WHERE doc_id = ? AND citation_id NOT IN (${placeholders})`
+              : 'DELETE FROM document_citations WHERE doc_id = ?',
+            args: [docId, ...existingIds],
+          });
+        } catch (restoreError) {
+          logger.error('Failed to restore citation links after local swap error', {
+            docId,
+            error: restoreError?.message || String(restoreError),
+          });
+        }
+        throw error;
+      }
+    }
   }
   await collectOrphanedCitations(stale);
 }
@@ -4223,6 +4304,101 @@ export async function listPendingCitationExtractions({
     String(parserVersion || 'citation-v1'),
     Math.max(1, Math.min(1000, Number(limit) || 100)),
   ]);
+}
+
+// Selection gate shared by `listPendingCitationScans` and
+// `countPendingCitationScans`, factored out so the two never drift. Returns just
+// an SQL fragment (appended after the `content_source`/checksum requirement);
+// every clause is a literal comparison against the 1:1 `ces` row, so the gate
+// binds no args of its own.
+//
+// Scan-once, and parser-version-independent by design. A document that has a
+// terminal citation record — any `document_citations` rows, or a `completed`
+// state row, or a `failed` state row — is NOT reselected automatically, and a
+// citation-parser/GROBID version bump changes nothing about selection. The only
+// ways to reconsider a document are the explicit UI options: `retryFailures`
+// drops the failed exclusion and overrides legacy partial links for a document
+// explicitly recorded as failed, while `reprocess`
+// drops every gate so all streamable in-scope documents are reselected — its
+// re-extraction safely replaces existing citations (reextractDocumentCitations →
+// replaceDocumentCitationLinks), so no manual clearing is needed. `reprocess`
+// implies `retryFailures`. This keeps a parser upgrade from silently
+// re-downloading the corpus; a deliberate `reprocess` run is the one path that
+// re-scans already-scanned documents.
+function citationScanGate({ retryFailures = false, reprocess = false }) {
+  if (reprocess) return '';
+  const clauses = ["AND COALESCE(ces.status, '') <> 'completed'"];
+  if (retryFailures) {
+    // A failed extraction may predate the atomic link-swap implementation and
+    // have left partial links. An explicit retry must be able to repair it while
+    // ordinary citation-bearing documents remain protected from re-scanning.
+    clauses.push(`AND (
+        COALESCE(ces.status, '') = 'failed'
+        OR NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = d.doc_id)
+      )`);
+  } else {
+    clauses.push("AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = d.doc_id)");
+    clauses.push("AND COALESCE(ces.status, '') <> 'failed'");
+  }
+  return clauses.join('\n      ');
+}
+
+// Selection for the re-streaming citation scan job. Unlike
+// `listPendingCitationExtractions`, this deliberately requires NO cached bytes
+// (the scan re-streams the PDF). A document qualifies when it recorded a
+// successful streamed content download at import (`content_source =
+// 'streamed_pdf'` with a checksum) and passes the scan-once gates above (unless
+// `reprocess` forces every streamable in-scope document to be reselected).
+export async function listPendingCitationScans({
+  limit = 50, afterDocId = '', syncKey = null, filters: requestedFilters = {},
+  retryFailures = false, reprocess = false,
+} = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  const gateSql = citationScanGate({ retryFailures, reprocess });
+  const args = [
+    ...filters.args,
+    String(afterDocId || ''),
+    Math.max(1, Math.min(1000, Number(limit) || 50)),
+  ];
+  return all(`
+    SELECT d.doc_id, d.metadata_json,
+           COALESCE(fm.content_checksum, fm.updated_at, '') AS content_checksum,
+           fm.content_source
+    FROM documents d
+    JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN citation_extraction_state ces ON ces.doc_id = d.doc_id
+    ${filters.where}
+    ${qualifier} d.doc_id > ?
+      AND fm.content_source = 'streamed_pdf'
+      AND COALESCE(fm.content_checksum, '') <> ''
+      ${gateSql}
+    ORDER BY d.doc_id
+    LIMIT ?
+  `, args);
+}
+
+// Corpus-wide count of documents the citation scan would process, for the
+// preview affordance and the schedule status card. Mirrors the selection above
+// without the cursor or limit.
+export async function countPendingCitationScans({
+  syncKey = null, filters: requestedFilters = {},
+  retryFailures = false, reprocess = false,
+} = {}) {
+  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  const gateSql = citationScanGate({ retryFailures, reprocess });
+  const row = await get(`
+    SELECT COUNT(*) AS total
+    FROM documents d
+    JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN citation_extraction_state ces ON ces.doc_id = d.doc_id
+    ${filters.where}
+    ${qualifier} fm.content_source = 'streamed_pdf'
+      AND COALESCE(fm.content_checksum, '') <> ''
+      ${gateSql}
+  `, filters.args);
+  return Number(row?.total || 0);
 }
 
 export async function saveCitationExtractionState(docId, {
