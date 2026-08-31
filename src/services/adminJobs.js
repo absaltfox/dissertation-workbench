@@ -5,9 +5,12 @@ import { BERTOPIC_PYTHON_COMMAND, BERTOPIC_TIMEOUT_MS, SQLITE_PATH } from '../co
 import {
   appendAdminJobLog,
   claimAdminJob,
+  finishClaimedAdminJob,
   getAdminJob,
   getTopicBuildStatus,
+  updateClaimedAdminJob,
   updateAdminJob,
+  updateClaimedAdminJobProgress,
   updateAdminJobProgress,
 } from '../db.js';
 import { isCatalogueLookupCancelledError, runPendingCatalogueLookups } from '../catalogue.js';
@@ -35,6 +38,7 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
     type: 'catalogue_lookup',
     controller,
   });
+  let executionId = null;
 
   let lastProgressWriteAt = 0;
   const writeProgress = async ({
@@ -51,7 +55,7 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
     if (!isMilestone && now - lastProgressWriteAt < 5_000) return;
     lastProgressWriteAt = now;
     const status = phase === 'complete' ? 'completed' : 'running';
-    await updateAdminJobProgress(id, {
+    const progress = {
       phase,
       currentTask: 'Z39.50 catalogue lookup',
       tasks: [{
@@ -78,12 +82,16 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
         skipped: stats.skipped || 0,
         failed: stats.failed || 0,
       },
-    });
+    };
+    if (executionId) await updateClaimedAdminJobProgress(id, executionId, progress);
+    else await updateAdminJobProgress(id, progress);
   };
 
   (async () => {
-    await claimAdminJob(id, runnerId);
-    await updateAdminJob(id, {
+    const claimed = await claimAdminJob(id, runnerId);
+    if (!claimed) throw new Error(`Catalogue lookup job ${id} could not be claimed`);
+    executionId = claimed.executionId;
+    await updateClaimedAdminJob(id, executionId, {
       runnerType: 'in_process',
       runnerId,
       runnerState: 'starting',
@@ -108,7 +116,7 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
         stats,
       });
       await appendAdminJobLog(jobId, `Catalogue lookup completed: ${stats.processed || 0} processed, ${stats.found || 0} found, ${stats.notFound || 0} not found, ${stats.skipped || 0} skipped, ${stats.failed || 0} failed.\n`);
-      await updateAdminJob(jobId, {
+      await finishClaimedAdminJob(jobId, executionId, {
         status: 'completed',
         result: stats,
         runnerState: 'completed',
@@ -118,7 +126,7 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
     .catch(async (error) => {
       if (isCatalogueLookupCancelledError(error)) {
         const now = new Date().toISOString();
-        await updateAdminJob(jobId, {
+        await finishClaimedAdminJob(jobId, executionId, {
           status: 'cancelled',
           error: null,
           runnerState: 'cancelled',
@@ -127,7 +135,7 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
         });
         return;
       }
-      await updateAdminJob(jobId, {
+      await finishClaimedAdminJob(jobId, executionId, {
         status: 'failed',
         error: error?.message || String(error),
         result: error?.stats || null,

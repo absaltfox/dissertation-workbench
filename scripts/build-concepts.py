@@ -17,6 +17,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -204,24 +205,40 @@ def get_db_client(db_path):
 
 
 class JobReporter:
-    def __init__(self, client, job_id):
+    def __init__(self, client, job_id, execution_id=None):
         self.client = client
         self.job_id = int(job_id) if job_id else None
+        self.execution_id = execution_id
         self.tasks = []
         self.task_index = {}
+
+    def assert_owned(self):
+        if not self.job_id:
+            return
+        result = self.client.execute(
+            "SELECT status, execution_id, finished_at FROM admin_jobs WHERE id = ?",
+            [self.job_id],
+        )
+        row = result.rows[0] if result.rows else None
+        if not row or row["status"] != "running" or row["finished_at"] or row["execution_id"] != self.execution_id:
+            raise RuntimeError("Admin job execution lease is no longer active")
 
     def append_log(self, text):
         print(text, end="" if text.endswith("\n") else "\n")
         if not self.job_id:
             return
+        self.assert_owned()
         self.client.execute(
-            "UPDATE admin_jobs SET log = COALESCE(log, '') || ? WHERE id = ?",
-            [text if text.endswith("\n") else text + "\n", self.job_id],
+            "UPDATE admin_jobs SET log = COALESCE(log, '') || ? "
+            "WHERE id = ? AND execution_id = ? AND status = 'running' AND finished_at IS NULL",
+            [text if text.endswith("\n") else text + "\n", self.job_id, self.execution_id],
         )
+        self.assert_owned()
 
     def report(self, key, label, status="running", detail=None, counts=None, next_task=None):
         if not self.job_id:
             return
+        self.assert_owned()
         task = {
             "key": key,
             "label": label,
@@ -244,18 +261,26 @@ class JobReporter:
         }
         now = datetime.now(timezone.utc).isoformat()
         self.client.execute(
-            "UPDATE admin_jobs SET progress_json = ?, runner_state = ?, heartbeat_at = ? WHERE id = ?",
-            [json.dumps(progress), current_task, now, self.job_id],
+            "UPDATE admin_jobs SET progress_json = ?, runner_state = ?, heartbeat_at = ? "
+            "WHERE id = ? AND execution_id = ? AND status = 'running' AND finished_at IS NULL",
+            [json.dumps(progress), current_task, now, self.job_id, self.execution_id],
         )
+        self.assert_owned()
 
     def finish(self, status, result=None, error=None):
         if not self.job_id:
             return
         now = datetime.now(timezone.utc).isoformat()
         self.client.execute(
-            "UPDATE admin_jobs SET status = ?, runner_state = ?, result_json = ?, error = ?, finished_at = ?, artifact_token_hash = NULL WHERE id = ?",
-            [status, status, json.dumps(result) if result is not None else None, error, now, self.job_id],
+            "UPDATE admin_jobs SET status = ?, runner_state = ?, result_json = ?, error = ?, finished_at = ?, "
+            "artifact_token_hash = NULL, execution_id = NULL "
+            "WHERE id = ? AND execution_id = ? AND status = 'running' AND finished_at IS NULL",
+            [status, status, json.dumps(result) if result is not None else None, error, now, self.job_id, self.execution_id],
         )
+        row_result = self.client.execute("SELECT status, execution_id FROM admin_jobs WHERE id = ?", [self.job_id])
+        row = row_result.rows[0] if row_result.rows else None
+        if not row or row["status"] != status or row["execution_id"] is not None:
+            raise RuntimeError("Admin job terminal state was rejected because its execution lease was revoked")
 
 
 def normalize_text(value):
@@ -798,14 +823,24 @@ def upload_concept_artifact(artifact):
         return json.loads(res.read().decode("utf-8"))
 
 
-def claim_job(client, job_id):
+def claim_job(client, job_id, execution_id=None):
     if not job_id:
-        return
+        return None
+    execution_id = execution_id or str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     client.execute(
-        "UPDATE admin_jobs SET claimed_at = COALESCE(claimed_at, ?), runner_state = 'running', heartbeat_at = ? WHERE id = ? AND status = 'running'",
-        [now, now, int(job_id)],
+        "UPDATE admin_jobs SET claimed_at = ?, execution_id = ?, runner_state = 'running', heartbeat_at = ? "
+        "WHERE id = ? AND status = 'running' AND finished_at IS NULL AND claimed_at IS NULL",
+        [now, execution_id, now, int(job_id)],
     )
+    result = client.execute(
+        "SELECT status, execution_id, finished_at FROM admin_jobs WHERE id = ?",
+        [int(job_id)],
+    )
+    row = result.rows[0] if result.rows else None
+    if not row or row["status"] != "running" or row["finished_at"] or row["execution_id"] != execution_id:
+        raise RuntimeError("Admin job could not be claimed by this concept worker execution")
+    return execution_id
 
 
 def utc_now():
@@ -1811,8 +1846,8 @@ def main():
 
     client = get_db_client(db_path)
     job_id = os.environ.get("ADMIN_JOB_ID")
-    claim_job(client, job_id)
-    reporter = JobReporter(client, job_id)
+    execution_id = claim_job(client, job_id, os.environ.get("ADMIN_JOB_EXECUTION_ID"))
+    reporter = JobReporter(client, job_id, execution_id)
 
     selected = None
     try:
@@ -1841,6 +1876,7 @@ def main():
                 )
             merged_artifact = merge_partition_artifacts(client)
             log_merge_fanin(reporter, merged_artifact)
+            reporter.assert_owned()
             upload_concept_artifact(merged_artifact)
             mark_global_published(client)
             result = {
@@ -2097,6 +2133,7 @@ def main():
             },
         )
         if should_publish:
+            reporter.assert_owned()
             upload_concept_artifact(merged_artifact)
             mark_global_published(client)
         elif not selected["publishGlobally"]:
@@ -2125,6 +2162,15 @@ def main():
         reporter.finish("completed", result=result)
     except Exception as exc:
         message = str(exc)
+        try:
+            reporter.assert_owned()
+        except RuntimeError:
+            print(
+                f"PatternRank concept worker stopped after its execution lease was revoked: {message}",
+                file=sys.stderr,
+            )
+            client.close()
+            sys.exit(1)
         if selected and selected.get("key"):
             client.execute(
                 "UPDATE concept_partitions SET status = 'failed', error = ?, updated_at = ? WHERE partition_key = ?",

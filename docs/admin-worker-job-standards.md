@@ -25,12 +25,16 @@ The web app is responsible for:
 
 The worker is responsible for:
 
-- claiming the job with `claimAdminJob(jobId, runnerId)`;
-- heartbeating while work is active;
-- writing progress updates at meaningful intervals;
+- claiming the job with `claimAdminJob(jobId, runnerId, executionId)` and retaining the returned opaque `executionId`;
+- heartbeating through the claimed-job API while work is active;
+- writing progress updates at meaningful intervals through the claimed-job API;
 - appending human-readable logs;
 - writing durable output;
-- finishing the job with `completed`, `failed`, `timed_out`, or `cancelled`.
+- finishing through `finishClaimedAdminJob` with `completed`, `failed`, `timed_out`, or `cancelled`.
+
+Worker progress and terminal writes must match both `execution_id` and the expected
+non-terminal `running` state. Administrative cancellation and stale-job reaping
+revoke the execution ID, so an orphaned worker cannot publish late success.
 
 New worker-backed job types should be routed through `src/jobWorker.js` or a Python worker entrypoint that follows the same database contract. Do not hide heavyweight work inside a synchronous HTTP handler.
 

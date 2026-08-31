@@ -8,8 +8,8 @@ import {
   FLY_WORKER_REGION, IS_PRODUCTION, WORKER_IMAGE
 } from '../config.js';
 import {
-  appendAdminJobLog, createAdminJob, finishAdminJob, getAdminJob, hashAdminJobToken,
-  updateAdminJob
+  appendAdminJobLog, createAdminJob, finishAdminJob, finishRunningAdminJob, getAdminJob, hashAdminJobToken,
+  updateRunningAdminJob
 } from '../db.js';
 
 const localChildren = new Map();
@@ -80,7 +80,9 @@ async function resolveWorkerImage() {
   return image;
 }
 
-export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = ADMIN_WORKER_TIMEOUT_MS, jobType = null }) {
+export function buildFlyWorkerMachinePayload({
+  image, jobId, token, executionId = '', timeoutMs = ADMIN_WORKER_TIMEOUT_MS, jobType = null
+}) {
   const isBertopic = jobType === 'bertopic';
   const isTopicLabels = jobType === 'topic_labels';
   const isConceptRebuild = jobType === 'concept_rebuild';
@@ -103,6 +105,7 @@ export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = 
   const env = {
     ADMIN_JOB_ID: String(jobId),
     ADMIN_JOB_ARTIFACT_TOKEN: token,
+    ADMIN_JOB_EXECUTION_ID: executionId,
     ADMIN_WORKER_TIMEOUT_MS: String(timeoutMs),
     DOCUMENT_SYNC_ENABLED: '0',
     DOCUMENT_SYNC_ON_START: '0',
@@ -156,15 +159,15 @@ export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = 
   };
 }
 
-async function startFlyWorker(jobId, token) {
+async function startFlyWorker(jobId, token, executionId) {
   const job = await getAdminJob(jobId);
   const image = await resolveWorkerImage();
-  const payload = buildFlyWorkerMachinePayload({ image, jobId, token, jobType: job?.type });
+  const payload = buildFlyWorkerMachinePayload({ image, jobId, token, executionId, jobType: job?.type });
   const machine = await flyRequest(`/v1/apps/${encodeURIComponent(FLY_APP_NAME)}/machines`, {
     method: 'POST',
     body: JSON.stringify(payload),
   });
-  await updateAdminJob(jobId, {
+  await updateRunningAdminJob(jobId, {
     runnerType: 'fly',
     runnerId: machine?.id || null,
     runnerState: machine?.state || 'created',
@@ -173,28 +176,43 @@ async function startFlyWorker(jobId, token) {
   return machine;
 }
 
-function startLocalWorker(jobId, token) {
+function startLocalWorker(jobId, token, executionId) {
   const child = spawn(process.execPath, ['src/jobWorker.js'], {
     cwd: process.cwd(),
     env: {
       ...process.env,
       ADMIN_JOB_ID: String(jobId),
       ADMIN_JOB_ARTIFACT_TOKEN: token,
+      ADMIN_JOB_EXECUTION_ID: executionId,
       ADMIN_WORKER_TIMEOUT_MS: String(ADMIN_WORKER_TIMEOUT_MS),
       DOCUMENT_SYNC_ENABLED: '0',
       DOCUMENT_SYNC_ON_START: '0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const timer = setTimeout(async () => {
-    await appendAdminJobLog(jobId, 'Local worker timed out; terminating process.\n');
-    child.kill('SIGTERM');
-    setTimeout(() => child.kill('SIGKILL'), ADMIN_WORKER_GRACE_MS).unref();
+  const timer = setTimeout(() => {
+    void (async () => {
+      try {
+        await finishRunningAdminJob(jobId, {
+          status: 'timed_out',
+          runnerState: 'timed_out',
+          error: 'Local admin worker timed out.',
+          finishedAt: new Date().toISOString(),
+        });
+      } catch (error) {
+        await appendAdminJobLog(jobId, `Could not publish local worker timeout: ${error?.message || String(error)}\n`).catch(() => {});
+      }
+      await appendAdminJobLog(jobId, 'Local worker timed out; terminating process.\n').catch(() => {});
+      child.kill('SIGTERM');
+      setTimeout(() => {
+        if (child.exitCode == null && child.signalCode == null) child.kill('SIGKILL');
+      }, ADMIN_WORKER_GRACE_MS).unref();
+    })();
   }, ADMIN_WORKER_TIMEOUT_MS);
   timer.unref();
 
   localChildren.set(jobId, { child, timer });
-  updateAdminJob(jobId, {
+  updateRunningAdminJob(jobId, {
     runnerType: 'local',
     runnerId: String(child.pid || ''),
     runnerState: 'running',
@@ -204,13 +222,14 @@ function startLocalWorker(jobId, token) {
   child.on('close', async (code, signal) => {
     clearTimeout(timer);
     localChildren.delete(jobId);
-    await updateAdminJob(jobId, { runnerState: signal ? `exited:${signal}` : `exited:${code}` });
+    await updateRunningAdminJob(jobId, { runnerState: signal ? `exited:${signal}` : `exited:${code}` });
   });
   return child;
 }
 
 export async function createAndStartAdminWorkerJob({ type, label, params = null }) {
   const token = crypto.randomBytes(32).toString('hex');
+  const executionId = crypto.randomUUID();
   let runnerType;
   try {
     runnerType = shouldUseFly() ? 'fly' : 'local';
@@ -227,9 +246,9 @@ export async function createAndStartAdminWorkerJob({ type, label, params = null 
   });
   try {
     if (runnerType === 'fly') {
-      await startFlyWorker(jobId, token);
+      await startFlyWorker(jobId, token, executionId);
     } else {
-      startLocalWorker(jobId, token);
+      startLocalWorker(jobId, token, executionId);
     }
   } catch (error) {
     await finishAdminJob(jobId, {
@@ -255,7 +274,7 @@ export async function cancelAdminWorkerJob(jobId) {
       });
     } catch (error) {
       await appendAdminJobLog(jobId, `Fly worker destroy failed: ${error?.message || String(error)}\n`);
-      await updateAdminJob(jobId, { runnerState: 'kill_failed' });
+      await updateRunningAdminJob(jobId, { runnerState: 'kill_failed' });
       return { ok: false, error: `Fly worker destroy failed: ${error?.message || String(error)}` };
     }
   }
@@ -264,19 +283,27 @@ export async function cancelAdminWorkerJob(jobId) {
     const entry = localChildren.get(Number(jobId));
     if (entry?.child) {
       entry.child.kill('SIGTERM');
-      setTimeout(() => entry.child.kill('SIGKILL'), ADMIN_WORKER_GRACE_MS).unref();
+      setTimeout(() => {
+        if (entry.child.exitCode == null && entry.child.signalCode == null) entry.child.kill('SIGKILL');
+      }, ADMIN_WORKER_GRACE_MS).unref();
       clearTimeout(entry.timer);
       localChildren.delete(Number(jobId));
     }
   }
 
   const now = new Date().toISOString();
-  await finishAdminJob(jobId, {
+  const cancelled = await finishRunningAdminJob(jobId, {
     status: 'cancelled',
     runnerState: 'cancelled',
     cancelledAt: now,
     finishedAt: now,
   });
+  if (!cancelled) {
+    const current = await getAdminJob(jobId);
+    if (current?.status !== 'cancelled') {
+      return { ok: false, error: `Job reached ${current?.status || 'an unknown state'} before cancellation was published` };
+    }
+  }
   await appendAdminJobLog(jobId, 'Job cancelled by administrator.\n');
   return { ok: true };
 }

@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { EventEmitter } from 'node:events';
 
 const execFileAsync = promisify(execFile);
 let testDataDir;
@@ -33,6 +34,7 @@ let heartbeatAdminJob;
 let hasRunningAdminJob;
 let updateAdminJob;
 let finishAdminJob;
+let finishClaimedAdminJob;
 let getDb;
 let loadDocumentCitations;
 let loadDocumentMetadata;
@@ -54,6 +56,7 @@ let selectTopicLabelCandidate;
 let updateTopicManualLabel;
 let deleteTopicLabelOverride;
 let validateAdminJobArtifactToken;
+let updateClaimedAdminJobProgress;
 
 async function writeTextPdf(filePath, lines) {
   const escapedLines = lines.map((line) => String(line).replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)'));
@@ -158,6 +161,7 @@ test.before(async () => {
     heartbeatAdminJob,
     hasRunningAdminJob,
     finishAdminJob,
+    finishClaimedAdminJob,
     getDb,
     loadDocumentCitations,
     loadDocumentMetadata,
@@ -179,6 +183,7 @@ test.before(async () => {
     updateTopicManualLabel,
     deleteTopicLabelOverride,
     updateAdminJob,
+    updateClaimedAdminJobProgress,
     validateAdminJobArtifactToken,
   } = await import('../src/db.js'));
 });
@@ -193,6 +198,7 @@ test('Fly worker machine payload is private, one-shot, and job-scoped', () => {
     image: 'registry.fly.io/dissertation-workbench:deployment-123',
     jobId: 42,
     token: 'secret-token',
+    executionId: 'worker-execution-42',
     timeoutMs: 12345,
   });
 
@@ -203,6 +209,7 @@ test('Fly worker machine payload is private, one-shot, and job-scoped', () => {
   assert.deepEqual(payload.config.init.exec, ['node', 'src/jobWorker.js']);
   assert.equal(payload.config.env.ADMIN_JOB_ID, '42');
   assert.equal(payload.config.env.ADMIN_JOB_ARTIFACT_TOKEN, 'secret-token');
+  assert.equal(payload.config.env.ADMIN_JOB_EXECUTION_ID, 'worker-execution-42');
   assert.equal(payload.config.env.ADMIN_WORKER_TIMEOUT_MS, '12345');
   assert.equal(payload.config.env.DOCUMENT_SYNC_ENABLED, '0');
   assert.equal(payload.config.metadata.role, 'admin-worker');
@@ -368,6 +375,100 @@ test('admin worker job lifecycle helpers claim once, heartbeat, log, and validat
 
   await finishAdminJob(jobId, { status: 'completed', runnerState: 'completed' });
   assert.equal(await validateAdminJobArtifactToken(jobId, token, { docId: 'lifecycle-doc' }), false);
+});
+
+test('claimed job updates require the current execution lease and a running status', async () => {
+  const jobId = await createAdminJob({
+    type: 'lease_fence_test',
+    label: 'Lease fence test',
+    timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const claimed = await claimAdminJob(jobId, 'runner-a', 'execution-a');
+  assert.equal(claimed.executionId, 'execution-a');
+
+  assert.equal(await updateClaimedAdminJobProgress(jobId, 'execution-stale', {
+    phase: 'stale', currentTask: 'Stale worker',
+  }), false);
+  assert.equal((await getAdminJob(jobId)).progress, null);
+
+  assert.equal(await updateClaimedAdminJobProgress(jobId, 'execution-a', {
+    phase: 'owned', currentTask: 'Current worker',
+  }), true);
+  assert.equal((await getAdminJob(jobId)).progress.phase, 'owned');
+
+  const cancelledAt = new Date().toISOString();
+  await finishAdminJob(jobId, {
+    status: 'cancelled', runnerState: 'cancelled', cancelledAt, finishedAt: cancelledAt,
+  });
+  assert.equal(await finishClaimedAdminJob(jobId, 'execution-a', {
+    status: 'completed', runnerState: 'completed', result: { late: true },
+  }), false);
+  assert.equal(await updateClaimedAdminJobProgress(jobId, 'execution-a', {
+    phase: 'late_success', currentTask: 'Late success',
+  }), false);
+  const terminal = await getAdminJob(jobId);
+  assert.equal(terminal.status, 'cancelled');
+  assert.equal(terminal.result, null);
+  assert.equal(terminal.progress.phase, 'owned');
+  assert.equal(terminal.executionId, null);
+});
+
+test('stale-job reaper wins its CAS against a late worker completion', async () => {
+  const jobId = await createAdminJob({
+    type: 'reaper_lease_race_test',
+    label: 'Reaper lease race',
+    timeoutAt: new Date(Date.now() - 1_000).toISOString(),
+  });
+  await claimAdminJob(jobId, 'late-runner', 'late-execution');
+
+  assert.equal(await hasRunningAdminJob('reaper_lease_race_test'), null);
+  assert.equal(await finishClaimedAdminJob(jobId, 'late-execution', {
+    status: 'completed', result: { shouldNotPublish: true }, runnerState: 'completed',
+  }), false);
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'timed_out');
+  assert.equal(job.result, null);
+  assert.equal(job.executionId, null);
+});
+
+test('terminal failure publication survives cleanup failures and reports them separately', async () => {
+  const { publishTerminalFailure } = await import('../src/services/workerLifecycle.js');
+  const events = [];
+  const result = await publishTerminalFailure({
+    finish: async (patch) => {
+      events.push(['finish', patch.status]);
+      return true;
+    },
+    failRollout: async () => { throw new Error('rollout cleanup exploded'); },
+    appendLog: async () => { throw new Error('terminal log exploded'); },
+    onCleanupError: async (context, error) => events.push(['cleanup', context, error.message]),
+  }, { error: new Error('worker exploded'), status: 'failed' });
+
+  assert.deepEqual(events[0], ['finish', 'failed']);
+  assert.equal(result.published, true);
+  assert.equal(result.cleanupErrors.length, 2);
+  assert.match(events[1][2], /rollout cleanup exploded/);
+  assert.match(events[2][2], /terminal log exploded/);
+});
+
+test('worker child termination escalates from SIGTERM to SIGKILL after the grace bound', async () => {
+  const { terminateChild } = await import('../src/services/workerLifecycle.js');
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    signals = [];
+    kill(signal) {
+      this.signals.push(signal);
+      if (signal === 'SIGKILL') {
+        this.signalCode = signal;
+        queueMicrotask(() => this.emit('close', null, signal));
+      }
+      return true;
+    }
+  }
+  const child = new FakeChild();
+  await terminateChild(child, { graceMs: 5, forceWaitMs: 20 });
+  assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
 });
 
 test('expired running admin jobs are timed out before they block new jobs', async () => {

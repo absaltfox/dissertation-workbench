@@ -1,49 +1,80 @@
 import {
-  appendAdminJobLog, claimAdminJob, closeDb, ensureStorage, finishAdminJob, getAdminJob,
-  failEnrichmentRolloutForJob, heartbeatAdminJob, updateAdminJob
+  appendAdminJobLog, claimAdminJob, closeDb, ensureStorage, finishClaimedAdminJob, getAdminJob,
+  failEnrichmentRolloutForJob, heartbeatClaimedAdminJob,
 } from './db.js';
-import { ADMIN_WORKER_TIMEOUT_MS } from './config.js';
+import { ADMIN_WORKER_GRACE_MS, ADMIN_WORKER_TIMEOUT_MS } from './config.js';
 import { createWorkerArtifactClientFromEnv } from './workerArtifacts.js';
 import { runImportPdfAdminJob } from './services/importPdfJobRunner.js';
 import { runThemeRecomputeAdminJob } from './services/themeJobRunner.js';
+import { publishTerminalFailure, terminateChild } from './services/workerLifecycle.js';
 
 const jobId = Number(process.env.ADMIN_JOB_ID || 0);
-let finished = false;
+let executionId = process.env.ADMIN_JOB_EXECUTION_ID || null;
+let hasLease = false;
+let activeChild = null;
+let terminalPublication = null;
+let shutdown = null;
 
-async function finishFailure(error, status = 'failed') {
-  if (!jobId || finished) return;
-  finished = true;
-  const message = error?.message || String(error);
-  await failEnrichmentRolloutForJob(jobId, error);
-  await appendAdminJobLog(jobId, `Worker ${status}: ${message}\n`);
-  const now = new Date().toISOString();
-  await finishAdminJob(jobId, {
-    status,
-    runnerState: status,
-    error: message,
-    finishedAt: now,
-  });
+async function recordCleanupFailure(context, error) {
+  const message = `${context}: ${error?.message || String(error)}`;
+  console.error(message);
+  if (!jobId) return;
+  try {
+    await appendAdminJobLog(jobId, `[worker cleanup warning] ${message}\n`);
+  } catch (logError) {
+    console.error(`Could not record cleanup warning: ${logError?.message || String(logError)}`);
+  }
+}
+
+async function publishFailure(error, status = 'failed') {
+  if (!jobId || !executionId || !hasLease) return false;
+  if (terminalPublication) return terminalPublication;
+  terminalPublication = publishTerminalFailure({
+    finish: (patch) => finishClaimedAdminJob(jobId, executionId, patch),
+    failRollout: (failure) => failEnrichmentRolloutForJob(jobId, failure),
+    appendLog: (line) => appendAdminJobLog(jobId, line),
+    onCleanupError: recordCleanupFailure,
+  }, { error, status }).then(({ published }) => published);
+  return terminalPublication;
+}
+
+async function stopActiveChild() {
+  const child = activeChild;
+  if (!child) return;
+  await terminateChild(child, { graceMs: ADMIN_WORKER_GRACE_MS });
 }
 
 async function main() {
   if (!jobId) throw new Error('ADMIN_JOB_ID is required');
   await ensureStorage();
 
-  const claimed = await claimAdminJob(jobId, process.env.FLY_MACHINE_ID || String(process.pid));
+  const claimed = await claimAdminJob(
+    jobId,
+    process.env.FLY_MACHINE_ID || String(process.pid),
+    executionId || undefined,
+  );
   if (!claimed) {
     const existing = await getAdminJob(jobId);
     throw new Error(existing ? `Job ${jobId} could not be claimed (${existing.status})` : `Job ${jobId} not found`);
   }
+  executionId = claimed.executionId;
+  hasLease = true;
 
   await appendAdminJobLog(jobId, `Worker claimed job ${jobId}.\n`);
   const heartbeat = setInterval(() => {
-    heartbeatAdminJob(jobId, null).catch(() => {});
+    heartbeatClaimedAdminJob(jobId, executionId, null).catch(() => {});
   }, 15_000);
   heartbeat.unref();
 
+  let timeoutTimer;
   const timeout = new Promise((_, reject) => {
-    const timer = setTimeout(() => reject(new Error('Admin worker timed out')), ADMIN_WORKER_TIMEOUT_MS);
-    timer.unref();
+    timeoutTimer = setTimeout(() => {
+      const error = new Error('Admin worker timed out');
+      error.workerStatus = 'timed_out';
+      error.exitCode = 124;
+      reject(error);
+    }, ADMIN_WORKER_TIMEOUT_MS);
+    timeoutTimer.unref();
   });
 
   let run;
@@ -68,14 +99,19 @@ async function main() {
         cwd: path.join(__dirname, '..'),
         env: {
           ...process.env,
+          ADMIN_JOB_EXECUTION_ID: executionId,
         },
       });
+      activeChild = child;
       child.stdout.on('data', (chunk) => appendAdminJobLog(jobId, chunk.toString()).catch(() => {}));
       child.stderr.on('data', (chunk) => appendAdminJobLog(jobId, chunk.toString()).catch(() => {}));
-      child.on('error', (err) => reject(err));
-      child.on('close', (code) => {
+      child.on('error', reject);
+      child.on('close', (code, signal) => {
+        if (activeChild === child) activeChild = null;
         if (code === 0) resolve();
-        else reject(new Error(`Local Python process exited with code ${code}`));
+        else reject(new Error(signal
+          ? `Local Python process exited from ${signal}`
+          : `Local Python process exited with code ${code}`));
       });
     });
   } else if (claimed.type === 'theme_recompute') {
@@ -88,34 +124,68 @@ async function main() {
 
   try {
     await Promise.race([run, timeout]);
-    finished = true;
-    await updateAdminJob(jobId, { runnerState: 'completed', heartbeatAt: new Date().toISOString() });
+    // Some runners publish their own rich result. This is a safe fallback for
+    // runners (and Python versions) that only return success to the supervisor.
+    const current = await getAdminJob(jobId);
+    if (current?.status === 'running') {
+      await finishClaimedAdminJob(jobId, executionId, {
+        status: 'completed',
+        runnerState: 'completed',
+        error: null,
+      });
+    }
     await appendAdminJobLog(jobId, `Worker completed job ${jobId}.\n`);
   } catch (error) {
-    const status = error?.message === 'Admin worker timed out' ? 'timed_out' : 'failed';
-    await finishFailure(error, status);
-    await closeDb().catch(() => {});
-    process.exit(status === 'timed_out' ? 124 : 1);
+    await stopActiveChild();
+    const status = error?.workerStatus || 'failed';
+    await publishFailure(error, status);
+    error.exitCode = error.exitCode || (status === 'timed_out' ? 124 : 1);
+    throw error;
   } finally {
     clearInterval(heartbeat);
+    clearTimeout(timeoutTimer);
   }
 }
 
-process.on('SIGTERM', () => {
-  finishFailure(new Error('Worker received SIGTERM'), 'cancelled')
-    .finally(() => process.exit(143));
-});
+async function handleSignal(signal, exitCode) {
+  if (shutdown) return shutdown;
+  shutdown = (async () => {
+    try {
+      await stopActiveChild();
+    } catch (error) {
+      await recordCleanupFailure(`Failed to terminate Python child after ${signal}`, error);
+    }
+    try {
+      await publishFailure(new Error(`Worker received ${signal}`), 'cancelled');
+    } catch (error) {
+      console.error(`Failed to publish signal cancellation: ${error?.message || String(error)}`);
+    }
+    try {
+      await closeDb();
+    } catch (error) {
+      console.error(`Failed to close worker database after ${signal}: ${error?.message || String(error)}`);
+    }
+    process.exit(exitCode);
+  })();
+  return shutdown;
+}
 
-process.on('SIGINT', () => {
-  finishFailure(new Error('Worker received SIGINT'), 'cancelled')
-    .finally(() => process.exit(130));
-});
+process.on('SIGTERM', () => { void handleSignal('SIGTERM', 143); });
+process.on('SIGINT', () => { void handleSignal('SIGINT', 130); });
 
 main()
   .catch(async (error) => {
-    await finishFailure(error, 'failed');
-    process.exitCode = 1;
+    try {
+      await publishFailure(error, error?.workerStatus || 'failed');
+    } catch (publicationError) {
+      console.error(`Failed to publish worker terminal state: ${publicationError?.message || String(publicationError)}`);
+    }
+    process.exitCode = error?.exitCode || 1;
   })
   .finally(async () => {
-    await closeDb().catch(() => {});
+    try {
+      await closeDb();
+    } catch (error) {
+      await recordCleanupFailure('Failed to close worker database', error);
+    }
   });
