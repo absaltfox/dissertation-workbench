@@ -26,6 +26,7 @@ let claimAdminJob;
 let clearAllCitations;
 let closeDb;
 let createAdminJob;
+let createAdminJobIfNotRunning;
 let ensureStorage;
 let getAdminJob;
 let hashAdminJobToken;
@@ -152,6 +153,7 @@ test.before(async () => {
     clearAllCitations,
     closeDb,
     createAdminJob,
+    createAdminJobIfNotRunning,
     ensureStorage,
     getAdminJob,
     hashAdminJobToken,
@@ -333,6 +335,21 @@ test('topic label candidates can be reviewed, selected, edited, unlocked, and bu
   await publishPassingTopicLabels();
   topic = (await listTopicLabelReviews()).topics.find((item) => item.topicId === 7001);
   assert.equal(topic.label, `Teacher Identity Practice ${suffix}`);
+});
+
+test('atomic citation job creation admits exactly one concurrent starter', async () => {
+  await ensureStorage();
+  const type = 'citation_scan';
+  const results = await Promise.all(Array.from({ length: 8 }, () => createAdminJobIfNotRunning({
+    type,
+    label: 'Concurrent citation scan',
+    params: { trigger: 'test' },
+    runnerType: 'local',
+  })));
+  const created = results.filter((result) => result.created);
+  assert.equal(created.length, 1);
+  assert.ok(results.every((result) => result.jobId === created[0].jobId));
+  await finishAdminJob(created[0].jobId, { status: 'completed', runnerState: 'completed' });
 });
 
 test('admin worker job lifecycle helpers claim once, heartbeat, log, and validate artifact token', async () => {
@@ -2348,6 +2365,12 @@ test('citation re-extraction publishes links atomically and preserves the last g
 
   const linked = await loadDocumentCitations(docId);
   assert.deepEqual(linked.map((row) => row.citation_text), [`Known, G. (2017). Last good citation. ${suffix}`]);
+  const state = await (await getDb()).execute({
+    sql: 'SELECT status, citation_count FROM citation_extraction_state WHERE doc_id = ?', args: [docId],
+  });
+  assert.equal(state.rows[0].status, 'failed');
+  assert.equal(Number(state.rows[0].citation_count), 1,
+    'a failed re-extraction remains explicitly retryable even with prior links');
 });
 
 test('strict citation failure preserves successful stream status and the attempted checksum', async () => {

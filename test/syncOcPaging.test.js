@@ -98,6 +98,8 @@ test('overlap detector logs when a page returns a doc id already seen this pass'
     // The detector counts the re-served id, without failing the run.
     assert.equal(result.duplicateDocIdsThisPass, 1,
       `expected exactly one detected overlap, got ${result.duplicateDocIdsThisPass}`);
+    assert.equal(result.upstreamUniqueSeen, 3, 'only distinct upstream ids count toward completion');
+    assert.equal(result.runStatus, 'incomplete', 'an overlap must not falsely satisfy the upstream total');
     assert.ok(
       warnings.some((args) => /already seen this pass/.test(args[0] || '')),
       'expected the overlap detector to log a warning'
