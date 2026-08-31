@@ -52,7 +52,7 @@ export async function getDb() {
     // idempotent, so retry the complete startup pass on SQLITE_BUSY instead of
     // letting a transient schema-read lock prevent a singleton claimant from
     // reaching its durable lease.
-    schemaReady = withDbRetry(() => ensureSchema(db), { label: 'ensureSchema' });
+    schemaReady = ensureSchemaWithRetry(db);
   }
   await schemaReady;
   return db;
@@ -175,11 +175,30 @@ async function exec(sql) {
   await client.executeMultiple(sql);
 }
 
-async function tryExec(client, sql) {
+// A few pre-IF-NOT-EXISTS migrations remain for databases that were created by
+// older releases.  Those statements may legitimately report that the named
+// schema object already exists.  Do not turn this into a general migration
+// error sink: a lock needs to reach ensureSchemaWithRetry, and any other error
+// (bad SQL, a missing table, an incompatible schema, etc.) must fail startup.
+function isAlreadyAppliedLegacyDdlError(error) {
+  const message = String(error?.message || '');
+  return /duplicate column name|(?:index|table)\s+.+\s+already exists/i.test(message);
+}
+
+export async function tryExec(client, sql, {
+  ignoreError = isAlreadyAppliedLegacyDdlError,
+} = {}) {
   try {
     await client.executeMultiple(sql);
-  } catch {
-    // Migration already applied or unsupported in the current database.
+    return true;
+  } catch (error) {
+    // Never swallow a database lock: getDb wraps the complete schema pass in
+    // a bounded retry, so this must propagate to that outer boundary.
+    if (classifyDbError(error) === 'transient') throw error;
+    if (ignoreError?.(error)) {
+      return false;
+    }
+    throw error;
   }
 }
 
@@ -712,6 +731,17 @@ async function ensureSchema(client) {
   if (cleaned > 0) logger.info(`Cleaned up ${cleaned} committee artefact rows`);
   await backfillDocumentPeopleProjection(client);
   await backfillSourceJsonProvenance(client);
+}
+
+// Exported for migration tests and for callers that need to initialise a
+// separately constructed client.  Keeping the retry around the complete,
+// idempotent schema pass means a lock at any migration statement restarts from
+// a known boundary and remains bounded by withDbRetry's maxAttempts.
+export function ensureSchemaWithRetry(client, retryOptions = {}) {
+  return withDbRetry(() => ensureSchema(client), {
+    label: 'ensureSchema',
+    ...retryOptions,
+  });
 }
 
 const SOURCE_JSON_TRIM_STATE_KEY = 'source_json_trim';
