@@ -6,10 +6,10 @@ import {
   appendAdminJobLog,
   claimAdminJob,
   finishClaimedAdminJob,
+  finishRunningAdminJob,
   getAdminJob,
   getTopicBuildStatus,
   updateClaimedAdminJob,
-  updateAdminJob,
   updateClaimedAdminJobProgress,
   updateAdminJobProgress,
 } from '../db.js';
@@ -149,23 +149,37 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
     });
 }
 
-export async function cancelInProcessAdminJob(jobId) {
+export async function cancelInProcessAdminJob(jobId, {
+  getJob = getAdminJob,
+  finishRunning = finishRunningAdminJob,
+} = {}) {
   const id = Number(jobId || 0);
   const running = runningInProcessAdminJobs.get(id);
   if (!running) return { ok: false, error: 'Job is not running in this process' };
 
-  const job = await getAdminJob(id);
+  const job = await getJob(id);
   if (!job) return { ok: false, error: 'Job not found' };
   if (job.status !== 'running') return { ok: false, error: 'Job is not running' };
 
-  running.controller.abort();
   const now = new Date().toISOString();
-  await updateAdminJob(id, {
+  const cancelled = await finishRunning(id, {
     status: 'cancelled',
     error: null,
+    runnerState: 'cancelled',
     cancelledAt: now,
     finishedAt: now,
   });
+  if (!cancelled) {
+    const current = await getJob(id);
+    return {
+      ok: false,
+      error: `Job reached ${current?.status || 'an unknown state'} before cancellation was published`,
+    };
+  }
+
+  // Publish cancellation (and revoke the worker's lease) before signalling the
+  // cooperative worker. A completion that wins the race must not be replaced.
+  running.controller.abort();
   await appendAdminJobLog(id, 'Job cancelled by administrator.\n');
   return { ok: true, jobId: id, cancelled: true };
 }

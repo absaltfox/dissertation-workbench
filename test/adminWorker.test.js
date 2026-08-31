@@ -471,6 +471,18 @@ test('worker child termination escalates from SIGTERM to SIGKILL after the grace
   assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
 });
 
+test('worker child termination does not signal a child that already exited', async () => {
+  const { terminateChild } = await import('../src/services/workerLifecycle.js');
+  const child = {
+    exitCode: 0,
+    signalCode: null,
+    kill() {
+      throw new Error('kill must not be called for an exited child');
+    },
+  };
+  await terminateChild(child, { graceMs: 5, forceWaitMs: 5 });
+});
+
 test('expired running admin jobs are timed out before they block new jobs', async () => {
   await ensureStorage();
   const token = `expired-worker-token-${Date.now()}`;
@@ -525,6 +537,54 @@ test('in-process catalogue lookup jobs can be cancelled cooperatively', async ()
   assert.ok(job.cancelledAt);
   assert.ok(job.finishedAt);
   assert.match(job.log, /cancelled by administrator/i);
+});
+
+test('in-process cancellation cannot overwrite a completion that wins its terminal CAS race', async () => {
+  await ensureStorage();
+  const jobId = await createAdminJob({
+    type: 'catalogue_lookup',
+    label: 'Catalogue Completion Race Test',
+    params: { limit: 5, pendingOnly: true },
+  });
+  let startedResolve;
+  const started = new Promise((resolve) => { startedResolve = resolve; });
+  let releaseLookup;
+  const lookupReleased = new Promise((resolve) => { releaseLookup = resolve; });
+
+  runCatalogueLookupJob(jobId, 5, {
+    runLookup: async () => {
+      startedResolve();
+      await lookupReleased;
+      return { processed: 0, found: 0, notFound: 0, skipped: 0, failed: 0 };
+    },
+  });
+
+  await started;
+  let reads = 0;
+  const result = await cancelInProcessAdminJob(jobId, {
+    getJob: async (id) => {
+      reads += 1;
+      if (reads === 1) {
+        const current = await getAdminJob(id);
+        await finishClaimedAdminJob(id, current.executionId, {
+          status: 'completed',
+          runnerState: 'completed',
+          result: { raced: true },
+        });
+        return { ...current, status: 'running', finishedAt: null };
+      }
+      return getAdminJob(id);
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /reached completed/i);
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'completed');
+  assert.equal(job.runnerState, 'completed');
+  assert.equal(job.cancelledAt, null);
+  releaseLookup();
+  const { isAdminJobRunning } = await import('../src/services/adminJobs.js');
+  await waitFor(() => !isAdminJobRunning('catalogue_lookup'));
 });
 
 test('in-process catalogue lookup jobs publish heartbeat and progress', async () => {

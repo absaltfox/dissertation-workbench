@@ -11,8 +11,19 @@ import {
   appendAdminJobLog, createAdminJob, finishAdminJob, finishRunningAdminJob, getAdminJob, hashAdminJobToken,
   updateRunningAdminJob
 } from '../db.js';
+import { terminateChild } from './workerLifecycle.js';
 
 const localChildren = new Map();
+
+async function terminateLocalChild(jobId, entry, reason) {
+  if (!entry?.child) return;
+  clearTimeout(entry.timer);
+  try {
+    await terminateChild(entry.child, { graceMs: ADMIN_WORKER_GRACE_MS });
+  } catch (error) {
+    await appendAdminJobLog(jobId, `Could not terminate local worker after ${reason}: ${error?.message || String(error)}\n`).catch(() => {});
+  }
+}
 
 function isoAfter(ms) {
   return new Date(Date.now() + ms).toISOString();
@@ -193,20 +204,19 @@ function startLocalWorker(jobId, token, executionId) {
   const timer = setTimeout(() => {
     void (async () => {
       try {
-        await finishRunningAdminJob(jobId, {
+        const timedOut = await finishRunningAdminJob(jobId, {
           status: 'timed_out',
           runnerState: 'timed_out',
           error: 'Local admin worker timed out.',
           finishedAt: new Date().toISOString(),
         });
+        if (!timedOut) return;
       } catch (error) {
         await appendAdminJobLog(jobId, `Could not publish local worker timeout: ${error?.message || String(error)}\n`).catch(() => {});
+        return;
       }
       await appendAdminJobLog(jobId, 'Local worker timed out; terminating process.\n').catch(() => {});
-      child.kill('SIGTERM');
-      setTimeout(() => {
-        if (child.exitCode == null && child.signalCode == null) child.kill('SIGKILL');
-      }, ADMIN_WORKER_GRACE_MS).unref();
+      await terminateLocalChild(jobId, { child, timer }, 'timeout');
     })();
   }, ADMIN_WORKER_TIMEOUT_MS);
   timer.unref();
@@ -281,14 +291,21 @@ export async function cancelAdminWorkerJob(jobId) {
 
   if (job.runnerType === 'local') {
     const entry = localChildren.get(Number(jobId));
-    if (entry?.child) {
-      entry.child.kill('SIGTERM');
-      setTimeout(() => {
-        if (entry.child.exitCode == null && entry.child.signalCode == null) entry.child.kill('SIGKILL');
-      }, ADMIN_WORKER_GRACE_MS).unref();
-      clearTimeout(entry.timer);
-      localChildren.delete(Number(jobId));
+    const now = new Date().toISOString();
+    const cancelled = await finishRunningAdminJob(jobId, {
+      status: 'cancelled',
+      runnerState: 'cancelled',
+      cancelledAt: now,
+      finishedAt: now,
+    });
+    if (!cancelled) {
+      const current = await getAdminJob(jobId);
+      return { ok: false, error: `Job reached ${current?.status || 'an unknown state'} before cancellation was published` };
     }
+    await terminateLocalChild(jobId, entry, 'cancellation');
+    localChildren.delete(Number(jobId));
+    await appendAdminJobLog(jobId, 'Job cancelled by administrator.\n');
+    return { ok: true };
   }
 
   const now = new Date().toISOString();
@@ -300,9 +317,7 @@ export async function cancelAdminWorkerJob(jobId) {
   });
   if (!cancelled) {
     const current = await getAdminJob(jobId);
-    if (current?.status !== 'cancelled') {
-      return { ok: false, error: `Job reached ${current?.status || 'an unknown state'} before cancellation was published` };
-    }
+    return { ok: false, error: `Job reached ${current?.status || 'an unknown state'} before cancellation was published` };
   }
   await appendAdminJobLog(jobId, 'Job cancelled by administrator.\n');
   return { ok: true };

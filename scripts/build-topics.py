@@ -64,10 +64,11 @@ class SqliteClientWrapper:
 
 
 class DatabaseLogger:
-    def __init__(self, client, job_id, original_stdout):
+    def __init__(self, client, job_id, original_stdout, execution_id):
         self.client = client
         self.job_id = int(job_id)
         self.original_stdout = original_stdout
+        self.execution_id = execution_id
         self.buffer = ""
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._flush_loop, daemon=True)
@@ -92,8 +93,9 @@ class DatabaseLogger:
             
         try:
             self.client.execute(
-                "UPDATE admin_jobs SET log = COALESCE(log, '') || ? WHERE id = ?",
-                [text_to_write, self.job_id]
+                "UPDATE admin_jobs SET log = COALESCE(log, '') || ? "
+                "WHERE id = ? AND execution_id = ? AND status = 'running' AND finished_at IS NULL",
+                [text_to_write, self.job_id, self.execution_id]
             )
         except Exception as e:
             self.original_stdout.write(f"\n[Logger Error] Failed to write log to DB: {e}\n")
@@ -1141,7 +1143,7 @@ def main():
     if job_id:
         print(f"Claiming and starting job ID {job_id}")
         execution_id = claim_job(client, job_id, os.environ.get("ADMIN_JOB_EXECUTION_ID"))
-        db_logger = DatabaseLogger(client, job_id, sys.stdout)
+        db_logger = DatabaseLogger(client, job_id, sys.stdout, execution_id)
         sys.stdout = db_logger
         sys.stderr = db_logger
         reporter = ProgressReporter(client, job_id, execution_id)
