@@ -47,7 +47,12 @@ export async function getDb() {
     });
   }
   if (!schemaReady) {
-    schemaReady = ensureSchema(db);
+    // Separate local SQLite clients can arrive during a migration at the same
+    // time (for example, concurrent worker processes). Schema migrations are
+    // idempotent, so retry the complete startup pass on SQLITE_BUSY instead of
+    // letting a transient schema-read lock prevent a singleton claimant from
+    // reaching its durable lease.
+    schemaReady = withDbRetry(() => ensureSchema(db), { label: 'ensureSchema' });
   }
   await schemaReady;
   return db;
@@ -280,6 +285,8 @@ async function ensureSchema(client) {
       source_json TEXT NOT NULL,
       status TEXT NOT NULL,
       total_seen INTEGER NOT NULL DEFAULT 0,
+      local_queue_seen INTEGER NOT NULL DEFAULT 0,
+      upstream_unique_seen INTEGER NOT NULL DEFAULT 0,
       total_saved INTEGER NOT NULL DEFAULT 0,
       api_total INTEGER,
       error TEXT,
@@ -582,6 +589,12 @@ async function ensureSchema(client) {
   `);
 
   await tryExec(client, 'ALTER TABLE catalogue_lookups ADD COLUMN bib_id TEXT');
+  // #17: These counters distinguish local enrichment retries from records
+  // observed during the upstream OC scan.  Use the verified, idempotent helper
+  // rather than tryExec so an actual migration failure cannot be mistaken for
+  // an already-applied column on a concurrently starting replica.
+  await addColumnIfMissing(client, 'sync_runs', 'local_queue_seen', 'INTEGER NOT NULL DEFAULT 0');
+  await addColumnIfMissing(client, 'sync_runs', 'upstream_unique_seen', 'INTEGER NOT NULL DEFAULT 0');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN runner_type TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN runner_id TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN runner_state TEXT');
@@ -2291,6 +2304,8 @@ export async function updateSyncRun(id, patch) {
   for (const [key, column] of Object.entries({
     status: 'status',
     totalSeen: 'total_seen',
+    localQueueSeen: 'local_queue_seen',
+    upstreamUniqueSeen: 'upstream_unique_seen',
     totalSaved: 'total_saved',
     apiTotal: 'api_total',
     error: 'error',
@@ -2320,6 +2335,8 @@ export async function getLatestSyncRun(syncKey = null) {
     source: (() => { try { return JSON.parse(row.source_json); } catch { return null; } })(),
     status: row.status,
     totalSeen: Number(row.total_seen || 0),
+    localQueueSeen: Number(row.local_queue_seen || 0),
+    upstreamUniqueSeen: Number(row.upstream_unique_seen || 0),
     totalSaved: Number(row.total_saved || 0),
     apiTotal: row.api_total == null ? null : Number(row.api_total),
     error: row.error || null,
@@ -2340,6 +2357,8 @@ export async function listRecentSyncRuns(limit = 25) {
     source: (() => { try { return JSON.parse(row.source_json); } catch { return null; } })(),
     status: row.status,
     totalSeen: Number(row.total_seen || 0),
+    localQueueSeen: Number(row.local_queue_seen || 0),
+    upstreamUniqueSeen: Number(row.upstream_unique_seen || 0),
     totalSaved: Number(row.total_saved || 0),
     apiTotal: row.api_total == null ? null : Number(row.api_total),
     error: row.error || null,

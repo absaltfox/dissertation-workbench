@@ -490,7 +490,13 @@ async function runSync(syncKey, source, apiKey, runId, {
       }));
       await runEnrichmentBatch(missing);
       totalSaved += missing.length;
-      await updateSyncRun(runId, { totalSeen, totalSaved, apiTotal });
+      await updateSyncRun(runId, {
+        totalSeen,
+        localQueueSeen,
+        upstreamUniqueSeen,
+        totalSaved,
+        apiTotal,
+      });
       if (candidates.length < pageLimit) return false;
     }
   }
@@ -543,6 +549,8 @@ async function runSync(syncKey, source, apiKey, runId, {
       ok: true,
       runStatus,
       totalSeen,
+      localQueueSeen,
+      upstreamUniqueSeen,
       totalSaved,
       totalSkipped,
       apiTotal,
@@ -731,7 +739,13 @@ async function runSync(syncKey, source, apiKey, runId, {
       } else {
         totalSaved += await saveDocumentMetadataBatch(filtered.items);
       }
-      await updateSyncRun(runId, { totalSeen, totalSaved, apiTotal });
+      await updateSyncRun(runId, {
+        totalSeen,
+        localQueueSeen,
+        upstreamUniqueSeen,
+        totalSaved,
+        apiTotal,
+      });
 
       if (apiTotal !== null && upstreamUniqueSeen === Number(apiTotal)) {
         upstreamExhausted = true;
@@ -747,6 +761,8 @@ async function runSync(syncKey, source, apiKey, runId, {
     await updateSyncRun(runId, {
       status: 'failed',
       totalSeen,
+      localQueueSeen,
+      upstreamUniqueSeen,
       totalSaved,
       apiTotal,
       error: error?.message || String(error),
@@ -756,6 +772,8 @@ async function runSync(syncKey, source, apiKey, runId, {
     return {
       ok: false,
       totalSeen,
+      localQueueSeen,
+      upstreamUniqueSeen,
       totalSaved,
       totalSkipped,
       apiTotal,

@@ -314,6 +314,9 @@ test('an underfilled local enrichment queue does not consume the upstream scan b
     assert.equal(result.upstreamUniqueSeen, 2);
     assert.equal(result.totalSeen, 3);
     assert.equal(result.runStatus, 'completed');
+    const persisted = await getLatestSyncRun(result.syncKey);
+    assert.equal(persisted.localQueueSeen, 1);
+    assert.equal(persisted.upstreamUniqueSeen, 2);
   } finally {
     globalThis.fetch = originalFetch;
   }

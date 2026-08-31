@@ -352,6 +352,46 @@ test('atomic citation job creation admits exactly one concurrent starter', async
   await finishAdminJob(created[0].jobId, { status: 'completed', runnerState: 'completed' });
 });
 
+test('singleton lease admits one citation starter across independent SQLite clients', async () => {
+  // The in-process test above shares one module-level libSQL client. Exercise
+  // the production topology too: independent Node processes, each with its
+  // own client, contend for the same local SQLite lease row.
+  await ensureStorage();
+  const type = `citation_scan_cross_client_${Date.now()}`;
+  const dbModuleUrl = new URL('../src/db.js', import.meta.url).href;
+  const childSource = `
+    const db = await import(${JSON.stringify(dbModuleUrl)});
+    const result = await db.createAdminJobIfNotRunning({
+      type: ${JSON.stringify(type)},
+      label: 'Cross-client citation scan',
+      params: { trigger: 'cross-client-test' },
+      runnerType: 'local',
+    });
+    process.stdout.write(JSON.stringify(result));
+    await db.closeDb();
+  `;
+  const childOptions = {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      APP_DATA_DIR: testDataDir,
+      SQLITE_PATH: path.join(testDataDir, 'metrics.sqlite'),
+      TURSO_DATABASE_URL: '',
+      SKIP_LOCAL_ENV: '1',
+    },
+  };
+  const children = await Promise.all(Array.from({ length: 4 }, () => execFileAsync(
+    process.execPath,
+    ['--input-type=module', '-e', childSource],
+    childOptions
+  )));
+  const results = children.map(({ stdout }) => JSON.parse(stdout.trim().split('\n').at(-1)));
+  const created = results.filter((result) => result.created);
+  assert.equal(created.length, 1);
+  assert.ok(results.every((result) => result.jobId === created[0].jobId));
+  await finishAdminJob(created[0].jobId, { status: 'completed', runnerState: 'completed' });
+});
+
 test('admin worker job lifecycle helpers claim once, heartbeat, log, and validate artifact token', async () => {
   await ensureStorage();
   const token = `token-${Date.now()}`;
