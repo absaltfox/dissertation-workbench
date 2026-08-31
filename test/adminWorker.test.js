@@ -18,7 +18,9 @@ let runImportPdfAdminJob;
 let startCitationScanContinuation;
 let runThemeRecomputeAdminJob;
 let runCatalogueLookupJob;
+let runBertopicJob;
 let runPendingCatalogueLookups;
+let runYazClient;
 let analyzeDocumentFile;
 let extractAndSaveParsedData;
 let _setDownloadSafetyOptionsForTests;
@@ -142,8 +144,8 @@ test.before(async () => {
   process.env.NODE_ENV = 'test';
 
   ({ buildFlyWorkerMachinePayload, cancelAdminWorkerJob } = await import('../src/services/adminWorker.js'));
-  ({ cancelInProcessAdminJob, runCatalogueLookupJob } = await import('../src/services/adminJobs.js'));
-  ({ CatalogueLookupCancelledError, runPendingCatalogueLookups } = await import('../src/catalogue.js'));
+  ({ cancelInProcessAdminJob, runBertopicJob, runCatalogueLookupJob } = await import('../src/services/adminJobs.js'));
+  ({ CatalogueLookupCancelledError, runPendingCatalogueLookups, runYazClient } = await import('../src/catalogue.js'));
   ({ WorkerArtifactClient } = await import('../src/workerArtifacts.js'));
   ({ runImportPdfAdminJob, startCitationScanContinuation } = await import('../src/services/importPdfJobRunner.js'));
   ({ runThemeRecomputeAdminJob } = await import('../src/services/themeJobRunner.js'));
@@ -481,6 +483,93 @@ test('worker child termination does not signal a child that already exited', asy
     },
   };
   await terminateChild(child, { graceMs: 5, forceWaitMs: 5 });
+});
+
+test('BERTopic timeout terminates the child through the guarded escalation lifecycle', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    signals = [];
+    stdout = new EventEmitter();
+    stderr = new EventEmitter();
+    kill(signal) {
+      this.signals.push(signal);
+      if (signal === 'SIGKILL') {
+        this.signalCode = signal;
+        queueMicrotask(() => this.emit('close', null, signal));
+      }
+      return true;
+    }
+  }
+  const child = new FakeChild();
+  const updates = [];
+  runBertopicJob(991, {
+    spawnProcess: () => child,
+    timeoutMs: 5,
+    terminationGraceMs: 5,
+    terminationForceWaitMs: 20,
+    updateJob: async (_jobId, patch) => updates.push(patch),
+  });
+
+  await waitFor(() => updates.length === 1, 250);
+  assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
+  assert.equal(updates[0].status, 'failed');
+  assert.match(updates[0].error, /timed out/i);
+});
+
+test('cancelled YAZ lookup does not signal a child that has already exited', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = 0;
+    signalCode = null;
+    signals = [];
+    stdout = new EventEmitter();
+    stdin = { write() {}, end() {} };
+    kill(signal) {
+      this.signals.push(signal);
+      return true;
+    }
+  }
+  const child = new FakeChild();
+  const controller = new AbortController();
+  const result = runYazClient('quit\n', {
+    signal: controller.signal,
+    spawnProcess: () => child,
+    terminationGraceMs: 5,
+  });
+  controller.abort();
+
+  await assert.rejects(result, CatalogueLookupCancelledError);
+  assert.deepEqual(child.signals, []);
+});
+
+test('timed-out YAZ lookup escalates when SIGTERM does not produce exit evidence', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    signals = [];
+    stdout = new EventEmitter();
+    stdin = { write() {}, end() {} };
+    kill(signal) {
+      this.signals.push(signal);
+      if (signal === 'SIGKILL') {
+        this.signalCode = signal;
+        queueMicrotask(() => this.emit('close', null, signal));
+      }
+      return true;
+    }
+  }
+  const child = new FakeChild();
+  await assert.rejects(
+    runYazClient('quit\n', {
+      timeoutMs: 5,
+      spawnProcess: () => child,
+      terminationGraceMs: 5,
+      terminationForceWaitMs: 20,
+    }),
+    (error) => error?.code === 'YAZ_TIMEOUT',
+  );
+  await waitFor(() => child.signals.length === 2, 250);
+  assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
 });
 
 test('expired running admin jobs are timed out before they block new jobs', async () => {

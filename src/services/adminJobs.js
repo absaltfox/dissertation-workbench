@@ -11,9 +11,11 @@ import {
   getTopicBuildStatus,
   updateClaimedAdminJob,
   updateClaimedAdminJobProgress,
+  updateAdminJob,
   updateAdminJobProgress,
 } from '../db.js';
 import { isCatalogueLookupCancelledError, runPendingCatalogueLookups } from '../catalogue.js';
+import { terminateChild } from './workerLifecycle.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -184,11 +186,20 @@ export async function cancelInProcessAdminJob(jobId, {
   return { ok: true, jobId: id, cancelled: true };
 }
 
-export function runBertopicJob(jobId, { clearMetricsCache } = {}) {
+export function runBertopicJob(jobId, {
+  clearMetricsCache,
+  spawnProcess = spawn,
+  timeoutMs = BERTOPIC_TIMEOUT_MS,
+  terminationGraceMs = 5_000,
+  terminationForceWaitMs,
+  terminate = terminateChild,
+  updateJob = updateAdminJob,
+  getStatus = getTopicBuildStatus,
+} = {}) {
   runningAdminJobs.add('bertopic');
   const scriptPath = path.join(__dirname, '..', '..', 'scripts', 'build-topics.py');
   let timedOut = false;
-  const child = spawn(BERTOPIC_PYTHON_COMMAND, [scriptPath], {
+  const child = spawnProcess(BERTOPIC_PYTHON_COMMAND, [scriptPath], {
     cwd: path.join(__dirname, '..', '..'),
     env: {
       PATH: process.env.PATH || '',
@@ -201,13 +212,22 @@ export function runBertopicJob(jobId, { clearMetricsCache } = {}) {
       SENTENCE_TRANSFORMERS_HOME: process.env.SENTENCE_TRANSFORMERS_HOME || '',
     },
   });
+  let termination = null;
+  const stopChild = () => {
+    if (!termination) {
+      termination = Promise.resolve(terminate(child, {
+        graceMs: terminationGraceMs,
+        ...(terminationForceWaitMs == null ? {} : { forceWaitMs: terminationForceWaitMs }),
+      })).catch((error) => {
+        output = tailLog(`${output}\nCould not terminate BERTopic process: ${error?.message || String(error)}\n`);
+      });
+    }
+    return termination;
+  };
   const timer = setTimeout(() => {
     timedOut = true;
-    child.kill('SIGTERM');
-    setTimeout(() => {
-      if (!child.killed) child.kill('SIGKILL');
-    }, 5_000).unref();
-  }, BERTOPIC_TIMEOUT_MS);
+    void stopChild();
+  }, timeoutMs);
   timer.unref();
   let output = '';
   child.stdout.on('data', (chunk) => {
@@ -222,7 +242,7 @@ export function runBertopicJob(jobId, { clearMetricsCache } = {}) {
     if (jobFinished) return;
     jobFinished = true;
     clearTimeout(timer);
-    await updateAdminJob(jobId, {
+    await updateJob(jobId, {
       status,
       log: output,
       error: err,
@@ -236,14 +256,17 @@ export function runBertopicJob(jobId, { clearMetricsCache } = {}) {
   };
 
   child.on('error', async (error) => {
+    await termination;
     await finishJob('failed', error?.message || String(error));
   });
   child.on('close', async (code) => {
+    await termination;
     const status = code === 0 && !timedOut ? 'completed' : 'failed';
     const err = status === 'completed' ? null : timedOut ? 'BERTopic process timed out' : `BERTopic process exited with code ${code}`;
-    const result = status === 'completed' ? await getTopicBuildStatus() : null;
+    const result = status === 'completed' ? await getStatus() : null;
     await finishJob(status, err, result);
   });
+  return child;
 }
 
 export function runImportRulesJob(jobId, { mode, scope, ruleIds, downloadFiles = true, clearMetricsCache }) {

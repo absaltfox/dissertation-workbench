@@ -2,6 +2,22 @@ function childHasExited(child) {
   return child.exitCode != null || child.signalCode != null;
 }
 
+function signalChild(child, signal) {
+  // `child.killed` only says that Node accepted an earlier kill request. It is
+  // not evidence that the process has exited, so it cannot be used to decide
+  // whether escalation is still required.
+  if (!child || childHasExited(child)) return false;
+  try {
+    child.kill(signal);
+    return true;
+  } catch (error) {
+    // A child can exit in the small interval between the terminal-state guard
+    // and kill(). Treat a disappeared child as already cleaned up.
+    if (childHasExited(child) || error?.code === 'ESRCH') return false;
+    throw error;
+  }
+}
+
 function waitForChildExit(child, timeoutMs) {
   if (!child || childHasExited(child)) return Promise.resolve(true);
   return new Promise((resolve) => {
@@ -25,9 +41,9 @@ export async function terminateChild(child, {
   forceWaitMs = Math.min(Math.max(1, graceMs), 5_000),
 } = {}) {
   if (!child || childHasExited(child)) return;
-  child.kill('SIGTERM');
+  if (!signalChild(child, 'SIGTERM')) return;
   if (await waitForChildExit(child, graceMs)) return;
-  child.kill('SIGKILL');
+  if (!signalChild(child, 'SIGKILL')) return;
   await waitForChildExit(child, forceWaitMs);
 }
 

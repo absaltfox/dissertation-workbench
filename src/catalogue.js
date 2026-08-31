@@ -9,6 +9,7 @@ import {
   YAZ_CLIENT_BATCH_ITEM_TIMEOUT_MS,
   YAZ_CLIENT_TIMEOUT_MS,
 } from './config.js';
+import { terminateChild } from './services/workerLifecycle.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -269,7 +270,14 @@ function parseBibIdFromOutput(stdout) {
   return match ? match[1] : null;
 }
 
-function runYazClient(commands, { timeoutMs = YAZ_CLIENT_TIMEOUT_MS, signal } = {}) {
+export function runYazClient(commands, {
+  timeoutMs = YAZ_CLIENT_TIMEOUT_MS,
+  signal,
+  spawnProcess = spawn,
+  terminationGraceMs = 3_000,
+  terminationForceWaitMs,
+  terminate = terminateChild,
+} = {}) {
   return new Promise((resolve, reject) => {
     try {
       throwIfAborted(signal);
@@ -278,7 +286,7 @@ function runYazClient(commands, { timeoutMs = YAZ_CLIENT_TIMEOUT_MS, signal } = 
       return;
     }
 
-    const child = spawn('yaz-client', [], { stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawnProcess('yaz-client', [], { stdio: ['pipe', 'pipe', 'pipe'] });
     const chunks = [];
     let size = 0;
     const maxBuffer = 512 * 1024;
@@ -293,20 +301,26 @@ function runYazClient(commands, { timeoutMs = YAZ_CLIENT_TIMEOUT_MS, signal } = 
       else resolve(stdout);
     };
 
+    let termination = null;
     const stopChild = () => {
-      if (!child.killed) child.kill('SIGTERM');
-      setTimeout(() => {
-        if (!child.killed) child.kill('SIGKILL');
-      }, 3_000).unref();
+      if (!termination) {
+        termination = Promise.resolve(terminate(child, {
+          graceMs: terminationGraceMs,
+          ...(terminationForceWaitMs == null ? {} : { forceWaitMs: terminationForceWaitMs }),
+        })).catch((error) => {
+          logger.warn(`Could not terminate yaz-client: ${error?.message || String(error)}`);
+        });
+      }
+      return termination;
     };
 
     const onAbort = () => {
-      stopChild();
+      void stopChild();
       finish(new CatalogueLookupCancelledError());
     };
 
     const timer = setTimeout(() => {
-      stopChild();
+      void stopChild();
       finish(makeYazTimeoutError());
     }, timeoutMs);
     timer.unref();
