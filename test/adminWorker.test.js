@@ -2382,6 +2382,137 @@ print(json.dumps({
   assert.deepEqual(result.finalArtifacts, [[1, true], [2, true]]);
 });
 
+test('concept publication uses transactional batches for HTTPS Turso clients', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'concept-publication-remote-'));
+  const harnessPath = path.join(dir, 'remote_publication_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, os, sqlite3, sys, types
+
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+class Result:
+    def __init__(self, rows):
+        self.rows = rows
+
+class RemoteClient:
+    def __init__(self):
+        self.executed = []
+        self.batches = []
+        self.transaction_called = False
+        self.conn = sqlite3.connect(':memory:')
+        self.conn.row_factory = sqlite3.Row
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        cursor = self.conn.execute(sql, tuple(params or ()))
+        self.conn.commit()
+        return Result(cursor.fetchall())
+    def transaction(self):
+        self.transaction_called = True
+        raise AssertionError('HTTPS publication must not use interactive transactions')
+    def batch(self, statements):
+        self.batches.append(statements)
+        try:
+            self.conn.execute('BEGIN IMMEDIATE')
+            results = []
+            for sql, params in statements:
+                cursor = self.conn.execute(sql, tuple(params or ()))
+                results.append(Result(cursor.fetchall()))
+            self.conn.commit()
+            return results
+        except Exception:
+            self.conn.rollback()
+            raise
+    def close(self):
+        self.conn.close()
+
+remote = RemoteClient()
+created = []
+def create_client_sync(url, auth_token=None):
+    created.append((url, auth_token))
+    return remote
+
+sys.modules['libsql_client'] = types.SimpleNamespace(create_client_sync=create_client_sync)
+os.environ['TURSO_DATABASE_URL'] = 'libsql://example.turso.io'
+os.environ['TURSO_AUTH_TOKEN'] = 'test-token'
+client = bc.get_db_client(':memory:')
+assert isinstance(client, bc.HttpLibsqlClientWrapper)
+assert created == [('https://example.turso.io', 'test-token')]
+
+scope = {'degree': 'Remote Test'}
+bc.ensure_incremental_schema(client)
+client.execute(
+    "INSERT INTO concept_partitions (partition_key, scope_json, status, source_document_count, updated_at) "
+    "VALUES (?, ?, 'pending', 1, '2026-01-01T00:00:00+00:00')",
+    ['remote-test', json.dumps(scope)],
+)
+artifact = {
+    'version': 4, 'generatedAt': '2026-01-01T00:00:00+00:00',
+    'source': {'scope': scope}, 'stats': {'documents': 1, 'concepts': 1, 'aliases': 0},
+    'concepts': [], 'variantToCanonical': {},
+}
+assert bc.save_partition_artifact(client, 'remote-test', scope, artifact) == 1
+assert artifact['partition'] == {'key': 'remote-test', 'scope': scope, 'version': 1}
+# A repeat takes the active-match branch of the same batch and does not create v2.
+assert bc.save_partition_artifact(client, 'remote-test', scope, dict(artifact)) == 1
+assert not remote.transaction_called
+assert len(remote.batches) == 2
+statements = remote.batches[0]
+assert len(statements) == 3
+assert 'INSERT INTO concept_partition_artifacts' in statements[0][0]
+assert 'UPDATE concept_partitions' in statements[1][0]
+assert 'SELECT artifact_version' in statements[2][0]
+
+# A stale unactivated v2 forces the server-side INSERT to conflict. The batch
+# rolls back, so the pointer remains at v1 and the caller's artifact is not
+# marked published.
+stale = dict(artifact)
+stale['partition'] = {'key': 'remote-test', 'scope': scope, 'version': 2}
+client.execute(
+    "INSERT INTO concept_partition_artifacts "
+    "(partition_key, version, artifact_json, document_count, created_at, artifact_checksum) "
+    "VALUES (?, 2, ?, 1, '2026-01-02T00:00:00+00:00', ?)",
+    ['remote-test', json.dumps(stale), bc.artifact_content_checksum(stale)],
+)
+failed = dict(artifact)
+failed.pop('partition')
+failed['different'] = True
+try:
+    bc.save_partition_artifact(client, 'remote-test', scope, failed)
+    raise AssertionError('expected stale-version conflict')
+except sqlite3.IntegrityError:
+    pass
+assert 'partition' not in failed
+assert client.execute(
+    "SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", ['remote-test']
+).rows[0]['artifact_version'] == 1
+
+class NoBatchClient:
+    def execute(self, sql, params=None):
+        return Result([])
+    def close(self):
+        pass
+
+sys.modules['libsql_client'] = types.SimpleNamespace(
+    create_client_sync=lambda url, auth_token=None: NoBatchClient()
+)
+try:
+    bc.get_db_client(':memory:')
+    raise AssertionError('expected missing-batch configuration error')
+except RuntimeError as exc:
+    assert 'transactional batch support' in str(exc)
+
+print(json.dumps({'batchStatements': len(statements)}))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync(
+    'python3', [harnessPath, path.resolve('scripts/build-concepts.py')], { cwd: path.resolve('.') },
+  );
+  const result = JSON.parse(stdout.trim().split('\n').at(-1));
+  assert.deepEqual(result, { batchStatements: 3 });
+});
+
 // --- Citation scan (re-streaming) job ---
 
 async function seedStreamableDoc(id, { degree = null, syncKey = null, checksum = 'scan-checksum-v1' } = {}) {
