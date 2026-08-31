@@ -485,7 +485,89 @@ test('worker child termination does not signal a child that already exited', asy
   await terminateChild(child, { graceMs: 5, forceWaitMs: 5 });
 });
 
-test('BERTopic timeout terminates the child through the guarded escalation lifecycle', async () => {
+test('legacy BERTopic runner completes and fails through its claimed execution lease', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    stdout = new EventEmitter();
+    stderr = new EventEmitter();
+    kill() { return true; }
+  }
+
+  const successfulJobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic success', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const successfulChild = new FakeChild();
+  let childEnv;
+  assert.equal(await runBertopicJob(successfulJobId, {
+    spawnProcess: (_command, _args, options) => {
+      childEnv = options.env;
+      return successfulChild;
+    },
+    getStatus: async () => ({ topics: 12 }),
+  }), successfulChild);
+  const claimed = await getAdminJob(successfulJobId);
+  assert.equal(childEnv.ADMIN_JOB_ID, String(successfulJobId));
+  assert.equal(childEnv.ADMIN_JOB_EXECUTION_ID, claimed.executionId);
+  successfulChild.emit('close', 0, null);
+  await waitFor(async () => (await getAdminJob(successfulJobId)).status === 'completed');
+  assert.deepEqual((await getAdminJob(successfulJobId)).result, { topics: 12 });
+
+  const failedJobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic failure', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const failedChild = new FakeChild();
+  await runBertopicJob(failedJobId, { spawnProcess: () => failedChild });
+  failedChild.emit('close', 2, null);
+  await waitFor(async () => (await getAdminJob(failedJobId)).status === 'failed');
+  assert.match((await getAdminJob(failedJobId)).error, /code 2/);
+
+  const preclaimedJobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic preclaimed', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  await claimAdminJob(preclaimedJobId, 'calling-runner', 'caller-execution');
+  const preclaimedChild = new FakeChild();
+  await runBertopicJob(preclaimedJobId, {
+    spawnProcess: () => preclaimedChild,
+    executionId: 'caller-execution',
+    getStatus: async () => ({ reusedLease: true }),
+  });
+  assert.equal((await getAdminJob(preclaimedJobId)).executionId, 'caller-execution');
+  preclaimedChild.emit('close', 0, null);
+  await waitFor(async () => (await getAdminJob(preclaimedJobId)).status === 'completed');
+});
+
+test('legacy BERTopic cancellation wins over a late successful child close', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    stdout = new EventEmitter();
+    stderr = new EventEmitter();
+    kill() { return true; }
+  }
+
+  const jobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic cancellation race', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const child = new FakeChild();
+  let cacheClears = 0;
+  await runBertopicJob(jobId, {
+    spawnProcess: () => child,
+    clearMetricsCache: () => { cacheClears += 1; },
+    getStatus: async () => ({ shouldNotPublish: true }),
+  });
+
+  assert.equal((await cancelAdminWorkerJob(jobId)).ok, true);
+  child.emit('close', 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'cancelled');
+  assert.equal(job.result, null);
+  assert.equal(job.executionId, null);
+  assert.equal(cacheClears, 0);
+});
+
+test('legacy BERTopic timeout terminates the child through the guarded escalation lifecycle', async () => {
   class FakeChild extends EventEmitter {
     exitCode = null;
     signalCode = null;
@@ -502,19 +584,51 @@ test('BERTopic timeout terminates the child through the guarded escalation lifec
     }
   }
   const child = new FakeChild();
-  const updates = [];
-  runBertopicJob(991, {
+  const jobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic timeout race', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  await runBertopicJob(jobId, {
     spawnProcess: () => child,
     timeoutMs: 5,
     terminationGraceMs: 5,
     terminationForceWaitMs: 20,
-    updateJob: async (_jobId, patch) => updates.push(patch),
   });
 
-  await waitFor(() => updates.length === 1, 250);
+  await waitFor(async () => (await getAdminJob(jobId)).status === 'timed_out', 250);
   assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
-  assert.equal(updates[0].status, 'failed');
-  assert.match(updates[0].error, /timed out/i);
+  const job = await getAdminJob(jobId);
+  assert.equal(job.executionId, null);
+  assert.match(job.error, /timed out/i);
+});
+
+test('legacy BERTopic timeout wins over a late successful child close', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    stdout = new EventEmitter();
+    stderr = new EventEmitter();
+    kill() { return true; }
+  }
+
+  const jobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic timeout close race', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const child = new FakeChild();
+  await runBertopicJob(jobId, {
+    spawnProcess: () => child,
+    timeoutMs: 5,
+    // Keep the process alive until after the terminal timeout is committed.
+    terminate: async () => {},
+    getStatus: async () => ({ shouldNotPublish: true }),
+  });
+
+  await waitFor(async () => (await getAdminJob(jobId)).status === 'timed_out');
+  child.emit('close', 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'timed_out');
+  assert.equal(job.result, null);
+  assert.equal(job.executionId, null);
 });
 
 test('cancelled YAZ lookup does not signal a child that has already exited', async () => {

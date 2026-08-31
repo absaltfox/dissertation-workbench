@@ -193,80 +193,132 @@ export function runBertopicJob(jobId, {
   terminationGraceMs = 5_000,
   terminationForceWaitMs,
   terminate = terminateChild,
-  updateJob = updateAdminJob,
   getStatus = getTopicBuildStatus,
+  claimJob = claimAdminJob,
+  getJob = getAdminJob,
+  updateClaimedJob = updateClaimedAdminJob,
+  finishJob = finishClaimedAdminJob,
+  executionId: suppliedExecutionId = null,
+  runnerId = `web:${process.pid}`,
 } = {}) {
-  runningAdminJobs.add('bertopic');
-  const scriptPath = path.join(__dirname, '..', '..', 'scripts', 'build-topics.py');
-  let timedOut = false;
-  const child = spawnProcess(BERTOPIC_PYTHON_COMMAND, [scriptPath], {
-    cwd: path.join(__dirname, '..', '..'),
-    env: {
-      PATH: process.env.PATH || '',
-      HOME: process.env.HOME || '',
-      NODE_ENV: process.env.NODE_ENV || '',
-      SQLITE_PATH,
-      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
-      HF_HOME: process.env.HF_HOME || '',
-      TRANSFORMERS_CACHE: process.env.TRANSFORMERS_CACHE || '',
-      SENTENCE_TRANSFORMERS_HOME: process.env.SENTENCE_TRANSFORMERS_HOME || '',
-    },
-  });
-  let termination = null;
-  const stopChild = () => {
-    if (!termination) {
-      termination = Promise.resolve(terminate(child, {
-        graceMs: terminationGraceMs,
-        ...(terminationForceWaitMs == null ? {} : { forceWaitMs: terminationForceWaitMs }),
-      })).catch((error) => {
-        output = tailLog(`${output}\nCould not terminate BERTopic process: ${error?.message || String(error)}\n`);
-      });
-    }
-    return termination;
-  };
-  const timer = setTimeout(() => {
-    timedOut = true;
-    void stopChild();
-  }, timeoutMs);
-  timer.unref();
-  let output = '';
-  child.stdout.on('data', (chunk) => {
-    output = tailLog(output + chunk.toString());
-  });
-  child.stderr.on('data', (chunk) => {
-    output = tailLog(output + chunk.toString());
-  });
+  const id = Number(jobId || 0);
+  if (!id) return Promise.resolve(null);
 
-  let jobFinished = false;
-  const finishJob = async (status, err, result = null) => {
-    if (jobFinished) return;
-    jobFinished = true;
-    clearTimeout(timer);
-    await updateJob(jobId, {
-      status,
-      log: output,
-      error: err,
-      result,
-      finishedAt: new Date().toISOString(),
+  // This runner predates the dedicated worker supervisor.  It may be handed an
+  // already-claimed lease by a caller, but otherwise must claim its own lease
+  // before it starts Python.  In either case every terminal write is fenced by
+  // that lease, so cancellation and the stale-job reaper win over a late child.
+  return (async () => {
+    let executionId = suppliedExecutionId;
+    let claimed = null;
+    if (executionId) {
+      const current = await getJob(id);
+      if (current?.status === 'running' && !current.finishedAt && current.executionId === executionId) {
+        claimed = current;
+      } else if (current?.status === 'running' && !current?.claimedAt) {
+        claimed = await claimJob(id, runnerId, executionId);
+      }
+    } else {
+      claimed = await claimJob(id, runnerId);
+      executionId = claimed?.executionId || null;
+    }
+    if (!claimed || !executionId) return null;
+
+    const markedRunning = await updateClaimedJob(id, executionId, {
+      runnerType: 'in_process',
+      runnerId,
+      runnerState: 'running',
     });
-    if (status === 'completed') {
-      clearMetricsCache?.();
-    }
-    runningAdminJobs.delete('bertopic');
-  };
+    if (!markedRunning) return null;
 
-  child.on('error', async (error) => {
-    await termination;
-    await finishJob('failed', error?.message || String(error));
-  });
-  child.on('close', async (code) => {
-    await termination;
-    const status = code === 0 && !timedOut ? 'completed' : 'failed';
-    const err = status === 'completed' ? null : timedOut ? 'BERTopic process timed out' : `BERTopic process exited with code ${code}`;
-    const result = status === 'completed' ? await getStatus() : null;
-    await finishJob(status, err, result);
-  });
-  return child;
+    runningAdminJobs.add('bertopic');
+    const scriptPath = path.join(__dirname, '..', '..', 'scripts', 'build-topics.py');
+    let timedOut = false;
+    const child = spawnProcess(BERTOPIC_PYTHON_COMMAND, [scriptPath], {
+      cwd: path.join(__dirname, '..', '..'),
+      env: {
+        PATH: process.env.PATH || '',
+        HOME: process.env.HOME || '',
+        NODE_ENV: process.env.NODE_ENV || '',
+        SQLITE_PATH,
+        ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+        HF_HOME: process.env.HF_HOME || '',
+        TRANSFORMERS_CACHE: process.env.TRANSFORMERS_CACHE || '',
+        SENTENCE_TRANSFORMERS_HOME: process.env.SENTENCE_TRANSFORMERS_HOME || '',
+        TURSO_DATABASE_URL: process.env.TURSO_DATABASE_URL || '',
+        TURSO_AUTH_TOKEN: process.env.TURSO_AUTH_TOKEN || '',
+        ADMIN_JOB_ID: String(id),
+        ADMIN_JOB_EXECUTION_ID: executionId,
+      },
+    });
+    let termination = null;
+    const stopChild = () => {
+      if (!termination) {
+        termination = Promise.resolve(terminate(child, {
+          graceMs: terminationGraceMs,
+          ...(terminationForceWaitMs == null ? {} : { forceWaitMs: terminationForceWaitMs }),
+        })).catch((error) => {
+          output = tailLog(`${output}\nCould not terminate BERTopic process: ${error?.message || String(error)}\n`);
+        });
+      }
+      return termination;
+    };
+    let output = '';
+    let terminalPublication = null;
+    const publishTerminal = async (status, err, result = null) => {
+      if (terminalPublication) return terminalPublication;
+      terminalPublication = (async () => {
+        const published = await finishJob(id, executionId, {
+          status,
+          log: output,
+          error: err,
+          result,
+          runnerState: status,
+          finishedAt: new Date().toISOString(),
+        });
+        if (published && status === 'completed') {
+          clearMetricsCache?.();
+        }
+        return published;
+      })().finally(() => {
+        runningAdminJobs.delete('bertopic');
+      });
+      return terminalPublication;
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      // Revoke the lease before asking the child to stop.  Its eventual close
+      // event can then only lose the fenced terminal update.
+      void publishTerminal('timed_out', 'BERTopic process timed out')
+        .catch(() => {})
+        .finally(() => { void stopChild(); });
+    }, timeoutMs);
+    timer.unref();
+    child.stdout.on('data', (chunk) => {
+      output = tailLog(output + chunk.toString());
+    });
+    child.stderr.on('data', (chunk) => {
+      output = tailLog(output + chunk.toString());
+    });
+
+    const finishChild = async (status, err, result = null) => {
+      clearTimeout(timer);
+      return publishTerminal(status, err, result);
+    };
+
+    child.on('error', async (error) => {
+      await termination;
+      await finishChild('failed', error?.message || String(error));
+    });
+    child.on('close', async (code) => {
+      await termination;
+      const status = code === 0 && !timedOut ? 'completed' : 'failed';
+      const err = status === 'completed' ? null : timedOut ? 'BERTopic process timed out' : `BERTopic process exited with code ${code}`;
+      const result = status === 'completed' ? await getStatus() : null;
+      await finishChild(status, err, result);
+    });
+    return child;
+  })();
 }
 
 export function runImportRulesJob(jobId, { mode, scope, ruleIds, downloadFiles = true, clearMetricsCache }) {

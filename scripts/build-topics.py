@@ -1096,13 +1096,25 @@ import threading
 import time
 
 def claim_job(client, job_id, execution_id=None):
+    supplied_execution_id = execution_id
     execution_id = execution_id or str(uuid.uuid4())
     now_str = datetime.now(timezone.utc).isoformat()
-    client.execute(
-        "UPDATE admin_jobs SET claimed_at = ?, execution_id = ?, runner_state = 'running', heartbeat_at = ? "
-        "WHERE id = ? AND status = 'running' AND finished_at IS NULL AND claimed_at IS NULL",
-        [now_str, execution_id, now_str, int(job_id)]
-    )
+    if supplied_execution_id:
+        # Node's legacy in-process runner can claim the job before launching
+        # this script.  Reuse precisely that lease, never another worker's.
+        client.execute(
+            "UPDATE admin_jobs SET claimed_at = COALESCE(claimed_at, ?), execution_id = ?, "
+            "runner_state = 'running', heartbeat_at = ? "
+            "WHERE id = ? AND status = 'running' AND finished_at IS NULL "
+            "AND (claimed_at IS NULL OR execution_id = ?)",
+            [now_str, execution_id, now_str, int(job_id), execution_id]
+        )
+    else:
+        client.execute(
+            "UPDATE admin_jobs SET claimed_at = ?, execution_id = ?, runner_state = 'running', heartbeat_at = ? "
+            "WHERE id = ? AND status = 'running' AND finished_at IS NULL AND claimed_at IS NULL",
+            [now_str, execution_id, now_str, int(job_id)]
+        )
     result = client.execute("SELECT status, execution_id, finished_at FROM admin_jobs WHERE id = ?", [int(job_id)])
     row = result.rows[0] if result.rows else None
     if not row or row["status"] != "running" or row["finished_at"] or row["execution_id"] != execution_id:
