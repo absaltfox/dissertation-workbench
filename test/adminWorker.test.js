@@ -2241,6 +2241,147 @@ print(json.dumps({"columnCount": cols.count("content_fingerprint"), "hasColumn":
   assert.equal(result.columnCount, 1);
 });
 
+test('concept partition publication is atomic, idempotent, and safe for concurrent builders', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'concept-publication-'));
+  const dbPath = path.join(dir, 'metrics.sqlite');
+  const harnessPath = path.join(dir, 'publication_harness.py');
+  await fs.writeFile(harnessPath, `
+import copy, importlib.util, json, sqlite3, sys, threading
+
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+db_path = sys.argv[2]
+key = 'publication-test'
+scope = {'degree': 'Publication Test'}
+
+def artifact(label, generated_at):
+    return {
+        'version': 4,
+        'generatedAt': generated_at,
+        'source': {'scope': scope},
+        'stats': {'documents': 1, 'concepts': 1, 'aliases': 0},
+        'concepts': [{'canonical': label, 'variants': [], 'docFreq': 1}],
+        'variantToCanonical': {},
+    }
+
+client = bc.SqliteClientWrapper(db_path)
+bc.ensure_incremental_schema(client)
+client.execute(
+    "INSERT INTO concept_partitions (partition_key, scope_json, status, source_document_count, updated_at) "
+    "VALUES (?, ?, 'pending', 1, '2026-01-01T00:00:00+00:00')",
+    [key, json.dumps(scope)],
+)
+
+base = artifact('previous active', '2026-01-01T00:00:00+00:00')
+assert bc.save_partition_artifact(client, key, scope, base) == 1
+
+# The retry has a fresh attempt timestamp but identical content. It must reuse v1.
+assert bc.save_partition_artifact(client, key, scope, artifact('previous active', '2026-01-02T00:00:00+00:00')) == 1
+
+reader_versions = []
+def inspect_reader():
+    reader = sqlite3.connect(db_path)
+    try:
+        row = reader.execute(
+            "SELECT cp.artifact_version, cpa.artifact_json FROM concept_partitions cp "
+            "JOIN concept_partition_artifacts cpa ON cpa.partition_key = cp.partition_key "
+            "AND cpa.version = cp.artifact_version WHERE cp.partition_key = ?",
+            [key],
+        ).fetchone()
+        reader_versions.append([row[0], json.loads(row[1])['concepts'][0]['canonical']])
+    finally:
+        reader.close()
+
+try:
+    bc.save_partition_artifact(
+        client, key, scope, artifact('must roll back', '2026-01-03T00:00:00+00:00'),
+        before_activate=lambda: (inspect_reader(), (_ for _ in ()).throw(RuntimeError('inject pointer failure'))),
+    )
+    raise AssertionError('expected injected publication failure')
+except RuntimeError as exc:
+    assert str(exc) == 'inject pointer failure'
+
+pointer_after_failure = client.execute(
+    "SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", [key]
+).rows[0]['artifact_version']
+artifact_rows_after_failure = client.execute(
+    "SELECT COUNT(*) AS count FROM concept_partition_artifacts WHERE partition_key = ?", [key]
+).rows[0]['count']
+
+# Simulate a pre-existing unactivated v2 (for example, from an older worker). A
+# different payload cannot silently take over that version.
+conflicting = artifact('other builder content', '2026-01-04T00:00:00+00:00')
+conflicting['partition'] = {'key': key, 'scope': scope, 'version': 2}
+client.execute(
+    "INSERT INTO concept_partition_artifacts (partition_key, version, artifact_json, document_count, created_at, artifact_checksum) "
+    "VALUES (?, 2, ?, 1, '2026-01-04T00:00:00+00:00', ?)",
+    [key, json.dumps(conflicting), bc.artifact_content_checksum(conflicting)],
+)
+try:
+    bc.save_partition_artifact(client, key, scope, artifact('different proposed content', '2026-01-05T00:00:00+00:00'))
+    raise AssertionError('expected same-version conflict')
+except ValueError as exc:
+    conflict_message = str(exc)
+    assert 'Conflicting concept artifact' in conflict_message
+
+# Remove the intentionally invalid old-worker row, then race two identical
+# builders. The immediate transaction makes one publish v2 and the other reuse it.
+client.execute("DELETE FROM concept_partition_artifacts WHERE partition_key = ? AND version = 2", [key])
+barrier = threading.Barrier(2)
+results = []
+errors = []
+def publish_concurrently():
+    worker = bc.SqliteClientWrapper(db_path)
+    try:
+        barrier.wait()
+        results.append(bc.save_partition_artifact(
+            worker, key, scope, artifact('concurrent content', '2026-01-06T00:00:00+00:00')
+        ))
+    except Exception as exc:
+        errors.append(str(exc))
+    finally:
+        worker.close()
+
+threads = [threading.Thread(target=publish_concurrently) for _ in range(2)]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+
+final_pointer = client.execute(
+    "SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", [key]
+).rows[0]['artifact_version']
+final_artifacts = client.execute(
+    "SELECT version, artifact_checksum FROM concept_partition_artifacts WHERE partition_key = ? ORDER BY version", [key]
+).rows
+print(json.dumps({
+    'readerVersions': reader_versions,
+    'pointerAfterFailure': pointer_after_failure,
+    'artifactRowsAfterFailure': artifact_rows_after_failure,
+    'conflictMessage': conflict_message,
+    'concurrentResults': sorted(results),
+    'concurrentErrors': errors,
+    'finalPointer': final_pointer,
+    'finalArtifacts': [[row['version'], bool(row['artifact_checksum'])] for row in final_artifacts],
+}))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync(
+    'python3', [harnessPath, path.resolve('scripts/build-concepts.py'), dbPath], { cwd: path.resolve('.') },
+  );
+  const result = JSON.parse(stdout);
+  assert.deepEqual(result.readerVersions, [[1, 'previous active']]);
+  assert.equal(result.pointerAfterFailure, 1);
+  assert.equal(result.artifactRowsAfterFailure, 1);
+  assert.match(result.conflictMessage, /Conflicting concept artifact/);
+  assert.deepEqual(result.concurrentResults, [2, 2]);
+  assert.deepEqual(result.concurrentErrors, []);
+  assert.equal(result.finalPointer, 2);
+  assert.deepEqual(result.finalArtifacts, [[1, true], [2, true]]);
+});
+
 // --- Citation scan (re-streaming) job ---
 
 async function seedStreamableDoc(id, { degree = null, syncKey = null, checksum = 'scan-checksum-v1' } = {}) {

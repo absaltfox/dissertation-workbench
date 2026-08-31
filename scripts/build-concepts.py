@@ -186,16 +186,59 @@ class SqliteClientWrapper:
         self.conn.commit()
         return ResultSet(cursor)
 
+    def transaction(self):
+        """Start a write-serializing transaction compatible with libsql-client.
+
+        ``execute()`` deliberately retains its legacy autocommit behaviour for the
+        worker's independent checkpoint writes. Publication uses this explicit
+        transaction instead so an artifact cannot become visible without its
+        partition pointer (or vice versa).
+        """
+        return SqliteTransaction(self.conn)
+
     def close(self):
         self.conn.close()
+
+
+class SqliteTransaction:
+    """The small transaction surface shared by sqlite3 and libsql-client."""
+
+    def __init__(self, conn):
+        self.conn = conn
+        # A writer lock before reading the current pointer prevents two local
+        # builders from proposing the same next version.
+        self.conn.execute("BEGIN IMMEDIATE")
+        self.closed = False
+
+    def execute(self, sql, params=None):
+        cursor = self.conn.cursor()
+        cursor.execute(sql, tuple(params or ()))
+
+        class ResultSet:
+            def __init__(self, cursor):
+                self.rows = cursor.fetchall()
+
+        return ResultSet(cursor)
+
+    def commit(self):
+        if not self.closed:
+            self.conn.commit()
+            self.closed = True
+
+    def rollback(self):
+        if not self.closed:
+            self.conn.rollback()
+            self.closed = True
+
+    def close(self):
+        if not self.closed:
+            self.rollback()
 
 
 def get_db_client(db_path):
     url = os.environ.get("TURSO_DATABASE_URL", "").strip()
     auth_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
     if url:
-        if url.startswith("libsql://"):
-            url = "https://" + url[len("libsql://"):]
         import libsql_client
         print(f"Connecting to remote Turso database: {url}")
         return libsql_client.create_client_sync(url, auth_token=auth_token)
@@ -832,7 +875,7 @@ def ensure_incremental_schema(client):
         )""",
         """CREATE TABLE IF NOT EXISTS concept_partition_artifacts (
           partition_key TEXT NOT NULL, version INTEGER NOT NULL, artifact_json TEXT NOT NULL,
-          document_count INTEGER NOT NULL, created_at TEXT NOT NULL,
+          document_count INTEGER NOT NULL, created_at TEXT NOT NULL, artifact_checksum TEXT,
           PRIMARY KEY (partition_key, version)
         )""",
         """CREATE TABLE IF NOT EXISTS concept_partition_candidates (
@@ -851,6 +894,7 @@ def ensure_incremental_schema(client):
     # compute_cohort_content_fingerprints) instead of source_updated_at, which any
     # enrichment pass bumps regardless of whether title/abstract/subjects changed.
     _ensure_column(client, "concept_partitions", "content_fingerprint", "TEXT")
+    _ensure_column(client, "concept_partition_artifacts", "artifact_checksum", "TEXT")
 
 
 def _ensure_column(client, table, column, sql_type):
@@ -1523,24 +1567,130 @@ def load_embedding_model():
     return SentenceTransformer(MODEL_NAME)
 
 
-def save_partition_artifact(client, key, scope, artifact):
-    current = client.execute(
-        "SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", [key]
-    ).rows[0]
-    version = int(current["artifact_version"] or 0) + 1
-    now = utc_now()
-    artifact["partition"] = {"key": key, "scope": scope, "version": version}
-    client.execute(
-        "INSERT INTO concept_partition_artifacts (partition_key, version, artifact_json, document_count, created_at) VALUES (?, ?, ?, ?, ?)",
-        [key, version, json.dumps(artifact), artifact["stats"]["documents"], now],
-    )
-    client.execute(
-        """UPDATE concept_partitions SET status = 'complete', checkpoint_json = NULL,
-             artifact_version = ?, last_completed_at = ?, error = NULL, updated_at = ?
-           WHERE partition_key = ?""",
-        [version, now, now, key],
-    )
-    return version
+def artifact_content_checksum(artifact):
+    """Checksum the publishable content, excluding publication-assigned metadata.
+
+    ``generatedAt`` is a build-attempt timestamp and ``partition`` is assigned only
+    after a version is chosen. Neither should turn a retry of the same dictionary
+    into a new version. All semantic artifact fields remain covered.
+    """
+    content = {
+        name: value for name, value in artifact.items()
+        if name not in ("generatedAt", "partition")
+    }
+    encoded = json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def artifact_partition_matches(artifact, key, scope, version):
+    return artifact.get("partition") == {"key": key, "scope": scope, "version": version}
+
+
+def read_partition_artifact(row):
+    try:
+        artifact = json.loads(row["artifact_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("Stored partition artifact is not valid JSON.") from exc
+    computed_checksum = artifact_content_checksum(artifact)
+    stored_checksum = row["artifact_checksum"]
+    if stored_checksum and stored_checksum != computed_checksum:
+        raise ValueError("Stored partition artifact checksum does not match its content.")
+    return artifact, stored_checksum or computed_checksum
+
+
+def save_partition_artifact(client, key, scope, artifact, before_activate=None):
+    """Publish one partition atomically and make a repeat publish idempotent.
+
+    The transaction contains both the immutable version row and the mutable active
+    pointer. Readers join the pointer to the version row, so they see either the
+    previous complete artifact or the new one after commit -- never the gap between
+    the two statements. Local sqlite takes an immediate writer lock; libsql-client
+    owns a remote transaction for the same read/propose/activate sequence.
+    """
+    transaction = client.transaction()
+    try:
+        current_rows = transaction.execute(
+            "SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", [key]
+        ).rows
+        if not current_rows:
+            raise ValueError(f"Cannot publish unknown concept partition '{key}'.")
+        current_version = int(current_rows[0]["artifact_version"] or 0)
+        checksum = artifact_content_checksum(artifact)
+
+        # A committed retry must not manufacture version N+1 merely because the
+        # first attempt returned after a successful commit.
+        if current_version:
+            active_rows = transaction.execute(
+                """SELECT artifact_json, artifact_checksum
+                   FROM concept_partition_artifacts
+                   WHERE partition_key = ? AND version = ?""",
+                [key, current_version],
+            ).rows
+            if active_rows:
+                active_artifact, active_checksum = read_partition_artifact(active_rows[0])
+                if (
+                    active_checksum == checksum
+                    and artifact_partition_matches(active_artifact, key, scope, current_version)
+                ):
+                    artifact["partition"] = active_artifact["partition"]
+                    # A complete artifact can be intentionally invalidated when a
+                    # shared candidate threshold changes elsewhere. Reusing the
+                    # same local bytes must still reactivate this partition so the
+                    # next global merge sees a complete generation.
+                    now = utc_now()
+                    transaction.execute(
+                        """UPDATE concept_partitions SET status = 'complete', checkpoint_json = NULL,
+                             artifact_version = ?, last_completed_at = ?, error = NULL, updated_at = ?
+                           WHERE partition_key = ?""",
+                        [current_version, now, now, key],
+                    )
+                    transaction.commit()
+                    return current_version
+
+        version = current_version + 1
+        partition_metadata = {"key": key, "scope": scope, "version": version}
+        artifact["partition"] = partition_metadata
+        now = utc_now()
+        serialized = json.dumps(artifact)
+        existing_rows = transaction.execute(
+            """SELECT artifact_json, artifact_checksum
+               FROM concept_partition_artifacts
+               WHERE partition_key = ? AND version = ?""",
+            [key, version],
+        ).rows
+        if existing_rows:
+            existing_artifact, existing_checksum = read_partition_artifact(existing_rows[0])
+            if (
+                existing_checksum != checksum
+                or not artifact_partition_matches(existing_artifact, key, scope, version)
+            ):
+                raise ValueError(
+                    f"Conflicting concept artifact for partition '{key}' version {version}: "
+                    "the stored checksum or partition metadata does not match this publication."
+                )
+        else:
+            transaction.execute(
+                """INSERT INTO concept_partition_artifacts
+                   (partition_key, version, artifact_json, document_count, created_at, artifact_checksum)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [key, version, serialized, artifact["stats"]["documents"], now, checksum],
+            )
+
+        if before_activate:
+            before_activate()
+        transaction.execute(
+            """UPDATE concept_partitions SET status = 'complete', checkpoint_json = NULL,
+                 artifact_version = ?, last_completed_at = ?, error = NULL, updated_at = ?
+               WHERE partition_key = ?""",
+            [version, now, now, key],
+        )
+        transaction.commit()
+        return version
+    except Exception:
+        transaction.rollback()
+        raise
+    finally:
+        transaction.close()
 
 
 def merged_component_doc_freq(members, shards, total_docs):
