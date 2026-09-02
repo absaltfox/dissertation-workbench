@@ -1,9 +1,9 @@
 import {
-  appendAdminJobLog, finishAdminJob, getDb, listFileMetrics, listImportRules,
+  appendAdminJobLog, finishAdminJob, finishClaimedAdminJob, getDb, listFileMetrics, listImportRules,
   listPendingCitationExtractions, listPendingCitationScans, loadCommitteeMembers,
   loadDocumentMetadata, loadStoredFileMetric, finishEnrichmentRolloutPhase, getEnrichmentRollout,
   listEnrichmentRolloutEvidence, saveCitationExtractionState, saveEnrichmentRolloutEvidence,
-  startEnrichmentRolloutPhase, updateAdminJobProgress
+  startEnrichmentRolloutPhase, updateAdminJobProgress, updateClaimedAdminJobProgress
 } from '../db.js';
 import fs from 'node:fs/promises';
 import {
@@ -24,7 +24,8 @@ async function log(jobId, message) {
   await appendAdminJobLog(jobId, `[${new Date().toISOString()}] ${message}\n`);
 }
 
-function createProgressReporter(jobId) {
+function createProgressReporter(job) {
+  const jobId = job.id;
   const tasks = [];
   const taskIndex = new Map();
 
@@ -46,13 +47,24 @@ function createProgressReporter(jobId) {
       taskIndex.set(key, tasks.length);
       tasks.push(task);
     }
-    await updateAdminJobProgress(jobId, {
+    const progress = {
       phase: key,
       currentTask: status === 'completed' ? event.nextTask || label : label,
       tasks,
       counts: event.counts || null,
-    });
+    };
+    if (job.executionId) {
+      await updateClaimedAdminJobProgress(jobId, job.executionId, progress);
+    } else {
+      await updateAdminJobProgress(jobId, progress);
+    }
   };
+}
+
+function finishWorkerAdminJob(job, patch) {
+  return job.executionId
+    ? finishClaimedAdminJob(job.id, job.executionId, patch)
+    : finishAdminJob(job.id, patch);
 }
 
 function readPdfBatchSize(params = {}) {
@@ -335,7 +347,7 @@ async function loadCitationSource(entry, artifactClient, progress, counts = null
 
 export async function runImportPdfAdminJob(job, { artifactClient = null, clearMetricsCache = null } = {}) {
   const params = job.params || {};
-  const progress = createProgressReporter(job.id);
+  const progress = createProgressReporter(job);
 
   if (job.type === 'document_sync') {
     const { runDocumentSync } = await import('../sync.js');
@@ -347,7 +359,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       artifactClient,
     });
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: result.ok ? 'completed' : 'failed',
       result,
       error: result.ok ? null : result.error || 'Document sync failed',
@@ -551,7 +563,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     if (continuation?.jobId) result.nextJobId = continuation.jobId;
     if (continuation?.error) result.continuationError = continuation.error;
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: result.ok ? 'completed' : 'failed',
       result,
       error: result.ok ? null : 'One or more import rules failed.',
@@ -596,7 +608,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       downloadError: doc.downloadError || null,
     };
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: 'completed',
       result,
       finishedAt: new Date().toISOString(),
@@ -640,7 +652,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       downloadError: doc.downloadError || null,
     };
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: result.ok ? 'completed' : 'failed',
       result,
       error: result.ok ? null : result.downloadError || 'Cached PDF/full-text reanalysis failed.',
@@ -687,7 +699,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
           error,
         };
         clearMetricsCache?.();
-        await finishAdminJob(job.id, {
+        await finishWorkerAdminJob(job, {
           status: 'failed',
           result,
           error,
@@ -733,7 +745,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       citations: doc.citationCount || 0,
     };
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: 'completed',
       result,
       finishedAt: new Date().toISOString(),
@@ -783,7 +795,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     }
     const result = { ok: true, processed, committees: withCommittee, citations: 0 };
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: 'completed',
       result,
       finishedAt: new Date().toISOString(),
@@ -891,7 +903,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       resolutionQueued: false,
     };
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: failed ? 'failed' : 'completed',
       result,
       error: failed ? `${failed} document(s) failed citation extraction.` : null,
@@ -1026,7 +1038,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     if (continuation?.jobId) result.nextJobId = continuation.jobId;
     if (continuation?.error) result.continuationError = continuation.error;
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: failed ? 'failed' : 'completed',
       result,
       error: failed ? `${failed} document(s) failed citation scan.` : null,
@@ -1090,7 +1102,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     }
     const result = { ok: true, processed, withCommittee };
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: 'completed',
       result,
       finishedAt: new Date().toISOString(),

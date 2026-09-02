@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { EventEmitter } from 'node:events';
 
 const execFileAsync = promisify(execFile);
 let testDataDir;
@@ -17,7 +18,9 @@ let runImportPdfAdminJob;
 let startCitationScanContinuation;
 let runThemeRecomputeAdminJob;
 let runCatalogueLookupJob;
+let runBertopicJob;
 let runPendingCatalogueLookups;
+let runYazClient;
 let analyzeDocumentFile;
 let extractAndSaveParsedData;
 let _setDownloadSafetyOptionsForTests;
@@ -34,6 +37,7 @@ let heartbeatAdminJob;
 let hasRunningAdminJob;
 let updateAdminJob;
 let finishAdminJob;
+let finishClaimedAdminJob;
 let getDb;
 let loadDocumentCitations;
 let loadDocumentMetadata;
@@ -55,6 +59,7 @@ let selectTopicLabelCandidate;
 let updateTopicManualLabel;
 let deleteTopicLabelOverride;
 let validateAdminJobArtifactToken;
+let updateClaimedAdminJobProgress;
 
 async function writeTextPdf(filePath, lines) {
   const escapedLines = lines.map((line) => String(line).replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)'));
@@ -140,8 +145,8 @@ test.before(async () => {
   process.env.NODE_ENV = 'test';
 
   ({ buildFlyWorkerMachinePayload, cancelAdminWorkerJob } = await import('../src/services/adminWorker.js'));
-  ({ cancelInProcessAdminJob, runCatalogueLookupJob } = await import('../src/services/adminJobs.js'));
-  ({ CatalogueLookupCancelledError, runPendingCatalogueLookups } = await import('../src/catalogue.js'));
+  ({ cancelInProcessAdminJob, runBertopicJob, runCatalogueLookupJob } = await import('../src/services/adminJobs.js'));
+  ({ CatalogueLookupCancelledError, runPendingCatalogueLookups, runYazClient } = await import('../src/catalogue.js'));
   ({ WorkerArtifactClient } = await import('../src/workerArtifacts.js'));
   ({ runImportPdfAdminJob, startCitationScanContinuation } = await import('../src/services/importPdfJobRunner.js'));
   ({ runThemeRecomputeAdminJob } = await import('../src/services/themeJobRunner.js'));
@@ -160,6 +165,7 @@ test.before(async () => {
     heartbeatAdminJob,
     hasRunningAdminJob,
     finishAdminJob,
+    finishClaimedAdminJob,
     getDb,
     loadDocumentCitations,
     loadDocumentMetadata,
@@ -181,6 +187,7 @@ test.before(async () => {
     updateTopicManualLabel,
     deleteTopicLabelOverride,
     updateAdminJob,
+    updateClaimedAdminJobProgress,
     validateAdminJobArtifactToken,
   } = await import('../src/db.js'));
 });
@@ -195,6 +202,7 @@ test('Fly worker machine payload is private, one-shot, and job-scoped', () => {
     image: 'registry.fly.io/dissertation-workbench:deployment-123',
     jobId: 42,
     token: 'secret-token',
+    executionId: 'worker-execution-42',
     timeoutMs: 12345,
   });
 
@@ -205,6 +213,7 @@ test('Fly worker machine payload is private, one-shot, and job-scoped', () => {
   assert.deepEqual(payload.config.init.exec, ['node', 'src/jobWorker.js']);
   assert.equal(payload.config.env.ADMIN_JOB_ID, '42');
   assert.equal(payload.config.env.ADMIN_JOB_ARTIFACT_TOKEN, 'secret-token');
+  assert.equal(payload.config.env.ADMIN_JOB_EXECUTION_ID, 'worker-execution-42');
   assert.equal(payload.config.env.ADMIN_WORKER_TIMEOUT_MS, '12345');
   assert.equal(payload.config.env.DOCUMENT_SYNC_ENABLED, '0');
   assert.equal(payload.config.metadata.role, 'admin-worker');
@@ -427,6 +436,313 @@ test('admin worker job lifecycle helpers claim once, heartbeat, log, and validat
   assert.equal(await validateAdminJobArtifactToken(jobId, token, { docId: 'lifecycle-doc' }), false);
 });
 
+test('claimed job updates require the current execution lease and a running status', async () => {
+  const jobId = await createAdminJob({
+    type: 'lease_fence_test',
+    label: 'Lease fence test',
+    timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const claimed = await claimAdminJob(jobId, 'runner-a', 'execution-a');
+  assert.equal(claimed.executionId, 'execution-a');
+
+  assert.equal(await updateClaimedAdminJobProgress(jobId, 'execution-stale', {
+    phase: 'stale', currentTask: 'Stale worker',
+  }), false);
+  assert.equal((await getAdminJob(jobId)).progress, null);
+
+  assert.equal(await updateClaimedAdminJobProgress(jobId, 'execution-a', {
+    phase: 'owned', currentTask: 'Current worker',
+  }), true);
+  assert.equal((await getAdminJob(jobId)).progress.phase, 'owned');
+
+  const cancelledAt = new Date().toISOString();
+  await finishAdminJob(jobId, {
+    status: 'cancelled', runnerState: 'cancelled', cancelledAt, finishedAt: cancelledAt,
+  });
+  assert.equal(await finishClaimedAdminJob(jobId, 'execution-a', {
+    status: 'completed', runnerState: 'completed', result: { late: true },
+  }), false);
+  assert.equal(await updateClaimedAdminJobProgress(jobId, 'execution-a', {
+    phase: 'late_success', currentTask: 'Late success',
+  }), false);
+  const terminal = await getAdminJob(jobId);
+  assert.equal(terminal.status, 'cancelled');
+  assert.equal(terminal.result, null);
+  assert.equal(terminal.progress.phase, 'owned');
+  assert.equal(terminal.executionId, null);
+});
+
+test('stale-job reaper wins its CAS against a late worker completion', async () => {
+  const jobId = await createAdminJob({
+    type: 'reaper_lease_race_test',
+    label: 'Reaper lease race',
+    timeoutAt: new Date(Date.now() - 1_000).toISOString(),
+  });
+  await claimAdminJob(jobId, 'late-runner', 'late-execution');
+
+  assert.equal(await hasRunningAdminJob('reaper_lease_race_test'), null);
+  assert.equal(await finishClaimedAdminJob(jobId, 'late-execution', {
+    status: 'completed', result: { shouldNotPublish: true }, runnerState: 'completed',
+  }), false);
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'timed_out');
+  assert.equal(job.result, null);
+  assert.equal(job.executionId, null);
+});
+
+test('terminal failure publication survives cleanup failures and reports them separately', async () => {
+  const { publishTerminalFailure } = await import('../src/services/workerLifecycle.js');
+  const events = [];
+  const result = await publishTerminalFailure({
+    finish: async (patch) => {
+      events.push(['finish', patch.status]);
+      return true;
+    },
+    failRollout: async () => { throw new Error('rollout cleanup exploded'); },
+    appendLog: async () => { throw new Error('terminal log exploded'); },
+    onCleanupError: async (context, error) => events.push(['cleanup', context, error.message]),
+  }, { error: new Error('worker exploded'), status: 'failed' });
+
+  assert.deepEqual(events[0], ['finish', 'failed']);
+  assert.equal(result.published, true);
+  assert.equal(result.cleanupErrors.length, 2);
+  assert.match(events[1][2], /rollout cleanup exploded/);
+  assert.match(events[2][2], /terminal log exploded/);
+});
+
+test('worker child termination escalates from SIGTERM to SIGKILL after the grace bound', async () => {
+  const { terminateChild } = await import('../src/services/workerLifecycle.js');
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    signals = [];
+    kill(signal) {
+      this.signals.push(signal);
+      if (signal === 'SIGKILL') {
+        this.signalCode = signal;
+        queueMicrotask(() => this.emit('close', null, signal));
+      }
+      return true;
+    }
+  }
+  const child = new FakeChild();
+  await terminateChild(child, { graceMs: 5, forceWaitMs: 20 });
+  assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
+});
+
+test('worker child termination does not signal a child that already exited', async () => {
+  const { terminateChild } = await import('../src/services/workerLifecycle.js');
+  const child = {
+    exitCode: 0,
+    signalCode: null,
+    kill() {
+      throw new Error('kill must not be called for an exited child');
+    },
+  };
+  await terminateChild(child, { graceMs: 5, forceWaitMs: 5 });
+});
+
+test('legacy BERTopic runner completes and fails through its claimed execution lease', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    stdout = new EventEmitter();
+    stderr = new EventEmitter();
+    kill() { return true; }
+  }
+
+  const successfulJobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic success', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const successfulChild = new FakeChild();
+  let childEnv;
+  assert.equal(await runBertopicJob(successfulJobId, {
+    spawnProcess: (_command, _args, options) => {
+      childEnv = options.env;
+      return successfulChild;
+    },
+    getStatus: async () => ({ topics: 12 }),
+  }), successfulChild);
+  const claimed = await getAdminJob(successfulJobId);
+  assert.equal(childEnv.ADMIN_JOB_ID, String(successfulJobId));
+  assert.equal(childEnv.ADMIN_JOB_EXECUTION_ID, claimed.executionId);
+  successfulChild.emit('close', 0, null);
+  await waitFor(async () => (await getAdminJob(successfulJobId)).status === 'completed');
+  assert.deepEqual((await getAdminJob(successfulJobId)).result, { topics: 12 });
+
+  const failedJobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic failure', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const failedChild = new FakeChild();
+  await runBertopicJob(failedJobId, { spawnProcess: () => failedChild });
+  failedChild.emit('close', 2, null);
+  await waitFor(async () => (await getAdminJob(failedJobId)).status === 'failed');
+  assert.match((await getAdminJob(failedJobId)).error, /code 2/);
+
+  const preclaimedJobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic preclaimed', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  await claimAdminJob(preclaimedJobId, 'calling-runner', 'caller-execution');
+  const preclaimedChild = new FakeChild();
+  await runBertopicJob(preclaimedJobId, {
+    spawnProcess: () => preclaimedChild,
+    executionId: 'caller-execution',
+    getStatus: async () => ({ reusedLease: true }),
+  });
+  assert.equal((await getAdminJob(preclaimedJobId)).executionId, 'caller-execution');
+  preclaimedChild.emit('close', 0, null);
+  await waitFor(async () => (await getAdminJob(preclaimedJobId)).status === 'completed');
+});
+
+test('legacy BERTopic cancellation wins over a late successful child close', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    stdout = new EventEmitter();
+    stderr = new EventEmitter();
+    kill() { return true; }
+  }
+
+  const jobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic cancellation race', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const child = new FakeChild();
+  let cacheClears = 0;
+  await runBertopicJob(jobId, {
+    spawnProcess: () => child,
+    clearMetricsCache: () => { cacheClears += 1; },
+    getStatus: async () => ({ shouldNotPublish: true }),
+  });
+
+  assert.equal((await cancelAdminWorkerJob(jobId)).ok, true);
+  child.emit('close', 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'cancelled');
+  assert.equal(job.result, null);
+  assert.equal(job.executionId, null);
+  assert.equal(cacheClears, 0);
+});
+
+test('legacy BERTopic timeout terminates the child through the guarded escalation lifecycle', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    signals = [];
+    stdout = new EventEmitter();
+    stderr = new EventEmitter();
+    kill(signal) {
+      this.signals.push(signal);
+      if (signal === 'SIGKILL') {
+        this.signalCode = signal;
+        queueMicrotask(() => this.emit('close', null, signal));
+      }
+      return true;
+    }
+  }
+  const child = new FakeChild();
+  const jobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic timeout race', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  await runBertopicJob(jobId, {
+    spawnProcess: () => child,
+    timeoutMs: 5,
+    terminationGraceMs: 5,
+    terminationForceWaitMs: 20,
+  });
+
+  await waitFor(async () => (await getAdminJob(jobId)).status === 'timed_out', 250);
+  assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
+  const job = await getAdminJob(jobId);
+  assert.equal(job.executionId, null);
+  assert.match(job.error, /timed out/i);
+});
+
+test('legacy BERTopic timeout wins over a late successful child close', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    stdout = new EventEmitter();
+    stderr = new EventEmitter();
+    kill() { return true; }
+  }
+
+  const jobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic timeout close race', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const child = new FakeChild();
+  await runBertopicJob(jobId, {
+    spawnProcess: () => child,
+    timeoutMs: 5,
+    // Keep the process alive until after the terminal timeout is committed.
+    terminate: async () => {},
+    getStatus: async () => ({ shouldNotPublish: true }),
+  });
+
+  await waitFor(async () => (await getAdminJob(jobId)).status === 'timed_out');
+  child.emit('close', 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'timed_out');
+  assert.equal(job.result, null);
+  assert.equal(job.executionId, null);
+});
+
+test('cancelled YAZ lookup does not signal a child that has already exited', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = 0;
+    signalCode = null;
+    signals = [];
+    stdout = new EventEmitter();
+    stdin = { write() {}, end() {} };
+    kill(signal) {
+      this.signals.push(signal);
+      return true;
+    }
+  }
+  const child = new FakeChild();
+  const controller = new AbortController();
+  const result = runYazClient('quit\n', {
+    signal: controller.signal,
+    spawnProcess: () => child,
+    terminationGraceMs: 5,
+  });
+  controller.abort();
+
+  await assert.rejects(result, CatalogueLookupCancelledError);
+  assert.deepEqual(child.signals, []);
+});
+
+test('timed-out YAZ lookup escalates when SIGTERM does not produce exit evidence', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    signals = [];
+    stdout = new EventEmitter();
+    stdin = { write() {}, end() {} };
+    kill(signal) {
+      this.signals.push(signal);
+      if (signal === 'SIGKILL') {
+        this.signalCode = signal;
+        queueMicrotask(() => this.emit('close', null, signal));
+      }
+      return true;
+    }
+  }
+  const child = new FakeChild();
+  await assert.rejects(
+    runYazClient('quit\n', {
+      timeoutMs: 5,
+      spawnProcess: () => child,
+      terminationGraceMs: 5,
+      terminationForceWaitMs: 20,
+    }),
+    (error) => error?.code === 'YAZ_TIMEOUT',
+  );
+  await waitFor(() => child.signals.length === 2, 250);
+  assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
+});
+
 test('expired running admin jobs are timed out before they block new jobs', async () => {
   await ensureStorage();
   const token = `expired-worker-token-${Date.now()}`;
@@ -481,6 +797,54 @@ test('in-process catalogue lookup jobs can be cancelled cooperatively', async ()
   assert.ok(job.cancelledAt);
   assert.ok(job.finishedAt);
   assert.match(job.log, /cancelled by administrator/i);
+});
+
+test('in-process cancellation cannot overwrite a completion that wins its terminal CAS race', async () => {
+  await ensureStorage();
+  const jobId = await createAdminJob({
+    type: 'catalogue_lookup',
+    label: 'Catalogue Completion Race Test',
+    params: { limit: 5, pendingOnly: true },
+  });
+  let startedResolve;
+  const started = new Promise((resolve) => { startedResolve = resolve; });
+  let releaseLookup;
+  const lookupReleased = new Promise((resolve) => { releaseLookup = resolve; });
+
+  runCatalogueLookupJob(jobId, 5, {
+    runLookup: async () => {
+      startedResolve();
+      await lookupReleased;
+      return { processed: 0, found: 0, notFound: 0, skipped: 0, failed: 0 };
+    },
+  });
+
+  await started;
+  let reads = 0;
+  const result = await cancelInProcessAdminJob(jobId, {
+    getJob: async (id) => {
+      reads += 1;
+      if (reads === 1) {
+        const current = await getAdminJob(id);
+        await finishClaimedAdminJob(id, current.executionId, {
+          status: 'completed',
+          runnerState: 'completed',
+          result: { raced: true },
+        });
+        return { ...current, status: 'running', finishedAt: null };
+      }
+      return getAdminJob(id);
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /reached completed/i);
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'completed');
+  assert.equal(job.runnerState, 'completed');
+  assert.equal(job.cancelledAt, null);
+  releaseLookup();
+  const { isAdminJobRunning } = await import('../src/services/adminJobs.js');
+  await waitFor(() => !isAdminJobRunning('catalogue_lookup'));
 });
 
 test('in-process catalogue lookup jobs publish heartbeat and progress', async () => {

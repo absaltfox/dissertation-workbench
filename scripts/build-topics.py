@@ -30,6 +30,7 @@ import sqlite3
 import argparse
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 
 MODEL_NAME = "allenai/specter2_base"
@@ -63,10 +64,11 @@ class SqliteClientWrapper:
 
 
 class DatabaseLogger:
-    def __init__(self, client, job_id, original_stdout):
+    def __init__(self, client, job_id, original_stdout, execution_id):
         self.client = client
         self.job_id = int(job_id)
         self.original_stdout = original_stdout
+        self.execution_id = execution_id
         self.buffer = ""
         self.lock = threading.Lock()
         self.thread = threading.Thread(target=self._flush_loop, daemon=True)
@@ -91,8 +93,9 @@ class DatabaseLogger:
             
         try:
             self.client.execute(
-                "UPDATE admin_jobs SET log = COALESCE(log, '') || ? WHERE id = ?",
-                [text_to_write, self.job_id]
+                "UPDATE admin_jobs SET log = COALESCE(log, '') || ? "
+                "WHERE id = ? AND execution_id = ? AND status = 'running' AND finished_at IS NULL",
+                [text_to_write, self.job_id, self.execution_id]
             )
         except Exception as e:
             self.original_stdout.write(f"\n[Logger Error] Failed to write log to DB: {e}\n")
@@ -104,9 +107,10 @@ class DatabaseLogger:
 
 
 class ProgressReporter:
-    def __init__(self, client, job_id):
+    def __init__(self, client, job_id, execution_id=None):
         self.client = client
         self.job_id = int(job_id) if job_id else None
+        self.execution_id = execution_id
         self.tasks = []
         self.task_index = {}
 
@@ -139,8 +143,9 @@ class ProgressReporter:
         try:
             now_str = datetime.now(timezone.utc).isoformat()
             self.client.execute(
-                "UPDATE admin_jobs SET progress_json = ?, runner_state = ?, heartbeat_at = ? WHERE id = ?",
-                [json.dumps(progress_data), current_task, now_str, self.job_id]
+                "UPDATE admin_jobs SET progress_json = ?, runner_state = ?, heartbeat_at = ? "
+                "WHERE id = ? AND execution_id = ? AND status = 'running' AND finished_at IS NULL",
+                [json.dumps(progress_data), current_task, now_str, self.job_id, self.execution_id]
             )
         except Exception as e:
             sys.stderr.write(f"\n[Progress Error] Failed to update progress in DB: {e}\n")
@@ -1090,6 +1095,42 @@ def run_label_only(client, topic_id=None, reporter=None):
 import threading
 import time
 
+def claim_job(client, job_id, execution_id=None):
+    supplied_execution_id = execution_id
+    execution_id = execution_id or str(uuid.uuid4())
+    now_str = datetime.now(timezone.utc).isoformat()
+    if supplied_execution_id:
+        # Node's legacy in-process runner can claim the job before launching
+        # this script.  Reuse precisely that lease, never another worker's.
+        client.execute(
+            "UPDATE admin_jobs SET claimed_at = COALESCE(claimed_at, ?), execution_id = ?, "
+            "runner_state = 'running', heartbeat_at = ? "
+            "WHERE id = ? AND status = 'running' AND finished_at IS NULL "
+            "AND (claimed_at IS NULL OR execution_id = ?)",
+            [now_str, execution_id, now_str, int(job_id), execution_id]
+        )
+    else:
+        client.execute(
+            "UPDATE admin_jobs SET claimed_at = ?, execution_id = ?, runner_state = 'running', heartbeat_at = ? "
+            "WHERE id = ? AND status = 'running' AND finished_at IS NULL AND claimed_at IS NULL",
+            [now_str, execution_id, now_str, int(job_id)]
+        )
+    result = client.execute("SELECT status, execution_id, finished_at FROM admin_jobs WHERE id = ?", [int(job_id)])
+    row = result.rows[0] if result.rows else None
+    if not row or row["status"] != "running" or row["finished_at"] or row["execution_id"] != execution_id:
+        raise RuntimeError("Admin job could not be claimed by this topic worker execution")
+    return execution_id
+
+
+def finish_job(client, job_id, execution_id, status, error=None):
+    now_str = datetime.now(timezone.utc).isoformat()
+    client.execute(
+        "UPDATE admin_jobs SET status = ?, runner_state = ?, error = ?, finished_at = ?, "
+        "artifact_token_hash = NULL, execution_id = NULL "
+        "WHERE id = ? AND execution_id = ? AND status = 'running' AND finished_at IS NULL",
+        [status, status, error, now_str, int(job_id), execution_id]
+    )
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--labels-only", action="store_true")
@@ -1110,17 +1151,14 @@ def main():
     job_id = os.environ.get("ADMIN_JOB_ID")
     db_logger = None
     reporter = None
+    execution_id = None
     if job_id:
         print(f"Claiming and starting job ID {job_id}")
-        now_str = datetime.now(timezone.utc).isoformat()
-        client.execute(
-            "UPDATE admin_jobs SET status = 'running', claimed_at = ?, started_at = ?, runner_state = 'running' WHERE id = ?",
-            [now_str, now_str, int(job_id)]
-        )
-        db_logger = DatabaseLogger(client, job_id, sys.stdout)
+        execution_id = claim_job(client, job_id, os.environ.get("ADMIN_JOB_EXECUTION_ID"))
+        db_logger = DatabaseLogger(client, job_id, sys.stdout, execution_id)
         sys.stdout = db_logger
         sys.stderr = db_logger
-        reporter = ProgressReporter(client, job_id)
+        reporter = ProgressReporter(client, job_id, execution_id)
 
     try:
         if args.labels_only:
@@ -1141,11 +1179,7 @@ def main():
                     next_task="Completed"
                 )
             if job_id:
-                now_str = datetime.now(timezone.utc).isoformat()
-                client.execute(
-                    "UPDATE admin_jobs SET status = 'completed', runner_state = 'completed', finished_at = ? WHERE id = ?",
-                    [now_str, int(job_id)]
-                )
+                finish_job(client, job_id, execution_id, "completed")
             return
 
         # Load abstracts
@@ -1563,11 +1597,7 @@ def main():
         # Mark job completed if in worker mode
         if job_id:
             print(f"\nCompleting job ID {job_id} in database")
-            now_str = datetime.now(timezone.utc).isoformat()
-            client.execute(
-                "UPDATE admin_jobs SET status = 'completed', runner_state = 'completed', finished_at = ? WHERE id = ?",
-                [now_str, int(job_id)]
-            )
+            finish_job(client, job_id, execution_id, "completed")
             
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
@@ -1579,11 +1609,7 @@ def main():
                 detail=str(e)
             )
         if job_id:
-            now_str = datetime.now(timezone.utc).isoformat()
-            client.execute(
-                "UPDATE admin_jobs SET status = 'failed', runner_state = 'failed', error = ?, finished_at = ? WHERE id = ?",
-                [str(e), now_str, int(job_id)]
-            )
+            finish_job(client, job_id, execution_id, "failed", str(e))
         if db_logger:
             db_logger.flush()
         client.close()

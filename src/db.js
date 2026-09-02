@@ -330,6 +330,7 @@ async function ensureSchema(client) {
       cancelled_at TEXT,
       artifact_token_hash TEXT,
       claimed_at TEXT,
+      execution_id TEXT,
       progress_json TEXT,
       started_at TEXT NOT NULL,
       finished_at TEXT
@@ -622,6 +623,7 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN cancelled_at TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN artifact_token_hash TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN claimed_at TEXT');
+  await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN execution_id TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN progress_json TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN sync_key TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN title TEXT');
@@ -2420,6 +2422,7 @@ function parseAdminJobRow(row) {
     timeoutAt: row.timeout_at || null,
     cancelledAt: row.cancelled_at || null,
     claimedAt: row.claimed_at || null,
+    executionId: row.execution_id || null,
     startedAt: row.started_at,
     finishedAt: row.finished_at || null,
   };
@@ -2595,6 +2598,7 @@ export async function updateAdminJob(id, patch = {}) {
     cancelledAt: 'cancelled_at',
     artifactTokenHash: 'artifact_token_hash',
     claimedAt: 'claimed_at',
+    executionId: 'execution_id',
     progress: 'progress_json',
     finishedAt: 'finished_at',
   })) {
@@ -2612,10 +2616,111 @@ export async function updateAdminJob(id, patch = {}) {
   await run(`UPDATE admin_jobs SET ${fields.join(', ')} WHERE id = ?`, args);
 }
 
+export async function updateRunningAdminJob(id, patch = {}) {
+  if (!id) return false;
+  const fields = [];
+  const args = [];
+  for (const [key, column] of Object.entries({
+    runnerType: 'runner_type', runnerId: 'runner_id', runnerState: 'runner_state',
+    heartbeatAt: 'heartbeat_at', timeoutAt: 'timeout_at',
+  })) {
+    if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+    fields.push(`${column} = ?`);
+    args.push(patch[key]);
+  }
+  if (!fields.length) return false;
+  args.push(id);
+  const result = await run(`
+    UPDATE admin_jobs SET ${fields.join(', ')}
+    WHERE id = ? AND status = 'running' AND finished_at IS NULL
+  `, args);
+  return result.changes > 0;
+}
+
 export async function finishAdminJob(id, patch = {}) {
   await updateAdminJob(id, {
     ...patch,
     artifactTokenHash: null,
+    executionId: null,
+    finishedAt: patch.finishedAt || new Date().toISOString(),
+  });
+}
+
+export async function finishRunningAdminJob(id, patch = {}) {
+  if (!id) return false;
+  const terminalPatch = {
+    ...patch,
+    artifactTokenHash: null,
+    executionId: null,
+    finishedAt: patch.finishedAt || new Date().toISOString(),
+  };
+  const fields = [];
+  const args = [];
+  for (const [key, column] of Object.entries({
+    status: 'status', result: 'result_json', error: 'error', runnerState: 'runner_state',
+    cancelledAt: 'cancelled_at', artifactTokenHash: 'artifact_token_hash',
+    executionId: 'execution_id', finishedAt: 'finished_at',
+  })) {
+    if (!Object.prototype.hasOwnProperty.call(terminalPatch, key)) continue;
+    fields.push(`${column} = ?`);
+    args.push(key === 'result' && terminalPatch[key] != null
+      ? JSON.stringify(terminalPatch[key])
+      : terminalPatch[key]);
+  }
+  args.push(id);
+  const result = await run(`
+    UPDATE admin_jobs SET ${fields.join(', ')}
+    WHERE id = ? AND status = 'running' AND finished_at IS NULL
+  `, args);
+  return result.changes > 0;
+}
+
+// Worker writes are fenced by the opaque execution id installed at claim time.
+// Administrative writes intentionally continue to use updateAdminJob/finishAdminJob:
+// cancellation and the stale-job reaper must be able to revoke a lease without
+// knowing it. Once revoked (or once status leaves `running`), late worker writes
+// can no longer change progress or publish a terminal result.
+export async function updateClaimedAdminJob(id, executionId, patch = {}) {
+  if (!id || !executionId) return false;
+  const fields = [];
+  const args = [];
+  for (const [key, column] of Object.entries({
+    status: 'status',
+    result: 'result_json',
+    log: 'log',
+    error: 'error',
+    runnerType: 'runner_type',
+    runnerId: 'runner_id',
+    runnerState: 'runner_state',
+    heartbeatAt: 'heartbeat_at',
+    cancelledAt: 'cancelled_at',
+    artifactTokenHash: 'artifact_token_hash',
+    executionId: 'execution_id',
+    progress: 'progress_json',
+    finishedAt: 'finished_at',
+  })) {
+    if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+    fields.push(`${column} = ?`);
+    const value = (key === 'result' || key === 'progress') && patch[key] != null
+      ? JSON.stringify(patch[key])
+      : patch[key];
+    args.push(value);
+  }
+  if (!fields.length) return false;
+  args.push(id, executionId);
+  const result = await run(`
+    UPDATE admin_jobs
+    SET ${fields.join(', ')}
+    WHERE id = ? AND execution_id = ? AND status = 'running' AND finished_at IS NULL
+  `, args);
+  return result.changes > 0;
+}
+
+export async function finishClaimedAdminJob(id, executionId, patch = {}) {
+  return updateClaimedAdminJob(id, executionId, {
+    ...patch,
+    artifactTokenHash: null,
+    executionId: null,
     finishedAt: patch.finishedAt || new Date().toISOString(),
   });
 }
@@ -2640,13 +2745,14 @@ export async function getAdminJob(id) {
   return parseAdminJobRow(row);
 }
 
-export async function claimAdminJob(id, runnerId = null) {
+export async function claimAdminJob(id, runnerId = null, executionId = crypto.randomUUID()) {
+  if (!executionId) return null;
   const now = new Date().toISOString();
   const result = await run(`
     UPDATE admin_jobs
-    SET claimed_at = ?, runner_id = COALESCE(?, runner_id), runner_state = 'running', heartbeat_at = ?
+    SET claimed_at = ?, execution_id = ?, runner_id = COALESCE(?, runner_id), runner_state = 'running', heartbeat_at = ?
     WHERE id = ? AND status = 'running' AND claimed_at IS NULL
-  `, [now, runnerId, now, id]);
+  `, [now, executionId, runnerId, now, id]);
   return result.changes > 0 ? getAdminJob(id) : null;
 }
 
@@ -2658,14 +2764,30 @@ export async function heartbeatAdminJob(id, runnerState = 'running') {
   await updateAdminJob(id, patch);
 }
 
-export async function updateAdminJobProgress(id, progress = {}) {
-  await updateAdminJob(id, {
+export async function heartbeatClaimedAdminJob(id, executionId, runnerState = 'running') {
+  const patch = { heartbeatAt: new Date().toISOString() };
+  if (runnerState != null) patch.runnerState = runnerState;
+  return updateClaimedAdminJob(id, executionId, patch);
+}
+
+function adminJobProgressPatch(progress = {}) {
+  return {
     progress: {
       ...progress,
       updatedAt: new Date().toISOString(),
     },
     heartbeatAt: new Date().toISOString(),
     runnerState: progress.currentTask || progress.phase || 'running',
+  };
+}
+
+export async function updateAdminJobProgress(id, progress = {}) {
+  await updateAdminJob(id, adminJobProgressPatch(progress));
+}
+
+export async function updateClaimedAdminJobProgress(id, executionId, progress = {}) {
+  return updateClaimedAdminJob(id, executionId, {
+    ...adminJobProgressPatch(progress),
   });
 }
 
@@ -2702,7 +2824,8 @@ export async function reapStaleAdminJobs(type = null) {
         runner_state = 'timed_out',
         error = COALESCE(error, 'Admin worker timed out or stopped heartbeating.'),
         finished_at = ?,
-        artifact_token_hash = NULL
+        artifact_token_hash = NULL,
+        execution_id = NULL
     WHERE status = 'running'
       AND (
         (timeout_at IS NOT NULL AND timeout_at <= ?)
