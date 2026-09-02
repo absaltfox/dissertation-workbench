@@ -29,6 +29,7 @@ let claimAdminJob;
 let clearAllCitations;
 let closeDb;
 let createAdminJob;
+let createAdminJobIfNotRunning;
 let ensureStorage;
 let getAdminJob;
 let hashAdminJobToken;
@@ -157,6 +158,7 @@ test.before(async () => {
     clearAllCitations,
     closeDb,
     createAdminJob,
+    createAdminJobIfNotRunning,
     ensureStorage,
     getAdminJob,
     hashAdminJobToken,
@@ -342,6 +344,61 @@ test('topic label candidates can be reviewed, selected, edited, unlocked, and bu
   await publishPassingTopicLabels();
   topic = (await listTopicLabelReviews()).topics.find((item) => item.topicId === 7001);
   assert.equal(topic.label, `Teacher Identity Practice ${suffix}`);
+});
+
+test('atomic citation job creation admits exactly one concurrent starter', async () => {
+  await ensureStorage();
+  const type = 'citation_scan';
+  const results = await Promise.all(Array.from({ length: 8 }, () => createAdminJobIfNotRunning({
+    type,
+    label: 'Concurrent citation scan',
+    params: { trigger: 'test' },
+    runnerType: 'local',
+  })));
+  const created = results.filter((result) => result.created);
+  assert.equal(created.length, 1);
+  assert.ok(results.every((result) => result.jobId === created[0].jobId));
+  await finishAdminJob(created[0].jobId, { status: 'completed', runnerState: 'completed' });
+});
+
+test('singleton lease admits one citation starter across independent SQLite clients', async () => {
+  // The in-process test above shares one module-level libSQL client. Exercise
+  // the production topology too: independent Node processes, each with its
+  // own client, contend for the same local SQLite lease row.
+  await ensureStorage();
+  const type = `citation_scan_cross_client_${Date.now()}`;
+  const dbModuleUrl = new URL('../src/db.js', import.meta.url).href;
+  const childSource = `
+    const db = await import(${JSON.stringify(dbModuleUrl)});
+    const result = await db.createAdminJobIfNotRunning({
+      type: ${JSON.stringify(type)},
+      label: 'Cross-client citation scan',
+      params: { trigger: 'cross-client-test' },
+      runnerType: 'local',
+    });
+    process.stdout.write(JSON.stringify(result));
+    await db.closeDb();
+  `;
+  const childOptions = {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      APP_DATA_DIR: testDataDir,
+      SQLITE_PATH: path.join(testDataDir, 'metrics.sqlite'),
+      TURSO_DATABASE_URL: '',
+      SKIP_LOCAL_ENV: '1',
+    },
+  };
+  const children = await Promise.all(Array.from({ length: 4 }, () => execFileAsync(
+    process.execPath,
+    ['--input-type=module', '-e', childSource],
+    childOptions
+  )));
+  const results = children.map(({ stdout }) => JSON.parse(stdout.trim().split('\n').at(-1)));
+  const created = results.filter((result) => result.created);
+  assert.equal(created.length, 1);
+  assert.ok(results.every((result) => result.jobId === created[0].jobId));
+  await finishAdminJob(created[0].jobId, { status: 'completed', runnerState: 'completed' });
 });
 
 test('admin worker job lifecycle helpers claim once, heartbeat, log, and validate artifact token', async () => {
@@ -2605,6 +2662,278 @@ print(json.dumps({"columnCount": cols.count("content_fingerprint"), "hasColumn":
   assert.equal(result.columnCount, 1);
 });
 
+test('concept partition publication is atomic, idempotent, and safe for concurrent builders', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'concept-publication-'));
+  const dbPath = path.join(dir, 'metrics.sqlite');
+  const harnessPath = path.join(dir, 'publication_harness.py');
+  await fs.writeFile(harnessPath, `
+import copy, importlib.util, json, sqlite3, sys, threading
+
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+db_path = sys.argv[2]
+key = 'publication-test'
+scope = {'degree': 'Publication Test'}
+
+def artifact(label, generated_at):
+    return {
+        'version': 4,
+        'generatedAt': generated_at,
+        'source': {'scope': scope},
+        'stats': {'documents': 1, 'concepts': 1, 'aliases': 0},
+        'concepts': [{'canonical': label, 'variants': [], 'docFreq': 1}],
+        'variantToCanonical': {},
+    }
+
+client = bc.SqliteClientWrapper(db_path)
+bc.ensure_incremental_schema(client)
+client.execute(
+    "INSERT INTO concept_partitions (partition_key, scope_json, status, source_document_count, updated_at) "
+    "VALUES (?, ?, 'pending', 1, '2026-01-01T00:00:00+00:00')",
+    [key, json.dumps(scope)],
+)
+
+base = artifact('previous active', '2026-01-01T00:00:00+00:00')
+assert bc.save_partition_artifact(client, key, scope, base) == 1
+
+# The retry has a fresh attempt timestamp but identical content. It must reuse v1.
+assert bc.save_partition_artifact(client, key, scope, artifact('previous active', '2026-01-02T00:00:00+00:00')) == 1
+
+reader_versions = []
+def inspect_reader():
+    reader = sqlite3.connect(db_path)
+    try:
+        row = reader.execute(
+            "SELECT cp.artifact_version, cpa.artifact_json FROM concept_partitions cp "
+            "JOIN concept_partition_artifacts cpa ON cpa.partition_key = cp.partition_key "
+            "AND cpa.version = cp.artifact_version WHERE cp.partition_key = ?",
+            [key],
+        ).fetchone()
+        reader_versions.append([row[0], json.loads(row[1])['concepts'][0]['canonical']])
+    finally:
+        reader.close()
+
+try:
+    bc.save_partition_artifact(
+        client, key, scope, artifact('must roll back', '2026-01-03T00:00:00+00:00'),
+        before_activate=lambda: (inspect_reader(), (_ for _ in ()).throw(RuntimeError('inject pointer failure'))),
+    )
+    raise AssertionError('expected injected publication failure')
+except RuntimeError as exc:
+    assert str(exc) == 'inject pointer failure'
+
+pointer_after_failure = client.execute(
+    "SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", [key]
+).rows[0]['artifact_version']
+artifact_rows_after_failure = client.execute(
+    "SELECT COUNT(*) AS count FROM concept_partition_artifacts WHERE partition_key = ?", [key]
+).rows[0]['count']
+
+# Simulate a pre-existing unactivated v2 (for example, from an older worker). A
+# different payload cannot silently take over that version.
+conflicting = artifact('other builder content', '2026-01-04T00:00:00+00:00')
+conflicting['partition'] = {'key': key, 'scope': scope, 'version': 2}
+client.execute(
+    "INSERT INTO concept_partition_artifacts (partition_key, version, artifact_json, document_count, created_at, artifact_checksum) "
+    "VALUES (?, 2, ?, 1, '2026-01-04T00:00:00+00:00', ?)",
+    [key, json.dumps(conflicting), bc.artifact_content_checksum(conflicting)],
+)
+try:
+    bc.save_partition_artifact(client, key, scope, artifact('different proposed content', '2026-01-05T00:00:00+00:00'))
+    raise AssertionError('expected same-version conflict')
+except ValueError as exc:
+    conflict_message = str(exc)
+    assert 'Conflicting concept artifact' in conflict_message
+
+# Remove the intentionally invalid old-worker row, then race two identical
+# builders. The immediate transaction makes one publish v2 and the other reuse it.
+client.execute("DELETE FROM concept_partition_artifacts WHERE partition_key = ? AND version = 2", [key])
+barrier = threading.Barrier(2)
+results = []
+errors = []
+def publish_concurrently():
+    worker = bc.SqliteClientWrapper(db_path)
+    try:
+        barrier.wait()
+        results.append(bc.save_partition_artifact(
+            worker, key, scope, artifact('concurrent content', '2026-01-06T00:00:00+00:00')
+        ))
+    except Exception as exc:
+        errors.append(str(exc))
+    finally:
+        worker.close()
+
+threads = [threading.Thread(target=publish_concurrently) for _ in range(2)]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+
+final_pointer = client.execute(
+    "SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", [key]
+).rows[0]['artifact_version']
+final_artifacts = client.execute(
+    "SELECT version, artifact_checksum FROM concept_partition_artifacts WHERE partition_key = ? ORDER BY version", [key]
+).rows
+print(json.dumps({
+    'readerVersions': reader_versions,
+    'pointerAfterFailure': pointer_after_failure,
+    'artifactRowsAfterFailure': artifact_rows_after_failure,
+    'conflictMessage': conflict_message,
+    'concurrentResults': sorted(results),
+    'concurrentErrors': errors,
+    'finalPointer': final_pointer,
+    'finalArtifacts': [[row['version'], bool(row['artifact_checksum'])] for row in final_artifacts],
+}))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync(
+    'python3', [harnessPath, path.resolve('scripts/build-concepts.py'), dbPath], { cwd: path.resolve('.') },
+  );
+  const result = JSON.parse(stdout);
+  assert.deepEqual(result.readerVersions, [[1, 'previous active']]);
+  assert.equal(result.pointerAfterFailure, 1);
+  assert.equal(result.artifactRowsAfterFailure, 1);
+  assert.match(result.conflictMessage, /Conflicting concept artifact/);
+  assert.deepEqual(result.concurrentResults, [2, 2]);
+  assert.deepEqual(result.concurrentErrors, []);
+  assert.equal(result.finalPointer, 2);
+  assert.deepEqual(result.finalArtifacts, [[1, true], [2, true]]);
+});
+
+test('concept publication uses transactional batches for HTTPS Turso clients', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'concept-publication-remote-'));
+  const harnessPath = path.join(dir, 'remote_publication_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, os, sqlite3, sys, types
+
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+class Result:
+    def __init__(self, rows):
+        self.rows = rows
+
+class RemoteClient:
+    def __init__(self):
+        self.executed = []
+        self.batches = []
+        self.transaction_called = False
+        self.conn = sqlite3.connect(':memory:')
+        self.conn.row_factory = sqlite3.Row
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        cursor = self.conn.execute(sql, tuple(params or ()))
+        self.conn.commit()
+        return Result(cursor.fetchall())
+    def transaction(self):
+        self.transaction_called = True
+        raise AssertionError('HTTPS publication must not use interactive transactions')
+    def batch(self, statements):
+        self.batches.append(statements)
+        try:
+            self.conn.execute('BEGIN IMMEDIATE')
+            results = []
+            for sql, params in statements:
+                cursor = self.conn.execute(sql, tuple(params or ()))
+                results.append(Result(cursor.fetchall()))
+            self.conn.commit()
+            return results
+        except Exception:
+            self.conn.rollback()
+            raise
+    def close(self):
+        self.conn.close()
+
+remote = RemoteClient()
+created = []
+def create_client_sync(url, auth_token=None):
+    created.append((url, auth_token))
+    return remote
+
+sys.modules['libsql_client'] = types.SimpleNamespace(create_client_sync=create_client_sync)
+os.environ['TURSO_DATABASE_URL'] = 'libsql://example.turso.io'
+os.environ['TURSO_AUTH_TOKEN'] = 'test-token'
+client = bc.get_db_client(':memory:')
+assert isinstance(client, bc.HttpLibsqlClientWrapper)
+assert created == [('https://example.turso.io', 'test-token')]
+
+scope = {'degree': 'Remote Test'}
+bc.ensure_incremental_schema(client)
+client.execute(
+    "INSERT INTO concept_partitions (partition_key, scope_json, status, source_document_count, updated_at) "
+    "VALUES (?, ?, 'pending', 1, '2026-01-01T00:00:00+00:00')",
+    ['remote-test', json.dumps(scope)],
+)
+artifact = {
+    'version': 4, 'generatedAt': '2026-01-01T00:00:00+00:00',
+    'source': {'scope': scope}, 'stats': {'documents': 1, 'concepts': 1, 'aliases': 0},
+    'concepts': [], 'variantToCanonical': {},
+}
+assert bc.save_partition_artifact(client, 'remote-test', scope, artifact) == 1
+assert artifact['partition'] == {'key': 'remote-test', 'scope': scope, 'version': 1}
+# A repeat takes the active-match branch of the same batch and does not create v2.
+assert bc.save_partition_artifact(client, 'remote-test', scope, dict(artifact)) == 1
+assert not remote.transaction_called
+assert len(remote.batches) == 2
+statements = remote.batches[0]
+assert len(statements) == 3
+assert 'INSERT INTO concept_partition_artifacts' in statements[0][0]
+assert 'UPDATE concept_partitions' in statements[1][0]
+assert 'SELECT artifact_version' in statements[2][0]
+
+# A stale unactivated v2 forces the server-side INSERT to conflict. The batch
+# rolls back, so the pointer remains at v1 and the caller's artifact is not
+# marked published.
+stale = dict(artifact)
+stale['partition'] = {'key': 'remote-test', 'scope': scope, 'version': 2}
+client.execute(
+    "INSERT INTO concept_partition_artifacts "
+    "(partition_key, version, artifact_json, document_count, created_at, artifact_checksum) "
+    "VALUES (?, 2, ?, 1, '2026-01-02T00:00:00+00:00', ?)",
+    ['remote-test', json.dumps(stale), bc.artifact_content_checksum(stale)],
+)
+failed = dict(artifact)
+failed.pop('partition')
+failed['different'] = True
+try:
+    bc.save_partition_artifact(client, 'remote-test', scope, failed)
+    raise AssertionError('expected stale-version conflict')
+except sqlite3.IntegrityError:
+    pass
+assert 'partition' not in failed
+assert client.execute(
+    "SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", ['remote-test']
+).rows[0]['artifact_version'] == 1
+
+class NoBatchClient:
+    def execute(self, sql, params=None):
+        return Result([])
+    def close(self):
+        pass
+
+sys.modules['libsql_client'] = types.SimpleNamespace(
+    create_client_sync=lambda url, auth_token=None: NoBatchClient()
+)
+try:
+    bc.get_db_client(':memory:')
+    raise AssertionError('expected missing-batch configuration error')
+except RuntimeError as exc:
+    assert 'transactional batch support' in str(exc)
+
+print(json.dumps({'batchStatements': len(statements)}))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync(
+    'python3', [harnessPath, path.resolve('scripts/build-concepts.py')], { cwd: path.resolve('.') },
+  );
+  const result = JSON.parse(stdout.trim().split('\n').at(-1));
+  assert.deepEqual(result, { batchStatements: 3 });
+});
+
 // --- Citation scan (re-streaming) job ---
 
 async function seedStreamableDoc(id, { degree = null, syncKey = null, checksum = 'scan-checksum-v1' } = {}) {
@@ -2712,6 +3041,12 @@ test('citation re-extraction publishes links atomically and preserves the last g
 
   const linked = await loadDocumentCitations(docId);
   assert.deepEqual(linked.map((row) => row.citation_text), [`Known, G. (2017). Last good citation. ${suffix}`]);
+  const state = await (await getDb()).execute({
+    sql: 'SELECT status, citation_count FROM citation_extraction_state WHERE doc_id = ?', args: [docId],
+  });
+  assert.equal(state.rows[0].status, 'failed');
+  assert.equal(Number(state.rows[0].citation_count), 1,
+    'a failed re-extraction remains explicitly retryable even with prior links');
 });
 
 test('strict citation failure preserves successful stream status and the attempted checksum', async () => {

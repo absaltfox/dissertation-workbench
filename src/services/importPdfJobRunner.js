@@ -179,6 +179,11 @@ export async function startCitationScanContinuation(job, result, progress, { cre
       type: 'citation_scan',
       label: 'Citation Scan (continuation)',
       params: nextParams,
+      // Atomically transfer the citation-scan singleton lease from this
+      // still-running worker to its child. Manual/scheduled starts therefore
+      // see the child as already running throughout the hand-off.
+      singleInstance: true,
+      replaceRunningJobId: job.id,
     });
     await log(job.id, `Scheduled next citation scan batch as job ${next.jobId}.`);
     await progress?.({

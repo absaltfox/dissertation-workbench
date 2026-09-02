@@ -47,7 +47,12 @@ export async function getDb() {
     });
   }
   if (!schemaReady) {
-    schemaReady = ensureSchema(db);
+    // Separate local SQLite clients can arrive during a migration at the same
+    // time (for example, concurrent worker processes). Schema migrations are
+    // idempotent, so retry the complete startup pass on SQLITE_BUSY instead of
+    // letting a transient schema-read lock prevent a singleton claimant from
+    // reaching its durable lease.
+    schemaReady = ensureSchemaWithRetry(db);
   }
   await schemaReady;
   return db;
@@ -170,11 +175,30 @@ async function exec(sql) {
   await client.executeMultiple(sql);
 }
 
-async function tryExec(client, sql) {
+// A few pre-IF-NOT-EXISTS migrations remain for databases that were created by
+// older releases.  Those statements may legitimately report that the named
+// schema object already exists.  Do not turn this into a general migration
+// error sink: a lock needs to reach ensureSchemaWithRetry, and any other error
+// (bad SQL, a missing table, an incompatible schema, etc.) must fail startup.
+function isAlreadyAppliedLegacyDdlError(error) {
+  const message = String(error?.message || '');
+  return /duplicate column name|(?:index|table)\s+.+\s+already exists/i.test(message);
+}
+
+export async function tryExec(client, sql, {
+  ignoreError = isAlreadyAppliedLegacyDdlError,
+} = {}) {
   try {
     await client.executeMultiple(sql);
-  } catch {
-    // Migration already applied or unsupported in the current database.
+    return true;
+  } catch (error) {
+    // Never swallow a database lock: getDb wraps the complete schema pass in
+    // a bounded retry, so this must propagate to that outer boundary.
+    if (classifyDbError(error) === 'transient') throw error;
+    if (ignoreError?.(error)) {
+      return false;
+    }
+    throw error;
   }
 }
 
@@ -280,6 +304,8 @@ async function ensureSchema(client) {
       source_json TEXT NOT NULL,
       status TEXT NOT NULL,
       total_seen INTEGER NOT NULL DEFAULT 0,
+      local_queue_seen INTEGER NOT NULL DEFAULT 0,
+      upstream_unique_seen INTEGER NOT NULL DEFAULT 0,
       total_saved INTEGER NOT NULL DEFAULT 0,
       api_total INTEGER,
       error TEXT,
@@ -308,6 +334,15 @@ async function ensureSchema(client) {
       progress_json TEXT,
       started_at TEXT NOT NULL,
       finished_at TEXT
+    );
+
+    -- A durable singleton lease for job types that must never overlap.  A
+    -- separate row (rather than a process-local check) makes the decision
+    -- safe when two HTTP replicas receive the same request at once.
+    CREATE TABLE IF NOT EXISTS admin_job_singletons (
+      type TEXT PRIMARY KEY,
+      job_id INTEGER NOT NULL,
+      updated_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS users (
@@ -574,6 +609,12 @@ async function ensureSchema(client) {
   `);
 
   await tryExec(client, 'ALTER TABLE catalogue_lookups ADD COLUMN bib_id TEXT');
+  // #17: These counters distinguish local enrichment retries from records
+  // observed during the upstream OC scan.  Use the verified, idempotent helper
+  // rather than tryExec so an actual migration failure cannot be mistaken for
+  // an already-applied column on a concurrently starting replica.
+  await addColumnIfMissing(client, 'sync_runs', 'local_queue_seen', 'INTEGER NOT NULL DEFAULT 0');
+  await addColumnIfMissing(client, 'sync_runs', 'upstream_unique_seen', 'INTEGER NOT NULL DEFAULT 0');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN runner_type TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN runner_id TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN runner_state TEXT');
@@ -692,6 +733,17 @@ async function ensureSchema(client) {
   if (cleaned > 0) logger.info(`Cleaned up ${cleaned} committee artefact rows`);
   await backfillDocumentPeopleProjection(client);
   await backfillSourceJsonProvenance(client);
+}
+
+// Exported for migration tests and for callers that need to initialise a
+// separately constructed client.  Keeping the retry around the complete,
+// idempotent schema pass means a lock at any migration statement restarts from
+// a known boundary and remains bounded by withDbRetry's maxAttempts.
+export function ensureSchemaWithRetry(client, retryOptions = {}) {
+  return withDbRetry(() => ensureSchema(client), {
+    label: 'ensureSchema',
+    ...retryOptions,
+  });
 }
 
 const SOURCE_JSON_TRIM_STATE_KEY = 'source_json_trim';
@@ -2284,6 +2336,8 @@ export async function updateSyncRun(id, patch) {
   for (const [key, column] of Object.entries({
     status: 'status',
     totalSeen: 'total_seen',
+    localQueueSeen: 'local_queue_seen',
+    upstreamUniqueSeen: 'upstream_unique_seen',
     totalSaved: 'total_saved',
     apiTotal: 'api_total',
     error: 'error',
@@ -2313,6 +2367,8 @@ export async function getLatestSyncRun(syncKey = null) {
     source: (() => { try { return JSON.parse(row.source_json); } catch { return null; } })(),
     status: row.status,
     totalSeen: Number(row.total_seen || 0),
+    localQueueSeen: Number(row.local_queue_seen || 0),
+    upstreamUniqueSeen: Number(row.upstream_unique_seen || 0),
     totalSaved: Number(row.total_saved || 0),
     apiTotal: row.api_total == null ? null : Number(row.api_total),
     error: row.error || null,
@@ -2333,6 +2389,8 @@ export async function listRecentSyncRuns(limit = 25) {
     source: (() => { try { return JSON.parse(row.source_json); } catch { return null; } })(),
     status: row.status,
     totalSeen: Number(row.total_seen || 0),
+    localQueueSeen: Number(row.local_queue_seen || 0),
+    upstreamUniqueSeen: Number(row.upstream_unique_seen || 0),
     totalSaved: Number(row.total_saved || 0),
     apiTotal: row.api_total == null ? null : Number(row.api_total),
     error: row.error || null,
@@ -2391,6 +2449,136 @@ export async function createAdminJob({
     now
   ]);
   return Number(result.lastInsertRowid || result.lastInsertRowId || 0);
+}
+
+// Atomically creates a running job only when this type has no running owner.
+// `admin_job_singletons` is deliberately a lease table instead of a partial
+// unique index on admin_jobs: a citation continuation is queued before its
+// current worker finishes, so the lease can be handed to the child without a
+// window in which a scheduled/manual request starts a competing scan.
+//
+// `replaceRunningJobId` is used solely by that continuation hand-off. It may
+// replace the lease only when the caller owns it; every other caller receives
+// the current job id. This works across local SQLite and multi-replica libSQL.
+export async function createAdminJobIfNotRunning({
+  type, label, params = null, artifactTokenHash = null, timeoutAt = null, runnerType = null,
+  replaceRunningJobId = null,
+}) {
+  // SQLite rejects a second simultaneous write transaction with SQLITE_BUSY;
+  // retrying the entire acquire-or-observe operation is safe because the
+  // singleton lease makes a committed first attempt observable as the same
+  // job on every later attempt.
+  return withDbRetry(() => createAdminJobIfNotRunningOnce({
+    type, label, params, artifactTokenHash, timeoutAt, runnerType, replaceRunningJobId,
+  }), { label: `createAdminJobIfNotRunning:${type}` });
+}
+
+async function createAdminJobIfNotRunningOnce({
+  type, label, params = null, artifactTokenHash = null, timeoutAt = null, runnerType = null,
+  replaceRunningJobId = null,
+}) {
+  const client = await getDb();
+  const now = new Date().toISOString();
+  const singleton = await client.execute({
+    sql: 'SELECT job_id FROM admin_job_singletons WHERE type = ?', args: [type],
+  });
+  const leaseJobId = Number(singleton.rows[0]?.job_id || 0);
+  let expectedLeaseJobId = -1;
+  if (leaseJobId > 0) {
+    const current = await client.execute({
+      sql: `SELECT id, status, timeout_at, heartbeat_at, claimed_at, started_at
+            FROM admin_jobs WHERE id = ?`, args: [leaseJobId],
+    });
+    const row = current.rows[0];
+    const nowMs = Date.now();
+    const timedOut = row?.status === 'running' && (
+      (row.timeout_at && Date.parse(row.timeout_at) <= nowMs)
+      || (!row.timeout_at && Date.parse(row.heartbeat_at || row.claimed_at || row.started_at) <= nowMs - STALE_HEARTBEAT_MS)
+    );
+    if (timedOut) {
+      const staleCutoff = new Date(nowMs - STALE_HEARTBEAT_MS).toISOString();
+      await client.execute({
+        sql: `UPDATE admin_jobs
+              SET status = 'timed_out', runner_state = 'timed_out',
+                  error = COALESCE(error, 'Admin worker timed out or stopped heartbeating.'),
+                  finished_at = ?, artifact_token_hash = NULL
+              WHERE id = ? AND status = 'running'
+                AND (timeout_at <= ? OR (timeout_at IS NULL AND COALESCE(heartbeat_at, claimed_at, started_at) <= ?))`,
+        args: [now, leaseJobId, now, staleCutoff],
+      });
+    } else if (row?.status === 'running' && leaseJobId !== Number(replaceRunningJobId || 0)) {
+      return { jobId: leaseJobId, created: false };
+    }
+    // A completed/timed-out owner may be replaced. A continuation uses the
+    // same compare-and-swap path, but only if it still owns the current lease.
+    expectedLeaseJobId = leaseJobId;
+  } else {
+    // Databases upgraded while a job was already running have no lease yet.
+    // Observing that job is enough to preserve the no-overlap invariant; the
+    // next creation after it finishes establishes the durable lease.
+    const legacy = await client.execute({
+      sql: `SELECT id FROM admin_jobs
+            WHERE type = ? AND status = 'running'
+            ORDER BY started_at DESC LIMIT 1`,
+      args: [type],
+    });
+    const legacyJobId = Number(legacy.rows[0]?.id || 0);
+    if (legacyJobId && legacyJobId !== Number(replaceRunningJobId || 0)) {
+      return { jobId: legacyJobId, created: false };
+    }
+  }
+
+  // `batch(..., 'write')` is an atomic transaction on both adapters, without
+  // keeping SQLite SELECT cursors open through COMMIT. The temporary negative
+  // lease is private to this batch: only its owner may insert a job, then the
+  // final statement replaces it with that job id.
+  const provisionalLeaseId = -((Date.now() % 1_000_000_000) * 10_000 + Math.floor(Math.random() * 10_000) + 1);
+  const results = await client.batch([
+    {
+      sql: `INSERT INTO admin_job_singletons (type, job_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(type) DO UPDATE SET job_id = excluded.job_id, updated_at = excluded.updated_at
+            WHERE admin_job_singletons.job_id = ?`,
+      args: [type, provisionalLeaseId, now, expectedLeaseJobId],
+    },
+    {
+      sql: `
+        INSERT INTO admin_jobs (
+          type, label, status, params_json, artifact_token_hash, timeout_at,
+          runner_type, runner_state, started_at
+        )
+        SELECT ?, ?, 'running', ?, ?, ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM admin_job_singletons WHERE type = ? AND job_id = ?
+        )
+      `,
+      args: [
+        type,
+        label,
+        params ? JSON.stringify(params) : null,
+        artifactTokenHash,
+        timeoutAt,
+        runnerType,
+        runnerType ? 'queued' : null,
+        now,
+        type,
+        provisionalLeaseId,
+      ],
+    },
+    {
+      sql: `UPDATE admin_job_singletons
+            SET job_id = last_insert_rowid(), updated_at = ?
+            WHERE type = ? AND job_id = ?`,
+      args: [now, type, provisionalLeaseId],
+    },
+  ], 'write');
+  if (changes(results[1]) > 0) {
+    return { jobId: Number(results[1].lastInsertRowid || results[1].lastInsertRowId || 0), created: true };
+  }
+  const current = await client.execute({
+    sql: 'SELECT job_id FROM admin_job_singletons WHERE type = ?', args: [type],
+  });
+  return { jobId: Number(current.rows[0]?.job_id || 0), created: false };
 }
 
 export async function updateAdminJob(id, patch = {}) {
@@ -4236,15 +4424,36 @@ export async function loadDocsByCitation(citationId) {
 // matching fails, the previous known-good link set remains visible; a failed
 // attempt can never publish a partial bibliography.
 export async function reextractDocumentCitations(docId, citations, hashFn, options = {}) {
-  let linkedIds = [];
-  if (citations.length) {
-    linkedIds = await saveCitations(docId, citations, hashFn, {
-      ...options,
-      linkDocument: false,
-    });
+  try {
+    let linkedIds = [];
+    if (citations.length) {
+      linkedIds = await saveCitations(docId, citations, hashFn, {
+        ...options,
+        linkDocument: false,
+      });
+    }
+    await replaceDocumentCitationLinks(docId, linkedIds);
+    return linkedIds;
+  } catch (error) {
+    // A failed extraction is retryable even if an older implementation left
+    // links behind. The scan gate explicitly admits failed rows when an
+    // operator chooses retryFailures, while ordinary runs keep the last known
+    // good bibliography untouched.
+    try {
+      const existing = await all('SELECT COUNT(*) AS total FROM document_citations WHERE doc_id = ?', [docId]);
+      await saveCitationExtractionState(docId, {
+        status: 'failed',
+        citationCount: Number(existing[0]?.total || 0),
+        error: error?.message || String(error),
+      });
+    } catch (stateError) {
+      logger.error('Could not record failed citation extraction state', {
+        docId,
+        error: stateError?.message || String(stateError),
+      });
+    }
+    throw error;
   }
-  await replaceDocumentCitationLinks(docId, linkedIds);
-  return linkedIds;
 }
 
 export async function replaceDocumentCitationLinks(docId, keepCitationIds = []) {
@@ -4253,74 +4462,49 @@ export async function replaceDocumentCitationLinks(docId, keepCitationIds = []) 
   );
   const now = new Date().toISOString();
   const client = await getDb();
-  const existing = await all('SELECT citation_id FROM document_citations WHERE doc_id = ?', [docId]);
-  const existingIds = existing.map((row) => Number(row.citation_id));
-  const stale = existing
-    .map((row) => Number(row.citation_id))
-    .filter((id) => !keep.has(id));
-  const statements = [];
-  for (const citationId of keep) {
-    statements.push({
-      sql: `
+  // Both libSQL and the embedded file client implement `transaction('write')`.
+  // Keeping the read, inserts, and deletes in that one transaction is stronger
+  // than the former file-SQLite compensating loop: an interruption can now only
+  // expose the old complete set or the new complete set, never a partial swap.
+  const transaction = await client.transaction('write');
+  let stale = [];
+  try {
+    const existingResult = await transaction.execute({
+      sql: 'SELECT citation_id FROM document_citations WHERE doc_id = ?', args: [docId],
+    });
+    const existing = existingResult.rows;
+    stale = existing
+      .map((row) => Number(row.citation_id))
+      .filter((id) => !keep.has(id));
+    const statements = [];
+    for (const citationId of keep) {
+      statements.push({
+        sql: `
           INSERT INTO document_citations (doc_id, citation_id, updated_at)
           VALUES (?, ?, ?)
           ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
-      `,
-      args: [docId, citationId, now],
-    });
-  }
-  const chunkSize = 900;
-  for (let i = 0; i < stale.length; i += chunkSize) {
-    const chunk = stale.slice(i, i + chunkSize);
-    const placeholders = chunk.map(() => '?').join(', ');
-    statements.push({
-      sql: `DELETE FROM document_citations WHERE doc_id = ? AND citation_id IN (${placeholders})`,
-      args: [docId, ...chunk],
-    });
-  }
-  if (statements.length) {
-    if (!getDatabaseUrl().startsWith('file:')) {
-      // Production libSQL/Turso path: publish the complete link set atomically.
-      await client.batch(statements, 'write');
-    } else {
-      // The embedded sqlite adapter cannot commit a batch while a diagnostic
-      // result iterator (notably EXPLAIN QUERY PLAN in tests/admin tooling) is
-      // live on the same connection. Apply the idempotent set locally and restore
-      // the exact previous links if a statement fails.
-      try {
-        for (const statement of statements) {
-          // eslint-disable-next-line no-await-in-loop
-          await client.execute(statement);
-        }
-      } catch (error) {
-        try {
-          for (const citationId of existingIds) {
-            // eslint-disable-next-line no-await-in-loop
-            await client.execute({
-              sql: `
-                INSERT INTO document_citations (doc_id, citation_id, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
-              `,
-              args: [docId, citationId, now],
-            });
-          }
-          const placeholders = existingIds.map(() => '?').join(', ');
-          await client.execute({
-            sql: existingIds.length
-              ? `DELETE FROM document_citations WHERE doc_id = ? AND citation_id NOT IN (${placeholders})`
-              : 'DELETE FROM document_citations WHERE doc_id = ?',
-            args: [docId, ...existingIds],
-          });
-        } catch (restoreError) {
-          logger.error('Failed to restore citation links after local swap error', {
-            docId,
-            error: restoreError?.message || String(restoreError),
-          });
-        }
-        throw error;
-      }
+        `,
+        args: [docId, citationId, now],
+      });
     }
+    const chunkSize = 900;
+    for (let i = 0; i < stale.length; i += chunkSize) {
+      const chunk = stale.slice(i, i + chunkSize);
+      const placeholders = chunk.map(() => '?').join(', ');
+      statements.push({
+        sql: `DELETE FROM document_citations WHERE doc_id = ? AND citation_id IN (${placeholders})`,
+        args: [docId, ...chunk],
+      });
+    }
+    if (statements.length) {
+      await transaction.batch(statements);
+    }
+    await transaction.commit();
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    throw error;
+  } finally {
+    transaction.close();
   }
   await collectOrphanedCitations(stale);
 }

@@ -144,11 +144,6 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
       return;
     }
 
-    const runningId = await hasRunningAdminJob('citation_scan');
-    if (runningId) {
-      res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
-      return;
-    }
     const result = await createAndStartAdminWorkerJob({
       type: 'citation_scan',
       label: 'Citation Scan',
@@ -161,7 +156,12 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
         autoContinue,
         scope,
       },
+      singleInstance: true,
     });
+    if (result.alreadyRunning) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: result.jobId });
+      return;
+    }
     clearMetricsCache();
     res.status(202).json({ ok: true, started: true, ...result });
   }));

@@ -200,6 +200,12 @@ async function runSync(syncKey, source, apiKey, runId, {
 } = {}) {
   const startedAt = Date.now();
   let totalSeen = 0;
+  // Local retry work is useful operational accounting, but it is not evidence
+  // about the upstream corpus. Keep it independent from the OC page budget and
+  // completion proof below.
+  let localQueueSeen = 0;
+  let upstreamUniqueSeen = 0;
+  let upstreamScanStarted = false;
   let totalSaved = 0;
   let totalSkipped = 0;
   let totalEnrichmentAttempted = 0;
@@ -461,10 +467,8 @@ async function runSync(syncKey, source, apiKey, runId, {
         pdfBatchLimitReached = true;
         return true;
       }
-      if (totalSeen >= source.maxRecords) return true;
       const pageLimit = Math.max(1, Math.min(
         source.pageSize,
-        source.maxRecords - totalSeen,
         pdfBatchLimit ? pdfBatchLimit - totalEnrichmentAttempted : source.pageSize
       ));
       const candidates = await listDocumentsPendingEnrichment({
@@ -478,6 +482,7 @@ async function runSync(syncKey, source, apiKey, runId, {
       if (!candidates.length) return false;
       queueCursor = candidates[candidates.length - 1].docId;
       totalSeen += candidates.length;
+      localQueueSeen += candidates.length;
       const missing = candidates.map((candidate) => ({
         doc: candidate.metadata && candidate.metadata.id ? candidate.metadata : { id: candidate.docId },
         syncKey,
@@ -485,24 +490,35 @@ async function runSync(syncKey, source, apiKey, runId, {
       }));
       await runEnrichmentBatch(missing);
       totalSaved += missing.length;
-      await updateSyncRun(runId, { totalSeen, totalSaved, apiTotal });
+      await updateSyncRun(runId, {
+        totalSeen,
+        localQueueSeen,
+        upstreamUniqueSeen,
+        totalSaved,
+        apiTotal,
+      });
       if (candidates.length < pageLimit) return false;
     }
   }
 
   async function finishSync() {
-    // #17: a run whose apiTotal is known (a live OC scan happened) but whose
-    // totalSeen never confirmed reaching it — the scan hit scanLimit/
-    // maxRecords/pdfBatchLimit before exhausting the upstream, or the API
-    // stopped returning results early (unstable deep pagination) — reports
-    // 'incomplete' rather than a blanket 'completed'. apiTotal stays null on
-    // the local-queue-drain-only path (no live OC scan happened this run),
-    // which keeps reporting 'completed' exactly as before — this status is
-    // specifically about OC-scan paging confidence, not queue-drain progress.
-    const runStatus = (apiTotal === null || totalSeen === apiTotal) ? 'completed' : 'incomplete';
+    // Completion belongs solely to the upstream scan. A local retry batch can
+    // fill a worker cap without ever reading OC, and its records must neither
+    // spend the upstream budget nor make a corpus scan look complete. When OC
+    // supplies a total, only the number of distinct upstream ids can prove it;
+    // without a total, an empty page is enough only when no duplicate made
+    // pagination ambiguous.
+    const authoritativeExhaustion = apiTotal !== null && upstreamUniqueSeen === Number(apiTotal);
+    const upstreamCompletionProven = upstreamScanStarted && (
+      authoritativeExhaustion
+      || (apiTotal === null && upstreamExhausted && duplicateDocIdsThisPass === 0)
+    );
+    const runStatus = upstreamCompletionProven ? 'completed' : 'incomplete';
     await updateSyncRun(runId, {
       status: runStatus,
       totalSeen,
+      localQueueSeen,
+      upstreamUniqueSeen,
       totalSaved,
       apiTotal,
       finishedAt: new Date().toISOString(),
@@ -513,6 +529,8 @@ async function runSync(syncKey, source, apiKey, runId, {
       mode,
       status: runStatus,
       totalSeen,
+      localQueueSeen,
+      upstreamUniqueSeen,
       totalSaved,
       totalSkipped,
       pdfBatchSize: pdfBatchLimit || null,
@@ -531,6 +549,8 @@ async function runSync(syncKey, source, apiKey, runId, {
       ok: true,
       runStatus,
       totalSeen,
+      localQueueSeen,
+      upstreamUniqueSeen,
       totalSaved,
       totalSkipped,
       apiTotal,
@@ -568,12 +588,13 @@ async function runSync(syncKey, source, apiKey, runId, {
       : null;
 
     for (let from = 0; from < source.scanLimit; from += source.pageSize) {
+      upstreamScanStarted = true;
       await onProgress?.({
         phase: 'oc_scan',
         label: 'Scanning Open Collections records',
         detail: `Records ${from + 1}-${from + source.pageSize}`,
         status: 'running',
-        counts: { processed: totalSeen, total: apiTotal ?? source.maxRecords },
+        counts: { processed: upstreamUniqueSeen, total: apiTotal ?? source.maxRecords },
       });
       requestCounts.metadata += 1;
       const pageRequest = {
@@ -624,9 +645,17 @@ async function runSync(syncKey, source, apiKey, runId, {
       // of whether Track 2's sort/search_after ends up usable — logs (does
       // not fail) when a page returns a doc id already seen this pass, the
       // exact silent-skip/duplicate symptom unstable deep pagination causes.
+      const uniqueDocs = [];
       for (const raw of docs) {
-        const rawId = String(raw?.id ?? raw?._id ?? raw?.identifier ?? '').trim();
-        if (!rawId) continue;
+        const rawId = String(rawSourceId(raw) || '').trim();
+        if (!rawId) {
+          // An unidentifiable record cannot contribute to a unique corpus
+          // count. Treat it like an unstable page rather than allowing it to
+          // make an API total look satisfied.
+          duplicateDocIdsThisPass += 1;
+          logger.warn('OC scan returned a record without a document id (unsafe paging)', { syncKey, from });
+          continue;
+        }
         if (seenDocIdsThisPass.has(rawId)) {
           duplicateDocIdsThisPass += 1;
           logger.warn('OC scan returned a doc id already seen this pass (possible unstable paging)', {
@@ -634,6 +663,7 @@ async function runSync(syncKey, source, apiKey, runId, {
           });
         } else {
           seenDocIdsThisPass.add(rawId);
+          uniqueDocs.push(raw);
         }
       }
 
@@ -651,7 +681,7 @@ async function runSync(syncKey, source, apiKey, runId, {
         if (lastSort !== undefined) searchAfterCursor = lastSort;
       }
 
-      const batch = docs.slice(0, Math.max(0, source.maxRecords - totalSeen)).map((raw) => {
+      const batch = uniqueDocs.slice(0, Math.max(0, source.maxRecords - upstreamUniqueSeen)).map((raw) => {
         const normalized = normalizeRecord(raw);
         return {
           doc: normalized,
@@ -668,6 +698,7 @@ async function runSync(syncKey, source, apiKey, runId, {
         };
       });
       totalSeen += batch.length;
+      upstreamUniqueSeen += batch.length;
       const filtered = await filterSyncItemsForMode(batch, enrichmentRequested ? mode : 'import_all');
       totalSkipped += filtered.skipped;
       if (enrichmentRequested) {
@@ -708,13 +739,19 @@ async function runSync(syncKey, source, apiKey, runId, {
       } else {
         totalSaved += await saveDocumentMetadataBatch(filtered.items);
       }
-      await updateSyncRun(runId, { totalSeen, totalSaved, apiTotal });
+      await updateSyncRun(runId, {
+        totalSeen,
+        localQueueSeen,
+        upstreamUniqueSeen,
+        totalSaved,
+        apiTotal,
+      });
 
-      if (apiTotal !== null && totalSeen >= apiTotal) {
+      if (apiTotal !== null && upstreamUniqueSeen === Number(apiTotal)) {
         upstreamExhausted = true;
         break;
       }
-      if (totalSeen >= source.maxRecords) break;
+      if (upstreamUniqueSeen >= source.maxRecords) break;
       if (pdfBatchLimitReached) break;
       if (requiredEnrichmentIds.size && pdfAttemptedIds.length >= requiredEnrichmentIds.size) break;
     }
@@ -724,6 +761,8 @@ async function runSync(syncKey, source, apiKey, runId, {
     await updateSyncRun(runId, {
       status: 'failed',
       totalSeen,
+      localQueueSeen,
+      upstreamUniqueSeen,
       totalSaved,
       apiTotal,
       error: error?.message || String(error),
@@ -733,6 +772,8 @@ async function runSync(syncKey, source, apiKey, runId, {
     return {
       ok: false,
       totalSeen,
+      localQueueSeen,
+      upstreamUniqueSeen,
       totalSaved,
       totalSkipped,
       apiTotal,

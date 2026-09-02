@@ -187,19 +187,99 @@ class SqliteClientWrapper:
         self.conn.commit()
         return ResultSet(cursor)
 
+    def transaction(self):
+        """Start a write-serializing transaction compatible with libsql-client.
+
+        ``execute()`` deliberately retains its legacy autocommit behaviour for the
+        worker's independent checkpoint writes. Publication uses this explicit
+        transaction instead so an artifact cannot become visible without its
+        partition pointer (or vice versa).
+        """
+        return SqliteTransaction(self.conn)
+
     def close(self):
         self.conn.close()
+
+
+class SqliteTransaction:
+    """The small transaction surface shared by sqlite3 and libsql-client."""
+
+    def __init__(self, conn):
+        self.conn = conn
+        # A writer lock before reading the current pointer prevents two local
+        # builders from proposing the same next version.
+        self.conn.execute("BEGIN IMMEDIATE")
+        self.closed = False
+
+    def execute(self, sql, params=None):
+        cursor = self.conn.cursor()
+        cursor.execute(sql, tuple(params or ()))
+
+        class ResultSet:
+            def __init__(self, cursor):
+                self.rows = cursor.fetchall()
+
+        return ResultSet(cursor)
+
+    def commit(self):
+        if not self.closed:
+            self.conn.commit()
+            self.closed = True
+
+    def rollback(self):
+        if not self.closed:
+            self.conn.rollback()
+            self.closed = True
+
+    def close(self):
+        if not self.closed:
+            self.rollback()
+
+
+class HttpLibsqlClientWrapper:
+    """Expose the HTTP-safe subset of a libsql client.
+
+    ``libsql_client`` supports a transactional ``batch(...)`` over
+    HTTP(S), but interactive transactions require a websocket/libsql transport.
+    Deliberately not forwarding ``transaction`` here prevents publication from
+    accidentally selecting an API that the configured transport cannot support.
+    """
+
+    def __init__(self, client):
+        self.client = client
+
+    def execute(self, sql, params=None):
+        return self.client.execute(sql, params)
+
+    def batch(self, statements):
+        return self.client.batch(statements)
+
+    def close(self):
+        return self.client.close()
 
 
 def get_db_client(db_path):
     url = os.environ.get("TURSO_DATABASE_URL", "").strip()
     auth_token = os.environ.get("TURSO_AUTH_TOKEN", "").strip()
     if url:
+        # Preserve the worker's established libsql:// -> HTTPS deployment
+        # conversion. HTTPS has transactional batches but no interactive
+        # ``transaction()`` API.
         if url.startswith("libsql://"):
             url = "https://" + url[len("libsql://"):]
         import libsql_client
         print(f"Connecting to remote Turso database: {url}")
-        return libsql_client.create_client_sync(url, auth_token=auth_token)
+        client = libsql_client.create_client_sync(url, auth_token=auth_token)
+        if url.startswith(("http://", "https://")):
+            if not callable(getattr(client, "batch", None)):
+                raise RuntimeError(
+                    "TURSO_DATABASE_URL uses HTTP(S), but this libsql-client "
+                    "does not provide transactional batch support required for "
+                    "atomic concept publication. Use a client with batch support "
+                    "or configure a websocket/libsql endpoint."
+                )
+            return HttpLibsqlClientWrapper(client)
+        return client
     print(f"Connecting to local SQLite database: {db_path}")
     return SqliteClientWrapper(db_path)
 
@@ -783,6 +863,12 @@ def artifact_base_url():
 
 
 def upload_concept_artifact(artifact):
+    """Upload the already-complete global artifact.
+
+    This transport operation is not a global publication lock: independent
+    builders may still race to upload different merged generations. Per-partition
+    artifact/pointer atomicity is deliberately narrower than that workflow.
+    """
     job_id = os.environ.get("ADMIN_JOB_ID")
     token = os.environ.get("ADMIN_JOB_ARTIFACT_TOKEN")
     if not job_id or not token:
@@ -867,7 +953,7 @@ def ensure_incremental_schema(client):
         )""",
         """CREATE TABLE IF NOT EXISTS concept_partition_artifacts (
           partition_key TEXT NOT NULL, version INTEGER NOT NULL, artifact_json TEXT NOT NULL,
-          document_count INTEGER NOT NULL, created_at TEXT NOT NULL,
+          document_count INTEGER NOT NULL, created_at TEXT NOT NULL, artifact_checksum TEXT,
           PRIMARY KEY (partition_key, version)
         )""",
         """CREATE TABLE IF NOT EXISTS concept_partition_candidates (
@@ -886,6 +972,7 @@ def ensure_incremental_schema(client):
     # compute_cohort_content_fingerprints) instead of source_updated_at, which any
     # enrichment pass bumps regardless of whether title/abstract/subjects changed.
     _ensure_column(client, "concept_partitions", "content_fingerprint", "TEXT")
+    _ensure_column(client, "concept_partition_artifacts", "artifact_checksum", "TEXT")
 
 
 def _ensure_column(client, table, column, sql_type):
@@ -1558,24 +1645,225 @@ def load_embedding_model():
     return SentenceTransformer(MODEL_NAME)
 
 
-def save_partition_artifact(client, key, scope, artifact):
-    current = client.execute(
-        "SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", [key]
-    ).rows[0]
-    version = int(current["artifact_version"] or 0) + 1
+def artifact_content_checksum(artifact):
+    """Checksum the publishable content, excluding publication-assigned metadata.
+
+    ``generatedAt`` is a build-attempt timestamp and ``partition`` is assigned only
+    after a version is chosen. Neither should turn a retry of the same dictionary
+    into a new version. All semantic artifact fields remain covered.
+    """
+    content = {
+        name: value for name, value in artifact.items()
+        if name not in ("generatedAt", "partition")
+    }
+    encoded = json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def artifact_partition_matches(artifact, key, scope, version):
+    return artifact.get("partition") == {"key": key, "scope": scope, "version": version}
+
+
+def read_partition_artifact(row):
+    try:
+        artifact = json.loads(row["artifact_json"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("Stored partition artifact is not valid JSON.") from exc
+    computed_checksum = artifact_content_checksum(artifact)
+    stored_checksum = row["artifact_checksum"]
+    if stored_checksum and stored_checksum != computed_checksum:
+        raise ValueError("Stored partition artifact checksum does not match its content.")
+    return artifact, stored_checksum or computed_checksum
+
+
+def _save_partition_artifact_transaction(client, key, scope, artifact, before_activate=None):
+    """Publish one partition atomically and make a repeat publish idempotent.
+
+    The transaction contains both the immutable version row and the mutable active
+    pointer. Readers join the pointer to the version row, so they see either the
+    previous complete artifact or the new one after commit -- never the gap between
+    the two statements. Local sqlite takes an immediate writer lock; libsql-client
+    owns a remote transaction for the same read/propose/activate sequence.
+    """
+    transaction = client.transaction()
+    try:
+        current_rows = transaction.execute(
+            "SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", [key]
+        ).rows
+        if not current_rows:
+            raise ValueError(f"Cannot publish unknown concept partition '{key}'.")
+        current_version = int(current_rows[0]["artifact_version"] or 0)
+        checksum = artifact_content_checksum(artifact)
+
+        # A committed retry must not manufacture version N+1 merely because the
+        # first attempt returned after a successful commit.
+        if current_version:
+            active_rows = transaction.execute(
+                """SELECT artifact_json, artifact_checksum
+                   FROM concept_partition_artifacts
+                   WHERE partition_key = ? AND version = ?""",
+                [key, current_version],
+            ).rows
+            if active_rows:
+                active_artifact, active_checksum = read_partition_artifact(active_rows[0])
+                if (
+                    active_checksum == checksum
+                    and artifact_partition_matches(active_artifact, key, scope, current_version)
+                ):
+                    artifact["partition"] = active_artifact["partition"]
+                    # A complete artifact can be intentionally invalidated when a
+                    # shared candidate threshold changes elsewhere. Reusing the
+                    # same local bytes must still reactivate this partition so the
+                    # next global merge sees a complete generation.
+                    now = utc_now()
+                    transaction.execute(
+                        """UPDATE concept_partitions SET status = 'complete', checkpoint_json = NULL,
+                             artifact_version = ?, last_completed_at = ?, error = NULL, updated_at = ?
+                           WHERE partition_key = ?""",
+                        [current_version, now, now, key],
+                    )
+                    transaction.commit()
+                    return current_version
+
+        version = current_version + 1
+        partition_metadata = {"key": key, "scope": scope, "version": version}
+        artifact["partition"] = partition_metadata
+        now = utc_now()
+        serialized = json.dumps(artifact)
+        existing_rows = transaction.execute(
+            """SELECT artifact_json, artifact_checksum
+               FROM concept_partition_artifacts
+               WHERE partition_key = ? AND version = ?""",
+            [key, version],
+        ).rows
+        if existing_rows:
+            existing_artifact, existing_checksum = read_partition_artifact(existing_rows[0])
+            if (
+                existing_checksum != checksum
+                or not artifact_partition_matches(existing_artifact, key, scope, version)
+            ):
+                raise ValueError(
+                    f"Conflicting concept artifact for partition '{key}' version {version}: "
+                    "the stored checksum or partition metadata does not match this publication."
+                )
+        else:
+            transaction.execute(
+                """INSERT INTO concept_partition_artifacts
+                   (partition_key, version, artifact_json, document_count, created_at, artifact_checksum)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [key, version, serialized, artifact["stats"]["documents"], now, checksum],
+            )
+
+        if before_activate:
+            before_activate()
+        transaction.execute(
+            """UPDATE concept_partitions SET status = 'complete', checkpoint_json = NULL,
+                 artifact_version = ?, last_completed_at = ?, error = NULL, updated_at = ?
+               WHERE partition_key = ?""",
+            [version, now, now, key],
+        )
+        transaction.commit()
+        return version
+    except Exception:
+        transaction.rollback()
+        raise
+    finally:
+        transaction.close()
+
+
+def _save_partition_artifact_batch(client, key, scope, artifact, before_activate=None):
+    """Publish through libsql's atomic HTTP batch primitive.
+
+    HTTP(S) clients cannot open an interactive transaction.  A write batch is a
+    single server-side transaction, so both the version insert and pointer
+    update commit or roll back together.  Version selection happens in SQL in
+    that transaction, rather than relying on a stale client-side read.
+    """
+    if before_activate:
+        raise RuntimeError(
+            "before_activate is only available with an interactive transaction; "
+            "HTTP(S) publication is atomic as one write batch."
+        )
+
+    # Preserve the useful error raised by the interactive path. This check is
+    # only validation; the write batch still protects against a concurrent
+    # pointer change or partition deletion.
+    partition_rows = client.execute(
+        "SELECT 1 FROM concept_partitions WHERE partition_key = ?", [key]
+    ).rows
+    if not partition_rows:
+        raise ValueError(f"Cannot publish unknown concept partition '{key}'.")
+
+    checksum = artifact_content_checksum(artifact)
+    scope_json = json.dumps(scope, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     now = utc_now()
+    serialized = json.dumps(artifact)
+
+    # The same predicate is used by both statements. A retry with the active
+    # bytes reactivates that version; any other payload inserts exactly the next
+    # version. If a stale unactivated next-version row exists, the plain INSERT
+    # fails and libsql rolls the entire write batch back rather than taking it
+    # over.
+    active_matches = """EXISTS (
+        SELECT 1 FROM concept_partition_artifacts active
+        WHERE active.partition_key = cp.partition_key
+          AND active.version = cp.artifact_version
+          AND active.artifact_checksum = ?
+          AND json_extract(active.artifact_json, '$.partition.key') = ?
+          AND json_extract(active.artifact_json, '$.partition.scope') = json(?)
+          AND json_extract(active.artifact_json, '$.partition.version') = cp.artifact_version
+    )"""
+    insert_sql = f"""INSERT INTO concept_partition_artifacts
+        (partition_key, version, artifact_json, document_count, created_at, artifact_checksum)
+        SELECT cp.partition_key, cp.artifact_version + 1,
+               json_set(?, '$.partition', json_object('key', ?, 'scope', json(?),
+                        'version', cp.artifact_version + 1)),
+               ?, ?, ?
+        FROM concept_partitions cp
+        WHERE cp.partition_key = ? AND NOT ({active_matches})"""
+    update_sql = f"""UPDATE concept_partitions AS cp
+        SET status = 'complete', checkpoint_json = NULL,
+            artifact_version = CASE WHEN {active_matches}
+                                    THEN cp.artifact_version
+                                    ELSE cp.artifact_version + 1 END,
+            last_completed_at = ?, error = NULL, updated_at = ?
+        WHERE cp.partition_key = ?"""
+    # The last query runs in the same write transaction and is the authoritative
+    # chosen version. It also makes a partition deletion race observable.
+    result_sets = client.batch([
+        (insert_sql, [
+            serialized, key, scope_json, artifact["stats"]["documents"], now, checksum,
+            key, checksum, key, scope_json,
+        ]),
+        (update_sql, [checksum, key, scope_json, now, now, key]),
+        ("SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", [key]),
+    ])
+    final_rows = result_sets[-1].rows if result_sets else []
+    if not final_rows:
+        raise RuntimeError(
+            f"Concept partition '{key}' disappeared during atomic HTTP(S) publication."
+        )
+    version = int(final_rows[0]["artifact_version"])
     artifact["partition"] = {"key": key, "scope": scope, "version": version}
-    client.execute(
-        "INSERT INTO concept_partition_artifacts (partition_key, version, artifact_json, document_count, created_at) VALUES (?, ?, ?, ?, ?)",
-        [key, version, json.dumps(artifact), artifact["stats"]["documents"], now],
-    )
-    client.execute(
-        """UPDATE concept_partitions SET status = 'complete', checkpoint_json = NULL,
-             artifact_version = ?, last_completed_at = ?, error = NULL, updated_at = ?
-           WHERE partition_key = ?""",
-        [version, now, now, key],
-    )
     return version
+
+
+def save_partition_artifact(client, key, scope, artifact, before_activate=None):
+    """Publish one partition atomically and make a repeat publish idempotent.
+
+    SQLite and websocket/libsql clients use an interactive transaction. HTTP(S)
+    Turso clients use libsql's transactional write batch, which has the same
+    all-or-nothing visibility guarantee without calling the unsupported
+    interactive transaction API.
+    """
+    if callable(getattr(client, "transaction", None)):
+        return _save_partition_artifact_transaction(client, key, scope, artifact, before_activate)
+    if callable(getattr(client, "batch", None)):
+        return _save_partition_artifact_batch(client, key, scope, artifact, before_activate)
+    raise RuntimeError(
+        "Atomic concept publication requires either an interactive transaction "
+        "or libsql transactional batch support."
+    )
 
 
 def merged_component_doc_freq(members, shards, total_docs):
@@ -2134,6 +2422,12 @@ def main():
         )
         if should_publish:
             reporter.assert_owned()
+            # Partition artifact + active-pointer publication is atomic above.
+            # The subsequent cross-partition merge/upload remains a separate
+            # operation: concurrent global publishers can still upload stale
+            # merged generations. Serializing that broader workflow needs a
+            # dedicated global publication lease and is intentionally outside
+            # this per-partition atomic-publication change.
             upload_concept_artifact(merged_artifact)
             mark_global_published(client)
         elif not selected["publishGlobally"]:
