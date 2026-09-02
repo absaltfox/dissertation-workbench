@@ -8,7 +8,7 @@ import {
   FLY_WORKER_REGION, IS_PRODUCTION, WORKER_IMAGE
 } from '../config.js';
 import {
-  appendAdminJobLog, createAdminJob, finishAdminJob, getAdminJob, hashAdminJobToken,
+  appendAdminJobLog, createAdminJob, createAdminJobIfNotRunning, finishAdminJob, getAdminJob, hashAdminJobToken,
   updateAdminJob
 } from '../db.js';
 
@@ -209,7 +209,9 @@ function startLocalWorker(jobId, token) {
   return child;
 }
 
-export async function createAndStartAdminWorkerJob({ type, label, params = null }) {
+export async function createAndStartAdminWorkerJob({
+  type, label, params = null, singleInstance = false, replaceRunningJobId = null,
+}) {
   const token = crypto.randomBytes(32).toString('hex');
   let runnerType;
   try {
@@ -217,14 +219,26 @@ export async function createAndStartAdminWorkerJob({ type, label, params = null 
   } catch (error) {
     throw adminWorkerStartError(error);
   }
-  const jobId = await createAdminJob({
-    type,
-    label,
-    params,
-    artifactTokenHash: hashAdminJobToken(token),
-    timeoutAt: isoAfter(ADMIN_WORKER_TIMEOUT_MS),
-    runnerType,
-  });
+  const job = singleInstance
+    ? await createAdminJobIfNotRunning({
+      type,
+      label,
+      params,
+      artifactTokenHash: hashAdminJobToken(token),
+      timeoutAt: isoAfter(ADMIN_WORKER_TIMEOUT_MS),
+      runnerType,
+      replaceRunningJobId,
+    })
+    : { jobId: await createAdminJob({
+      type,
+      label,
+      params,
+      artifactTokenHash: hashAdminJobToken(token),
+      timeoutAt: isoAfter(ADMIN_WORKER_TIMEOUT_MS),
+      runnerType,
+    }), created: true };
+  if (!job.created) return { jobId: job.jobId, alreadyRunning: true };
+  const jobId = job.jobId;
   try {
     if (runnerType === 'fly') {
       await startFlyWorker(jobId, token);

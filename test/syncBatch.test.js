@@ -14,6 +14,7 @@ let loadStoredFileMetric;
 let runDocumentSync;
 let runImportPdfAdminJob;
 let saveImportRule;
+let saveDocumentMetadata;
 let reserveImportRuleRequestSlot;
 let rulesForContinuation;
 let setDownloadSafetyOptions;
@@ -50,6 +51,7 @@ test.before(async () => {
     getLatestSyncRun,
     loadStoredFileMetric,
     reserveImportRuleRequestSlot,
+    saveDocumentMetadata,
     saveImportRule,
   } = await import('../src/db.js'));
   ({ runDocumentSync } = await import('../src/sync.js'));
@@ -271,6 +273,50 @@ test('a fully upstream-exhausted scan reports status completed', async () => {
     assert.equal(result.totalSeen, 3);
     assert.equal(result.runStatus, 'completed');
     assert.equal((await getLatestSyncRun(result.syncKey)).status, 'completed');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('an underfilled local enrichment queue does not consume the upstream scan budget', async () => {
+  const originalFetch = globalThis.fetch;
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const source = {
+    mode: 'sync_missing_pdfs',
+    baseUrl: 'https://oc-index.test',
+    term: `degree.raw,Queue budget ${suffix}`,
+    source: 'id,title,author',
+    pageSize: 10,
+    scanLimit: 10,
+    syncMaxRecords: 2,
+    pdfBatchSize: 2,
+    downloadFiles: false,
+  };
+  const { getSyncKeyForOptions } = await import('../src/sync.js');
+  await saveDocumentMetadata({
+    id: `queue-local-${suffix}`, title: 'Local retry', author: 'Tester', supervisors: [],
+  }, { syncKey: getSyncKeyForOptions(source) });
+  const upstream = [
+    { id: `queue-upstream-a-${suffix}`, title: 'Upstream A', author: 'Tester' },
+    { id: `queue-upstream-b-${suffix}`, title: 'Upstream B', author: 'Tester' },
+  ];
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/search/8.5')) {
+      return new Response(JSON.stringify({
+        data: { hits: { total: upstream.length, hits: upstream.map((doc) => ({ _source: doc })) } },
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  try {
+    const result = await runDocumentSync(source);
+    assert.equal(result.localQueueSeen, 1);
+    assert.equal(result.upstreamUniqueSeen, 2);
+    assert.equal(result.totalSeen, 3);
+    assert.equal(result.runStatus, 'completed');
+    const persisted = await getLatestSyncRun(result.syncKey);
+    assert.equal(persisted.localQueueSeen, 1);
+    assert.equal(persisted.upstreamUniqueSeen, 2);
   } finally {
     globalThis.fetch = originalFetch;
   }

@@ -87,16 +87,16 @@ function scheduleDailyConceptRebuildJob() {
 }
 
 export async function startCitationScanJob(trigger) {
-  const runningId = await hasRunningAdminJob('citation_scan');
-  if (runningId) {
-    logger.info('Citation scan job already running', { trigger, jobId: runningId });
-    return { alreadyRunning: true, jobId: runningId };
-  }
   const result = await createAndStartAdminWorkerJob({
     type: 'citation_scan',
     label: trigger === 'scheduled' ? 'Scheduled Citation Scan' : 'Citation Scan',
     params: { trigger, retryFailures: false },
+    singleInstance: true,
   });
+  if (result.alreadyRunning) {
+    logger.info('Citation scan job already running', { trigger, jobId: result.jobId });
+    return result;
+  }
   logger.info('Citation scan job started', { trigger, jobId: result.jobId, runnerType: result.runnerType });
   return result;
 }

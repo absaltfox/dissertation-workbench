@@ -20,6 +20,7 @@ import path from 'node:path';
 
 let tempDir;
 let closeDb;
+let getLatestSyncRun;
 let runDocumentSync;
 
 test.before(async () => {
@@ -32,6 +33,7 @@ test.before(async () => {
   process.env.NODE_ENV = 'test';
   const db = await import('../src/db.js');
   closeDb = db.closeDb;
+  getLatestSyncRun = db.getLatestSyncRun;
   ({ runDocumentSync } = await import('../src/sync.js'));
   await db.ensureStorage();
 });
@@ -98,6 +100,13 @@ test('overlap detector logs when a page returns a doc id already seen this pass'
     // The detector counts the re-served id, without failing the run.
     assert.equal(result.duplicateDocIdsThisPass, 1,
       `expected exactly one detected overlap, got ${result.duplicateDocIdsThisPass}`);
+    assert.equal(result.upstreamUniqueSeen, 3, 'only distinct upstream ids count toward completion');
+    assert.equal(result.runStatus, 'incomplete', 'an overlap must not falsely satisfy the upstream total');
+    const persisted = await getLatestSyncRun(result.syncKey);
+    assert.equal(persisted.upstreamUniqueSeen, 3,
+      'the durable run evidence must retain distinct upstream observations');
+    assert.equal(persisted.localQueueSeen, 0,
+      'an upstream-only scan must not be recorded as local queue work');
     assert.ok(
       warnings.some((args) => /already seen this pass/.test(args[0] || '')),
       'expected the overlap detector to log a warning'
