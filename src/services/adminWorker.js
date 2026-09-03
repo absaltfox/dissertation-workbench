@@ -8,8 +8,9 @@ import {
   FLY_WORKER_REGION, IS_PRODUCTION, WORKER_IMAGE
 } from '../config.js';
 import {
-  appendAdminJobLog, createAdminJob, createAdminJobIfNotRunning, finishAdminJob,
-  finishRunningAdminJob, getAdminJob, hashAdminJobToken, updateRunningAdminJob
+  appendAdminJobLog, completeAdminJobFollowup, createAdminJob, createAdminJobIfNotRunning,
+  finishAdminJob, finishRunningAdminJob, getAdminJob, hashAdminJobToken,
+  listAdminJobFollowups, updateRunningAdminJob
 } from '../db.js';
 import { terminateChild } from './workerLifecycle.js';
 
@@ -284,6 +285,32 @@ export async function createAndStartAdminWorkerJob({
     throw adminWorkerStartError(error);
   }
   return { jobId, runnerType };
+}
+
+// Called periodically by the long-lived web process. Requests remain in the
+// outbox while their singleton is busy or a worker fails to start. Deletion is
+// generation-fenced so an import arriving during dispatch cannot be lost.
+export async function dispatchAdminJobFollowups({ createJob = createAndStartAdminWorkerJob } = {}) {
+  const followups = await listAdminJobFollowups();
+  const dispatched = [];
+  for (const followup of followups) {
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const job = await createJob({
+        type: followup.type,
+        label: followup.label,
+        params: followup.params,
+        singleInstance: true,
+      });
+      if (job.alreadyRunning) continue;
+      // eslint-disable-next-line no-await-in-loop
+      const completed = await completeAdminJobFollowup(followup.type, followup.requestToken);
+      dispatched.push({ type: followup.type, jobId: job.jobId, superseded: !completed });
+    } catch {
+      // A transient launch error leaves the durable row for the next pass.
+    }
+  }
+  return dispatched;
 }
 
 export async function cancelAdminWorkerJob(jobId) {

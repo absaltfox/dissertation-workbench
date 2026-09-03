@@ -4,10 +4,13 @@ import {
 } from './config.js';
 import { fetchPage, extractHits, resolveIndexName, OC_STABLE_SORT_FIELD } from './api.js';
 import {
-  createSyncRun, documentExists, documentsExist, getDocumentCacheStats, getLatestSyncRun,
+  abortImportRuleEligibilityProjection, beginImportRuleEligibilityProjection,
+  createSyncRun, documentExists, documentsExist, finalizeImportRuleEligibilityProjection,
+  getDocumentCacheStats, getLatestSyncRun,
   listDocumentsPendingEnrichment, loadEnrichmentAttempts, loadStoredFileMetric,
   loadStoredFileMetrics, markEnrichmentAttempts, reserveImportRuleRequestSlot,
-  saveDocumentMetadata, saveDocumentMetadataBatch, saveFileMetric, updateSyncRun
+  projectImportRuleEligibilityBatch, saveDocumentMetadata, saveDocumentMetadataBatch,
+  saveFileMetric, updateSyncRun
 } from './db.js';
 import {
   buildDocumentSyncKey, buildMetricsSourceOptions, ensureSourceFields, normalizeRecord
@@ -225,6 +228,10 @@ async function runSync(syncKey, source, apiKey, runId, {
   // few MB, trivial for a single scan's lifetime.
   const seenDocIdsThisPass = new Set();
   let duplicateDocIdsThisPass = 0;
+  let eligibilityProjectionToken = null;
+  let eligibilityProjectionPublished = false;
+  const projectsRuleEligibility = Boolean(importRuleId)
+    && (mode === 'import_all' || mode === 'sync_missing_pdfs');
   // #17 Track 2: whether the OC endpoint accepts/honors a stable sort. Starts
   // 'unknown' and is probed defensively on the first live page — if the
   // request itself is rejected, or accepted but hits never carry back a sort
@@ -514,6 +521,15 @@ async function runSync(syncKey, source, apiKey, runId, {
       || (apiTotal === null && upstreamExhausted && duplicateDocIdsThisPass === 0)
     );
     const runStatus = upstreamCompletionProven ? 'completed' : 'incomplete';
+    if (eligibilityProjectionToken) {
+      if (upstreamCompletionProven) {
+        await finalizeImportRuleEligibilityProjection(importRuleId, eligibilityProjectionToken);
+        eligibilityProjectionPublished = true;
+      } else {
+        await abortImportRuleEligibilityProjection(importRuleId, eligibilityProjectionToken);
+      }
+      eligibilityProjectionToken = null;
+    }
     await updateSyncRun(runId, {
       status: runStatus,
       totalSeen,
@@ -566,10 +582,16 @@ async function runSync(syncKey, source, apiKey, runId, {
       enrichmentCursor: queueCursor,
       heapGrowthBytes: Math.max(0, peakHeapBytes - startingHeapBytes),
       requestCounts,
+      eligibilityProjectionPublished,
     };
   }
 
   try {
+    if (projectsRuleEligibility) {
+      eligibilityProjectionToken = await beginImportRuleEligibilityProjection(importRuleId, {
+        token: `sync-run:${runId}`,
+      });
+    }
     // H-03: enrichment takes its work from the local queue and returns here, without
     // resolving an index or fetching a single Open Collections page. The scan below
     // is reached only when there is nothing outstanding locally - a corpus that has
@@ -699,9 +721,26 @@ async function runSync(syncKey, source, apiKey, runId, {
       });
       totalSeen += batch.length;
       upstreamUniqueSeen += batch.length;
-      const filtered = await filterSyncItemsForMode(batch, enrichmentRequested ? mode : 'import_all');
+      // A metadata-only use of the enrichment action intentionally degrades to
+      // a normal metadata import. Other explicit modes retain their own
+      // filtering semantics (the removed maintenance UI no longer invokes
+      // them, but API compatibility must not silently turn them into import_all).
+      const effectiveMode = mode === 'sync_missing_pdfs' && !enrichmentRequested ? 'import_all' : mode;
+      const filtered = await filterSyncItemsForMode(batch, effectiveMode);
       totalSkipped += filtered.skipped;
       if (enrichmentRequested) {
+        // Import & Enrich is a metadata sync first: every matching record is
+        // refreshed even when its existing content already satisfies policy.
+        // This also ensures the document rows exist before the eligibility
+        // generation records their rule membership.
+        await saveDocumentMetadataBatch(batch);
+        if (eligibilityProjectionToken) {
+          await projectImportRuleEligibilityBatch(
+            importRuleId,
+            eligibilityProjectionToken,
+            filtered.items.map((item) => item.doc.id)
+          );
+        }
         // One batched read of the stored metrics and the attempt log for the whole
         // page replaces one loadStoredFileMetric round trip per record (H-05). The
         // control allowlist ignores both, so it does not pay for them at all.
@@ -738,6 +777,13 @@ async function runSync(syncKey, source, apiKey, runId, {
         totalSaved += missing.length;
       } else {
         totalSaved += await saveDocumentMetadataBatch(filtered.items);
+        if (eligibilityProjectionToken) {
+          await projectImportRuleEligibilityBatch(
+            importRuleId,
+            eligibilityProjectionToken,
+            filtered.items.map((item) => item.doc.id)
+          );
+        }
       }
       await updateSyncRun(runId, {
         totalSeen,
@@ -752,12 +798,21 @@ async function runSync(syncKey, source, apiKey, runId, {
         break;
       }
       if (upstreamUniqueSeen >= source.maxRecords) break;
-      if (pdfBatchLimitReached) break;
+      // Rule imports continue the upstream metadata scan after reaching the
+      // bounded content cap. That lets one action synchronize the complete
+      // metadata scope and atomically publish eligibility while later content
+      // batches drain from the local queue. Legacy ad-hoc syncs retain their
+      // early-stop behavior.
+      if (pdfBatchLimitReached && !importRuleId) break;
       if (requiredEnrichmentIds.size && pdfAttemptedIds.length >= requiredEnrichmentIds.size) break;
     }
 
     return await finishSync();
   } catch (error) {
+    if (eligibilityProjectionToken) {
+      await abortImportRuleEligibilityProjection(importRuleId, eligibilityProjectionToken).catch(() => {});
+      eligibilityProjectionToken = null;
+    }
     await updateSyncRun(runId, {
       status: 'failed',
       totalSeen,
@@ -787,6 +842,7 @@ async function runSync(syncKey, source, apiKey, runId, {
       enrichmentCursor: queueCursor,
       heapGrowthBytes: Math.max(0, peakHeapBytes - startingHeapBytes),
       requestCounts,
+      eligibilityProjectionPublished,
       error: error?.message || String(error),
     };
   } finally {

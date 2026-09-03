@@ -1056,6 +1056,56 @@ def scope_where(scope, alias="d"):
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
 
+def _processing_eligibility_activated(client):
+    """Return whether rule eligibility has become authoritative for this corpus.
+
+    Older databases (and deliberately minimal worker fixtures) have no eligibility
+    activation table, and databases upgraded before their first successful
+    projection have no activation row. Both retain the historical all-document
+    corpus. Once activated, every PatternRank read is permanently constrained to
+    the effective union of live rules whose current policy enables PatternRank;
+    deleting the final rule therefore produces an empty corpus instead of silently
+    restoring legacy selection. The marker is monotonic, so cache it on the client
+    rather than adding a schema/presence round trip to every corpus query.
+    """
+    cached = getattr(client, "_patternrank_eligibility_activated", None)
+    if cached is not None:
+        return cached
+    try:
+        rows = client.execute(
+            "SELECT 1 AS activated FROM processing_eligibility_activation WHERE id = 1"
+        ).rows
+    except Exception as exc:
+        message = str(exc).lower()
+        if "no such table" not in message and "does not exist" not in message:
+            raise
+        rows = []
+    activated = bool(rows)
+    setattr(client, "_patternrank_eligibility_activated", activated)
+    return activated
+
+
+def _patternrank_eligibility_predicate(client, alias="d"):
+    if not _processing_eligibility_activated(client):
+        return ""
+    return f"""EXISTS (
+      SELECT 1
+      FROM rule_document_processing_eligibility eligibility
+      JOIN import_rule_eligibility_projections projection
+        ON projection.rule_id = eligibility.rule_id
+       AND projection.completed_token = eligibility.projection_token
+      JOIN import_rules rule_policy ON rule_policy.id = eligibility.rule_id
+      WHERE eligibility.doc_id = {alias}.doc_id
+        AND rule_policy.run_concepts = 1
+    )"""
+
+
+def _append_where_predicate(where, predicate):
+    if not predicate:
+        return where
+    return f"{where} AND {predicate}" if where else f" WHERE {predicate}"
+
+
 def cohort_year_bucket(year):
     """Coarsen a document year into the automatic-partition grouping key (#21)."""
     year = int(year or 0)
@@ -1066,13 +1116,14 @@ def cohort_year_bucket(year):
     return (year // 10) * 10
 
 
-def _year_bucket_sql():
+def _year_bucket_sql(alias=None):
     """SQL expression computing the same bucket cohort_year_bucket() computes in
     Python, so the automatic GROUP BY (one round trip) can bucket server-side
     instead of pulling every document's raw year back to bucket it here."""
+    column = f"{alias}.year" if alias else "year"
     if CONCEPT_PARTITION_GRANULARITY == "year":
-        return "COALESCE(year, 0)"
-    return "(CASE WHEN COALESCE(year, 0) <= 0 THEN 0 ELSE (COALESCE(year, 0) / 10) * 10 END)"
+        return f"COALESCE({column}, 0)"
+    return f"(CASE WHEN COALESCE({column}, 0) <= 0 THEN 0 ELSE (COALESCE({column}, 0) / 10) * 10 END)"
 
 
 def _cohort_scope_from_bucket(degree, bucket):
@@ -1113,13 +1164,16 @@ def fetch_cohort_content_fingerprints(client):
     in Python into the same (degree, year-bucket) cohorts the automatic GROUP BY
     query above uses, and hashed into one content fingerprint per cohort.
     """
+    eligibility_where = _append_where_predicate(
+        "", _patternrank_eligibility_predicate(client, "d")
+    )
     rows = client.execute(
-        """SELECT doc_id, COALESCE(degree, '') AS degree, COALESCE(year, 0) AS year,
-                  json_extract(metadata_json, '$.title') AS title,
-                  COALESCE(json_extract(metadata_json, '$.abstract'),
-                           json_extract(metadata_json, '$.description')) AS abstract,
-                  json_extract(metadata_json, '$.subjects') AS subjects
-           FROM documents"""
+        f"""SELECT d.doc_id, COALESCE(d.degree, '') AS degree, COALESCE(d.year, 0) AS year,
+                   json_extract(d.metadata_json, '$.title') AS title,
+                   COALESCE(json_extract(d.metadata_json, '$.abstract'),
+                            json_extract(d.metadata_json, '$.description')) AS abstract,
+                   json_extract(d.metadata_json, '$.subjects') AS subjects
+            FROM documents d{eligibility_where}"""
     ).rows
     grouped = {}
     for row in rows:
@@ -1135,6 +1189,7 @@ def fetch_scope_content_fingerprint(client, scope):
     (non-automatic) partition scope -- kept as a single scoped query, matching the
     explicit-scope path's existing once-per-job (not per-cohort) COUNT query."""
     where, args = scope_where(scope)
+    where = _append_where_predicate(where, _patternrank_eligibility_predicate(client, "d"))
     rows = client.execute(
         f"""SELECT d.doc_id AS doc_id,
                    json_extract(d.metadata_json, '$.title') AS title,
@@ -1215,6 +1270,7 @@ def discover_partition(client, requested_scope=None, priority=0, force=False):
         scope = requested_scope
         key = partition_key(scope, "custom")
         where, args = scope_where(scope)
+        where = _append_where_predicate(where, _patternrank_eligibility_predicate(client, "d"))
         summary_rows = client.execute(
             f"SELECT COUNT(*) AS document_count, MAX(updated_at) AS source_updated_at FROM documents d{where}",
             args,
@@ -1231,12 +1287,15 @@ def discover_partition(client, requested_scope=None, priority=0, force=False):
         existing_rows = client.execute("SELECT * FROM concept_partitions WHERE partition_key = ?", [key]).rows
         existing_by_key = {key: existing_rows[0]} if existing_rows else {}
     else:
-        bucket_sql = _year_bucket_sql()
+        bucket_sql = _year_bucket_sql("d")
+        eligibility_where = _append_where_predicate(
+            "", _patternrank_eligibility_predicate(client, "d")
+        )
         rows = client.execute(
-            f"""SELECT COALESCE(degree, '') AS degree, {bucket_sql} AS partition_year,
-                      COUNT(*) AS document_count, MAX(updated_at) AS source_updated_at
-               FROM documents
-               GROUP BY COALESCE(degree, ''), {bucket_sql}
+            f"""SELECT COALESCE(d.degree, '') AS degree, {bucket_sql} AS partition_year,
+                      COUNT(*) AS document_count, MAX(d.updated_at) AS source_updated_at
+               FROM documents d{eligibility_where}
+               GROUP BY COALESCE(d.degree, ''), {bucket_sql}
                ORDER BY degree, partition_year"""
         ).rows
         fingerprints = fetch_cohort_content_fingerprints(client)
@@ -1399,6 +1458,7 @@ def discover_partition(client, requested_scope=None, priority=0, force=False):
 
 def load_partition_documents(client, scope):
     where, args = scope_where(scope)
+    where = _append_where_predicate(where, _patternrank_eligibility_predicate(client, "d"))
     rows = client.execute(
         f"SELECT d.doc_id, d.metadata_json, d.updated_at FROM documents d{where} ORDER BY d.doc_id LIMIT ?",
         [*args, MAX_PARTITION_DOCUMENTS + 1],

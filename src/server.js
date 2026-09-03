@@ -7,12 +7,14 @@ import {
   CITATION_SCAN_NIGHTLY_ENABLED, CITATION_SCAN_NIGHTLY_HOUR_LOCAL, validateRuntimeSecrets
 } from './config.js';
 import {
-  checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb, hasRunningAdminJob
+  checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb
 } from './db.js';
 import { ensureDefaultAdmin } from './auth.js';
 import { createBoundedCache } from './boundedCache.js';
 import { getConceptPipelineStatus } from './conceptsPipeline.js';
-import { createAndStartAdminWorkerJob } from './services/adminWorker.js';
+import {
+  createAndStartAdminWorkerJob, dispatchAdminJobFollowups
+} from './services/adminWorker.js';
 import { logger } from './logger.js';
 import {
   msUntilNextDailyHour,
@@ -45,7 +47,9 @@ const metricsInflight = new Map();
 let stopDailyConceptScheduler = null;
 let stopDailyCitationScanScheduler = null;
 let stopWorkbenchCacheWarmup = null;
+let stopAdminJobFollowupDispatcher = null;
 const DAILY_CONCEPT_REBUILD_HOUR_LOCAL = 2;
+const ADMIN_JOB_FOLLOWUP_INTERVAL_MS = 5_000;
 
 // Sync pulls in the metrics/PDF pipeline and is only needed for admin import
 // workflows. Loading it lazily keeps normal API startup cheaper and avoids
@@ -66,16 +70,16 @@ export function scheduleDaily(hourLocal, fn, options = {}) {
 }
 
 async function startConceptRebuildJob(trigger) {
-  const runningId = await hasRunningAdminJob('concept_rebuild');
-  if (runningId) {
-    logger.info('Concept rebuild job already running', { trigger, jobId: runningId });
-    return { alreadyRunning: true, jobId: runningId };
-  }
   const result = await createAndStartAdminWorkerJob({
     type: 'concept_rebuild',
     label: trigger === 'scheduled' ? 'Scheduled PatternRank Partition' : 'Startup PatternRank Partition',
     params: { method: 'patternrank_incremental', trigger },
+    singleInstance: true,
   });
+  if (result.alreadyRunning) {
+    logger.info('Concept rebuild job already running', { trigger, jobId: result.jobId });
+    return result;
+  }
   logger.info('Concept rebuild job started', { trigger, jobId: result.jobId, runnerType: result.runnerType });
   return result;
 }
@@ -243,6 +247,16 @@ export async function start() {
   }, WORKBENCH_CACHE_REFRESH_MS);
   stopWorkbenchCacheWarmup = () => clearInterval(workbenchCacheWarmupTimer);
 
+  // Singleton collisions write a durable reconciliation request. Polling from
+  // the long-lived web process guarantees a fresh pass starts after the active
+  // worker releases its lease, including when that worker runs on Fly.
+  const dispatchFollowups = () => dispatchAdminJobFollowups().catch((error) => {
+    logger.error('Admin job follow-up dispatch failed', { error: error?.message || String(error) });
+  });
+  dispatchFollowups();
+  const followupTimer = setInterval(dispatchFollowups, ADMIN_JOB_FOLLOWUP_INTERVAL_MS);
+  stopAdminJobFollowupDispatcher = () => clearInterval(followupTimer);
+
   stopDailyConceptScheduler = scheduleDailyConceptRebuildJob();
   logger.info('Scheduled daily concept rebuild job', { hourLocal: DAILY_CONCEPT_REBUILD_HOUR_LOCAL });
   if (CITATION_SCAN_NIGHTLY_ENABLED) {
@@ -274,6 +288,10 @@ export async function start() {
     if (stopWorkbenchCacheWarmup) {
       stopWorkbenchCacheWarmup();
       stopWorkbenchCacheWarmup = null;
+    }
+    if (stopAdminJobFollowupDispatcher) {
+      stopAdminJobFollowupDispatcher();
+      stopAdminJobFollowupDispatcher = null;
     }
     
     server.close(() => {

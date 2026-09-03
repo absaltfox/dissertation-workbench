@@ -112,7 +112,12 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
         priority: Math.max(-1000, Math.min(1000, Number(req.body?.priority) || 0)),
         force: req.body?.force === true,
       },
+      singleInstance: true,
     });
+    if (result.alreadyRunning) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: result.jobId });
+      return;
+    }
     clearMetricsCache();
     res.status(202).json({ ok: true, started: true, ...result });
   }));

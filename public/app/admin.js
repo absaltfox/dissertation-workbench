@@ -36,6 +36,7 @@ const {
   documentSyncStatusEl,
   importAffiliationEl,
   importAllRuleBtn,
+  importEnrichRuleBtn,
   importDegreeEl,
   importGeneratedTermEl,
   importIndexEl,
@@ -89,7 +90,6 @@ const {
   recomputeThemesBtn,
   refreshCacheBtn,
   refreshJobsBtn,
-  refreshMetadataRuleBtn,
   refreshTopicLabelsBtn,
   regenerateTopicLabelsBtn,
   reparseAllBtn,
@@ -99,9 +99,7 @@ const {
   saveSettingsBtn,
   settingsForm,
   setupOwnMfaBtn,
-  syncDifferencesRuleBtn,
   syncDocumentsBtn,
-  syncMissingPdfsRuleBtn,
   syncRunsTableEl,
   topicLabelCountEl,
   topicLabelDetailPanelEl,
@@ -138,9 +136,7 @@ function initAdmin() {
   newImportRuleBtn?.addEventListener('click', () => setImportRuleForm({}));
   previewImportRuleBtn?.addEventListener('click', handlePreviewImportRule);
   importAllRuleBtn?.addEventListener('click', () => handleRunImportRules('import_all', importAllRuleBtn));
-  syncDifferencesRuleBtn?.addEventListener('click', () => handleRunImportRules('sync_differences', syncDifferencesRuleBtn));
-  refreshMetadataRuleBtn?.addEventListener('click', () => handleRunImportRules('refresh_metadata', refreshMetadataRuleBtn));
-  syncMissingPdfsRuleBtn?.addEventListener('click', () => handleRunImportRules('sync_missing_pdfs', syncMissingPdfsRuleBtn));
+  importEnrichRuleBtn?.addEventListener('click', () => handleRunImportRules('sync_missing_pdfs', importEnrichRuleBtn));
   deleteImportRuleBtn?.addEventListener('click', handleDeleteImportRule);
 
   for (const input of [importRuleNameEl, importDegreeEl, importProgramEl, importAffiliationEl, importIndexEl, importQueryEl, importSourceEl]) {
@@ -898,9 +894,7 @@ async function handleRunImportRules(mode, button) {
   }
   const labels = {
     import_all: 'Import metadata',
-    sync_differences: 'Import new metadata',
-    refresh_metadata: 'Refresh existing metadata',
-    sync_missing_pdfs: 'Import and enrich using rule policy'
+    sync_missing_pdfs: 'Import and enrich metadata'
   };
   const selectedRules = state.importRules.filter((rule) => ruleIds.includes(rule.id));
   const enrichingRules = selectedRules.filter((rule) => rule.contentMode !== 'metadata_only');

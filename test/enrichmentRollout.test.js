@@ -57,6 +57,40 @@ test('PDF control compares the same documents against append-only derivative evi
   assert.ok(result.comparison.medianWordRelativeError < 0.1);
 });
 
+test('PDF word-count divergence is flagged per document without failing the control job', () => {
+  const derivative = Array.from({ length: 10 }, (_, index) => outcome(`divergent-${index}`));
+  const pdf = derivative.map((item, index) => outcome(item.docId, {
+    contentSource: 'streamed_pdf',
+    wordSource: 'streamed_pdf_text',
+    wordCount: index < 6 ? 5_000 : 9_900,
+  }));
+  const result = evaluateEnrichmentRun({
+    phase: 'control',
+    targetSize: 10,
+    outcomes: pdf,
+    controlOutcomes: derivative,
+    requestCounts: { originalPdf: 10 },
+    durationMs: 60_000,
+  });
+
+  assert.equal(result.checks.medianWordRelativeError, false);
+  assert.equal(result.checks.p90WordRelativeError, false);
+  assert.equal(result.blockingChecks.medianWordRelativeError, undefined);
+  assert.equal(result.passed, true);
+  assert.equal(result.warnings.wordCountDivergence, true);
+  assert.equal(result.comparison.flaggedDocuments, 6);
+  assert.deepEqual(result.comparison.documents[0], {
+    docId: 'divergent-0',
+    baselineWordCount: 10_000,
+    baselineWordSource: 'dspace_full_text',
+    observedWordCount: 5_000,
+    observedWordSource: 'streamed_pdf_text',
+    relativeDifference: 0.5,
+    threshold: 0.15,
+    flagged: true,
+  });
+});
+
 test('cohort gate blocks expansion on incomplete or operationally unsafe runs', () => {
   const result = evaluateEnrichmentRun({
     phase: 'cohort',

@@ -11,6 +11,7 @@ let ensureStorage;
 let getAdminJob;
 let getLatestSyncRun;
 let loadStoredFileMetric;
+let listEffectiveDocumentEligibility;
 let runDocumentSync;
 let runImportPdfAdminJob;
 let saveImportRule;
@@ -50,6 +51,7 @@ test.before(async () => {
     getAdminJob,
     getLatestSyncRun,
     loadStoredFileMetric,
+    listEffectiveDocumentEligibility,
     reserveImportRuleRequestSlot,
     saveDocumentMetadata,
     saveImportRule,
@@ -87,6 +89,99 @@ test('durable per-rule request reservations are atomic across workers', async ()
     reserveImportRuleRequestSlot(rule.id, 2, { nowMs: 10_000, windowMs: 60_000 }),
   ]);
   assert.deepEqual(reservations.sort((left, right) => left - right), [0, 0, 60_000]);
+});
+
+test('a complete metadata import publishes rule eligibility while an incomplete retry preserves it', async () => {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const rule = await saveImportRule({
+    id: `projection-${suffix}`,
+    name: 'Import eligibility projection',
+    extractCitations: true,
+    runConcepts: false,
+  });
+  const ids = ['1.0999901', '1.0999902'];
+  const payload = {
+    data: {
+      hits: {
+        total: ids.length,
+        hits: ids.map((id, index) => ({
+          _source: { id, title: `Eligibility ${index + 1}`, author: 'Projection Tester' },
+        })),
+      },
+    },
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/search/8.5')) {
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  try {
+    const complete = await runDocumentSync({
+      mode: 'import_all',
+      importRuleId: rule.id,
+      baseUrl: 'https://oc-index.test',
+      term: 'degree.raw,Eligibility',
+      source: 'id,title,author',
+      pageSize: 100,
+      scanLimit: 100,
+      syncMaxRecords: 100,
+    });
+    assert.equal(complete.runStatus, 'completed');
+    assert.equal(complete.eligibilityProjectionPublished, true);
+    assert.deepEqual(await listEffectiveDocumentEligibility({ docIds: ids }), ids.map((docId) => ({
+      docId,
+      citationEligible: true,
+      patternRankEligible: false,
+      matchingRuleCount: 1,
+    })));
+
+    const incomplete = await runDocumentSync({
+      mode: 'import_all',
+      importRuleId: rule.id,
+      baseUrl: 'https://oc-index.test',
+      term: 'degree.raw,Eligibility',
+      source: 'id,title,author',
+      pageSize: 100,
+      scanLimit: 100,
+      syncMaxRecords: 1,
+    });
+    assert.equal(incomplete.runStatus, 'incomplete');
+    assert.equal(incomplete.eligibilityProjectionPublished, false);
+    assert.deepEqual(
+      (await listEffectiveDocumentEligibility({ docIds: ids })).map((row) => row.docId),
+      ids
+    );
+
+    // Legacy maintenance modes operate on filtered subsets and therefore
+    // cannot prove the complete rule scope. They must leave the last published
+    // generation untouched rather than replacing it with that subset.
+    for (const mode of ['sync_differences', 'refresh_metadata']) {
+      const partial = await runDocumentSync({
+        mode,
+        importRuleId: rule.id,
+        baseUrl: 'https://oc-index.test',
+        term: 'degree.raw,Eligibility',
+        source: 'id,title,author',
+        pageSize: 100,
+        scanLimit: 100,
+        syncMaxRecords: 100,
+      });
+      assert.equal(partial.runStatus, 'completed');
+      assert.equal(partial.eligibilityProjectionPublished, false);
+      assert.deepEqual(
+        (await listEffectiveDocumentEligibility({ docIds: ids })).map((row) => row.docId),
+        ids
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('worker rejects invalid snapshotted content policies before network access', async () => {

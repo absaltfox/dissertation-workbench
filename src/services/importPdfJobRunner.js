@@ -2,7 +2,9 @@ import {
   appendAdminJobLog, finishAdminJob, finishClaimedAdminJob, getDb, listFileMetrics, listImportRules,
   listPendingCitationExtractions, listPendingCitationScans, loadCommitteeMembers,
   loadDocumentMetadata, loadStoredFileMetric, finishEnrichmentRolloutPhase, getEnrichmentRollout,
-  listEnrichmentRolloutEvidence, saveCitationExtractionState, saveEnrichmentRolloutEvidence,
+  listEffectiveCitationPoliciesForDocument, listEnrichmentRolloutEvidence,
+  reserveImportRuleRequestSlot, saveCitationExtractionState, saveEnrichmentRolloutEvidence,
+  requestAdminJobFollowup, saveWordCountComparisonParadata,
   startEnrichmentRolloutPhase, updateAdminJobProgress, updateClaimedAdminJobProgress
 } from '../db.js';
 import fs from 'node:fs/promises';
@@ -76,6 +78,55 @@ function readDocIdList(value) {
   return Array.isArray(value)
     ? value.map((id) => String(id || '').trim()).filter(Boolean)
     : [];
+}
+
+const DEFAULT_CITATION_MAX_CONTENT_BYTES = 200 * 1024 * 1024;
+
+// Overlapping eligible rules compose conservatively: the smallest byte ceiling
+// wins, and every positive per-rule request limit is reserved. A zero rate is
+// the documented "no rule-specific limit" value and therefore adds no gate.
+export function citationContentPolicy(policies = []) {
+  const normalized = (Array.isArray(policies) ? policies : [])
+    .map((policy) => ({
+      ruleId: String(policy?.ruleId || '').trim(),
+      maxContentBytes: Number(policy?.maxContentBytes),
+      contentRateLimit: Number(policy?.contentRateLimit),
+    }))
+    .filter((policy) => policy.ruleId);
+  const byteLimits = normalized
+    .map((policy) => policy.maxContentBytes)
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return {
+    maxContentBytes: byteLimits.length
+      ? Math.min(...byteLimits)
+      : DEFAULT_CITATION_MAX_CONTENT_BYTES,
+    rateLimits: normalized
+      .filter((policy) => Number.isFinite(policy.contentRateLimit) && policy.contentRateLimit > 0)
+      .map((policy) => ({
+        ruleId: policy.ruleId,
+        contentRateLimit: Math.floor(policy.contentRateLimit),
+      }))
+      .sort((left, right) => (
+        left.contentRateLimit - right.contentRateLimit || left.ruleId.localeCompare(right.ruleId)
+      )),
+  };
+}
+
+export async function reserveCitationPolicyRequest(rateLimits, {
+  reserveSlot = reserveImportRuleRequestSlot,
+  now = () => Date.now(),
+  wait = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+  windowMs = 60_000,
+} = {}) {
+  for (const policy of Array.isArray(rateLimits) ? rateLimits : []) {
+    for (;;) {
+      const waitMs = await reserveSlot(policy.ruleId, policy.contentRateLimit, {
+        nowMs: now(), windowMs,
+      });
+      if (!waitMs) break;
+      await wait(waitMs);
+    }
+  }
 }
 
 // `createContinuationJob` is a test seam only: production always takes the
@@ -204,6 +255,113 @@ export async function startCitationScanContinuation(job, result, progress, { cre
     });
     return { error: message };
   }
+}
+
+// Import and enrichment remain the source-of-truth job. Downstream processors
+// are queued only after the final automatic content batch, and a failure to
+// start either processor is reported without rewriting an otherwise successful
+// metadata/content result as failed.
+export async function queueEligibleImportProcessing(
+  job,
+  result,
+  progress,
+  { createProcessingJob = null, requestProcessingFollowup = requestAdminJobFollowup } = {}
+) {
+  const params = job.params || {};
+  if (params.mode !== 'sync_missing_pdfs' || params.queueEligibleProcessing !== true) return null;
+  if (!result.ok) return null;
+  if (result.nextJobId) return null;
+  if (params.autoContinuePdfBatches && result.pdfBatchLimitReached) return null;
+
+  // `params.rules` is deliberately narrowed as content continuations finish.
+  // The immutable policy snapshot remains complete so a rule whose content
+  // finished in an earlier batch does not lose its downstream work.
+  const rules = Array.isArray(params.downstreamPolicyRules)
+    ? params.downstreamPolicyRules
+    : Array.isArray(params.rules) ? params.rules : [];
+  const citationRuleIds = rules
+    .filter((rule) => rule?.extractCitations)
+    .map((rule) => String(rule.id || '').trim())
+    .filter(Boolean);
+  const patternRankRuleIds = rules
+    .filter((rule) => rule?.runConcepts !== false)
+    .map((rule) => String(rule.id || '').trim())
+    .filter(Boolean);
+  if (!citationRuleIds.length && !patternRankRuleIds.length) return { jobs: [], errors: [] };
+
+  const createJob = createProcessingJob || (async (payload) => {
+    const { createAndStartAdminWorkerJob } = await import('./adminWorker.js');
+    return createAndStartAdminWorkerJob(payload);
+  });
+  const jobs = [];
+  const deferred = [];
+  const errors = [];
+  const queueOne = async (processor, payload) => {
+    try {
+      const queued = await createJob(payload);
+      if (queued.alreadyRunning) {
+        // Reconcile the complete effective eligibility set, rather than the
+        // triggering rule subset: several imports may collide with one active
+        // singleton, and pending-state selectors make the broad pass cheap.
+        const { scope: _ignoredScope, ...citationParams } = payload.params || {};
+        const followupParams = processor === 'citation'
+          ? { ...citationParams, trigger: 'import_enrichment_reconciliation' }
+          : { ...payload.params, trigger: 'import_enrichment_reconciliation' };
+        await requestProcessingFollowup({
+          type: payload.type,
+          label: `${payload.label} (reconciliation)`,
+          params: followupParams,
+        });
+        deferred.push({ processor, activeJobId: queued.jobId, reason: 'processor_already_running' });
+        await log(job.id, `${processor} eligibility is durable; processing is deferred behind active job ${queued.jobId}.`).catch(() => {});
+      } else {
+        jobs.push({ processor, jobId: queued.jobId });
+        await log(job.id, `${processor} processing queued as job ${queued.jobId}.`).catch(() => {});
+      }
+    } catch (error) {
+      const message = error?.message || String(error);
+      errors.push({ processor, error: message });
+      await log(job.id, `Could not queue ${processor} processing: ${message}`).catch(() => {});
+    }
+  };
+
+  if (progress) {
+    await progress({
+      phase: 'downstream_processing',
+      label: 'Queueing eligible processing',
+      status: 'running',
+    }).catch(() => {});
+  }
+  if (citationRuleIds.length) {
+    await queueOne('citation', {
+      type: 'citation_scan',
+      label: 'Citation Scan (import policy)',
+      params: {
+        trigger: 'import_enrichment',
+        retryFailures: false,
+        autoContinue: true,
+        scope: { eligibilityRuleIds: citationRuleIds },
+      },
+      singleInstance: true,
+    });
+  }
+  if (patternRankRuleIds.length) {
+    await queueOne('PatternRank', {
+      type: 'concept_rebuild',
+      label: 'Incremental PatternRank (import policy)',
+      params: { method: 'patternrank_incremental', trigger: 'import_enrichment' },
+      singleInstance: true,
+    });
+  }
+  if (progress) {
+    await progress({
+      phase: 'downstream_processing',
+      label: 'Eligible processing queued',
+      status: errors.length ? 'failed' : 'completed',
+      counts: { queued: jobs.length, deferred: deferred.length, failed: errors.length },
+    }).catch(() => {});
+  }
+  return { jobs, deferred, errors };
 }
 
 export function rulesForContinuation(rules, completedRuleResults) {
@@ -502,6 +660,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         },
         heapGrowthBytes: Number(result.heapGrowthBytes || 0),
         enrichmentExhausted: Boolean(result.enrichmentExhausted),
+        eligibilityProjectionPublished: Boolean(result.eligibilityProjectionPublished),
         error: result.error || null,
       });
       await log(job.id, `Rule result: ${result.ok ? 'success' : 'failed'}; ${result.totalSaved || 0} saved.`);
@@ -552,6 +711,18 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         heapGrowthBytes,
         exhausted: perRule.length === 1 && Boolean(perRule[0].enrichmentExhausted),
       });
+      if (rollout.phase === 'control') {
+        for (const comparison of evaluation.comparison?.documents || []) {
+          await saveWordCountComparisonParadata(comparison.docId, {
+            ...comparison,
+            status: comparison.flagged ? 'flagged' : 'within_threshold',
+            ruleId: rule.id,
+            ruleRevision: rollout.ruleRevision,
+            jobId: job.id,
+            phase: rollout.phase,
+          });
+        }
+      }
       if (rollout.phase === 'sample' && Number(requestCounts.originalPdf || 0) > 0) {
         await log(job.id, `ALERT: protected full-text sample made ${requestCounts.originalPdf} original PDF request(s); rollout blocked.`);
       }
@@ -562,6 +733,8 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     const continuation = await startContinuationJob(job, result, progress);
     if (continuation?.jobId) result.nextJobId = continuation.jobId;
     if (continuation?.error) result.continuationError = continuation.error;
+    const downstreamProcessing = await queueEligibleImportProcessing(job, result, progress);
+    if (downstreamProcessing) result.downstreamProcessing = downstreamProcessing;
     clearMetricsCache?.();
     await finishWorkerAdminJob(job, {
       status: result.ok ? 'completed' : 'failed',
@@ -827,6 +1000,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         afterDocId: cursor,
         syncKey: scope.syncKey || null,
         filters: scope.filters || scope,
+        eligibilityRuleIds: scope.eligibilityRuleIds || [],
         parserVersion: CITATION_PARSER_VERSION,
       });
       if (!entries.length) break;
@@ -888,6 +1062,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         afterDocId: cursor,
         syncKey: scope.syncKey || null,
         filters: scope.filters || scope,
+        eligibilityRuleIds: scope.eligibilityRuleIds || [],
         parserVersion: CITATION_PARSER_VERSION,
       });
       reachedLimit = remaining.length > 0;
@@ -942,6 +1117,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         afterDocId: cursor,
         syncKey: scope.syncKey || null,
         filters: scope.filters || scope,
+        eligibilityRuleIds: scope.eligibilityRuleIds || [],
         retryFailures,
         reprocess,
       });
@@ -959,6 +1135,9 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
           });
           const doc = await loadDocumentMetadata(entry.doc_id);
           if (!doc) throw new Error('Document metadata not found for citation scan.');
+          const contentPolicy = citationContentPolicy(
+            await listEffectiveCitationPoliciesForDocument(entry.doc_id)
+          );
           // Re-stream the original PDF (rate-limited, temp file deleted after
           // parse, nothing cached), extract and dedup citations. No committee,
           // no catalogue resolution.
@@ -971,6 +1150,12 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
             extractCitations: true,
             strictCitationErrors: true,
             artifactClient,
+            maxContentBytes: contentPolicy.maxContentBytes,
+            onContentRequest: async (event = {}) => {
+              if (event.request) {
+                await reserveCitationPolicyRequest(contentPolicy.rateLimits);
+              }
+            },
             onProgress: progress,
           });
           if (doc.downloadStatus !== 'streamed') {
@@ -1017,6 +1202,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         afterDocId: cursor,
         syncKey: scope.syncKey || null,
         filters: scope.filters || scope,
+        eligibilityRuleIds: scope.eligibilityRuleIds || [],
         retryFailures,
         reprocess,
       });

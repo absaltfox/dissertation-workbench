@@ -117,6 +117,7 @@ test('schema migration adds content policy and provenance fields conservatively'
     const committeeState = await client.execute("SELECT projection_value FROM serving_projection_state WHERE projection_key = 'committee_people'");
     const rolloutTables = await client.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('enrichment_rollouts', 'enrichment_rollout_evidence') ORDER BY name");
     const limiterTable = await client.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'import_rule_request_limits'");
+    const eligibilityTables = await client.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('import_rule_eligibility_projections', 'rule_document_processing_eligibility', 'document_processing_state', 'processing_eligibility_activation') ORDER BY name");
     process.stdout.write(JSON.stringify({
       rule, metric, syncRun, people,
       projectionVersion: projection.rows[0]?.serving_projection_version,
@@ -124,6 +125,7 @@ test('schema migration adds content policy and provenance fields conservatively'
       committeeState: committeeState.rows[0]?.projection_value,
       rolloutTables: rolloutTables.rows.map((row) => row.name),
       limiterTable: limiterTable.rows.map((row) => row.name),
+      eligibilityTables: eligibilityTables.rows.map((row) => row.name),
     }));
     await db.closeDb();
   `;
@@ -156,6 +158,7 @@ test('schema migration adds content policy and provenance fields conservatively'
     assert.equal(migrated.metric.content_source, null);
     assert.equal(Number(migrated.metric.metadata_request_count), 0);
     assert.equal(Number(migrated.metric.original_pdf_request_count), 0);
+    assert.equal(migrated.metric.word_count_comparison_json, null);
     assert.equal(migrated.syncRun.totalSeen, 7);
     assert.equal(migrated.syncRun.totalSaved, 6);
     assert.equal(migrated.syncRun.localQueueSeen, 0);
@@ -180,6 +183,12 @@ test('schema migration adds content policy and provenance fields conservatively'
     assert.equal(migrated.committeeState, 'complete');
     assert.deepEqual(migrated.rolloutTables, ['enrichment_rollout_evidence', 'enrichment_rollouts']);
     assert.deepEqual(migrated.limiterTable, ['import_rule_request_limits']);
+    assert.deepEqual(migrated.eligibilityTables, [
+      'document_processing_state',
+      'import_rule_eligibility_projections',
+      'processing_eligibility_activation',
+      'rule_document_processing_eligibility',
+    ]);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

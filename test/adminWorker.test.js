@@ -1088,6 +1088,102 @@ test('incremental PatternRank reuses checkpoints and rebuilds changed documents 
   assert.equal(third.result.partitionVersion, 3);
 });
 
+test('PatternRank corpus consistently follows the published union of live rule eligibility', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-eligibility-'));
+  const dbPath = path.join(dir, 'eligibility.sqlite');
+  const harnessPath = path.join(dir, 'eligibility_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sqlite3, sys
+spec = importlib.util.spec_from_file_location("build_concepts", sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+db_path = sys.argv[2]
+
+db = sqlite3.connect(db_path)
+db.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, degree TEXT, year INTEGER, updated_at TEXT NOT NULL)")
+for doc_id in ("enabled-only", "disabled-only", "overlap", "unprojected"):
+    meta = {"id": doc_id, "title": doc_id, "abstract": f"{doc_id} community learning leadership", "subjects": [doc_id]}
+    db.execute("INSERT INTO documents VALUES (?, ?, ?, ?, ?)", (doc_id, json.dumps(meta), "Eligibility Degree", 2025, "2026-01-01T00:00:00Z"))
+db.commit()
+db.close()
+
+# No published eligibility membership means a pre-migration corpus remains whole.
+legacy = bc.SqliteClientWrapper(db_path)
+bc.ensure_incremental_schema(legacy)
+legacy_docs, _ = bc.load_partition_documents(legacy, {"degree": "Eligibility Degree"})
+legacy.close()
+
+db = sqlite3.connect(db_path)
+db.executescript("""
+CREATE TABLE import_rules (id TEXT PRIMARY KEY, run_concepts INTEGER NOT NULL);
+CREATE TABLE import_rule_eligibility_projections (
+  rule_id TEXT PRIMARY KEY, current_token TEXT, completed_token TEXT, status TEXT
+);
+CREATE TABLE rule_document_processing_eligibility (
+  rule_id TEXT NOT NULL, doc_id TEXT NOT NULL, projection_token TEXT NOT NULL
+);
+CREATE TABLE processing_eligibility_activation (
+  id INTEGER PRIMARY KEY CHECK (id = 1), activated_at TEXT NOT NULL
+);
+INSERT INTO processing_eligibility_activation VALUES (1, '2026-01-01T00:00:00Z');
+INSERT INTO import_rules VALUES ('rule-on', 1), ('rule-off', 0);
+INSERT INTO import_rule_eligibility_projections VALUES
+  ('rule-on', NULL, 'generation-on', 'completed'),
+  ('rule-off', NULL, 'generation-off', 'completed');
+INSERT INTO rule_document_processing_eligibility VALUES
+  ('rule-on', 'enabled-only', 'generation-on'),
+  ('rule-on', 'overlap', 'generation-on'),
+  ('rule-off', 'disabled-only', 'generation-off'),
+  ('rule-off', 'overlap', 'generation-off'),
+  -- Staging rows must not become visible before their generation is finalized.
+  ('rule-off', 'unprojected', 'staging-generation');
+""")
+db.commit()
+db.close()
+
+client = bc.SqliteClientWrapper(db_path)
+selected = bc.discover_partition(client, requested_scope={"degree": "Eligibility Degree"})
+eligible_docs, _ = bc.load_partition_documents(client, {"degree": "Eligibility Degree"})
+cohort_fingerprints = bc.fetch_cohort_content_fingerprints(client)
+scope_fingerprint = bc.fetch_scope_content_fingerprint(client, {"degree": "Eligibility Degree"})
+
+# Policy is evaluated live and overlapping rules use union semantics.
+client.execute("UPDATE import_rules SET run_concepts = 0 WHERE id = 'rule-on'")
+none_docs, _ = bc.load_partition_documents(client, {"degree": "Eligibility Degree"})
+client.execute("UPDATE import_rules SET run_concepts = 1 WHERE id = 'rule-off'")
+flipped_docs, _ = bc.load_partition_documents(client, {"degree": "Eligibility Degree"})
+# Activation is permanent: removing the final rule/membership yields an empty
+# eligible corpus and must never restore the pre-migration all-document fallback.
+client.execute("DELETE FROM rule_document_processing_eligibility")
+client.execute("DELETE FROM import_rule_eligibility_projections")
+client.execute("DELETE FROM import_rules")
+after_last_rule_deleted, _ = bc.load_partition_documents(client, {"degree": "Eligibility Degree"})
+client.close()
+
+print(json.dumps({
+  "legacy": sorted(doc["id"] for doc in legacy_docs),
+  "selectedCount": selected["documentCount"],
+  "eligible": sorted(doc["id"] for doc in eligible_docs),
+  "fingerprintsAgree": cohort_fingerprints[("Eligibility Degree", 2020)] == scope_fingerprint,
+  "none": sorted(doc["id"] for doc in none_docs),
+  "flipped": sorted(doc["id"] for doc in flipped_docs),
+  "afterLastRuleDeleted": sorted(doc["id"] for doc in after_last_rule_deleted),
+}))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync('python3', [
+    harnessPath, path.resolve('scripts/build-concepts.py'), dbPath,
+  ], { cwd: path.resolve('.') });
+  const result = JSON.parse(stdout);
+  assert.deepEqual(result.legacy, ['disabled-only', 'enabled-only', 'overlap', 'unprojected']);
+  assert.equal(result.selectedCount, 2);
+  assert.deepEqual(result.eligible, ['enabled-only', 'overlap']);
+  assert.equal(result.fingerprintsAgree, true);
+  assert.deepEqual(result.none, []);
+  assert.deepEqual(result.flipped, ['disabled-only', 'overlap']);
+  assert.deepEqual(result.afterLastRuleDeleted, []);
+});
+
 test('automatic PatternRank publishes only a complete generation and reconciles retired shards', async () => {
   const autoDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-auto-'));
   const sqlitePath = path.join(autoDir, 'metrics.sqlite');

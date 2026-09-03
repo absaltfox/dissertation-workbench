@@ -259,6 +259,7 @@ async function ensureSchema(client) {
       full_text_request_count INTEGER DEFAULT 0,
       original_pdf_request_count INTEGER DEFAULT 0,
       retrieved_bytes INTEGER DEFAULT 0,
+      word_count_comparison_json TEXT,
       status TEXT,
       error TEXT,
       updated_at TEXT NOT NULL
@@ -345,6 +346,17 @@ async function ensureSchema(client) {
       updated_at TEXT NOT NULL
     );
 
+    -- Durable reconciliation requests for singleton processors. If eligible
+    -- work appears after the active job has passed it, the web dispatcher
+    -- starts one fresh pass after the singleton lease becomes available.
+    CREATE TABLE IF NOT EXISTS admin_job_followups (
+      type TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      params_json TEXT,
+      request_token TEXT NOT NULL,
+      requested_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       username TEXT UNIQUE NOT NULL,
@@ -400,6 +412,45 @@ async function ensureSchema(client) {
       timestamps_json TEXT NOT NULL DEFAULT '[]',
       updated_at TEXT NOT NULL,
       FOREIGN KEY (rule_id) REFERENCES import_rules(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS import_rule_eligibility_projections (
+      rule_id TEXT PRIMARY KEY,
+      current_token TEXT,
+      completed_token TEXT,
+      rule_revision TEXT,
+      status TEXT NOT NULL DEFAULT 'idle',
+      started_at TEXT,
+      completed_at TEXT,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (rule_id) REFERENCES import_rules(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS rule_document_processing_eligibility (
+      rule_id TEXT NOT NULL,
+      doc_id TEXT NOT NULL,
+      projection_token TEXT NOT NULL,
+      projected_at TEXT NOT NULL,
+      PRIMARY KEY (rule_id, doc_id, projection_token),
+      FOREIGN KEY (rule_id) REFERENCES import_rules(id) ON DELETE CASCADE,
+      FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS document_processing_state (
+      doc_id TEXT NOT NULL,
+      processor TEXT NOT NULL,
+      status TEXT NOT NULL,
+      content_checksum TEXT,
+      processor_version TEXT,
+      error TEXT,
+      attempted_at TEXT NOT NULL,
+      PRIMARY KEY (doc_id, processor),
+      FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS processing_eligibility_activation (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      activated_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS enrichment_rollouts (
@@ -658,6 +709,7 @@ async function ensureSchema(client) {
   await addColumnIfMissing(client, 'file_metrics', 'full_text_request_count', 'INTEGER DEFAULT 0');
   await addColumnIfMissing(client, 'file_metrics', 'original_pdf_request_count', 'INTEGER DEFAULT 0');
   await addColumnIfMissing(client, 'file_metrics', 'retrieved_bytes', 'INTEGER DEFAULT 0');
+  await addColumnIfMissing(client, 'file_metrics', 'word_count_comparison_json', 'TEXT');
   await addColumnIfMissing(client, 'import_rules', 'content_mode', "TEXT NOT NULL DEFAULT 'metadata_only'");
   await addColumnIfMissing(client, 'import_rules', 'content_fallback', "TEXT NOT NULL DEFAULT 'fail_document'");
   await addColumnIfMissing(client, 'import_rules', 'extract_citations', 'INTEGER NOT NULL DEFAULT 0');
@@ -666,6 +718,7 @@ async function ensureSchema(client) {
   await addColumnIfMissing(client, 'import_rules', 'max_content_bytes', 'INTEGER NOT NULL DEFAULT 209715200');
   await addColumnIfMissing(client, 'import_rules', 'content_concurrency', 'INTEGER NOT NULL DEFAULT 1');
   await addColumnIfMissing(client, 'import_rules', 'content_rate_limit', 'INTEGER NOT NULL DEFAULT 0');
+  await addColumnIfMissing(client, 'import_rule_eligibility_projections', 'rule_revision', 'TEXT');
   await addColumnIfMissing(client, 'enrichment_rollouts', 'rule_revision', 'TEXT');
   await addColumnIfMissing(client, 'enrichment_rollout_evidence', 'rule_revision', 'TEXT');
   // Citation match keys (M-06 / B-01). `year` is free text and the match year is a
@@ -695,6 +748,9 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_concept_partition_candidates_phrase ON concept_partition_candidates(phrase, partition_key)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_citation_extraction_status ON citation_extraction_state(status, extracted_at)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_import_rules_updated_at ON import_rules(updated_at)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_rule_document_eligibility_doc ON rule_document_processing_eligibility(doc_id, rule_id, projection_token)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_import_rules_processing_policy ON import_rules(extract_citations, run_concepts, id)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_processing_state_queue ON document_processing_state(processor, status, doc_id)');
   await client.execute('CREATE INDEX IF NOT EXISTS idx_enrichment_evidence_rule_phase ON enrichment_rollout_evidence(rule_id, phase, job_id)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_username ON password_reset_tokens(username)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)');
@@ -742,6 +798,10 @@ async function ensureSchema(client) {
 export function ensureSchemaWithRetry(client, retryOptions = {}) {
   return withDbRetry(() => ensureSchema(client), {
     label: 'ensureSchema',
+    // Worker processes can cold-start together and each runs the idempotent
+    // migration pass. Give the winning process enough time to release its DDL
+    // lock before treating another worker as unhealthy.
+    maxAttempts: 10,
     ...retryOptions,
   });
 }
@@ -1206,7 +1266,8 @@ export async function listCachedDocuments({ syncKey, limit = null, offset = 0 } 
   let sql = `
     SELECT d.doc_id, d.metadata_json,
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
-           fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error
+           fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+           fm.word_count_comparison_json
     FROM documents d
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
   `;
@@ -1311,6 +1372,7 @@ export async function queryCachedDocumentPage({
     SELECT d.doc_id, d.metadata_json,
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+           fm.word_count_comparison_json,
            COALESCE(dc.citation_count, 0) AS citation_count
     FROM documents d
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
@@ -1351,6 +1413,7 @@ export async function queryTopicDocumentPage({
     SELECT d.doc_id, d.metadata_json,
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+           fm.word_count_comparison_json,
            COALESCE(dc.citation_count, 0) AS citation_count
     FROM documents d
     ${topicJoin}
@@ -2089,6 +2152,7 @@ export async function queryPersonDetailPage({
     SELECT d.doc_id, d.metadata_json, pd.person_roles,
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+           fm.word_count_comparison_json,
            COALESCE(dc.citation_count, 0) AS citation_count,
            dt.topic_id, dt.probability
     FROM person_docs pd
@@ -2181,7 +2245,8 @@ export async function applyStoredFileMetricsToDocuments(documents = []) {
     const placeholders = chunk.map(() => '?').join(', ');
     const rows = await all(`
       SELECT doc_id, download_url, file_bytes, word_count, body_word_count,
-             page_count, word_source, page_source, status, error
+             page_count, word_source, page_source, status, error,
+             word_count_comparison_json
       FROM file_metrics
       WHERE doc_id IN (${placeholders})
     `, chunk);
@@ -2297,6 +2362,14 @@ function applyStoredFileMetricToDocument(doc, row) {
   }
   if (row.error != null) {
     doc.downloadError = row.error;
+  }
+  if (row.word_count_comparison_json) {
+    try {
+      const comparison = JSON.parse(row.word_count_comparison_json);
+      doc.paradata = { ...(doc.paradata || {}), wordCountComparison: comparison };
+    } catch {
+      // Invalid legacy paradata must not make the document itself unreadable.
+    }
   }
   return doc;
 }
@@ -2451,6 +2524,44 @@ export async function createAdminJob({
   return Number(result.lastInsertRowid || result.lastInsertRowId || 0);
 }
 
+export async function requestAdminJobFollowup({ type, label, params = null }) {
+  const now = new Date().toISOString();
+  const requestToken = crypto.randomUUID();
+  await run(`
+    INSERT INTO admin_job_followups (type, label, params_json, request_token, requested_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(type) DO UPDATE SET
+      label = excluded.label,
+      params_json = excluded.params_json,
+      request_token = excluded.request_token,
+      requested_at = excluded.requested_at
+  `, [type, label, params ? JSON.stringify(params) : null, requestToken, now]);
+  return { type, requestToken, requestedAt: now };
+}
+
+export async function listAdminJobFollowups() {
+  const result = await execute(`
+    SELECT type, label, params_json, request_token, requested_at
+    FROM admin_job_followups
+    ORDER BY requested_at, type
+  `);
+  return result.rows.map((row) => ({
+    type: String(row.type),
+    label: String(row.label),
+    params: (() => { try { return row.params_json ? JSON.parse(row.params_json) : null; } catch { return null; } })(),
+    requestToken: String(row.request_token),
+    requestedAt: String(row.requested_at),
+  }));
+}
+
+export async function completeAdminJobFollowup(type, requestToken) {
+  const result = await run(
+    'DELETE FROM admin_job_followups WHERE type = ? AND request_token = ?',
+    [type, requestToken]
+  );
+  return result.changes > 0;
+}
+
 // Atomically creates a running job only when this type has no running owner.
 // `admin_job_singletons` is deliberately a lease table instead of a partial
 // unique index on admin_jobs: a citation continuation is queued before its
@@ -2470,7 +2581,12 @@ export async function createAdminJobIfNotRunning({
   // job on every later attempt.
   return withDbRetry(() => createAdminJobIfNotRunningOnce({
     type, label, params, artifactTokenHash, timeoutAt, runnerType, replaceRunningJobId,
-  }), { label: `createAdminJobIfNotRunning:${type}` });
+  }), {
+    label: `createAdminJobIfNotRunning:${type}`,
+    // A burst of independently starting workers may still be completing their
+    // schema passes. The singleton operation is idempotent and safe to retry.
+    maxAttempts: 10,
+  });
 }
 
 async function createAdminJobIfNotRunningOnce({
@@ -2887,7 +3003,8 @@ export async function loadStoredFileMetric(docId) {
            word_source, page_source, content_source, content_checksum,
            content_source_url, content_retrieved_at, parser_version,
            metadata_request_count, full_text_request_count,
-           original_pdf_request_count, retrieved_bytes, status, error, updated_at
+           original_pdf_request_count, retrieved_bytes, word_count_comparison_json,
+           status, error, updated_at
     FROM file_metrics
     WHERE doc_id = ?
   `, [docId]), { label: 'loadStoredFileMetric' });
@@ -2910,7 +3027,8 @@ export async function loadStoredFileMetrics(docIds = []) {
              word_source, page_source, content_source, content_checksum,
              content_source_url, content_retrieved_at, parser_version,
              metadata_request_count, full_text_request_count,
-             original_pdf_request_count, retrieved_bytes, status, error, updated_at
+             original_pdf_request_count, retrieved_bytes, word_count_comparison_json,
+             status, error, updated_at
       FROM file_metrics
       WHERE doc_id IN (${placeholders})
     `, chunk), { label: 'loadStoredFileMetrics' });
@@ -2985,6 +3103,20 @@ async function saveFileMetricOnce(docId, payload) {
     payload.error || null,
     now
   ]);
+}
+
+export async function saveWordCountComparisonParadata(docId, comparison) {
+  const now = new Date().toISOString();
+  const payload = JSON.stringify({ ...comparison, comparedAt: comparison?.comparedAt || now });
+  return withDbRetry(async () => {
+    const result = await run(`
+      UPDATE file_metrics
+      SET word_count_comparison_json = ?, updated_at = ?
+      WHERE doc_id = ?
+    `, [payload, now, docId]);
+    if (!result.changes) throw new Error(`Cannot save word-count comparison for missing file metric ${docId}`);
+    return result;
+  }, { label: 'saveWordCountComparisonParadata' });
 }
 
 export async function deleteFileMetric(docId) {
@@ -3117,6 +3249,7 @@ export async function listFileMetrics() {
            fm.content_source_url, fm.content_retrieved_at, fm.parser_version,
            fm.metadata_request_count, fm.full_text_request_count,
            fm.original_pdf_request_count, fm.retrieved_bytes,
+           fm.word_count_comparison_json,
            fm.status, fm.error, fm.updated_at,
            d.title, d.author, d.metadata_json
     FROM file_metrics fm
@@ -3365,9 +3498,7 @@ export function importRuleRevision(input) {
     source: rule.source,
     contentMode: rule.contentMode,
     contentFallback: rule.contentFallback,
-    extractCitations: rule.extractCitations,
     extractCommittee: rule.extractCommittee,
-    runConcepts: rule.runConcepts,
     maxContentBytes: rule.maxContentBytes,
     contentConcurrency: rule.contentConcurrency,
     contentRateLimit: rule.contentRateLimit,
@@ -3470,12 +3601,277 @@ export async function deleteImportRule(id) {
   if (!existing) return false;
   const client = await getDb();
   await client.batch([
+    { sql: 'DELETE FROM rule_document_processing_eligibility WHERE rule_id = ?', args: [id] },
+    { sql: 'DELETE FROM import_rule_eligibility_projections WHERE rule_id = ?', args: [id] },
     { sql: 'DELETE FROM import_rule_request_limits WHERE rule_id = ?', args: [id] },
     { sql: 'DELETE FROM enrichment_rollout_evidence WHERE rule_id = ?', args: [id] },
     { sql: 'DELETE FROM enrichment_rollouts WHERE rule_id = ?', args: [id] },
     { sql: 'DELETE FROM import_rules WHERE id = ?', args: [id] },
   ], 'write');
   return true;
+}
+
+const ELIGIBILITY_PROCESSORS = new Set(['citation', 'patternrank']);
+const PROCESSING_STATUSES = new Set(['pending', 'running', 'completed', 'failed']);
+
+function eligibilityProcessor(value) {
+  const processor = String(value || '').trim().toLowerCase();
+  if (!ELIGIBILITY_PROCESSORS.has(processor)) {
+    throw new Error(`Unsupported eligibility processor: ${value}`);
+  }
+  return processor;
+}
+
+// A projection is generation-based so a page-by-page import never needs to
+// retain the complete rule corpus in memory. Rows written for current_token are
+// staging rows; readers continue to use completed_token until finalize succeeds.
+export async function beginImportRuleEligibilityProjection(ruleId, { token = crypto.randomUUID() } = {}) {
+  const rule = await getImportRule(ruleId);
+  if (!rule) throw new Error(`Import rule not found: ${ruleId}`);
+  const ruleRevision = importRuleRevision(rule);
+  const projectionToken = String(token || '').trim();
+  if (!projectionToken) throw new Error('Eligibility projection token is required.');
+  const now = new Date().toISOString();
+  const client = await getDb();
+  await client.batch([
+    { sql: `
+      INSERT INTO import_rule_eligibility_projections (
+        rule_id, current_token, completed_token, rule_revision, status,
+        started_at, completed_at, updated_at
+      ) VALUES (?, ?, NULL, ?, 'running', ?, NULL, ?)
+      ON CONFLICT(rule_id) DO UPDATE SET
+        current_token = excluded.current_token,
+        rule_revision = excluded.rule_revision,
+        status = 'running',
+        started_at = excluded.started_at,
+        completed_at = NULL,
+        updated_at = excluded.updated_at
+    `, args: [ruleId, projectionToken, ruleRevision, now, now] },
+    { sql: `
+      DELETE FROM rule_document_processing_eligibility
+      WHERE rule_id = ?
+        AND projection_token <> ?
+        AND projection_token <> COALESCE((
+          SELECT completed_token FROM import_rule_eligibility_projections WHERE rule_id = ?
+        ), '')
+    `, args: [ruleId, projectionToken, ruleId] },
+  ], 'write');
+  return projectionToken;
+}
+
+export async function projectImportRuleEligibilityBatch(ruleId, projectionToken, docIds) {
+  const ids = [...new Set((docIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+  if (!ids.length) return 0;
+  const projection = await get(`
+    SELECT current_token, status FROM import_rule_eligibility_projections WHERE rule_id = ?
+  `, [ruleId]);
+  if (projection?.status !== 'running' || projection.current_token !== projectionToken) {
+    throw new Error(`Eligibility projection is not current for rule ${ruleId}.`);
+  }
+  const now = new Date().toISOString();
+  const client = await getDb();
+  const results = await client.batch(ids.map((docId) => ({ sql: `
+    INSERT INTO rule_document_processing_eligibility (
+      rule_id, doc_id, projection_token, projected_at
+    ) VALUES (?, ?, ?, ?)
+    ON CONFLICT(rule_id, doc_id, projection_token) DO UPDATE SET
+      projected_at = excluded.projected_at
+  `, args: [
+    ruleId, docId, projectionToken, now,
+  ] })), 'write');
+  return results.reduce((total, result) => total + changes(result), 0);
+}
+
+export async function finalizeImportRuleEligibilityProjection(ruleId, projectionToken) {
+  const now = new Date().toISOString();
+  const client = await getDb();
+  const transaction = await client.transaction('write');
+  let staleRuleError = null;
+  try {
+    const stateResult = await transaction.execute({ sql: `
+      SELECT p.current_token, p.status, p.rule_revision,
+             r.id, r.name, r.degree, r.program, r.affiliation, r.requested_index,
+             r.query, r.source, r.content_mode, r.content_fallback,
+             r.extract_citations, r.extract_committee, r.run_concepts,
+             r.max_content_bytes, r.content_concurrency, r.content_rate_limit,
+             r.created_at, r.updated_at
+      FROM import_rule_eligibility_projections p
+      JOIN import_rules r ON r.id = p.rule_id
+      WHERE p.rule_id = ?
+    `, args: [ruleId] });
+    const state = stateResult.rows[0];
+    if (state?.status !== 'running' || state.current_token !== projectionToken) {
+      await transaction.rollback();
+      throw new Error(`Eligibility projection is not current for rule ${ruleId}.`);
+    }
+    const savedRuleRevision = importRuleRevision(importRuleFromRow(state));
+    if (!state.rule_revision || state.rule_revision !== savedRuleRevision) {
+      await transaction.execute({ sql: `
+        DELETE FROM rule_document_processing_eligibility
+        WHERE rule_id = ? AND projection_token = ?
+      `, args: [ruleId, projectionToken] });
+      await transaction.execute({ sql: `
+        UPDATE import_rule_eligibility_projections
+        SET current_token = NULL, status = 'aborted', updated_at = ?
+        WHERE rule_id = ? AND current_token = ? AND status = 'running'
+      `, args: [now, ruleId, projectionToken] });
+      staleRuleError = new Error(`Eligibility projection rule scope changed for rule ${ruleId}.`);
+    } else {
+      const finalized = await transaction.execute({ sql: `
+        UPDATE import_rule_eligibility_projections
+        SET completed_token = ?, current_token = NULL, status = 'completed',
+            completed_at = ?, updated_at = ?
+        WHERE rule_id = ? AND current_token = ? AND rule_revision = ? AND status = 'running'
+      `, args: [projectionToken, now, now, ruleId, projectionToken, savedRuleRevision] });
+      if (changes(finalized) !== 1) {
+        await transaction.rollback();
+        throw new Error(`Eligibility projection is not current for rule ${ruleId}.`);
+      }
+      await transaction.execute({ sql: `
+        INSERT INTO processing_eligibility_activation (id, activated_at)
+        SELECT 1, ?
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM import_rules r
+          LEFT JOIN import_rule_eligibility_projections p ON p.rule_id = r.id
+          WHERE p.completed_token IS NULL
+        )
+        ON CONFLICT(id) DO NOTHING
+      `, args: [now] });
+      await transaction.execute({ sql: `
+        DELETE FROM rule_document_processing_eligibility
+        WHERE rule_id = ? AND projection_token <> ?
+          AND EXISTS (
+            SELECT 1 FROM import_rule_eligibility_projections
+            WHERE rule_id = ? AND completed_token = ? AND status = 'completed'
+          )
+      `, args: [ruleId, projectionToken, ruleId, projectionToken] });
+    }
+    await transaction.commit();
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    throw error;
+  } finally {
+    transaction.close();
+  }
+  if (staleRuleError) throw staleRuleError;
+  return true;
+}
+
+export async function abortImportRuleEligibilityProjection(ruleId, projectionToken) {
+  const now = new Date().toISOString();
+  const client = await getDb();
+  const results = await client.batch([
+    { sql: `
+      DELETE FROM rule_document_processing_eligibility
+      WHERE rule_id = ? AND projection_token = ?
+        AND EXISTS (
+          SELECT 1 FROM import_rule_eligibility_projections
+          WHERE rule_id = ? AND current_token = ? AND status = 'running'
+        )
+    `, args: [ruleId, projectionToken, ruleId, projectionToken] },
+    { sql: `
+      UPDATE import_rule_eligibility_projections
+      SET current_token = NULL, status = 'aborted', updated_at = ?
+      WHERE rule_id = ? AND current_token = ? AND status = 'running'
+    `, args: [now, ruleId, projectionToken] },
+  ], 'write');
+  return changes(results[1]) === 1;
+}
+
+export async function listEffectiveDocumentEligibility({ docIds = [] } = {}) {
+  const ids = [...new Set((docIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+  const where = ids.length ? `WHERE e.doc_id IN (${ids.map(() => '?').join(', ')})` : '';
+  const rows = await all(`
+    SELECT e.doc_id,
+           MAX(r.extract_citations) AS citation_eligible,
+           MAX(r.run_concepts) AS patternrank_eligible,
+           COUNT(DISTINCT e.rule_id) AS matching_rule_count
+    FROM rule_document_processing_eligibility e
+    JOIN import_rule_eligibility_projections p
+      ON p.rule_id = e.rule_id AND p.completed_token = e.projection_token
+    JOIN import_rules r ON r.id = e.rule_id
+    ${where}
+    GROUP BY e.doc_id
+    ORDER BY e.doc_id
+  `, ids);
+  return rows.map((row) => ({
+    docId: row.doc_id,
+    citationEligible: Boolean(row.citation_eligible),
+    patternRankEligible: Boolean(row.patternrank_eligible),
+    matchingRuleCount: Number(row.matching_rule_count || 0),
+  }));
+}
+
+export async function saveDocumentProcessingState(docId, processorValue, {
+  status, contentChecksum = null, processorVersion = null, error = null,
+} = {}) {
+  const processor = eligibilityProcessor(processorValue);
+  if (!PROCESSING_STATUSES.has(status)) throw new Error(`Unsupported processing status: ${status}`);
+  const now = new Date().toISOString();
+  await run(`
+    INSERT INTO document_processing_state (
+      doc_id, processor, status, content_checksum, processor_version, error, attempted_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(doc_id, processor) DO UPDATE SET
+      status = excluded.status,
+      content_checksum = excluded.content_checksum,
+      processor_version = excluded.processor_version,
+      error = excluded.error,
+      attempted_at = excluded.attempted_at
+  `, [docId, processor, status, contentChecksum, processorVersion, error, now]);
+}
+
+export async function listEligibleDocumentsForProcessing({
+  processor: processorValue, status = 'actionable', processorVersion = null,
+  afterDocId = '', limit = 100,
+} = {}) {
+  const processor = eligibilityProcessor(processorValue);
+  const requestedStatus = String(status || 'actionable').toLowerCase();
+  const allowedStatuses = new Set(['all', 'actionable', 'pending', 'running', 'completed', 'stale', 'failed']);
+  if (!allowedStatuses.has(requestedStatus)) throw new Error(`Unsupported eligibility status: ${status}`);
+  const eligibilityColumn = processor === 'citation' ? 'extract_citations' : 'run_concepts';
+  const statusPredicate = requestedStatus === 'all' ? '1 = 1'
+    : requestedStatus === 'actionable' ? "queue_status IN ('pending', 'stale', 'failed')"
+      : 'queue_status = ?';
+  const statusArgs = ['all', 'actionable'].includes(requestedStatus) ? [] : [requestedStatus];
+  return all(`
+    WITH effective AS (
+      SELECT DISTINCT e.doc_id
+      FROM rule_document_processing_eligibility e
+      JOIN import_rule_eligibility_projections p
+        ON p.rule_id = e.rule_id AND p.completed_token = e.projection_token
+      JOIN import_rules r ON r.id = e.rule_id
+      WHERE r.${eligibilityColumn} = 1
+    ), queued AS (
+      SELECT d.doc_id, d.metadata_json, fm.pdf_path, fm.full_text_path,
+             fm.content_source,
+             COALESCE(fm.content_checksum, fm.updated_at, '') AS content_checksum,
+             ps.status AS processing_status, ps.error, ps.attempted_at,
+             CASE
+               WHEN ps.doc_id IS NULL THEN 'pending'
+               WHEN ps.status = 'failed' THEN 'failed'
+               WHEN ps.status = 'completed' AND (
+                 COALESCE(ps.content_checksum, '') <> COALESCE(fm.content_checksum, fm.updated_at, '')
+                 OR (? IS NOT NULL AND COALESCE(ps.processor_version, '') <> ?)
+               ) THEN 'stale'
+               ELSE ps.status
+             END AS queue_status
+      FROM effective e
+      JOIN documents d ON d.doc_id = e.doc_id
+      LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+      LEFT JOIN document_processing_state ps
+        ON ps.doc_id = d.doc_id AND ps.processor = ?
+      WHERE d.doc_id > ?
+    )
+    SELECT * FROM queued
+    WHERE ${statusPredicate}
+    ORDER BY doc_id
+    LIMIT ?
+  `, [
+    processorVersion, processorVersion, processor, String(afterDocId || ''),
+    ...statusArgs, Math.max(1, Math.min(1000, Number(limit) || 100)),
+  ]);
 }
 
 // CAS backoff is intentionally smaller/faster-capped than Layer A's
@@ -4582,10 +4978,11 @@ export async function getCitationStats() {
 
 export async function listPendingCitationExtractions({
   limit = 100, afterDocId = '', syncKey = null, filters: requestedFilters = {},
-  parserVersion = 'citation-v1',
+  parserVersion = 'citation-v1', eligibilityRuleIds = [],
 } = {}) {
   const filters = documentServingFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
+  const eligibility = citationEligibilityGate({ eligibilityRuleIds });
   return all(`
     SELECT d.doc_id, d.metadata_json,
            fm.pdf_path, fm.full_text_path,
@@ -4597,6 +4994,7 @@ export async function listPendingCitationExtractions({
     ${filters.where}
     ${qualifier} d.doc_id > ?
       AND (fm.pdf_path IS NOT NULL OR fm.full_text_path IS NOT NULL)
+      ${eligibility.sql}
       AND (
         ces.doc_id IS NULL
         OR ces.status <> 'completed'
@@ -4608,9 +5006,80 @@ export async function listPendingCitationExtractions({
   `, [
     ...filters.args,
     String(afterDocId || ''),
+    ...eligibility.args,
     String(parserVersion || 'citation-v1'),
     Math.max(1, Math.min(1000, Number(limit) || 100)),
   ]);
+}
+
+// Content retrieval for citation scans is governed by every currently enabled
+// rule whose published membership includes the document. This deliberately
+// uses the global effective union rather than only the rule ids that triggered
+// an immediate scan: an overlapping rule must never have its tighter download
+// or request-rate policy bypassed merely because another matching rule queued
+// the work.
+export async function listEffectiveCitationPoliciesForDocument(docId) {
+  const rows = await all(`
+    SELECT r.id AS rule_id,
+           r.max_content_bytes,
+           r.content_rate_limit
+    FROM rule_document_processing_eligibility e
+    JOIN import_rule_eligibility_projections p
+      ON p.rule_id = e.rule_id
+     AND p.completed_token = e.projection_token
+    JOIN import_rules r ON r.id = e.rule_id
+    WHERE e.doc_id = ?
+      AND r.extract_citations = 1
+    ORDER BY r.id
+  `, [String(docId || '')]);
+  return rows.map((row) => ({
+    ruleId: String(row.rule_id),
+    maxContentBytes: Number(row.max_content_bytes || 209715200),
+    contentRateLimit: Number(row.content_rate_limit || 0),
+  }));
+}
+
+// Once the first rule/document eligibility projection has been finalized,
+// citation work is opt-in through the union of all matching rules whose current
+// policy enables extraction. Before that migration boundary, the legacy corpus
+// selectors remain available. A rule-scoped immediate run narrows the document
+// set to memberships published by the requested rules, but the effective policy
+// is still the global union, so an overlapping rule can keep a document eligible.
+function citationEligibilityGate({ eligibilityRuleIds = [], documentAlias = 'd' } = {}) {
+  const ruleIds = [...new Set((eligibilityRuleIds || [])
+    .map((id) => String(id || '').trim()).filter(Boolean))];
+  const eligibilityActivated = 'SELECT 1 FROM processing_eligibility_activation WHERE id = 1';
+  const effectiveEligibility = `
+    SELECT 1
+    FROM rule_document_processing_eligibility effective_e
+    JOIN import_rule_eligibility_projections effective_p
+      ON effective_p.rule_id = effective_e.rule_id
+     AND effective_p.completed_token = effective_e.projection_token
+    JOIN import_rules effective_r ON effective_r.id = effective_e.rule_id
+    WHERE effective_e.doc_id = ${documentAlias}.doc_id
+      AND effective_r.extract_citations = 1
+  `;
+  if (!ruleIds.length) {
+    return {
+      sql: `AND (NOT EXISTS (${eligibilityActivated}) OR EXISTS (${effectiveEligibility}))`,
+      args: [],
+      legacyFallback: true,
+    };
+  }
+  const placeholders = ruleIds.map(() => '?').join(', ');
+  return {
+    sql: `AND EXISTS (
+      SELECT 1
+      FROM rule_document_processing_eligibility scoped_e
+      JOIN import_rule_eligibility_projections scoped_p
+        ON scoped_p.rule_id = scoped_e.rule_id
+       AND scoped_p.completed_token = scoped_e.projection_token
+      WHERE scoped_e.doc_id = ${documentAlias}.doc_id
+        AND scoped_e.rule_id IN (${placeholders})
+    ) AND EXISTS (${effectiveEligibility})`,
+    args: ruleIds,
+    legacyFallback: false,
+  };
 }
 
 // Selection gate shared by `listPendingCitationScans` and
@@ -4650,22 +5119,24 @@ function citationScanGate({ retryFailures = false, reprocess = false }) {
   return clauses.join('\n      ');
 }
 
-// Selection for the re-streaming citation scan job. Unlike
-// `listPendingCitationExtractions`, this deliberately requires NO cached bytes
-// (the scan re-streams the PDF). A document qualifies when it recorded a
-// successful streamed content download at import (`content_source =
-// 'streamed_pdf'` with a checksum) and passes the scan-once gates above (unless
-// `reprocess` forces every streamable in-scope document to be reselected).
+// Selection for the re-streaming citation scan job. The scan retrieves the PDF
+// itself, so a published, eligible metadata-only document does not need an
+// existing file_metrics row. Before eligibility projection is first activated,
+// the legacy selector remains limited to documents previously recorded as a
+// successful streamed PDF. Terminal scan-once gates apply in both cases unless
+// `reprocess` deliberately reselects every eligible in-scope document.
 export async function listPendingCitationScans({
   limit = 50, afterDocId = '', syncKey = null, filters: requestedFilters = {},
-  retryFailures = false, reprocess = false,
+  retryFailures = false, reprocess = false, eligibilityRuleIds = [],
 } = {}) {
   const filters = documentServingFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
   const gateSql = citationScanGate({ retryFailures, reprocess });
+  const eligibility = citationEligibilityGate({ eligibilityRuleIds });
   const args = [
     ...filters.args,
     String(afterDocId || ''),
+    ...eligibility.args,
     Math.max(1, Math.min(1000, Number(limit) || 50)),
   ];
   return all(`
@@ -4673,12 +5144,24 @@ export async function listPendingCitationScans({
            COALESCE(fm.content_checksum, fm.updated_at, '') AS content_checksum,
            fm.content_source
     FROM documents d
-    JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
     LEFT JOIN citation_extraction_state ces ON ces.doc_id = d.doc_id
     ${filters.where}
     ${qualifier} d.doc_id > ?
-      AND fm.content_source = 'streamed_pdf'
-      AND COALESCE(fm.content_checksum, '') <> ''
+      AND (
+        (NOT EXISTS (
+          SELECT 1 FROM processing_eligibility_activation WHERE id = 1
+        ) AND fm.content_source = 'streamed_pdf' AND COALESCE(fm.content_checksum, '') <> '')
+        OR EXISTS (
+          SELECT 1
+          FROM rule_document_processing_eligibility active_e
+          JOIN import_rule_eligibility_projections active_p
+            ON active_p.rule_id = active_e.rule_id
+           AND active_p.completed_token = active_e.projection_token
+          WHERE active_e.doc_id = d.doc_id
+        )
+      )
+      ${eligibility.sql}
       ${gateSql}
     ORDER BY d.doc_id
     LIMIT ?
@@ -4690,21 +5173,34 @@ export async function listPendingCitationScans({
 // without the cursor or limit.
 export async function countPendingCitationScans({
   syncKey = null, filters: requestedFilters = {},
-  retryFailures = false, reprocess = false,
+  retryFailures = false, reprocess = false, eligibilityRuleIds = [],
 } = {}) {
   const filters = documentServingFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
   const gateSql = citationScanGate({ retryFailures, reprocess });
+  const eligibility = citationEligibilityGate({ eligibilityRuleIds });
   const row = await get(`
     SELECT COUNT(*) AS total
     FROM documents d
-    JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
     LEFT JOIN citation_extraction_state ces ON ces.doc_id = d.doc_id
     ${filters.where}
-    ${qualifier} fm.content_source = 'streamed_pdf'
-      AND COALESCE(fm.content_checksum, '') <> ''
+    ${qualifier} (
+      (NOT EXISTS (
+        SELECT 1 FROM processing_eligibility_activation WHERE id = 1
+      ) AND fm.content_source = 'streamed_pdf' AND COALESCE(fm.content_checksum, '') <> '')
+      OR EXISTS (
+        SELECT 1
+        FROM rule_document_processing_eligibility active_e
+        JOIN import_rule_eligibility_projections active_p
+          ON active_p.rule_id = active_e.rule_id
+         AND active_p.completed_token = active_e.projection_token
+        WHERE active_e.doc_id = d.doc_id
+      )
+    )
+      ${eligibility.sql}
       ${gateSql}
-  `, filters.args);
+  `, [...filters.args, ...eligibility.args]);
   return Number(row?.total || 0);
 }
 

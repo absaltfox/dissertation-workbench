@@ -81,14 +81,26 @@ export function evaluateEnrichmentRun({
       const wordRelativeError = derivative
         ? relativeDifference(pdf.wordCount, derivative.wordCount)
         : null;
-      return derivative ? { docId: pdf.docId, wordRelativeError } : null;
+      return derivative ? {
+        docId: String(pdf.docId),
+        baselineWordCount: Number(derivative.wordCount || 0),
+        baselineWordSource: derivative.wordSource || null,
+        observedWordCount: Number(pdf.wordCount || 0),
+        observedWordSource: pdf.wordSource || null,
+        relativeDifference: wordRelativeError,
+        threshold: thresholds.maximumMedianWordRelativeError,
+        flagged: Number.isFinite(wordRelativeError)
+          && wordRelativeError > thresholds.maximumMedianWordRelativeError,
+      } : null;
     }).filter(Boolean);
-    const errors = pairs.map((pair) => pair.wordRelativeError).filter(Number.isFinite).sort((a, b) => a - b);
+    const errors = pairs.map((pair) => pair.relativeDifference).filter(Number.isFinite).sort((a, b) => a - b);
     comparison = {
       pairedDocuments: pairs.length,
       pairRate: attempted ? pairs.length / attempted : 0,
       medianWordRelativeError: quantile(errors, 0.5),
       p90WordRelativeError: quantile(errors, 0.9),
+      flaggedDocuments: pairs.filter((pair) => pair.flagged).length,
+      documents: pairs,
     };
     checks.controlPairRate = comparison.pairRate >= thresholds.minimumControlPairRate;
     checks.medianWordRelativeError = comparison.medianWordRelativeError !== null
@@ -98,8 +110,17 @@ export function evaluateEnrichmentRun({
     checks.pdfSource = qualityOutcomes.every((item) => ['streamed_pdf', 'cached_pdf'].includes(item.contentSource));
   }
 
+  // Word-count divergence is document paradata, not an operational failure.
+  // Keep the aggregate checks visible as warnings, but only extraction safety,
+  // completeness, and infrastructure checks can block the job or rollout.
+  const blockingChecks = { ...checks };
+  if (phase === 'control') {
+    delete blockingChecks.medianWordRelativeError;
+    delete blockingChecks.p90WordRelativeError;
+  }
+
   return {
-    passed: Object.values(checks).every(Boolean),
+    passed: Object.values(blockingChecks).every(Boolean),
     phase,
     exhausted: Boolean(exhausted),
     targetSize: Number(targetSize || 0),
@@ -121,6 +142,11 @@ export function evaluateEnrichmentRun({
     repositoryRequestsPerMinute,
     comparison,
     checks,
+    blockingChecks,
+    warnings: phase === 'control' ? {
+      wordCountDivergence: Number(comparison?.flaggedDocuments || 0) > 0,
+      flaggedDocuments: Number(comparison?.flaggedDocuments || 0),
+    } : {},
     thresholds,
   };
 }

@@ -392,9 +392,12 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
         scope,
         ruleIds: selectedIds,
         rules: jobRules.map(importRuleSnapshot),
+        downstreamPolicyRules: jobRules.map(importRuleSnapshot),
         contentModeCounts: contentModeCounts(jobRules),
         pdfBatchSize: mode === 'sync_missing_pdfs' ? rollout?.targetSize || IMPORT_PDF_BATCH_SIZE : null,
         autoContinuePdfBatches: mode === 'sync_missing_pdfs' && !rollout,
+        queueEligibleProcessing: mode === 'sync_missing_pdfs'
+          && (!rollout || rollout.phase === 'cohort'),
         rollout,
       },
     });

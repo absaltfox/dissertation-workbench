@@ -540,14 +540,14 @@
                       </label>
                       <label class="checkbox-row">
                         <input id="importExtractCitations" type="checkbox" />
-                        <span>Declare citation-extraction eligibility</span>
+                        <span>Include in citation extraction</span>
                       </label>
                       <label class="checkbox-row">
                         <input id="importRunConcepts" type="checkbox" checked />
-                        <span>Declare PatternRank eligibility</span>
+                        <span>Include in PatternRank</span>
                       </label>
                     </div>
-                    <p class="meta">A rate of 0 uses only the deployment-wide limiter. Citation and concept toggles are stored intent for a later eligibility-projection step; current scheduled corpus jobs do not consume them. The complete policy is snapshotted when a job starts.</p>
+                    <p class="meta">A rate of 0 uses only the deployment-wide limiter. Import Metadata records the selected citation and PatternRank eligibility for scheduled processing. Import &amp; Enrich Metadata queues the selected processing immediately. The complete policy is snapshotted when a job starts.</p>
                   </fieldset>
                   <fieldset class="settings-section">
                     <legend>Rule</legend>
@@ -603,16 +603,12 @@
                     <div class="import-run-actions" aria-label="Import actions">
                       <button type="button" id="importAllRuleBtn" class="import-action-card">
                         <span class="import-action-title">Import Metadata</span>
-                        <span class="import-action-meta">Fast</span>
+                        <span class="import-action-meta">Add new records and update changed metadata</span>
                       </button>
-                      <button type="button" id="syncMissingPdfsRuleBtn" class="import-action-card primary">
-                        <span class="import-action-title">Import + Enrich Using Rule Policy</span>
-                        <span class="import-action-meta">Content handling follows each saved rule</span>
+                      <button type="button" id="importEnrichRuleBtn" class="import-action-card primary">
+                        <span class="import-action-title">Import &amp; Enrich Metadata</span>
+                        <span class="import-action-meta">Apply the saved content, citation, and PatternRank policy now</span>
                       </button>
-                    </div>
-                    <div class="import-maintenance-actions" aria-label="Maintenance actions">
-                      <button type="button" id="syncDifferencesRuleBtn" class="btn ghost btn-sm">Import New Metadata</button>
-                      <button type="button" id="refreshMetadataRuleBtn" class="btn ghost btn-sm">Refresh Existing Metadata</button>
                     </div>
                   </div>
                   <div id="importRulePreview" class="import-preview" aria-live="polite"></div>

@@ -22,6 +22,8 @@ let db;
 let runDocumentSync;
 let getSyncKeyForOptions;
 let startContinuationJob;
+let queueEligibleImportProcessing;
+let dispatchAdminJobFollowups;
 
 test.before(async () => {
   tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-enrich-cont-'));
@@ -34,7 +36,8 @@ test.before(async () => {
   delete process.env.TURSO_DATABASE_URL;
   db = await import('../src/db.js');
   ({ runDocumentSync, getSyncKeyForOptions } = await import('../src/sync.js'));
-  ({ startContinuationJob } = await import('../src/services/importPdfJobRunner.js'));
+  ({ startContinuationJob, queueEligibleImportProcessing } = await import('../src/services/importPdfJobRunner.js'));
+  ({ dispatchAdminJobFollowups } = await import('../src/services/adminWorker.js'));
   await db.ensureStorage();
 });
 
@@ -140,6 +143,140 @@ test('startContinuationJob keeps nextParams JSON size constant across many conti
     sizes.every((size) => size === sizes[0]),
     `params_json size was not constant across continuations: ${sizes.join(', ')}`
   );
+});
+
+test('final Import & Enrich batch queues only the processors selected by rule policy', async () => {
+  const payloads = [];
+  const job = {
+    id: 'import-policy-job',
+    params: {
+      mode: 'sync_missing_pdfs',
+      queueEligibleProcessing: true,
+      rules: [{ id: 'concept-rule', extractCitations: false, runConcepts: true }],
+      downstreamPolicyRules: [
+        { id: 'citation-rule', extractCitations: true, runConcepts: false },
+        { id: 'concept-rule', extractCitations: false, runConcepts: true },
+      ],
+    },
+  };
+  const queued = await queueEligibleImportProcessing(job, { ok: true }, null, {
+    createProcessingJob: async (payload) => {
+      payloads.push(payload);
+      return { jobId: `queued-${payloads.length}` };
+    },
+  });
+
+  assert.deepEqual(queued.errors, []);
+  assert.deepEqual(queued.deferred, []);
+  assert.deepEqual(payloads.map((payload) => payload.type), ['citation_scan', 'concept_rebuild']);
+  assert.deepEqual(payloads[0].params.scope.eligibilityRuleIds, ['citation-rule']);
+  assert.equal(payloads[0].params.autoContinue, true);
+  assert.equal(payloads[0].singleInstance, true);
+  assert.equal(payloads[1].singleInstance, true);
+});
+
+test('an active singleton leaves durable eligible work explicitly deferred instead of claiming a new queue', async () => {
+  const followups = [];
+  const queued = await queueEligibleImportProcessing({
+    id: 'active-processor-import',
+    params: {
+      mode: 'sync_missing_pdfs',
+      queueEligibleProcessing: true,
+      rules: [{ id: 'citation-rule', extractCitations: true, runConcepts: false }],
+    },
+  }, { ok: true }, null, {
+    createProcessingJob: async () => ({ jobId: 'active-citation-job', alreadyRunning: true }),
+    requestProcessingFollowup: async (followup) => { followups.push(followup); },
+  });
+  assert.deepEqual(queued.jobs, []);
+  assert.deepEqual(queued.deferred, [{
+    processor: 'citation',
+    activeJobId: 'active-citation-job',
+    reason: 'processor_already_running',
+  }]);
+  assert.deepEqual(queued.errors, []);
+  assert.equal(followups.length, 1);
+  assert.equal(followups[0].type, 'citation_scan');
+  assert.equal(followups[0].params.scope, undefined);
+  assert.equal(followups[0].params.trigger, 'import_enrichment_reconciliation');
+});
+
+test('durable singleton follow-ups survive busy workers and generation-fence concurrent requests', async () => {
+  const type = `followup-test-${Date.now()}`;
+  await db.requestAdminJobFollowup({ type, label: 'Initial follow-up', params: { generation: 1 } });
+
+  assert.deepEqual(await dispatchAdminJobFollowups({
+    createJob: async () => ({ alreadyRunning: true, jobId: 'busy-worker' }),
+  }), []);
+  assert.equal((await db.listAdminJobFollowups()).some((row) => row.type === type), true);
+
+  const dispatched = await dispatchAdminJobFollowups({
+    createJob: async () => {
+      await db.requestAdminJobFollowup({ type, label: 'Newer follow-up', params: { generation: 2 } });
+      return { jobId: 'fresh-worker' };
+    },
+  });
+  assert.deepEqual(dispatched, [{ type, jobId: 'fresh-worker', superseded: true }]);
+  const newer = (await db.listAdminJobFollowups()).find((row) => row.type === type);
+  assert.equal(newer.params.generation, 2);
+
+  assert.deepEqual(await dispatchAdminJobFollowups({
+    createJob: async () => ({ jobId: 'reconciliation-worker' }),
+  }), [{ type, jobId: 'reconciliation-worker', superseded: false }]);
+  assert.equal((await db.listAdminJobFollowups()).some((row) => row.type === type), false);
+});
+
+test('Import & Enrich defers downstream jobs while an automatic content continuation exists', async () => {
+  let calls = 0;
+  const queued = await queueEligibleImportProcessing({
+    id: 'continued-import',
+    params: {
+      mode: 'sync_missing_pdfs',
+      queueEligibleProcessing: true,
+      rules: [{ id: 'rule', extractCitations: true, runConcepts: true }],
+    },
+  }, { nextJobId: 'next-content-batch' }, null, {
+    createProcessingJob: async () => { calls += 1; },
+  });
+  assert.equal(queued, null);
+  assert.equal(calls, 0);
+});
+
+test('failed Import & Enrich jobs never queue downstream processing', async () => {
+  let calls = 0;
+  const queued = await queueEligibleImportProcessing({
+    id: 'failed-import',
+    params: {
+      mode: 'sync_missing_pdfs',
+      queueEligibleProcessing: true,
+      rules: [{ id: 'rule', extractCitations: true, runConcepts: true }],
+    },
+  }, { ok: false }, null, {
+    createProcessingJob: async () => { calls += 1; },
+  });
+  assert.equal(queued, null);
+  assert.equal(calls, 0);
+});
+
+test('a capped batch never queues downstream work when its continuation could not be created', async () => {
+  let calls = 0;
+  const queued = await queueEligibleImportProcessing({
+    id: 'continuation-start-failed',
+    params: {
+      mode: 'sync_missing_pdfs',
+      queueEligibleProcessing: true,
+      autoContinuePdfBatches: true,
+      rules: [{ id: 'rule', extractCitations: true, runConcepts: true }],
+    },
+  }, {
+    ok: true,
+    pdfBatchLimitReached: true,
+    continuationError: 'worker could not start',
+  }, null, {
+    createProcessingJob: async () => { calls += 1; },
+  });
+  assert.equal(queued, null);
+  assert.equal(calls, 0);
 });
 
 // --- 2 & 3: per-batch statement count as the local queue drains ---
