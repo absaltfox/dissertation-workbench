@@ -547,7 +547,7 @@
                         <span>Include in PatternRank</span>
                       </label>
                     </div>
-                    <p class="meta">A rate of 0 uses only the deployment-wide limiter. Import Metadata records the selected citation and PatternRank eligibility for scheduled processing. Import &amp; Enrich Metadata queues the selected processing immediately. The complete policy is snapshotted when a job starts.</p>
+                    <p class="meta">A rate of 0 uses only the deployment-wide limiter. Import Metadata updates records and processing eligibility without retrieving content. Import &amp; Enrich Metadata applies each saved content policy to every in-scope document, continues automatically in bounded batches, then queues the selected citation and PatternRank processing. The complete policy is snapshotted when a job starts.</p>
                   </fieldset>
                   <fieldset class="settings-section">
                     <legend>Rule</legend>
@@ -607,7 +607,7 @@
                       </button>
                       <button type="button" id="importEnrichRuleBtn" class="import-action-card primary">
                         <span class="import-action-title">Import &amp; Enrich Metadata</span>
-                        <span class="import-action-meta">Apply the saved content, citation, and PatternRank policy now</span>
+                        <span class="import-action-meta">Enrich every in-scope record, then run the selected processors</span>
                       </button>
                     </div>
                   </div>

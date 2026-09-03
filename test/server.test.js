@@ -11,9 +11,9 @@ import { CITATION_SCAN_NIGHTLY_ENABLED } from '../src/config.js';
 import {
   closeDb, createAdminJob, finishAdminJob, hashAdminJobToken, hasRunningAdminJob, saveCitations,
   countPendingCitationScans, saveCitationExtractionState,
-  finishEnrichmentRolloutPhase, importRuleRevision, saveCommitteeMembers, saveDocumentMetadata,
-  saveFileMetric, saveImportRule, startEnrichmentRolloutPhase
+  saveCommitteeMembers, saveDocumentMetadata, saveFileMetric, saveImportRule
 } from '../src/db.js';
+import { buildImportRulesRunParams } from '../src/routes/adminImportRoutes.js';
 
 test.after(async () => {
   await closeDb();
@@ -278,24 +278,24 @@ test('import rule run validates mode and scope', async () => {
   }
 });
 
-test('progressive enrichment requires an ordered phase and explicit PDF control approval', async () => {
+test('Import & Enrich runs the complete scope without rollout phases and requires PDF approval', async () => {
   const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const rule = await saveImportRule({
-    id: `progressive-${suffix}`,
-    name: `Progressive ${suffix}`,
+    id: `complete-enrichment-${suffix}`,
+    name: `Complete enrichment ${suffix}`,
     degree: 'Doctor of Philosophy',
-    contentMode: 'full_text_only',
+    contentMode: 'pdf_stream',
   });
   const token = createSession('admin');
   try {
     const csrfToken = getSessionCsrfToken(token);
-    const noPhase = await request(app)
+    const noApproval = await request(app)
       .post('/api/admin/import-rules/run')
       .set('Cookie', `session=${token}`)
       .set('x-csrf-token', csrfToken)
       .send({ mode: 'sync_missing_pdfs', scope: 'selected', ruleIds: [rule.id] })
-      .expect(400);
-    assert.match(noPhase.body.error, /progressive enrichment phase/i);
+      .expect(409);
+    assert.match(noApproval.body.error, /explicit approval/i);
 
     const legacyBypass = await request(app)
       .post('/api/admin/import-rules/sync')
@@ -303,11 +303,12 @@ test('progressive enrichment requires an ordered phase and explicit PDF control 
       .set('x-csrf-token', csrfToken)
       .send({ id: rule.id, mode: 'sync_missing_pdfs' })
       .expect(409);
-    assert.match(legacyBypass.body.error, /progressive import-rules run endpoint/i);
+    assert.match(legacyBypass.body.error, /import-rules run endpoint/i);
 
-    await startEnrichmentRolloutPhase(rule.id, 'sample', 9001, importRuleRevision(rule));
-    await finishEnrichmentRolloutPhase(rule.id, 'sample', 9001, { passed: true, phase: 'sample' });
-    const noApproval = await request(app)
+    const runningJobId = await createAdminJob({
+      type: 'import_rules_sync', label: 'Existing import rules sync', params: {}, runnerType: 'local',
+    });
+    const accepted = await request(app)
       .post('/api/admin/import-rules/run')
       .set('Cookie', `session=${token}`)
       .set('x-csrf-token', csrfToken)
@@ -315,13 +316,39 @@ test('progressive enrichment requires an ordered phase and explicit PDF control 
         mode: 'sync_missing_pdfs',
         scope: 'selected',
         ruleIds: [rule.id],
-        rolloutPhase: 'control',
+        approveOriginalPdfRetrieval: true,
       })
-      .expect(409);
-    assert.match(noApproval.body.error, /explicit approval/i);
+      .expect(202);
+    assert.equal(accepted.body.alreadyRunning, true);
+    assert.equal(accepted.body.jobId, runningJobId);
+    await finishAdminJob(runningJobId, { status: 'completed', runnerState: 'completed' });
   } finally {
     destroySession(token);
   }
+});
+
+test('Import & Enrich job params drain all bounded batches before downstream processing', () => {
+  const rules = [{
+    id: 'complete-rule', name: 'Complete rule', contentMode: 'pdf_stream',
+    extractCitations: true, runConcepts: true,
+  }];
+  const params = buildImportRulesRunParams({
+    mode: 'sync_missing_pdfs',
+    scope: 'selected',
+    selectedIds: ['complete-rule'],
+    rules,
+    pageSize: 75,
+    scanLimit: 125_000,
+  });
+  assert.equal(params.pdfBatchSize, 50);
+  assert.equal(params.autoContinuePdfBatches, true);
+  assert.equal(params.queueEligibleProcessing, true);
+  assert.deepEqual(params.syncOptions, {
+    pageSize: 75,
+    scanLimit: 125_000,
+    syncMaxRecords: 125_000,
+  });
+  assert.equal('rollout' in params, false);
 });
 
 test('legacy import-rule sync endpoint uses durable document sync job state', async () => {

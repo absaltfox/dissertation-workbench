@@ -613,6 +613,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         ...importRuleToSyncOptions(rule, {
           mode: params.mode,
           apiKey,
+          ...(params.syncOptions && typeof params.syncOptions === 'object' ? params.syncOptions : {}),
         }),
         artifactClient,
         onProgress: async (event = {}) => progress({

@@ -1,7 +1,6 @@
 import { Router } from 'express';
 import {
   deleteImportRule, getImportRule, listAllDocumentMetadata, listImportRules,
-  getEnrichmentRollout, importRuleRevision, listEnrichmentRolloutEvidence,
   saveImportRule, hasRunningAdminJob
 } from '../db.js';
 import { createAndStartAdminWorkerJob } from '../services/adminWorker.js';
@@ -19,7 +18,6 @@ import {
   contentModeEnrichesDocuments, importRuleToSyncOptions, normalizeImportRule, validateImportRule
 } from '../importRules.js';
 import { logger } from '../logger.js';
-import { ENRICHMENT_ROLLOUT_DEFAULTS, ENRICHMENT_ROLLOUT_PHASES } from '../services/enrichmentRollout.js';
 
 function cleanImportRequest(input = {}) {
   return normalizeImportRule({
@@ -64,6 +62,28 @@ function contentPolicyRunError(rules, mode) {
     return 'Original PDF retrieval is disabled for this deployment. Set ALLOW_ORIGINAL_PDF_RETRIEVAL=1 to run pdf_cache or pdf_stream rules.';
   }
   return null;
+}
+
+export function buildImportRulesRunParams({
+  mode, scope, selectedIds, rules, pageSize = 20, scanLimit = 50_000,
+} = {}) {
+  const enriching = mode === 'sync_missing_pdfs';
+  return {
+    mode,
+    scope,
+    ruleIds: selectedIds,
+    rules: rules.map(importRuleSnapshot),
+    downstreamPolicyRules: rules.map(importRuleSnapshot),
+    contentModeCounts: contentModeCounts(rules),
+    pdfBatchSize: enriching ? IMPORT_PDF_BATCH_SIZE : null,
+    autoContinuePdfBatches: enriching,
+    queueEligibleProcessing: enriching,
+    syncOptions: {
+      pageSize,
+      scanLimit,
+      syncMaxRecords: scanLimit,
+    },
+  };
 }
 
 function toList(value) {
@@ -119,13 +139,7 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
   const router = Router();
 
   router.get('/import-rules', asyncHandler(async (_req, res) => {
-    const rules = await listImportRules();
-    res.status(200).json({
-      rules: await Promise.all(rules.map(async (rule) => ({
-        ...rule,
-        rollout: await getEnrichmentRollout(rule.id),
-      }))),
-    });
+    res.status(200).json({ rules: await listImportRules() });
   }));
 
   router.post('/import-rules', asyncHandler(async (req, res) => {
@@ -272,7 +286,7 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
       return;
     }
     if (mode === 'sync_missing_pdfs' && contentModeEnrichesDocuments(rule.contentMode)) {
-      res.status(409).json({ error: 'Content enrichment must use the progressive import-rules run endpoint.' });
+      res.status(409).json({ error: 'Content enrichment must use the import-rules run endpoint.' });
       return;
     }
     const runningId = await hasRunningAdminJob('document_sync');
@@ -312,69 +326,17 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
       res.status(400).json({ error: scope === 'all' ? 'No import rules are saved.' : 'Select at least one import rule.' });
       return;
     }
-    let jobRules = rules;
-    let rollout = null;
-    const enrichingRules = rules.filter((rule) => contentModeEnrichesDocuments(rule.contentMode));
-    if (mode === 'sync_missing_pdfs' && enrichingRules.length) {
-      if (rules.length !== 1) {
-        res.status(409).json({ error: 'Progressive enrichment runs exactly one rule at a time so each cohort has an independent quality gate.' });
-        return;
-      }
-      const rule = rules[0];
-      const state = await getEnrichmentRollout(rule.id);
-      const requestedPhase = String(body.rolloutPhase || '');
-      if (!ENRICHMENT_ROLLOUT_PHASES.has(requestedPhase)) {
-        res.status(400).json({ error: 'Choose a progressive enrichment phase: sample, control, or cohort.' });
-        return;
-      }
-      const allowed = (
-        (requestedPhase === 'sample' && (!state || state.status === 'invalidated' || (state.status === 'blocked' && state.evaluation?.phase === 'sample')))
-        || (requestedPhase === 'control' && (state?.status === 'awaiting_control' || (state?.status === 'blocked' && state.evaluation?.phase === 'control')))
-        || (requestedPhase === 'cohort' && (state?.status === 'ready_for_cohort' || (state?.status === 'blocked' && state.evaluation?.phase === 'cohort')))
-      );
-      if (!allowed) {
-        res.status(409).json({ error: `The ${requestedPhase} phase is not allowed while this rollout is ${state?.status || 'not started'}.` });
-        return;
-      }
-      if (requestedPhase === 'control' && body.approveOriginalPdfControl !== true) {
-        res.status(409).json({ error: 'The PDF control requires explicit approval because it retrieves original PDFs.' });
-        return;
-      }
-      const contentMode = requestedPhase === 'sample'
-        ? 'full_text_only'
-        : requestedPhase === 'control' ? 'pdf_stream' : rule.contentMode;
-      jobRules = [{
-        ...rule,
-        contentMode,
-        contentFallback: requestedPhase === 'control' ? 'fail_document' : rule.contentFallback,
-      }];
-      let documentIds = [];
-      if (requestedPhase === 'control') {
-        const sampleEvidence = await listEnrichmentRolloutEvidence({ ruleId: rule.id, jobId: state.sampleJobId });
-        documentIds = sampleEvidence
-          .map((entry) => entry.outcome)
-          .filter((outcome) => outcome && !outcome.error && Number(outcome.wordCount) > 0 && Number(outcome.pageCount) > 0)
-          .slice(0, ENRICHMENT_ROLLOUT_DEFAULTS.controlSize)
-          .map((outcome) => String(outcome.docId));
-        if (documentIds.length < ENRICHMENT_ROLLOUT_DEFAULTS.controlSize) {
-          res.status(409).json({ error: 'The passed sample does not contain enough durable document evidence for the PDF control.' });
-          return;
-        }
-      }
-      rollout = {
-        phase: requestedPhase,
-        ruleRevision: importRuleRevision(rule),
-        documentIds,
-        targetSize: requestedPhase === 'sample'
-          ? ENRICHMENT_ROLLOUT_DEFAULTS.sampleSize
-          : requestedPhase === 'control'
-            ? ENRICHMENT_ROLLOUT_DEFAULTS.controlSize
-            : IMPORT_PDF_BATCH_SIZE,
-      };
-    }
-    const policyError = contentPolicyRunError(jobRules, mode);
+    const policyError = contentPolicyRunError(rules, mode);
     if (policyError) {
       res.status(409).json({ error: policyError });
+      return;
+    }
+    const retrievesOriginalPdfs = mode === 'sync_missing_pdfs'
+      && rules.some((rule) => contentModeRequestsOriginalPdf(rule.contentMode));
+    if (retrievesOriginalPdfs && body.approveOriginalPdfRetrieval !== true) {
+      res.status(409).json({
+        error: 'Explicit approval is required because this enrichment run retrieves original PDFs.',
+      });
       return;
     }
 
@@ -387,19 +349,14 @@ export function createAdminImportRouter({ loadSyncModule, clearMetricsCache }) {
     const result = await createAndStartAdminWorkerJob({
       type: 'import_rules_sync',
       label: 'Import Rules Sync',
-      params: {
+      params: buildImportRulesRunParams({
         mode,
         scope,
-        ruleIds: selectedIds,
-        rules: jobRules.map(importRuleSnapshot),
-        downstreamPolicyRules: jobRules.map(importRuleSnapshot),
-        contentModeCounts: contentModeCounts(jobRules),
-        pdfBatchSize: mode === 'sync_missing_pdfs' ? rollout?.targetSize || IMPORT_PDF_BATCH_SIZE : null,
-        autoContinuePdfBatches: mode === 'sync_missing_pdfs' && !rollout,
-        queueEligibleProcessing: mode === 'sync_missing_pdfs'
-          && (!rollout || rollout.phase === 'cohort'),
-        rollout,
-      },
+        selectedIds,
+        rules,
+        pageSize: parseNumberParam(body.pageSize, 20, 1, 100),
+        scanLimit: parseNumberParam(body.scanLimit, 50_000, 1, 200_000),
+      }),
     });
 
     clearMetricsCache();

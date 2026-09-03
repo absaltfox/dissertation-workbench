@@ -703,7 +703,6 @@ function summarizeImportRule(rule) {
   parts.push(`Content: ${importContentModeLabel(rule.contentMode)}`);
   parts.push(`Fallback: ${(rule.contentFallback || 'fail_document').replaceAll('_', ' ')}`);
   parts.push(`Concurrency: ${rule.contentConcurrency || 1}`);
-  if (rule.rollout?.status) parts.push(`Rollout: ${rule.rollout.status.replaceAll('_', ' ')}`);
   return parts.join(' · ');
 }
 
@@ -897,23 +896,6 @@ async function handleRunImportRules(mode, button) {
     sync_missing_pdfs: 'Import and enrich metadata'
   };
   const selectedRules = state.importRules.filter((rule) => ruleIds.includes(rule.id));
-  const enrichingRules = selectedRules.filter((rule) => rule.contentMode !== 'metadata_only');
-  let rolloutPhase = null;
-  if (mode === 'sync_missing_pdfs' && enrichingRules.length) {
-    if (selectedRules.length !== 1) {
-      alert('Progressive enrichment runs one rule at a time so each cohort has an independent quality gate.');
-      return;
-    }
-    const rolloutState = selectedRules[0].rollout;
-    if (!rolloutState || rolloutState.status === 'invalidated') rolloutPhase = 'sample';
-    else if (rolloutState.status === 'awaiting_control') rolloutPhase = 'control';
-    else if (rolloutState.status === 'ready_for_cohort') rolloutPhase = 'cohort';
-    else if (rolloutState.status === 'blocked') rolloutPhase = rolloutState.evaluation?.phase;
-    if (!rolloutPhase) {
-      alert(`This rollout cannot start while it is ${rolloutState?.status || 'in an unknown state'}.`);
-      return;
-    }
-  }
   const policyCounts = selectedRules.reduce((counts, rule) => {
     const label = importContentModeLabel(rule.contentMode);
     counts[label] = (counts[label] || 0) + 1;
@@ -922,14 +904,13 @@ async function handleRunImportRules(mode, button) {
   const policySummary = mode === 'sync_missing_pdfs'
     ? `\n\nContent policies:\n${Object.entries(policyCounts).map(([label, count]) => `- ${label}: ${count}`).join('\n')}`
     : '';
-  const rolloutSummary = rolloutPhase
-    ? `\n\nProgressive enrichment phase: ${rolloutPhase}`
-    : '';
+  const retrievesOriginalPdfs = mode === 'sync_missing_pdfs'
+    && selectedRules.some((rule) => ['pdf_stream', 'pdf_cache'].includes(rule.contentMode));
   const originalPdfWarning = mode === 'sync_missing_pdfs'
-    && (rolloutPhase === 'control' || selectedRules.some((rule) => ['pdf_stream', 'pdf_cache'].includes(rule.contentMode)))
-    ? '\n\nWarning: this phase requests original PDFs. Confirming explicitly approves retrieval for this bounded run.'
+    && retrievesOriginalPdfs
+    ? '\n\nWarning: this run retrieves original PDFs for every in-scope document that still needs enrichment. It continues automatically in bounded worker batches.'
     : '';
-  if (!confirm(`${labels[mode]} for ${importScopeLabel()}?${policySummary}${rolloutSummary}${originalPdfWarning}`)) return;
+  if (!confirm(`${labels[mode]} for ${importScopeLabel()}?${policySummary}${originalPdfWarning}`)) return;
 
   button.disabled = true;
   const originalHtml = button.innerHTML;
@@ -942,8 +923,7 @@ async function handleRunImportRules(mode, button) {
         mode,
         scope,
         ruleIds,
-        rolloutPhase,
-        approveOriginalPdfControl: rolloutPhase === 'control',
+        approveOriginalPdfRetrieval: retrievesOriginalPdfs,
         maxRecords: document.getElementById('s-maxRecords')?.value || '9999',
         pageSize: document.getElementById('s-pageSize')?.value || '20',
         scanLimit: document.getElementById('s-scanLimit')?.value || '50000'
