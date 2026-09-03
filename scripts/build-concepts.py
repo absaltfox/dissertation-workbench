@@ -976,20 +976,29 @@ def ensure_incremental_schema(client):
 
 
 def _ensure_column(client, table, column, sql_type):
-    """Idempotently add a column to an existing table.
+    """Idempotently add a column without using an expected SQL error as control flow.
 
-    ensure_incremental_schema only ever does CREATE TABLE IF NOT EXISTS -- there is
-    no ALTER-a-column-in idiom in this file yet (unlike src/db.js's tryExec pattern
-    for indexes/columns elsewhere in the app). SQLite and libsql both raise on a
-    duplicate column, so the guard is a plain try/except rather than an
-    information_schema probe, keeping this portable across the local sqlite3 module
-    used in tests and the remote libsql client used against Turso in production.
+    The archived Python ``libsql-client`` HTTP transport assumes every successful
+    HTTP response contains a ``result`` member. Turso can return statement errors
+    (including duplicate-column errors) in a different response shape, which that
+    client exposes as ``KeyError('result')`` and hides the useful SQLite message.
+    Inspecting the schema first avoids that client failure on every worker startup.
+    The second inspection handles two workers racing to install the same column.
     """
+    for identifier in (table, column):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", identifier):
+            raise ValueError(f"Unsafe SQL identifier: {identifier!r}")
+
+    def column_exists():
+        rows = client.execute(f"PRAGMA table_info({table})").rows
+        return any(str(row["name"]) == column for row in rows)
+
+    if column_exists():
+        return
     try:
         client.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
-    except Exception as exc:
-        message = str(exc).lower()
-        if "duplicate column" in message or "already exists" in message:
+    except Exception:
+        if column_exists():
             return
         raise
 

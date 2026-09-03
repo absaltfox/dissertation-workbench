@@ -2758,6 +2758,61 @@ print(json.dumps({"columnCount": cols.count("content_fingerprint"), "hasColumn":
   assert.equal(result.columnCount, 1);
 });
 
+test('PatternRank schema migration avoids opaque Turso duplicate-column errors', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-opaque-migration-'));
+  const harnessPath = path.join(dir, 'opaque_migration_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sqlite3, sys
+
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+class Result:
+    def __init__(self, rows):
+        self.rows = rows
+
+class OpaqueTursoClient:
+    def __init__(self):
+        self.conn = sqlite3.connect(':memory:')
+        self.conn.row_factory = sqlite3.Row
+        self.alter_attempts = []
+
+    def execute(self, sql, params=None):
+        if sql.lstrip().upper().startswith('ALTER TABLE'):
+            self.alter_attempts.append(sql)
+        try:
+            cursor = self.conn.execute(sql, tuple(params or ()))
+            self.conn.commit()
+            return Result(cursor.fetchall())
+        except sqlite3.OperationalError as exc:
+            if 'duplicate column' in str(exc).lower():
+                raise KeyError('result') from exc
+            raise
+
+client = OpaqueTursoClient()
+bc.ensure_incremental_schema(client)
+bc.ensure_incremental_schema(client)
+partition_cols = [row['name'] for row in client.execute('PRAGMA table_info(concept_partitions)').rows]
+artifact_cols = [row['name'] for row in client.execute('PRAGMA table_info(concept_partition_artifacts)').rows]
+print(json.dumps({
+    'alterAttempts': client.alter_attempts,
+    'partitionColumnCount': partition_cols.count('content_fingerprint'),
+    'artifactColumnCount': artifact_cols.count('artifact_checksum'),
+}))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync(
+    'python3', [harnessPath, path.resolve('scripts/build-concepts.py')], { cwd: path.resolve('.') },
+  );
+  const result = JSON.parse(stdout);
+  assert.equal(result.partitionColumnCount, 1);
+  assert.equal(result.artifactColumnCount, 1);
+  assert.deepEqual(result.alterAttempts, [
+    'ALTER TABLE concept_partitions ADD COLUMN content_fingerprint TEXT',
+  ]);
+});
+
 test('concept partition publication is atomic, idempotent, and safe for concurrent builders', async () => {
   const dir = await fs.mkdtemp(path.join(testDataDir, 'concept-publication-'));
   const dbPath = path.join(dir, 'metrics.sqlite');
