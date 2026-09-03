@@ -25,6 +25,10 @@ const METRIC_ROWS = [
   { pdf_path: '/cache/doc.pdf' },
   { pdf_path: '' },
   { word_source: 'dspace_full_text', word_count: 80_000, page_count: 250 },
+  {
+    word_source: 'dspace_full_text', word_count: 80_000, page_count: 250,
+    original_pdf_request_count: 1,
+  },
   { word_source: 'dspace_full_text', word_count: 0, page_count: 250 },
   { word_source: 'dspace_full_text', word_count: 80_000, page_count: 0 },
   { word_source: 'dspace_full_text', word_count: 80_000, page_count: 250, pdf_path: '/cache/doc.pdf' },
@@ -77,8 +81,8 @@ test('the queue SQL and hasCachedEnrichmentMetric agree for every content mode',
       sql: `
         INSERT INTO file_metrics (
           doc_id, pdf_path, word_count, page_count, word_source,
-          content_source, content_checksum, status, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          content_source, content_checksum, original_pdf_request_count, status, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       args: [
         docIds[index],
@@ -88,6 +92,7 @@ test('the queue SQL and hasCachedEnrichmentMetric agree for every content mode',
         row.word_source ?? null,
         row.content_source ?? null,
         row.content_checksum ?? null,
+        row.original_pdf_request_count ?? 0,
         'fixture',
         new Date().toISOString(),
       ],
@@ -135,6 +140,31 @@ test('a document with no file_metrics row at all is outstanding, never satisfied
       assert.equal(hasCachedEnrichmentMetric(null, contentMode, contentFallback), false);
     }
   }
+});
+
+test('PDF-preferring rules upgrade legacy estimated pages exactly once', async () => {
+  const syncKey = 'queue-pdf-upgrade';
+  await db.saveDocumentMetadata({ id: 'upgrade-needed', title: 'Legacy estimate' }, { syncKey });
+  await db.saveDocumentMetadata({ id: 'upgrade-attempted', title: 'Accepted fallback' }, { syncKey });
+  await db.saveFileMetric('upgrade-needed', {
+    status: 'full_text', wordSource: 'dspace_full_text', wordCount: 80_000,
+    pageCount: 250, pageSource: 'estimated_from_full_text_words', originalPdfRequestCount: 0,
+  });
+  await db.saveFileMetric('upgrade-attempted', {
+    status: 'full_text_fallback', wordSource: 'dspace_full_text', wordCount: 80_000,
+    pageCount: 250, pageSource: 'estimated_from_full_text_words', originalPdfRequestCount: 1,
+  });
+
+  const pending = await db.listDocumentsPendingEnrichment({
+    syncKey, contentMode: 'pdf_stream', contentFallback: 'full_text', limit: 10,
+  });
+  assert.deepEqual(pending.map((entry) => entry.docId), ['upgrade-needed']);
+  assert.equal(hasCachedEnrichmentMetric(
+    await db.loadStoredFileMetric('upgrade-needed'), 'pdf_stream', 'full_text'
+  ), false);
+  assert.equal(hasCachedEnrichmentMetric(
+    await db.loadStoredFileMetric('upgrade-attempted'), 'pdf_stream', 'full_text'
+  ), true);
 });
 
 test('the queue is scoped, ordered, cursored and drained by durable attempts', async () => {

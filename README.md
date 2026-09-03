@@ -286,7 +286,7 @@ Optional enrichment services:
 - `BERTOPIC_PYTHON_COMMAND`: Python executable for BERTopic jobs, default `python3`.
 - `BERTOPIC_TIMEOUT_MS`: BERTopic job timeout, default one hour.
 - `ANTHROPIC_API_KEY`: optional; `scripts/build-topics.py` uses it to generate human-readable topic labels.
-- `BERTOPIC_WORKER_IMAGE`: optional Fly image override for BERTopic rebuild workers.
+- `BERTOPIC_WORKER_IMAGE`: required on Fly for BERTopic and PatternRank workers. It is propagated to temporary import workers so they can safely launch downstream Python jobs.
 - `LABELER_WORKER_IMAGE`: optional Fly image override for label-only regeneration workers.
 - `LOCAL_LABEL_BACKEND`: topic label backend, default `llama_cpp` for labeler workers.
 - `LOCAL_LABEL_MODEL_PATH`: GGUF model path for llama.cpp label generation, default `/app/models/qwen2.5-1.5b-instruct-q4.gguf`.

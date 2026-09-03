@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {
   ADMIN_WORKER_GRACE_MS, ADMIN_WORKER_MODE, ADMIN_WORKER_TIMEOUT_MS,
+  BERTOPIC_WORKER_IMAGE,
   FLY_API_HOSTNAME, FLY_API_TOKEN, FLY_APP_NAME, FLY_MACHINE_ID,
   FLY_WORKER_CPUS, FLY_WORKER_CPU_KIND, FLY_WORKER_MEMORY_MB, LABELER_WORKER_IMAGE,
   LOCAL_LABEL_BACKEND, LOCAL_LABEL_MODEL_PATH,
@@ -98,11 +99,21 @@ export function buildFlyWorkerMachinePayload({
   const isBertopic = jobType === 'bertopic';
   const isTopicLabels = jobType === 'topic_labels';
   const isConceptRebuild = jobType === 'concept_rebuild';
+  const bertopicWorkerImage = process.env.BERTOPIC_WORKER_IMAGE || BERTOPIC_WORKER_IMAGE;
+  const labelerWorkerImage = process.env.LABELER_WORKER_IMAGE || LABELER_WORKER_IMAGE || bertopicWorkerImage;
   const workerImage = isTopicLabels
-    ? (process.env.LABELER_WORKER_IMAGE || LABELER_WORKER_IMAGE || process.env.BERTOPIC_WORKER_IMAGE || image)
+    ? labelerWorkerImage
     : isBertopic || isConceptRebuild
-    ? (process.env.BERTOPIC_WORKER_IMAGE || image)
+    ? bertopicWorkerImage
     : image;
+  if (!workerImage) {
+    const variable = isTopicLabels
+      ? 'LABELER_WORKER_IMAGE or BERTOPIC_WORKER_IMAGE'
+      : isBertopic || isConceptRebuild
+      ? 'BERTOPIC_WORKER_IMAGE'
+      : 'WORKER_IMAGE';
+    throw new Error(`${variable} is required for Fly ${jobType} workers.`);
+  }
   const execCmd = isTopicLabels
     ? ['python3', 'scripts/build-topics.py', '--labels-only']
     : isConceptRebuild
@@ -136,6 +147,10 @@ export function buildFlyWorkerMachinePayload({
     GROBID_APP_NAME: process.env.GROBID_APP_NAME || '',
     GROBID_FLY_API_TOKEN: process.env.GROBID_FLY_API_TOKEN || process.env.FLY_API_TOKEN || '',
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+    // Import workers can launch downstream Python jobs. Preserve the dedicated
+    // image selectors so those nested launches never fall back to the Node image.
+    BERTOPIC_WORKER_IMAGE: bertopicWorkerImage,
+    LABELER_WORKER_IMAGE: labelerWorkerImage,
     LOCAL_LABEL_BACKEND,
     LOCAL_LABEL_MODEL_PATH,
     HF_HUB_OFFLINE: '1',

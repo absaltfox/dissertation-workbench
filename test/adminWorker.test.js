@@ -216,6 +216,8 @@ test('Fly worker machine payload is private, one-shot, and job-scoped', () => {
   assert.equal(payload.config.env.ADMIN_JOB_EXECUTION_ID, 'worker-execution-42');
   assert.equal(payload.config.env.ADMIN_WORKER_TIMEOUT_MS, '12345');
   assert.equal(payload.config.env.DOCUMENT_SYNC_ENABLED, '0');
+  assert.equal(payload.config.env.BERTOPIC_WORKER_IMAGE, process.env.BERTOPIC_WORKER_IMAGE || '');
+  assert.equal(payload.config.env.LABELER_WORKER_IMAGE, process.env.LABELER_WORKER_IMAGE || process.env.BERTOPIC_WORKER_IMAGE || '');
   assert.equal(payload.config.metadata.role, 'admin-worker');
   assert.equal(payload.config.metadata.admin_job_id, '42');
   assert.equal(payload.config.services, undefined);
@@ -291,9 +293,64 @@ test('PatternRank concept rebuild Fly worker payload uses Python NLP worker', ()
     assert.deepEqual(payload.config.init.exec, ['python3', 'scripts/build-concepts.py']);
     assert.equal(payload.config.env.ADMIN_JOB_ID, '45');
     assert.equal(payload.config.env.ADMIN_JOB_ARTIFACT_TOKEN, 'secret-token');
+    assert.equal(payload.config.env.BERTOPIC_WORKER_IMAGE, 'registry.fly.io/dissertation-workbench:worker-latest');
     assert.equal(payload.config.env.HF_HUB_OFFLINE, '1');
     assert.equal(payload.config.env.TRANSFORMERS_OFFLINE, '1');
     assert.equal(payload.config.guest.memory_mb >= 2048, true);
+  } finally {
+    if (previousBertopicImage === undefined) delete process.env.BERTOPIC_WORKER_IMAGE;
+    else process.env.BERTOPIC_WORKER_IMAGE = previousBertopicImage;
+  }
+});
+
+test('Fly workers propagate Python image selectors to nested downstream jobs', () => {
+  const previousBertopicImage = process.env.BERTOPIC_WORKER_IMAGE;
+  const previousLabelerImage = process.env.LABELER_WORKER_IMAGE;
+  process.env.BERTOPIC_WORKER_IMAGE = 'registry.fly.io/dissertation-workbench:worker-latest';
+  process.env.LABELER_WORKER_IMAGE = 'registry.fly.io/dissertation-workbench:labeler-latest';
+
+  try {
+    const payload = buildFlyWorkerMachinePayload({
+      image: 'registry.fly.io/dissertation-workbench:deployment-123',
+      jobId: 46,
+      token: 'secret-token',
+      jobType: 'import_rules_sync',
+    });
+
+    assert.equal(payload.config.image, 'registry.fly.io/dissertation-workbench:deployment-123');
+    assert.equal(payload.config.env.BERTOPIC_WORKER_IMAGE, 'registry.fly.io/dissertation-workbench:worker-latest');
+    assert.equal(payload.config.env.LABELER_WORKER_IMAGE, 'registry.fly.io/dissertation-workbench:labeler-latest');
+
+    // Model the downstream launch from inside the temporary import machine.
+    process.env.BERTOPIC_WORKER_IMAGE = payload.config.env.BERTOPIC_WORKER_IMAGE;
+    process.env.LABELER_WORKER_IMAGE = payload.config.env.LABELER_WORKER_IMAGE;
+    const downstream = buildFlyWorkerMachinePayload({
+      image: payload.config.image,
+      jobId: 47,
+      token: 'downstream-token',
+      jobType: 'concept_rebuild',
+    });
+    assert.equal(downstream.config.image, 'registry.fly.io/dissertation-workbench:worker-latest');
+    assert.deepEqual(downstream.config.init.exec, ['python3', 'scripts/build-concepts.py']);
+  } finally {
+    if (previousBertopicImage === undefined) delete process.env.BERTOPIC_WORKER_IMAGE;
+    else process.env.BERTOPIC_WORKER_IMAGE = previousBertopicImage;
+    if (previousLabelerImage === undefined) delete process.env.LABELER_WORKER_IMAGE;
+    else process.env.LABELER_WORKER_IMAGE = previousLabelerImage;
+  }
+});
+
+test('PatternRank Fly worker fails closed without a Python worker image', () => {
+  const previousBertopicImage = process.env.BERTOPIC_WORKER_IMAGE;
+  delete process.env.BERTOPIC_WORKER_IMAGE;
+
+  try {
+    assert.throws(() => buildFlyWorkerMachinePayload({
+      image: 'registry.fly.io/dissertation-workbench:deployment-123',
+      jobId: 47,
+      token: 'secret-token',
+      jobType: 'concept_rebuild',
+    }), /BERTOPIC_WORKER_IMAGE is required/);
   } finally {
     if (previousBertopicImage === undefined) delete process.env.BERTOPIC_WORKER_IMAGE;
     else process.env.BERTOPIC_WORKER_IMAGE = previousBertopicImage;

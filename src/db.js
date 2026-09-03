@@ -3133,7 +3133,10 @@ export async function deleteFileMetric(docId) {
 // whenever the stored word source is DSpace full text, exactly as the JS does.
 export function enrichmentPolicySatisfiedSql(contentMode, contentFallback = null, alias = 'fm') {
   const counted = `COALESCE(${alias}.word_count, 0) > 0 AND COALESCE(${alias}.page_count, 0) > 0`;
-  const fullText = `${alias}.word_source = 'dspace_full_text' AND ${counted}`;
+  const pdfAttempted = `COALESCE(${alias}.original_pdf_request_count, 0) > 0`;
+  const pdfPreferred = contentMode === 'pdf_cache' || contentMode === 'pdf_stream';
+  const fullText = `${alias}.word_source = 'dspace_full_text' AND ${counted}`
+    + (pdfPreferred ? ` AND ${pdfAttempted}` : '');
   let byMode = '0';
   if (contentMode === 'pdf_cache') {
     byMode = `${alias}.pdf_path IS NOT NULL AND ${alias}.pdf_path <> ''`;
@@ -3145,7 +3148,7 @@ export function enrichmentPolicySatisfiedSql(contentMode, contentFallback = null
     byMode = fullText;
   }
   const expression = contentFallback === 'full_text'
-    ? `CASE WHEN ${alias}.word_source = 'dspace_full_text' THEN (${counted}) ELSE (${byMode}) END`
+    ? `CASE WHEN ${alias}.word_source = 'dspace_full_text' THEN (${fullText}) ELSE (${byMode}) END`
     : `(${byMode})`;
   return `COALESCE(${expression}, 0)`;
 }

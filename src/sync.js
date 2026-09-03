@@ -88,7 +88,14 @@ export const filterSyncItemsForMode = (items, mode, existsFn = null) =>
 
 export function hasCachedEnrichmentMetric(stored, contentMode, contentFallback = null) {
   if (contentFallback === 'full_text' && stored?.word_source === 'dspace_full_text') {
-    return Number(stored.word_count) > 0 && Number(stored.page_count) > 0;
+    const counted = Number(stored.word_count) > 0 && Number(stored.page_count) > 0;
+    const pdfPreferred = contentMode === 'pdf_cache' || contentMode === 'pdf_stream';
+    // Legacy full-text metrics predate PDF-attempt telemetry and contain estimated
+    // pages. Give a PDF-preferring rule one opportunity to replace those estimates
+    // with real page counts. Once a PDF request has actually been made, accepting
+    // the configured full-text fallback prevents every later import from retrying
+    // a permanently unavailable PDF.
+    return counted && (!pdfPreferred || Number(stored.original_pdf_request_count) > 0);
   }
   if (contentMode === 'pdf_cache') return Boolean(stored?.pdf_path);
   if (contentMode === 'pdf_stream') {
