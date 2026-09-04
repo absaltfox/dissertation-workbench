@@ -1043,6 +1043,8 @@ def run_label_only(client, topic_id=None, reporter=None):
         FROM document_topics dt
         JOIN documents d ON d.doc_id = dt.doc_id
         WHERE dt.topic_id != -1
+          AND COALESCE(json_extract(d.metadata_json, '$.accessStatus'), 'unknown')
+                NOT IN ('embargoed', 'verification_due')
         ORDER BY dt.topic_id, dt.probability DESC
     """).rows
     abstracts = []
@@ -1190,7 +1192,11 @@ def main():
                 status="running",
                 detail="Loading document abstracts from database..."
             )
-        rows_res = client.execute("SELECT doc_id, metadata_json FROM documents")
+        rows_res = client.execute("""
+            SELECT doc_id, metadata_json FROM documents
+            WHERE COALESCE(json_extract(metadata_json, '$.accessStatus'), 'unknown')
+                    NOT IN ('embargoed', 'verification_due')
+        """)
         print(f"Found {len(rows_res.rows)} documents in database")
 
         doc_ids = []

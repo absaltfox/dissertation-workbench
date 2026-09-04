@@ -105,6 +105,7 @@ function populateFacetFilters({ reset = true } = {}) {
 // --- Client-side analytics builder (used when facet filters are active) ---
 
 function buildAnalytics(docs) {
+  docs = (docs || []).filter((doc) => !['embargoed', 'verification_due'].includes(doc?.accessStatus));
   const MIN_RELIABLE_WORD_COUNT = 1000;
   const MIN_RELIABLE_PAGE_COUNT = 10;
   const unreliableWordSources = new Set(['metadata_text', 'degraded_pdf_text']);

@@ -60,6 +60,10 @@ test('schema migration adds content policy and provenance fields conservatively'
         'legacy-serving-doc',
         '{"id":"legacy-serving-doc","title":"Legacy serving document","supervisors":["Deirdre M. Kelly"]}',
         '2026-01-01T00:00:00.000Z'
+      ), (
+        'legacy-bibliographic-date',
+        '{"id":"legacy-bibliographic-date","title":"Ordinary current thesis","date":"2026-12-31","abstract":"This is a normal scholarly abstract, not a repository access notice."}',
+        '2026-01-01T00:00:00.000Z'
       );
       CREATE TABLE sync_runs (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -113,6 +117,7 @@ test('schema migration adds content policy and provenance fields conservatively'
     const people = await db.queryPeoplePage({ limit: 10 });
     const client = await db.getDb();
     const projection = await client.execute("SELECT serving_projection_version FROM documents WHERE doc_id = 'legacy-serving-doc'");
+    const bibliographicDate = await client.execute("SELECT access_status, metadata_json FROM documents WHERE doc_id = 'legacy-bibliographic-date'");
     const committeeProjection = await client.execute("SELECT doc_id, person_key, affiliation, source FROM document_people WHERE source <> 'metadata' ORDER BY doc_id");
     const committeeState = await client.execute("SELECT projection_value FROM serving_projection_state WHERE projection_key = 'committee_people'");
     const rolloutTables = await client.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('enrichment_rollouts', 'enrichment_rollout_evidence') ORDER BY name");
@@ -121,6 +126,7 @@ test('schema migration adds content policy and provenance fields conservatively'
     process.stdout.write(JSON.stringify({
       rule, metric, syncRun, people,
       projectionVersion: projection.rows[0]?.serving_projection_version,
+      bibliographicDate: bibliographicDate.rows[0],
       committeeProjection: committeeProjection.rows,
       committeeState: committeeState.rows[0]?.projection_value,
       rolloutTables: rolloutTables.rows.map((row) => row.name),
@@ -164,6 +170,8 @@ test('schema migration adds content policy and provenance fields conservatively'
     assert.equal(migrated.syncRun.localQueueSeen, 0);
     assert.equal(migrated.syncRun.upstreamUniqueSeen, 0);
     assert.equal(Number(migrated.projectionVersion), 1);
+    assert.equal(migrated.bibliographicDate.access_status, 'unknown');
+    assert.match(JSON.parse(migrated.bibliographicDate.metadata_json).abstract, /normal scholarly abstract/);
     assert.equal(migrated.people.total, 1);
     assert.equal(migrated.people.people[0].key, 'deirdre kelly');
     assert.deepEqual(migrated.committeeProjection, [

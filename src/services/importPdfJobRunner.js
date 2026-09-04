@@ -9,7 +9,8 @@ import {
 } from '../db.js';
 import fs from 'node:fs/promises';
 import {
-  analyzeDocumentFile, analyzePdfAtPath, deleteCachedPdf, extractAndSaveParsedData
+  analyzeDocumentFile, analyzePdfAtPath, deleteCachedPdf, extractAndSaveParsedData,
+  parseAcknowledgementsDetailed, parseCommittee
 } from '../pdf.js';
 import { getConfiguredApiKey } from '../secrets.js';
 import {
@@ -587,6 +588,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       totalEnrichmentAttempted: 0,
       totalEnriched: 0,
       totalEnrichmentFailed: 0,
+      totalEmbargoedDeferred: 0,
     };
     const enrichmentOutcomes = [];
     let heapGrowthBytes = 0;
@@ -637,6 +639,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       totals.totalEnrichmentAttempted += Number(result.totalEnrichmentAttempted || 0);
       totals.totalEnriched += Number(result.totalEnriched || 0);
       totals.totalEnrichmentFailed += Number(result.totalEnrichmentFailed || 0);
+      totals.totalEmbargoedDeferred += Number(result.totalEmbargoedDeferred || 0);
       enrichmentOutcomes.push(...(Array.isArray(result.enrichmentOutcomes) ? result.enrichmentOutcomes : []));
       heapGrowthBytes = Math.max(heapGrowthBytes, Number(result.heapGrowthBytes || 0));
       for (const docId of readDocIdList(result.pdfAttemptedIds)) attemptedPdfIds.add(docId);
@@ -656,6 +659,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         totalEnrichmentAttempted: Number(result.totalEnrichmentAttempted || 0),
         totalEnriched: Number(result.totalEnriched || 0),
         totalEnrichmentFailed: Number(result.totalEnrichmentFailed || 0),
+        totalEmbargoedDeferred: Number(result.totalEmbargoedDeferred || 0),
         requestCounts: result.requestCounts || {
           metadata: 0, fullText: 0, originalPdf: 0, retrievedBytes: 0,
         },
@@ -1244,18 +1248,50 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
   if (job.type === 'reparse_committee') {
     await log(job.id, 'Starting committee reparse.');
     await progress({ phase: 'reparse_committee', label: 'Reparsing missing committees', status: 'running' });
+    const requestedDocIds = readDocIdList(params.docIds).slice(0, 5000);
+    const ruleId = String(params.ruleId || '').trim();
+    const dryRun = Boolean(params.dryRun);
+    const maxDocuments = Math.max(1, Math.min(5000, Number(params.maxDocuments) || 1000));
+    const predicates = [
+      'fm.pdf_path IS NOT NULL',
+      `NOT EXISTS (
+        SELECT 1 FROM committee_members cm
+        WHERE cm.doc_id = fm.doc_id
+          AND cm.role IN ('Supervisor', 'Co-Supervisor')
+      )`,
+    ];
+    const queryArgs = [];
+    if (requestedDocIds.length) {
+      predicates.push(`fm.doc_id IN (${requestedDocIds.map(() => '?').join(', ')})`);
+      queryArgs.push(...requestedDocIds);
+    }
+    if (ruleId) {
+      predicates.push(`EXISTS (
+        SELECT 1
+        FROM rule_document_processing_eligibility e
+        JOIN import_rule_eligibility_projections p
+          ON p.rule_id = e.rule_id AND p.completed_token = e.projection_token
+        WHERE e.doc_id = fm.doc_id AND e.rule_id = ?
+      )`);
+      queryArgs.push(ruleId);
+    }
+    queryArgs.push(maxDocuments);
     const targetResult = await (await getDb()).execute({
       sql: `
       SELECT fm.doc_id, fm.pdf_path
       FROM file_metrics fm
-      WHERE fm.pdf_path IS NOT NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM committee_members cm WHERE cm.doc_id = fm.doc_id
-      )
-    `});
+      WHERE ${predicates.join('\n AND ')}
+      ORDER BY fm.doc_id
+      LIMIT ?
+    `, args: queryArgs });
     const targets = targetResult.rows;
     let processed = 0;
     let withCommittee = 0;
+    let supervisorsFound = 0;
+    let ocrRecovered = 0;
+    let stillMissingSupervisors = 0;
+    let failed = 0;
+    const proposedAdditions = [];
     for (const row of targets) {
       const doc = await loadDocumentMetadata(row.doc_id);
       if (!doc) continue;
@@ -1265,41 +1301,93 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
           label: 'Reparsing missing committees',
           detail: row.doc_id,
           status: 'running',
-          counts: { processed, total: targets.length, withCommittee },
+          counts: { processed, total: targets.length, withCommittee, supervisorsFound, failed },
         });
         const analysis = await analyzePdfEntry(row, artifactClient, {
           progress,
-          counts: { processed, total: targets.length, withCommittee },
+          counts: { processed, total: targets.length, withCommittee, supervisorsFound, failed },
           label: 'Parsing cached PDF text for committee data',
         });
         if (analysis?.fullText) {
           const before = (await loadCommitteeMembers(row.doc_id)).length;
-          await extractAndSaveParsedData(doc, analysis.fullText, null, {
-            onProgress: progress,
-            extractCommittee: true,
-            extractCitations: false,
-          });
-          const after = (await loadCommitteeMembers(row.doc_id)).length;
-          if (after > before) withCommittee += 1;
+          const certification = parseCommittee(analysis.fullText);
+          const hasCertificationSupervisor = certification.some((member) =>
+            member.role === 'Supervisor' || member.role === 'Co-Supervisor'
+          );
+          const acknowledgement = hasCertificationSupervisor
+            ? { members: [], ocrSpacingNormalized: false }
+            : parseAcknowledgementsDetailed(analysis.fullText);
+          const candidates = [
+            ...certification,
+            ...acknowledgement.members.filter((member) =>
+              member.role === 'Supervisor' || member.role === 'Co-Supervisor'
+            ),
+          ];
+          const supervisors = candidates.filter((member) =>
+            member.role === 'Supervisor' || member.role === 'Co-Supervisor'
+          );
+          if (!dryRun) {
+            await extractAndSaveParsedData(doc, analysis.fullText, null, {
+              onProgress: progress,
+              extractCommittee: true,
+              extractCitations: false,
+            });
+            const afterMembers = await loadCommitteeMembers(row.doc_id);
+            if (afterMembers.length > before) withCommittee += 1;
+            if (supervisors.length && !afterMembers.some((member) =>
+              member.role === 'Supervisor' || member.role === 'Co-Supervisor'
+            )) {
+              throw new Error('Supervisor candidates were parsed but not persisted.');
+            }
+          }
+          if (supervisors.length) {
+            supervisorsFound += 1;
+            if (acknowledgement.ocrSpacingNormalized) ocrRecovered += 1;
+            proposedAdditions.push({
+              docId: row.doc_id,
+              supervisors: supervisors.map((member) => ({
+                name: member.name,
+                role: member.role,
+                source: hasCertificationSupervisor ? 'pdf' : 'pdf_acknowledgements',
+              })),
+            });
+          } else {
+            stillMissingSupervisors += 1;
+          }
+        } else {
+          stillMissingSupervisors += 1;
         }
       } catch (error) {
+        failed += 1;
         await log(job.id, `Committee reparse failed for ${row.doc_id}: ${error?.message || String(error)}`);
       }
       processed += 1;
     }
-    const result = { ok: true, processed, withCommittee };
+    const result = {
+      ok: failed === 0,
+      dryRun,
+      processed,
+      withCommittee,
+      supervisorsFound,
+      ocrRecovered,
+      stillMissingSupervisors,
+      failed,
+      proposedAdditions,
+      scope: { docIds: requestedDocIds, ruleId: ruleId || null, maxDocuments },
+    };
     clearMetricsCache?.();
     await finishWorkerAdminJob(job, {
-      status: 'completed',
+      status: failed ? 'failed' : 'completed',
       result,
+      error: failed ? `${failed} document(s) failed committee reparse.` : null,
       finishedAt: new Date().toISOString(),
     });
-    await log(job.id, `Committee reparse finished: ${processed} processed.`);
+    await log(job.id, `Committee reparse finished: ${processed} processed, ${supervisorsFound} supervisors found, ${stillMissingSupervisors} still missing, ${failed} failed${dryRun ? ' (dry run)' : ''}.`);
     await progress({
       phase: 'reparse_committee',
       label: 'Committee reparse',
-      status: 'completed',
-      counts: { processed, total: targets.length, withCommittee },
+      status: failed ? 'failed' : 'completed',
+      counts: { processed, total: targets.length, withCommittee, supervisorsFound, ocrRecovered, stillMissingSupervisors, failed },
     });
     return result;
   }

@@ -17,6 +17,7 @@ import { logger } from './logger.js';
 import { dedupeSupervisorNames } from './supervisors.js';
 import { safeFetchDownloadUrl } from './urlSafety.js';
 import { isImportContentMode } from './importRules.js';
+import { isEmbargoDeferred } from './accessStatus.js';
 
 // Recorded as file_metrics.word_source when pdftotext could not produce text
 // and we fell back to scraping raw PDF bytes. Treated as unreliable everywhere
@@ -1515,6 +1516,43 @@ const DR_CAP = '((?:[A-Z\\u00C0-\\u024F]\\S*\\s*){1,4})';
 const TITLE_RE = '(?:Dr\\.|Prof(?:essor)?\\.?)';
 const BARE_NAME = '[A-Z\\u00C0-\\u024F][a-zA-Z\\u00C0-\\u024F]+(?:\\s+[A-Z\\u00C0-\\u024F][a-zA-Z\\u00C0-\\u024F]+){1,2}';
 
+// pdftotext/OCR sometimes emits words one glyph at a time ("a d v i s o r",
+// "M i c h a e l").  Repair only runs against the bounded acknowledgements
+// slice and only joins runs of four or more letters, preserving initials such
+// as "J R R" and avoiding any mutation of citations or the thesis body.
+function normalizeAcknowledgementOcrSpacing(value) {
+  let changed = false;
+  const text = String(value || '').replace(
+    /(?<![\p{L}\p{M}])(?:[\p{L}\p{M}]\s+){3,}[\p{L}\p{M}](?![\p{L}\p{M}])/gu,
+    (match) => {
+      changed = true;
+      return match.replace(/\s+/g, '');
+    }
+  );
+  return { text, changed };
+}
+
+const ADVISOR_NAME_STOP_WORDS = new Set([
+  'university', 'department', 'faculty', 'school', 'college', 'committee',
+  'advisor', 'adviser', 'supervisor', 'professor', 'doctor', 'research',
+  'thesis', 'support', 'guidance', 'encouragement', 'assistance',
+]);
+
+function isPlausibleBareAdvisorName(raw) {
+  const name = extractNameFromCapture(raw);
+  const tokens = name.split(/\s+/).filter(Boolean);
+  if (tokens.length < 2 || tokens.length > 4 || name.length > 60 || /\d/.test(name)) return '';
+  let substantive = 0;
+  for (const token of tokens) {
+    const bare = token.replace(/[.'’\-]/g, '');
+    if (NAME_PARTICLES.has(bare.toLowerCase())) continue;
+    if (ADVISOR_NAME_STOP_WORDS.has(bare.toLowerCase())) return '';
+    if (!/^\p{Lu}[\p{L}\p{M}'’.-]*$/u.test(token)) return '';
+    substantive += 1;
+  }
+  return substantive >= 2 ? name : '';
+}
+
 // --- Acknowledgement extraction patterns (constructed once at module scope) ---
 const PAT_PLURAL_SUPERVISORS = new RegExp(
   `my\\s+supervisors?,?\\s+${TITLE_RE}\\s+${DR_CAP}\\s+and\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
@@ -1530,6 +1568,10 @@ const PAT_CO_ADVISOR_SUFFIX = new RegExp(
   `${TITLE_RE}\\s+${DR_CAP},\\s*as\\s+(?:my\\s+)?co-?advisor\\b`, 'gi');
 const PAT_CO_ADVISOR_PREFIX = new RegExp(
   `co-?advisor,?\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
+// Untitled names are intentionally accepted only after first-person ownership
+// plus punctuation.  This avoids interpreting ordinary prose such as
+// "the advisor Michael suggested" as an asserted supervisory relationship.
+const PAT_BARE_ADVISOR_PREFIX = /\bmy\s+(?:(?:research|thesis|academic)\s+)?(co[- ]?)?advis(?:or|er)\s*[,;:–—-]\s*([^\n!?;:]{3,100})/giu;
 const PAT_AS_SUPERVISOR = new RegExp(
   `${TITLE_RE}\\s+${DR_CAP}[^.]{0,150}as\\s+(?:my\\s+)?(?:(co-?))?supervisor`, 'gi');
 const PAT_TITLED_NAME = new RegExp(`${TITLE_RE}\\s+${DR_CAP}`, 'g');
@@ -1540,8 +1582,8 @@ const PAT_BARE_COMMITTEE_MEMBER_SUFFIX = new RegExp(
 const PAT_DRS_ADVISORY_COMMITTEE = new RegExp(
   `(?:Advisory|Supervisory|Thesis)\\s+Committee\\s*[-:–—]\\s*Drs?\\.\\s+(${BARE_NAME}(?:,\\s*${BARE_NAME})*(?:,?\\s+and\\s+${BARE_NAME})?)`, 'g');
 
-export function parseAcknowledgements(fullText) {
-  if (!fullText) return [];
+export function parseAcknowledgementsDetailed(fullText) {
+  if (!fullText) return { members: [], ocrSpacingNormalized: false };
 
   // Normalize form feeds so they appear as newlines to the heading regex
   const text = fullText.replace(/\f/g, '\n');
@@ -1563,9 +1605,11 @@ export function parseAcknowledgements(fullText) {
       break;
     }
   }
-  if (!ackMatch) return [];
+  if (!ackMatch) return { members: [], ocrSpacingNormalized: false };
 
-  const section = text.slice(ackMatch.index + ackMatch[0].length, ackMatch.index + ackMatch[0].length + 3000);
+  const rawSection = text.slice(ackMatch.index + ackMatch[0].length, ackMatch.index + ackMatch[0].length + 3000);
+  const normalizedSection = normalizeAcknowledgementOcrSpacing(rawSection);
+  const section = normalizedSection.text;
 
   const members = [];
   const seen = new Set();
@@ -1628,6 +1672,14 @@ export function parseAcknowledgements(fullText) {
     addMember(pm[1], 'Co-Supervisor');
   }
 
+  // "my advisor, Michael Ignatieff" / "my thesis adviser: Jane Doe".
+  // Unlike the titled patterns, this path uses strict two-to-four-token name
+  // validation and requires punctuation before the candidate.
+  for (const pm of section.matchAll(PAT_BARE_ADVISOR_PREFIX)) {
+    const name = isPlausibleBareAdvisorName(pm[2]);
+    if (name) addMember(name, pm[1] ? 'Co-Supervisor' : 'Supervisor');
+  }
+
   // "Dr. X ... as my supervisor" (name comes before the role keyword, within 150 chars)
   for (const pm of section.matchAll(PAT_AS_SUPERVISOR)) {
     addMember(pm[1], pm[2] ? 'Co-Supervisor' : 'Supervisor');
@@ -1672,7 +1724,11 @@ export function parseAcknowledgements(fullText) {
     addBareNamesFromList(cm[1], 'Supervisory Committee Member');
   }
 
-  return members;
+  return { members, ocrSpacingNormalized: normalizedSection.changed };
+}
+
+export function parseAcknowledgements(fullText) {
+  return parseAcknowledgementsDetailed(fullText).members;
 }
 
 export function parseCommittee(fullText) {
@@ -2024,7 +2080,18 @@ function supervisorsFromCommittee(committee) {
 }
 
 function hasApiSupervisors(doc) {
-  return dedupeSupervisorNames(doc?.supervisors || []).length > 0;
+  // Missing source is retained as a legacy-metadata compatibility case. Modern
+  // PDF extraction always writes an explicit pdf_* source, so a previously
+  // inferred supervisor is no longer mistaken for API authority.
+  return (doc?.supervisorsSource === 'api' || doc?.supervisorsSource == null)
+    && dedupeSupervisorNames(doc?.supervisors || []).length > 0;
+}
+
+function inferredSupervisorSource(committee = []) {
+  const supervisors = (committee || []).filter((member) => SUPERVISOR_ROLES.has(member.role));
+  if (supervisors.some((member) => member.source === 'api')) return 'api';
+  if (supervisors.some((member) => member.source === 'pdf_acknowledgements')) return 'pdf_acknowledgements';
+  return supervisors.length ? 'pdf_fallback' : null;
 }
 
 export function detectDownloadBlockPage(html) {
@@ -2048,16 +2115,30 @@ export async function extractAndSaveParsedData(doc, fullText, pdfPath, {
     await onProgress?.({ phase: 'committee', label: 'Extracting committee information', status: 'running' });
     try {
       const committee = parseCommittee(fullText);
-      // Fall back to acknowledgements-based parsing when the certify-page parser finds nothing
-      const effectiveCommittee = committee.length > 0 ? committee : parseAcknowledgements(fullText);
+      const committeeHasSupervisor = supervisorsFromCommittee(committee).length > 0;
+      // A certification page may contain only examiners. In that case, retain
+      // those authoritative page-derived roles while consulting the bounded
+      // acknowledgement section for the still-missing supervisor role.
+      const acknowledgement = committeeHasSupervisor
+        ? { members: [], ocrSpacingNormalized: false }
+        : parseAcknowledgementsDetailed(fullText);
+      const acknowledgementSupervisors = acknowledgement.members.filter((member) => SUPERVISOR_ROLES.has(member.role));
+      const acknowledgementOtherMembers = committee.length ? [] : acknowledgement.members.filter((member) => !SUPERVISOR_ROLES.has(member.role));
 
       if (hasApiSupervisors(doc)) {
         const apiSupervisors = dedupeSupervisorNames(doc.supervisors || []);
-        const nonSupervisorCommittee = effectiveCommittee.filter((member) => !SUPERVISOR_ROLES.has(member.role));
+        const nonSupervisorCommittee = [
+          ...committee.filter((member) => !SUPERVISOR_ROLES.has(member.role)),
+          ...acknowledgementOtherMembers,
+        ];
         if (nonSupervisorCommittee.length) {
           await saveCommitteeMembers(doc.id, nonSupervisorCommittee, 'pdf');
         }
         await deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'pdf');
+        await deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'pdf_acknowledgements');
+        // The upstream list is an authoritative snapshot, not an append-only
+        // feed. Remove superseded API committee rows before projecting it.
+        await deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'api');
         await saveCommitteeMembers(
           doc.id,
           apiSupervisors.map((name) => ({ name, role: 'Supervisor', affiliation: null })),
@@ -2066,13 +2147,36 @@ export async function extractAndSaveParsedData(doc, fullText, pdfPath, {
         doc.supervisors = apiSupervisors;
         doc.supervisorsSource = 'api';
       } else {
-        if (effectiveCommittee.length) {
-          await saveCommitteeMembers(doc.id, effectiveCommittee, 'pdf');
+        const parsedSupervisors = supervisorsFromCommittee([
+          ...committee,
+          ...acknowledgementSupervisors,
+        ]);
+        // Replace lower-authority supervisor roles only when this parse found a
+        // replacement. A transiently degraded/short extraction must not erase a
+        // previously valid PDF-derived supervisor.
+        if (parsedSupervisors.length) {
+          await deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'pdf');
+          await deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'pdf_acknowledgements');
         }
-        const parsedSupervisors = supervisorsFromCommittee(effectiveCommittee);
+        if (committee.length) {
+          await saveCommitteeMembers(doc.id, committee, 'pdf');
+        }
+        if (acknowledgementSupervisors.length || acknowledgementOtherMembers.length) {
+          await saveCommitteeMembers(
+            doc.id,
+            [...acknowledgementSupervisors, ...acknowledgementOtherMembers],
+            'pdf_acknowledgements'
+          );
+        }
         if (parsedSupervisors.length) {
           doc.supervisors = parsedSupervisors;
-          doc.supervisorsSource = committee.length > 0 ? 'pdf_fallback' : 'pdf_acknowledgements';
+          doc.supervisorsSource = committeeHasSupervisor ? 'pdf_fallback' : 'pdf_acknowledgements';
+        } else {
+          // Durable committee state is loaded below and remains authoritative.
+          // Clear only the in-memory inference so stale metadata is not treated
+          // as a fresh parse result.
+          doc.supervisors = [];
+          doc.supervisorsSource = null;
         }
       }
       doc.committee = await loadCommitteeMembers(doc.id);
@@ -2081,11 +2185,7 @@ export async function extractAndSaveParsedData(doc, fullText, pdfPath, {
         const storedSupervisors = supervisorsFromCommittee(doc.committee);
         if (storedSupervisors.length) {
           doc.supervisors = storedSupervisors;
-          doc.supervisorsSource = doc.committee.some((member) =>
-            SUPERVISOR_ROLES.has(member.role) && member.source === 'api'
-          )
-            ? 'api'
-            : 'pdf_fallback';
+          doc.supervisorsSource = inferredSupervisorSource(doc.committee);
         }
       }
     } catch (err) {
@@ -2154,11 +2254,7 @@ async function loadStoredParsedData(doc) {
       const storedSupervisors = supervisorsFromCommittee(doc.committee);
       if (storedSupervisors.length) {
         doc.supervisors = storedSupervisors;
-        doc.supervisorsSource = doc.committee.some((member) =>
-          SUPERVISOR_ROLES.has(member.role) && member.source === 'api'
-        )
-          ? 'api'
-          : 'pdf_fallback';
+        doc.supervisorsSource = inferredSupervisorSource(doc.committee);
       }
     }
   } catch {
@@ -2180,6 +2276,11 @@ export async function analyzeDocumentFile(doc, options) {
   const fallback = contentFallback || (contentMode === 'pdf_cache' ? 'full_text' : 'legacy');
   if (!isImportContentMode(contentMode)) {
     throw new Error(`Unsupported content mode: ${contentMode}`);
+  }
+  if (isEmbargoDeferred(doc)) {
+    doc.downloadStatus = 'deferred_embargo';
+    doc.downloadError = null;
+    return;
   }
   if (contentMode !== 'metadata_only' && !CONTENT_RETRIEVAL_ENABLED) {
     throw new Error('Content retrieval is disabled for this deployment.');

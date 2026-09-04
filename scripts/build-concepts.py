@@ -1095,9 +1095,13 @@ def _processing_eligibility_activated(client):
 
 
 def _patternrank_eligibility_predicate(client, alias="d"):
+    access_predicate = f"""(
+      COALESCE(json_extract({alias}.metadata_json, '$.accessStatus'), 'unknown')
+        NOT IN ('embargoed', 'verification_due')
+    )"""
     if not _processing_eligibility_activated(client):
-        return ""
-    return f"""EXISTS (
+        return access_predicate
+    return f"""{access_predicate} AND EXISTS (
       SELECT 1
       FROM rule_document_processing_eligibility eligibility
       JOIN import_rule_eligibility_projections projection

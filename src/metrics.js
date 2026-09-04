@@ -20,6 +20,9 @@ import { enrichDocumentsWithFileAnalysis } from './pdf.js';
 import { dedupeSupervisorNames } from './supervisors.js';
 import { canonicalizeDomainText } from './domainDictionary.js';
 import { buildParentClusters, buildTopicsByYear } from './topicHierarchy.js';
+import {
+  deriveAccessState, isAccessRestricted, isAnalyticallyEligible, isEmbargoPlaceholder,
+} from './accessStatus.js';
 
 function average(values) {
   if (!values.length) return null;
@@ -99,7 +102,6 @@ export function normalizeRecord(doc, dict = null) {
   const supervisors = dedupeSupervisorNames(toArray(firstPresent(doc, ['supervisor', 'Supervisor'])));
   const affiliation = toArray(firstPresent(doc, ['affiliation', 'Affiliation']));
   const dateRaw = firstPresent(doc, [
-    'date_available', 'DateAvailable', 'dateAvailable',
     'dateIssued', 'DateIssued',
     'graduationDate', 'GraduationDate',
     'ubc_date_sort',
@@ -109,6 +111,9 @@ export function normalizeRecord(doc, dict = null) {
   ]);
 
   const description = flattenText(firstPresent(doc, ['description', 'Description', 'abstract', 'Abstract']));
+  const access = deriveAccessState(doc);
+  const accessRestricted = isAccessRestricted(access);
+  const analyticalDescription = isEmbargoPlaceholder(description) ? '' : description;
   const fullText = flattenText(firstPresent(doc, ['full_text', 'FullText', 'transcript', 'text', 'ocr', 'body']));
   const subjects = toArray(firstPresent(doc, ['subject', 'Subject', 'subjects', 'keywords', 'keyword']));
   const program = toArray(firstPresent(doc, ['program_theses', 'program', 'Program']));
@@ -128,14 +133,20 @@ export function normalizeRecord(doc, dict = null) {
   const derivedId = extractOcId(rawId) || extractOcId(uri) || downloadCandidates.map(extractOcId).find(Boolean);
   const stableId = derivedId || `${title}:${creators[0] || ''}`;
 
-  const textForLength = fullText || description;
+  const textForLength = accessRestricted ? '' : (fullText || analyticalDescription);
   const cleaned = String(textForLength).replace(/\s+/g, ' ').trim();
   const metadataWords = cleaned ? cleaned.split(' ').length : 0;
   const extentPages = parsePageCount(extentValues);
-  const metadataPages = extentPages || Math.max(1, Math.round((metadataWords || 1) / 300));
+  const metadataPages = accessRestricted
+    ? null
+    : (extentPages || Math.max(1, Math.round((metadataWords || 1) / 300)));
 
-  const methodologies = detectMethodologies([title, description, subjects.join(' ')].join(' '));
-  const conceptTerms = docConceptTerms({ title, abstract: description, subjects }, 12, dict);
+  const methodologies = accessRestricted
+    ? []
+    : detectMethodologies([title, analyticalDescription, subjects.join(' ')].join(' '));
+  const conceptTerms = accessRestricted
+    ? []
+    : docConceptTerms({ title, abstract: analyticalDescription, subjects }, 12, dict);
 
   return {
     id: stableId,
@@ -156,12 +167,15 @@ export function normalizeRecord(doc, dict = null) {
     scholarlyLevel,
     extent: extentValues.join('; '),
     pages: metadataPages,
-    pagesSource: extentPages ? 'metadata_extent' : 'estimated_from_metadata_words',
-    abstract: description,
+    pagesSource: accessRestricted
+      ? null
+      : (extentPages ? 'metadata_extent' : 'estimated_from_metadata_words'),
+    abstract: analyticalDescription,
+    rawAbstract: access.isEmbargoPlaceholder ? description : undefined,
     subjects: subjects.length ? subjects : ['(Unspecified)'],
-    wordCount: metadataWords,
-    wordCountSource: 'metadata_text',
-    charCount: cleaned.length,
+    wordCount: accessRestricted ? null : metadataWords,
+    wordCountSource: accessRestricted ? null : 'metadata_text',
+    charCount: accessRestricted ? null : cleaned.length,
     themes: [],
     methodologies,
     conceptTerms,
@@ -172,7 +186,12 @@ export function normalizeRecord(doc, dict = null) {
     downloadStatus: 'not_attempted',
     downloadError: null,
     fileBytes: null,
-    bodyWordCount: null
+    bodyWordCount: null,
+    accessStatus: access.accessStatus,
+    availableAt: access.availableAt,
+    accessStatusSource: access.accessStatusSource,
+    accessStatusReason: access.accessStatusReason,
+    accessEvidence: access.accessEvidence,
   };
 }
 
@@ -880,6 +899,16 @@ export function enrichDocumentSignals(records = []) {
   const conceptDict = loadConceptDictionary();
   const normalizedRecords = records.map(normalizeStoredRecordShape);
   for (const rec of normalizedRecords) {
+    if (isAccessRestricted(rec)) {
+      rec.abstract = '';
+      rec.themes = [];
+      rec.methodologies = [];
+      rec.conceptTerms = [];
+      rec.wordCount = null;
+      rec.bodyWordCount = null;
+      rec.pages = null;
+      continue;
+    }
     if (!rec.conceptTerms.length) {
       rec.conceptTerms = docConceptTerms(rec, 12, conceptDict);
     }
@@ -936,21 +965,22 @@ export async function collectMetricRecords(options = {}) {
   // bounds live Open Collections paging above.
   const limitedRecords = usesCachedDocuments ? records : records.slice(0, maxRecords);
   const normalizedRecords = limitedRecords.map(normalizeStoredRecordShape);
+  const analyticalRecords = normalizedRecords.filter(isAnalyticallyEligible);
 
   if (!options.skipFileEnrichment) {
-    await enrichDocumentsWithFileAnalysis(normalizedRecords, {
+    await enrichDocumentsWithFileAnalysis(analyticalRecords, {
       downloadFiles,
       forceDownload,
       recomputeFromCache
     });
   } else if (options.applyStoredFileMetrics && !usesCachedDocuments) {
-    await applyStoredFileMetricsToDocuments(normalizedRecords);
+    await applyStoredFileMetricsToDocuments(analyticalRecords);
   }
   if (options.applyCitationCounts) {
-    await applyCitationCountsToDocuments(normalizedRecords);
+    await applyCitationCountsToDocuments(analyticalRecords);
   }
   if (options.applyCommitteeMembers) {
-    await applyCommitteeMembersToDocuments(normalizedRecords);
+    await applyCommitteeMembersToDocuments(analyticalRecords);
   }
 
   const sourceMeta = {
@@ -973,11 +1003,11 @@ export async function collectMetricRecords(options = {}) {
     sqlitePath: SQLITE_PATH
   };
 
-  return { records: normalizedRecords, sourceMeta, subjectLimit };
+  return { records: analyticalRecords, sourceMeta, subjectLimit };
 }
 
 export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjectLimit = 25, { persistRun = false } = {}) {
-  const normalizedRecords = enrichDocumentSignals(records);
+  const normalizedRecords = enrichDocumentSignals(records).filter(isAnalyticallyEligible);
 
   const metrics = buildMetrics(normalizedRecords, subjectLimit);
   if (persistRun) await saveRunMetrics(sourceMeta, metrics);

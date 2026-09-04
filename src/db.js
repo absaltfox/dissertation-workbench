@@ -10,6 +10,10 @@ import { jaroWinkler } from './fuzzyMatch.js';
 import { documentThemeTerms, COOCCURRENCE_BLOCKLIST } from './nlp.js';
 import { buildParentClusters, buildTopicsByYearFromCounts } from './topicHierarchy.js';
 import { normalizeImportRule } from './importRules.js';
+import {
+  ACTIVE_ANALYTICS_ACCESS_SQL, CONTENT_RETRY_ACCESS_SQL, deriveAccessState,
+  isAccessRestricted, isEmbargoPlaceholder,
+} from './accessStatus.js';
 
 let db;
 let schemaReady;
@@ -230,6 +234,9 @@ async function ensureSchema(client) {
       year INTEGER,
       degree TEXT,
       program TEXT,
+      access_status TEXT NOT NULL DEFAULT 'unknown',
+      available_at TEXT,
+      access_status_reason TEXT,
       source_json TEXT,
       source_updated_at TEXT,
       synced_at TEXT,
@@ -686,6 +693,9 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN source_updated_at TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN synced_at TEXT');
   await addColumnIfMissing(client, 'documents', 'serving_projection_version', 'INTEGER NOT NULL DEFAULT 0');
+  await addColumnIfMissing(client, 'documents', 'access_status', "TEXT NOT NULL DEFAULT 'unknown'");
+  await addColumnIfMissing(client, 'documents', 'available_at', 'TEXT');
+  await addColumnIfMissing(client, 'documents', 'access_status_reason', 'TEXT');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_secret TEXT');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_enabled INTEGER NOT NULL DEFAULT 0');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_enabled_at TEXT');
@@ -784,6 +794,7 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree_year ON documents(degree, year)');
 
   await backfillCitationMatchKeys(client);
+  await backfillDocumentAccessStatus(client);
 
   const cleaned = await cleanupCommitteeArtifacts(client);
   if (cleaned > 0) logger.info(`Cleaned up ${cleaned} committee artefact rows`);
@@ -923,6 +934,9 @@ function documentColumns(doc, syncKey = null, source = null) {
     year: doc.year ?? null,
     degree: doc.degree || null,
     program: doc.program || null,
+    accessStatus: doc.accessStatus || 'unknown',
+    availableAt: doc.availableAt || null,
+    accessStatusReason: doc.accessStatusReason || null,
     sourceJson: provenance ? JSON.stringify(provenance) : null,
     sourceUpdatedAt: provenance?.sourceUpdatedAt || null,
   };
@@ -930,6 +944,19 @@ function documentColumns(doc, syncKey = null, source = null) {
 
 function withStoredThemes(doc) {
   if (!doc || typeof doc !== 'object') return doc;
+  if (isAccessRestricted(doc)) return {
+    ...doc,
+    abstract: '',
+    themes: [],
+    conceptTerms: [],
+    methodologies: [],
+    pages: null,
+    pagesSource: null,
+    wordCount: null,
+    bodyWordCount: null,
+    wordCountSource: null,
+    charCount: null,
+  };
   const themes = Array.isArray(doc.themes)
     ? doc.themes.map((value) => String(value || '').trim()).filter(Boolean)
     : [];
@@ -938,6 +965,87 @@ function withStoredThemes(doc) {
     ...doc,
     themes: documentThemeTerms(doc, 12),
   };
+}
+
+function embargoCleanupStatements(docId, now = new Date().toISOString()) {
+  return [
+    { sql: 'DELETE FROM document_topics WHERE doc_id = ?', args: [docId] },
+    { sql: 'DELETE FROM concept_document_state WHERE doc_id = ?', args: [docId] },
+    { sql: 'DELETE FROM document_citations WHERE doc_id = ?', args: [docId] },
+    { sql: "DELETE FROM committee_members WHERE doc_id = ? AND source <> 'api'", args: [docId] },
+    { sql: "DELETE FROM document_people WHERE doc_id = ? AND source <> 'metadata'", args: [docId] },
+    {
+      sql: `UPDATE file_metrics SET pdf_path = NULL, download_url = NULL, file_bytes = NULL,
+              full_text_path = NULL, full_text_bytes = NULL, full_text_source_url = NULL,
+              word_count = NULL, body_word_count = NULL, page_count = NULL,
+              word_source = NULL, page_source = NULL, content_source = NULL,
+              content_checksum = NULL, content_source_url = NULL, content_retrieved_at = NULL,
+              status = 'deferred_embargo', error = NULL, updated_at = ?
+            WHERE doc_id = ?`,
+      args: [now, docId],
+    },
+  ];
+}
+
+async function backfillDocumentAccessStatus(client) {
+  const migrationState = await client.execute({
+    sql: 'SELECT projection_value FROM serving_projection_state WHERE projection_key = ?',
+    args: ['document_access_v1'],
+  });
+  if (migrationState.rows[0]?.projection_value === 'complete') return;
+  let cursor = '';
+  let updated = 0;
+  while (true) {
+    const result = await client.execute({
+      sql: `SELECT doc_id, metadata_json FROM documents
+            WHERE doc_id > ? AND COALESCE(access_status, 'unknown') = 'unknown'
+            ORDER BY doc_id LIMIT 250`,
+      args: [cursor],
+    });
+    if (!result.rows.length) break;
+    const statements = [];
+    const now = new Date().toISOString();
+    for (const row of result.rows) {
+      cursor = String(row.doc_id);
+      let doc;
+      try { doc = JSON.parse(row.metadata_json); } catch { continue; }
+      // Some legacy normalized rows overloaded `date` with date_available,
+      // but most used it for the bibliographic/graduation date. A bare future
+      // bibliographic date must never suppress an otherwise ordinary thesis.
+      // Treat the ambiguous legacy field as availability evidence only when
+      // the same record has the narrow repository embargo placeholder.
+      const legacyDescription = doc.rawAbstract || doc.abstract;
+      const legacyAvailability = doc.availableAt || doc.accessEvidence?.dateAvailableRaw
+        || (isEmbargoPlaceholder(legacyDescription) ? doc.date : null);
+      const state = deriveAccessState({
+        date_available: legacyAvailability,
+        description: legacyDescription,
+      });
+      if (!isAccessRestricted(state)) continue;
+      const cleaned = withStoredThemes({
+        ...doc,
+        ...state,
+        rawAbstract: doc.rawAbstract || doc.abstract || undefined,
+      });
+      statements.push({
+        sql: `UPDATE documents SET metadata_json = ?, access_status = ?, available_at = ?,
+                access_status_reason = ?, updated_at = ? WHERE doc_id = ?`,
+        args: [JSON.stringify(cleaned), state.accessStatus, state.availableAt,
+          state.accessStatusReason, now, row.doc_id],
+      });
+      statements.push(...embargoCleanupStatements(row.doc_id, now));
+      updated += 1;
+    }
+    if (statements.length) await client.batch(statements, 'write');
+  }
+  await client.execute({
+    sql: `INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+          VALUES ('document_access_v1', 'complete', ?)
+          ON CONFLICT(projection_key) DO UPDATE SET
+            projection_value = excluded.projection_value, updated_at = excluded.updated_at`,
+    args: [new Date().toISOString()],
+  });
+  if (updated) logger.info('Backfilled embargo access status', { documents: updated });
 }
 
 function documentPersonKey(name) {
@@ -961,7 +1069,16 @@ function metadataPeopleStatements(doc, now = new Date().toISOString()) {
     sql: "DELETE FROM document_people WHERE doc_id = ? AND source = 'metadata'",
     args: [doc.id],
   }];
-  const names = dedupeSupervisorNames(Array.isArray(doc.supervisors) ? doc.supervisors : []);
+  // Only upstream supervisors belong in the metadata projection. PDF and
+  // acknowledgement inferences are projected transactionally from
+  // committee_members with their real source by saveCommitteeMembers().
+  // This also removes legacy mislabelled rows on the next metadata save.
+  // Legacy metadata records predate supervisorsSource; preserve their existing
+  // projection. Every PDF extraction path now assigns an explicit non-API
+  // source before saving, so inferred names cannot take this compatibility path.
+  const names = !doc?.supervisorsSource || doc.supervisorsSource === 'api'
+    ? dedupeSupervisorNames(Array.isArray(doc.supervisors) ? doc.supervisors : [])
+    : [];
   for (const name of names) {
     const key = documentPersonKey(name);
     if (!key) continue;
@@ -1117,6 +1234,7 @@ export async function saveDocumentMetadata(doc, { syncKey = null, source = null 
     await client.batch([
       saveDocumentStatement(doc, { syncKey, source }, now),
       ...metadataPeopleStatements(doc, now),
+      ...(isAccessRestricted(doc) ? embargoCleanupStatements(doc.id, now) : []),
     ], 'write');
   }, { label: 'saveDocumentMetadata' });
 }
@@ -1128,17 +1246,75 @@ function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now 
     sql: `
       INSERT INTO documents (
         doc_id, metadata_json, sync_key, title, author, year, degree, program,
+        access_status, available_at, access_status_reason,
         source_json, source_updated_at, synced_at, serving_projection_version, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
       ON CONFLICT(doc_id) DO UPDATE SET
-        metadata_json = excluded.metadata_json,
+        metadata_json = CASE
+          WHEN documents.access_status IN ('embargoed', 'verification_due')
+            AND excluded.access_status = 'unknown'
+          THEN json_set(
+            excluded.metadata_json,
+            '$.accessStatus', CASE
+              WHEN documents.access_status = 'embargoed'
+                AND documents.available_at IS NOT NULL
+                AND datetime(documents.available_at) > CURRENT_TIMESTAMP
+              THEN 'embargoed' ELSE 'verification_due' END,
+            '$.availableAt', COALESCE(excluded.available_at, documents.available_at),
+            '$.accessStatusSource', 'repository_metadata',
+            '$.accessStatusReason', CASE
+              WHEN documents.access_status = 'embargoed'
+                AND documents.available_at IS NOT NULL
+                AND datetime(documents.available_at) > CURRENT_TIMESTAMP
+              THEN COALESCE(documents.access_status_reason, 'future_repository_availability_date')
+              ELSE 'availability_date_reached_pending_verification' END,
+            '$.abstract', '',
+            '$.themes', json('[]'),
+            '$.conceptTerms', json('[]'),
+            '$.methodologies', json('[]'),
+            '$.pages', NULL,
+            '$.pagesSource', NULL,
+            '$.wordCount', NULL,
+            '$.bodyWordCount', NULL,
+            '$.wordCountSource', NULL,
+            '$.charCount', NULL
+          )
+          ELSE excluded.metadata_json
+        END,
         sync_key = COALESCE(excluded.sync_key, documents.sync_key),
         title = excluded.title,
         author = excluded.author,
         year = excluded.year,
         degree = excluded.degree,
         program = excluded.program,
+        access_status = CASE
+          WHEN documents.access_status IN ('embargoed', 'verification_due')
+            AND excluded.access_status = 'unknown'
+          THEN CASE
+            WHEN documents.access_status = 'embargoed'
+              AND documents.available_at IS NOT NULL
+              AND datetime(documents.available_at) > CURRENT_TIMESTAMP
+            THEN 'embargoed' ELSE 'verification_due' END
+          ELSE excluded.access_status
+        END,
+        available_at = CASE
+          WHEN documents.access_status IN ('embargoed', 'verification_due')
+            AND excluded.access_status = 'unknown'
+          THEN COALESCE(excluded.available_at, documents.available_at)
+          ELSE excluded.available_at
+        END,
+        access_status_reason = CASE
+          WHEN documents.access_status IN ('embargoed', 'verification_due')
+            AND excluded.access_status = 'unknown'
+          THEN CASE
+            WHEN documents.access_status = 'embargoed'
+              AND documents.available_at IS NOT NULL
+              AND datetime(documents.available_at) > CURRENT_TIMESTAMP
+            THEN COALESCE(documents.access_status_reason, 'future_repository_availability_date')
+            ELSE 'availability_date_reached_pending_verification' END
+          ELSE excluded.access_status_reason
+        END,
         source_json = COALESCE(excluded.source_json, documents.source_json),
         source_updated_at = COALESCE(excluded.source_updated_at, documents.source_updated_at),
         synced_at = COALESCE(excluded.synced_at, documents.synced_at),
@@ -1147,7 +1323,8 @@ function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now 
     `,
     args: [
       doc.id, JSON.stringify(doc), cols.syncKey, cols.title, cols.author, cols.year,
-      cols.degree, cols.program, cols.sourceJson, cols.sourceUpdatedAt,
+      cols.degree, cols.program, cols.accessStatus, cols.availableAt, cols.accessStatusReason,
+      cols.sourceJson, cols.sourceUpdatedAt,
       syncKey ? now : null, now
     ]
   };
@@ -1167,6 +1344,7 @@ export async function saveDocumentMetadataBatch(items) {
           source: item.source || null,
         }, now),
         ...metadataPeopleStatements(doc, now),
+        ...(isAccessRestricted(doc) ? embargoCleanupStatements(doc.id, now) : []),
       ];
     }),
     'write'
@@ -1245,7 +1423,10 @@ export async function recomputeStoredDocumentThemes({ limit = null, docIds = nul
     processed += 1;
     try {
       const doc = JSON.parse(row.metadata_json);
-      const next = { ...doc, themes: documentThemeTerms(doc, 12) };
+      // A manual theme rebuild must retain the same access boundary as the
+      // normal metadata write path. Otherwise an embargoed record can regain
+      // derived terms after the migration has deliberately removed them.
+      const next = withStoredThemes(doc);
       await client.execute({
         sql: 'UPDATE documents SET metadata_json = ?, updated_at = ? WHERE doc_id = ?',
         args: [JSON.stringify(next), new Date().toISOString(), row.doc_id],
@@ -1347,6 +1528,16 @@ function documentServingFilters({ syncKey = null, degree = '', program = '', aff
   };
 }
 
+function analyticalDocumentFilters(options = {}) {
+  const filters = documentServingFilters(options);
+  return {
+    where: filters.where
+      ? `${filters.where} AND ${ACTIVE_ANALYTICS_ACCESS_SQL}`
+      : `WHERE ${ACTIVE_ANALYTICS_ACCESS_SQL}`,
+    args: filters.args,
+  };
+}
+
 const DOCUMENT_PAGE_SORTS = {
   title: 'lower(COALESCE(d.title, \'\'))',
   author: 'lower(COALESCE(d.author, \'\'))',
@@ -1401,7 +1592,7 @@ export async function queryCachedDocumentPage({
 export async function queryTopicDocumentPage({
   syncKey = null, filters = {}, limit = 5000, offset = 0,
 } = {}) {
-  const queryFilters = documentServingFilters({ syncKey, ...filters });
+  const queryFilters = analyticalDocumentFilters({ syncKey, ...filters });
   const topicJoin = 'JOIN (SELECT DISTINCT doc_id FROM document_topics) dt ON dt.doc_id = d.doc_id';
   const countRow = await get(`
     SELECT COUNT(*) AS total
@@ -1442,8 +1633,9 @@ export async function queryTopicDocumentPage({
 /** Small, database-side bootstrap aggregates for metadata-scale landing pages. */
 export async function getDocumentServingSummary({ syncKey = null } = {}) {
   const filters = documentServingFilters({ syncKey });
+  const analyticsFilters = analyticalDocumentFilters({ syncKey });
   const [summary, degrees, programs, affiliations, supervisors] = await Promise.all([
-    get(`SELECT COUNT(*) AS documents FROM documents d ${filters.where}`, filters.args),
+    get(`SELECT COUNT(*) AS documents FROM documents d ${analyticsFilters.where}`, analyticsFilters.args),
     all(`SELECT DISTINCT d.degree AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.degree IS NOT NULL AND trim(d.degree) <> '' ORDER BY value`, filters.args),
     all(`SELECT DISTINCT d.program AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.program IS NOT NULL AND trim(d.program) <> '' ORDER BY value`, filters.args),
     all(`
@@ -1457,9 +1649,9 @@ export async function getDocumentServingSummary({ syncKey = null } = {}) {
       SELECT COUNT(DISTINCT p.person_key) AS count
       FROM document_people p
       JOIN documents d ON d.doc_id = p.doc_id
-      ${filters.where}
-      ${filters.where ? 'AND' : 'WHERE'} p.source = 'metadata' AND p.role = 'Supervisor'
-    `, filters.args),
+      ${analyticsFilters.where}
+      AND p.source = 'metadata' AND p.role = 'Supervisor'
+    `, analyticsFilters.args),
   ]);
   return {
     documents: Number(summary?.documents || 0),
@@ -1475,7 +1667,7 @@ export async function getDocumentServingSummary({ syncKey = null } = {}) {
 export async function queryCitationDocumentPage({
   syncKey = null, filters = {}, q = '', sortKey = 'citationCount', sortDir = 'desc', limit = 50, offset = 0,
 } = {}) {
-  const queryFilters = documentServingFilters({ syncKey, ...filters, q });
+  const queryFilters = analyticalDocumentFilters({ syncKey, ...filters, q });
   const counts = await get(`
     SELECT COUNT(*) AS total,
            SUM(CASE WHEN COALESCE(dc.citation_count, 0) > 0 THEN 1 ELSE 0 END) AS with_citations
@@ -1822,7 +2014,7 @@ async function computeSupervisorNgramMatrixSql(filters, qualifier, topN = 12, to
  * returns no document collection; document rows have their own paginated API.
  */
 export async function getDocumentServingAnalytics({ syncKey = null, filters: requestedFilters = {}, subjectLimit = 25 } = {}) {
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
   const activeWords = 'COALESCE(fm.body_word_count, fm.word_count)';
   const reliableWords = `${activeWords} >= 1000 AND COALESCE(fm.word_source, '') NOT IN ('metadata_text', 'degraded_pdf_text')`;
@@ -1996,7 +2188,7 @@ export async function queryPeoplePage({
   syncKey = null, filters: requestedFilters = {}, q = '', role = '',
   sortKey = 'docCount', sortDir = 'desc', limit = 50, offset = 0,
 } = {}) {
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const extra = [];
   const extraArgs = [];
   if (q) {
@@ -2070,7 +2262,7 @@ export async function queryPersonDetailPage({
 } = {}) {
   const key = String(personKey || '').trim().toLowerCase();
   if (!key) return null;
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const filterClause = filters.where ? `${filters.where} AND` : 'WHERE';
   const relationArgs = [...filters.args, key];
   const relationWhere = `${filterClause} p.person_key = ?`;
@@ -2219,6 +2411,7 @@ export async function queryRelatedDocuments(doc, { syncKey = null, limit = 6 } =
       )
     )
     WHERE d.doc_id <> ? ${syncClause}
+      AND ${ACTIVE_ANALYTICS_ACCESS_SQL}
     GROUP BY d.doc_id, d.title, d.author, d.year, d.degree
     ORDER BY overlap DESC, d.year DESC, d.title ASC
     LIMIT ?
@@ -2330,7 +2523,11 @@ export async function applyCommitteeMembersToDocuments(documents = []) {
             SUPERVISOR_COMMITTEE_ROLES.has(member.role) && member.source === 'api'
           )
             ? 'api'
-            : 'pdf_fallback';
+            : doc.committee.some((member) =>
+              SUPERVISOR_COMMITTEE_ROLES.has(member.role) && member.source === 'pdf_acknowledgements'
+            )
+              ? 'pdf_acknowledgements'
+              : 'pdf_fallback';
         }
       }
     }
@@ -2377,17 +2574,24 @@ function applyStoredFileMetricToDocument(doc, row) {
 export async function getDocumentCacheStats(syncKey = null) {
   const row = syncKey
     ? await get(`
-      SELECT COUNT(*) AS total, MAX(synced_at) AS last_synced_at
+      SELECT COUNT(*) AS total, MAX(synced_at) AS last_synced_at,
+             SUM(CASE WHEN access_status = 'embargoed'
+                       AND (available_at IS NULL OR datetime(available_at) > CURRENT_TIMESTAMP)
+                      THEN 1 ELSE 0 END) AS embargoed_deferred
       FROM documents
       WHERE sync_key = ?
     `, [syncKey])
     : await get(`
-      SELECT COUNT(*) AS total, MAX(synced_at) AS last_synced_at
+      SELECT COUNT(*) AS total, MAX(synced_at) AS last_synced_at,
+             SUM(CASE WHEN access_status = 'embargoed'
+                       AND (available_at IS NULL OR datetime(available_at) > CURRENT_TIMESTAMP)
+                      THEN 1 ELSE 0 END) AS embargoed_deferred
       FROM documents
     `);
   return {
     total: Number(row?.total || 0),
     lastSyncedAt: row?.last_synced_at || null,
+    embargoedDeferred: Number(row?.embargoed_deferred || 0),
   };
 }
 
@@ -3011,9 +3215,12 @@ export async function loadStoredFileMetric(docId) {
 }
 
 // Batched form of loadStoredFileMetric (H-05): one SELECT per page of sync
-// records instead of one per record. Returns a Map keyed by doc_id.
+// records instead of one per record. `includeRestrictedAccess` additionally
+// returns restricted document rows that have no file metric, in the same query;
+// sync uses that to honour a durable embargo hold when a source refresh omits
+// the original availability field.
 // Retry-safe (#18 Layer A): pure reads, chunk by chunk.
-export async function loadStoredFileMetrics(docIds = []) {
+export async function loadStoredFileMetrics(docIds = [], { includeRestrictedAccess = false } = {}) {
   const ids = normalizeDocIdList(docIds);
   const byDocId = new Map();
   if (!ids.length) return byDocId;
@@ -3022,15 +3229,18 @@ export async function loadStoredFileMetrics(docIds = []) {
     const placeholders = chunk.map(() => '?').join(', ');
     // eslint-disable-next-line no-await-in-loop
     const rows = await withDbRetry(() => all(`
-      SELECT doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count,
+      SELECT ${includeRestrictedAccess ? 'd.doc_id' : 'fm.doc_id'} AS doc_id,
+             pdf_path, download_url, file_bytes, word_count, body_word_count,
              full_text_path, full_text_bytes, full_text_source_url, page_count,
              word_source, page_source, content_source, content_checksum,
              content_source_url, content_retrieved_at, parser_version,
              metadata_request_count, full_text_request_count,
              original_pdf_request_count, retrieved_bytes, word_count_comparison_json,
-             status, error, updated_at
-      FROM file_metrics
-      WHERE doc_id IN (${placeholders})
+             status, error, fm.updated_at AS updated_at
+             ${includeRestrictedAccess ? ', d.access_status AS access_status, d.available_at AS available_at' : ''}
+      FROM ${includeRestrictedAccess ? 'documents d LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id' : 'file_metrics fm'}
+      WHERE ${includeRestrictedAccess ? 'd.doc_id' : 'fm.doc_id'} IN (${placeholders})
+        ${includeRestrictedAccess ? "AND (fm.doc_id IS NOT NULL OR d.access_status IN ('embargoed', 'verification_due'))" : ''}
     `, chunk), { label: 'loadStoredFileMetrics' });
     for (const row of rows) byDocId.set(String(row.doc_id), row);
   }
@@ -3182,6 +3392,7 @@ export async function listDocumentsPendingEnrichment({
     args.push(cursor);
   }
   where.push(`${enrichmentPolicySatisfiedSql(contentMode, contentFallback, 'fm')} = 0`);
+  where.push(CONTENT_RETRY_ACCESS_SQL);
   if (attemptedBefore) {
     where.push('(ea.attempted_at IS NULL OR ea.attempted_at < ?)');
     args.push(String(attemptedBefore));
@@ -3201,6 +3412,17 @@ export async function listDocumentsPendingEnrichment({
     try { metadata = row.metadata_json ? JSON.parse(row.metadata_json) : null; } catch { metadata = null; }
     return { docId: String(row.doc_id), metadata };
   });
+}
+
+export async function countDeferredEmbargoedDocuments({ syncKey = null } = {}) {
+  const clauses = ["d.access_status = 'embargoed'", "(d.available_at IS NULL OR datetime(d.available_at) > CURRENT_TIMESTAMP)"];
+  const args = [];
+  if (syncKey) {
+    clauses.push('d.sync_key = ?');
+    args.push(syncKey);
+  }
+  const row = await get(`SELECT COUNT(*) AS count FROM documents d WHERE ${clauses.join(' AND ')}`, args);
+  return Number(row?.count || 0);
 }
 
 // Retry-safe (#18 Layer A): each chunk is one client.batch() of upserts —
@@ -3866,6 +4088,7 @@ export async function listEligibleDocumentsForProcessing({
       LEFT JOIN document_processing_state ps
         ON ps.doc_id = d.doc_id AND ps.processor = ?
       WHERE d.doc_id > ?
+        AND ${ACTIVE_ANALYTICS_ACCESS_SQL}
     )
     SELECT * FROM queued
     WHERE ${statusPredicate}
@@ -4983,7 +5206,7 @@ export async function listPendingCitationExtractions({
   limit = 100, afterDocId = '', syncKey = null, filters: requestedFilters = {},
   parserVersion = 'citation-v1', eligibilityRuleIds = [],
 } = {}) {
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
   const eligibility = citationEligibilityGate({ eligibilityRuleIds });
   return all(`
@@ -5132,7 +5355,7 @@ export async function listPendingCitationScans({
   limit = 50, afterDocId = '', syncKey = null, filters: requestedFilters = {},
   retryFailures = false, reprocess = false, eligibilityRuleIds = [],
 } = {}) {
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
   const gateSql = citationScanGate({ retryFailures, reprocess });
   const eligibility = citationEligibilityGate({ eligibilityRuleIds });
@@ -5178,7 +5401,7 @@ export async function countPendingCitationScans({
   syncKey = null, filters: requestedFilters = {},
   retryFailures = false, reprocess = false, eligibilityRuleIds = [],
 } = {}) {
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
   const gateSql = citationScanGate({ retryFailures, reprocess });
   const eligibility = citationEligibilityGate({ eligibilityRuleIds });
@@ -5314,7 +5537,7 @@ function pendingLookupOptions(limitOrOptions = 100) {
 }
 
 function pendingLookupScope({ syncKey = null, filters: requestedFilters = {} } = {}) {
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   if (!filters.where) return { sql: '', args: [] };
   return {
     sql: `AND EXISTS (

@@ -99,6 +99,8 @@ Content policies are fail-closed: unknown values are rejected by the API, worker
 
 Content processing records its source, SHA-256 checksum, source URL, retrieval time, parser version, repository request counts, and retrieved bytes in `file_metrics`. Import-rule job results aggregate metadata, extracted-full-text, and original-PDF requests separately. A streamed PDF still counts as an original-PDF request and must be treated as a download for policy purposes.
 
+Repository embargoes are represented separately from bibliographic dates by `accessStatus`, `availableAt`, and access provenance fields. Embargoed records remain in the catalogue, but their repository placeholder text is not treated as an abstract and they are deferred from content enrichment, citations, PatternRank, topics, and aggregate metrics until the availability date has passed. Passing that date makes a record eligible for verification; only successful content resolution establishes availability. Job results report this population as `totalEmbargoedDeferred`, not as document failures.
+
 Dashboard reads never page Open Collections. If `/api/metrics` receives query parameters that match a stored sync key, it uses that stored subset; otherwise it falls back to the locally stored corpus. `refresh=1` only bypasses the web process's in-memory metrics payload cache. It does not call Open Collections, download PDFs, recompute file metrics, or extract citations/committee data.
 
 ## API
@@ -214,7 +216,7 @@ All `/api/admin/*` endpoints require an authenticated admin session. `POST`, `PU
 | `DELETE` | `/api/admin/cache/:docId` | Deletes cached PDF and file metrics for one document. |
 | `POST` | `/api/admin/reparse-all` | Re-extracts non-citation document data from cached PDFs. |
 | `POST` | `/api/admin/reparse-citations` | Extracts citations incrementally from cached PDFs/full text; accepts job limits and corpus scope and never starts catalogue resolution. |
-| `POST` | `/api/admin/reparse-committee` | Re-extracts committee data for cached PDFs missing committee records. |
+| `POST` | `/api/admin/reparse-committee` | Re-extracts cached PDFs missing a supervisor/co-supervisor; accepts `docIds`, `ruleId`, `maxDocuments`, and a non-writing `dryRun` diff preview. |
 | `GET` | `/api/admin/runs` | Returns recent import/sync runs. |
 
 ## Core Environment Variables

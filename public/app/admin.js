@@ -1186,7 +1186,9 @@ function summarizeJobResult(job) {
     return `${formatNum(result.updated || 0)} updated, ${formatNum(result.failed || 0)} failed`;
   }
   if (job.type === 'document_sync' || job.type === 'import_rules_sync') {
-    return `${formatNum(result.totalSaved || 0)} saved, ${formatNum(result.totalSkipped || 0)} skipped`;
+    const deferred = Number(result.totalEmbargoedDeferred || 0);
+    return `${formatNum(result.totalSaved || 0)} saved, ${formatNum(result.totalSkipped || 0)} skipped`
+      + (deferred ? `, ${formatNum(deferred)} embargoed/deferred` : '');
   }
   if (job.type === 'cache_refresh_doc' || job.type === 'cache_reanalyze_doc') {
     return result.docId ? `${escapeHtml(result.docId)}: ${escapeHtml(result.status || job.status || '-')}` : '-';
@@ -1204,7 +1206,7 @@ function summarizeJobResult(job) {
     return `${formatNum(result.processed || 0)} scanned, ${formatNum(result.citations || 0)} citations, ${formatNum(result.failed || 0)} failed`;
   }
   if (job.type === 'reparse_committee') {
-    return `${formatNum(result.processed || 0)} processed, ${formatNum(result.withCommittee || 0)} with committee`;
+    return `${result.dryRun ? 'dry run, ' : ''}${formatNum(result.processed || 0)} processed, ${formatNum(result.supervisorsFound || 0)} supervisors found, ${formatNum(result.stillMissingSupervisors || 0)} still missing, ${formatNum(result.failed || 0)} failed`;
   }
   return Object.keys(result).length ? JSON.stringify(result) : '-';
 }
@@ -1246,6 +1248,9 @@ function formatJobCounts(counts = {}) {
   if (counts.truncatedBuckets) parts.push(`${formatNum(counts.truncatedBuckets)} truncated buckets`);
   if (counts.truncationBlockedMerges) parts.push(`${formatNum(counts.truncationBlockedMerges)} merges blocked by truncation`);
   if (counts.withCommittee != null) parts.push(`${formatNum(counts.withCommittee)} with committee`);
+  if (counts.supervisorsFound != null) parts.push(`${formatNum(counts.supervisorsFound)} supervisors found`);
+  if (counts.ocrRecovered != null) parts.push(`${formatNum(counts.ocrRecovered)} OCR-recovered`);
+  if (counts.stillMissingSupervisors != null) parts.push(`${formatNum(counts.stillMissingSupervisors)} still missing supervisors`);
   if (counts.pages != null) parts.push(`${formatNum(counts.pages)} pages`);
   if (counts.words != null) parts.push(`${formatNum(counts.words)} words`);
   if (counts.saved != null) parts.push(`${formatNum(counts.saved)} saved`);

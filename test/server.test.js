@@ -14,6 +14,7 @@ import {
   saveCommitteeMembers, saveDocumentMetadata, saveFileMetric, saveImportRule
 } from '../src/db.js';
 import { buildImportRulesRunParams } from '../src/routes/adminImportRoutes.js';
+import { buildCommitteeReparseParams } from '../src/routes/adminOperationsRoutes.js';
 
 test.after(async () => {
   await closeDb();
@@ -28,6 +29,34 @@ test('GET /api/health returns an ok payload', async () => {
 
   assert.equal(res.body.ok, true);
   assert.match(res.body.timestamp, /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test('committee reparse parameters preserve narrow scopes and reject unsafe widening', () => {
+  const valid = buildCommitteeReparseParams({
+    docIds: [' 1.0094455 ', '1.0094455'],
+    ruleId: ' history-ma ',
+    dryRun: 'false',
+    maxDocuments: '25',
+  });
+  assert.deepEqual(valid, {
+    valid: true,
+    errors: [],
+    params: {
+      docIds: ['1.0094455'],
+      ruleId: 'history-ma',
+      dryRun: false,
+      maxDocuments: 25,
+    },
+  });
+
+  const stringScope = buildCommitteeReparseParams({ docIds: '1.0094455', dryRun: true });
+  assert.equal(stringScope.valid, false);
+  assert.ok(stringScope.errors.includes('docIds must be an array.'));
+
+  const invalidControls = buildCommitteeReparseParams({ dryRun: 'sometimes', maxDocuments: 0 });
+  assert.equal(invalidControls.valid, false);
+  assert.ok(invalidControls.errors.includes('dryRun must be a boolean.'));
+  assert.ok(invalidControls.errors.includes('maxDocuments must be an integer between 1 and 5000.'));
 });
 
 test('GET / serves the static dashboard shell', async () => {

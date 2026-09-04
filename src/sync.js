@@ -18,6 +18,7 @@ import {
 import { logger } from './logger.js';
 import { analyzeDocumentFile } from './pdf.js';
 import { DOCUMENT_SYNC_MODES, filterSyncItemsForMode as filterSyncItemsForModeWithExists } from './syncModes.js';
+import { isEmbargoDeferred } from './accessStatus.js';
 import {
   DEFAULT_IMPORT_CONTENT_MODE, contentModeEnrichesDocuments
 } from './importRules.js';
@@ -221,6 +222,7 @@ async function runSync(syncKey, source, apiKey, runId, {
   let totalEnrichmentAttempted = 0;
   let totalEnriched = 0;
   let totalEnrichmentFailed = 0;
+  let totalEmbargoedDeferred = 0;
   let apiTotal = null;
   let pdfBatchLimitReached = false;
   let upstreamExhausted = false;
@@ -365,9 +367,18 @@ async function runSync(syncKey, source, apiKey, runId, {
             });
           },
         });
-        await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
         const storedAfterAnalysis = await loadStoredFileMetric(item.doc.id);
         const policySatisfied = hasCachedEnrichmentMetric(storedAfterAnalysis, contentMode, contentFallback);
+        // A successful content fetch is the only proof that a verification-due
+        // record is available. This must not depend on the current upstream
+        // response still carrying its original availability date: repositories
+        // often remove that field once an embargo expires.
+        if (policySatisfied && !isEmbargoDeferred(item.doc)) {
+          item.doc.accessStatus = 'available';
+          item.doc.accessStatusSource = 'content_resolution';
+          item.doc.accessStatusReason = 'content_resolution_succeeded';
+        }
+        await saveDocumentMetadata(item.doc, { syncKey, source: item.source });
         if (policySatisfied) totalEnriched += 1;
         else totalEnrichmentFailed += 1;
         peakHeapBytes = Math.max(peakHeapBytes, process.memoryUsage().heapUsed);
@@ -563,6 +574,7 @@ async function runSync(syncKey, source, apiKey, runId, {
       totalEnrichmentAttempted,
       totalEnriched,
       totalEnrichmentFailed,
+      totalEmbargoedDeferred,
       heapGrowthBytes: Math.max(0, peakHeapBytes - startingHeapBytes),
       requestCounts,
       duplicateDocIdsThisPass,
@@ -584,6 +596,7 @@ async function runSync(syncKey, source, apiKey, runId, {
       totalEnrichmentAttempted,
       totalEnriched,
       totalEnrichmentFailed,
+      totalEmbargoedDeferred,
       enrichmentOutcomes,
       enrichmentAttemptedBefore: attemptedBefore,
       enrichmentCursor: queueCursor,
@@ -754,18 +767,29 @@ async function runSync(syncKey, source, apiKey, runId, {
         const pageIds = filtered.items.map((item) => String(item.doc.id));
         const storedByDocId = requiredEnrichmentIds.size
           ? new Map()
-          : await loadStoredFileMetrics(pageIds);
+          : await loadStoredFileMetrics(pageIds, { includeRestrictedAccess: true });
         const attemptedByDocId = requiredEnrichmentIds.size
           ? new Map()
           : await loadEnrichmentAttempts(pageIds);
         const missing = [];
         for (const item of filtered.items) {
           const docId = String(item.doc.id);
+          const stored = storedByDocId.get(docId) || null;
+          // The source can stop returning date_available once an embargo is
+          // recorded. Preserve a durable active hold from the just-written
+          // document row without adding a second query per upstream page.
+          const effectiveAccess = stored?.access_status
+            ? { accessStatus: stored.access_status, availableAt: stored.available_at }
+            : item.doc;
+          if (isEmbargoDeferred(effectiveAccess)) {
+            totalSkipped += 1;
+            totalEmbargoedDeferred += 1;
+            continue;
+          }
           if (requiredEnrichmentIds.size && !requiredEnrichmentIds.has(docId)) {
             totalSkipped += 1;
             continue;
           }
-          const stored = storedByDocId.get(docId) || null;
           if (!requiredEnrichmentIds.size && hasCachedEnrichmentMetric(stored, contentMode, contentFallback)) {
             totalSkipped += 1;
             continue;
@@ -916,7 +940,11 @@ export async function runDocumentSync(options = {}) {
     enrichmentAttemptedBefore: options.enrichmentAttemptedBefore || null,
     enrichmentCursor: options.enrichmentCursor || '',
   });
-  return { syncKey, runId, mode, ...summary, status: await getDocumentSyncStatus(syncKey) };
+  const status = await getDocumentSyncStatus(syncKey);
+  return {
+    syncKey, runId, mode, ...summary,
+    status,
+  };
 }
 
 export async function getDocumentSyncStatus(syncKey = null) {

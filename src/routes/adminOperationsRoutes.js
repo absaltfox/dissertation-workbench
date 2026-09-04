@@ -274,16 +274,21 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
     res.status(202).json({ ok: true, started: true, ...result });
   }));
 
-  router.post('/reparse-committee', asyncHandler(async (_req, res) => {
+  router.post('/reparse-committee', asyncHandler(async (req, res) => {
     const runningId = await hasRunningAdminJob('reparse_committee');
     if (runningId) {
       res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
       return;
     }
+    const validation = buildCommitteeReparseParams(req.body);
+    if (!validation.valid) {
+      res.status(400).json({ error: 'Validation failed', errors: validation.errors });
+      return;
+    }
     const result = await createAndStartAdminWorkerJob({
       type: 'reparse_committee',
       label: 'Reparse Missing Committees',
-      params: {},
+      params: validation.params,
     });
     clearMetricsCache();
     res.status(202).json({ ok: true, started: true, ...result });
@@ -295,4 +300,47 @@ export function createAdminOperationsRouter({ loadSyncModule, clearMetricsCache 
   }));
 
   return router;
+}
+
+export function buildCommitteeReparseParams(input = {}) {
+  const body = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const errors = [];
+  if (body.docIds != null && !Array.isArray(body.docIds)) {
+    errors.push('docIds must be an array.');
+  }
+  const docIds = Array.isArray(body.docIds)
+    ? Array.from(new Set(body.docIds.map((value) => String(value ?? '').trim()).filter(Boolean)))
+    : [];
+  if (docIds.length > 5000) errors.push('docIds must contain at most 5000 values.');
+  if (docIds.some((value) => value.length > 500)) {
+    errors.push('Each docId must be at most 500 characters.');
+  }
+
+  const ruleId = String(body.ruleId ?? '').trim();
+  if (ruleId.length > 200) errors.push('ruleId must be at most 200 characters.');
+
+  const rawMaxDocuments = body.maxDocuments;
+  const maxDocuments = rawMaxDocuments == null || rawMaxDocuments === ''
+    ? 1000
+    : Number(rawMaxDocuments);
+  if (!Number.isInteger(maxDocuments) || maxDocuments < 1 || maxDocuments > 5000) {
+    errors.push('maxDocuments must be an integer between 1 and 5000.');
+  }
+
+  const rawDryRun = body.dryRun;
+  const normalizedDryRun = rawDryRun == null || rawDryRun === ''
+    ? false
+    : parseBooleanParam(rawDryRun, null);
+  if (normalizedDryRun == null) errors.push('dryRun must be a boolean.');
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    params: {
+      docIds: docIds.slice(0, 5000),
+      ruleId: ruleId.slice(0, 200),
+      dryRun: normalizedDryRun ?? false,
+      maxDocuments: Number.isInteger(maxDocuments) ? Math.max(1, Math.min(5000, maxDocuments)) : 1000,
+    },
+  };
 }

@@ -473,6 +473,42 @@ and their ongoing efforts to challenge my thinking and strengthen this work.`;
   assert.ok(res6.some((m) => m.name === 'Jim Frankish' && m.role === 'Supervisory Committee Member'));
 });
 
+test('parseAcknowledgements recovers thesis 1.0094455 OCR spacing and bare advisor syntax', () => {
+  const text = `ACKNOWLEDGEMENTS
+I wish to thank my a d v i s o r, M i c h a e l Ignatieff, for his patient guidance
+throughout the research and writing of this thesis. I am also grateful to my family,
+friends, archivists, and the many communities who supported this project.`;
+
+  assert.deepEqual(parseAcknowledgements(text), [
+    { name: 'Michael Ignatieff', role: 'Supervisor', affiliation: null },
+  ]);
+});
+
+test('parseAcknowledgements accepts conservative advisor variants and complex names', () => {
+  const variants = [
+    ['my adviser, Anne-Marie O\'Neill', 'Supervisor', "Anne-Marie O'Neill"],
+    ['my thesis advisor: José de la Cruz', 'Supervisor', 'José de la Cruz'],
+    ['my academic co-adviser — J. R. Smith', 'Co-Supervisor', 'J. R. Smith'],
+  ];
+  for (const [phrase, role, name] of variants) {
+    const text = `ACKNOWLEDGEMENTS\nI am deeply grateful to ${phrase}, whose thoughtful guidance made this work possible.\nThe support of colleagues and friends sustained the project over many years.`;
+    assert.ok(parseAcknowledgements(text).some((member) => member.name === name && member.role === role), phrase);
+  }
+});
+
+test('parseAcknowledgements does not infer bare advisors from ambiguous prose or institutions', () => {
+  const negatives = [
+    'The advisor Michael suggested that I speak to the archive staff.',
+    'I thank my advisor at the University of British Columbia for guidance.',
+    'I thank my advisor, The Committee, for its institutional support.',
+    'My colleagues J R R and the project team offered encouragement.',
+  ];
+  for (const sentence of negatives) {
+    const text = `ACKNOWLEDGEMENTS\n${sentence}\nI remain grateful to friends and family whose generous support made this long project possible.`;
+    assert.equal(parseAcknowledgements(text).some((member) => ['Supervisor', 'Co-Supervisor'].includes(member.role)), false, sentence);
+  }
+});
+
 test('parseCommittee parses different layout structures from exam cert pages', () => {
   // Test case 1: Pre-2016 format (name above role label)
   const committeeText1 = `The following individuals certify that they have read, and recommend to the Faculty of Graduate and Postdoctoral Studies...

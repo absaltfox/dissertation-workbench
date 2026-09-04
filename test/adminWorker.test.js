@@ -41,6 +41,7 @@ let finishClaimedAdminJob;
 let getDb;
 let loadDocumentCitations;
 let loadDocumentMetadata;
+let loadCommitteeMembers;
 let listTopicLabelReviews;
 let loadCatalogueLookup;
 let loadStoredFileMetric;
@@ -169,6 +170,7 @@ test.before(async () => {
     getDb,
     loadDocumentCitations,
     loadDocumentMetadata,
+    loadCommitteeMembers,
     listTopicLabelReviews,
     loadCatalogueLookup,
     loadStoredFileMetric,
@@ -1075,6 +1077,144 @@ test('strict citation extraction propagates failures instead of creating a compl
     }),
     /simulated citation persistence failure/
   );
+});
+
+test('committee extraction fills a missing supervisor from acknowledgements without replacing certification roles', async () => {
+  await ensureStorage();
+  const docId = `ack-supervisor-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const doc = { id: docId, title: 'Attendance at Indian residential schools', supervisors: [], supervisorsSource: null };
+  await saveDocumentMetadata(doc);
+  const text = `The following individuals certify that they have read and recommend this thesis
+University Examiner
+Elaine Scholar, Professor, UBC
+
+ACKNOWLEDGEMENTS
+I am grateful to my a d v i s o r, M i c h a e l Ignatieff, for his patient guidance.
+Friends, family, archivists, and community members also sustained this research over many years.`;
+
+  await extractAndSaveParsedData(doc, text, null, { extractCommittee: true, extractCitations: false });
+  await extractAndSaveParsedData(doc, text, null, { extractCommittee: true, extractCitations: false });
+
+  const committee = await loadCommitteeMembers(docId);
+  assert.ok(committee.some((member) => member.name === 'Elaine Scholar' && member.role === 'University Examiner' && member.source === 'pdf'));
+  assert.ok(committee.some((member) => member.name === 'Michael Ignatieff' && member.role === 'Supervisor' && member.source === 'pdf_acknowledgements'));
+  assert.equal(doc.supervisorsSource, 'pdf_acknowledgements');
+  assert.equal(committee.filter((member) => member.name === 'Michael Ignatieff').length, 1);
+  const people = await (await getDb()).execute({
+    sql: 'SELECT name, role, source FROM document_people WHERE doc_id = ? ORDER BY name',
+    args: [docId],
+  });
+  assert.ok(people.rows.some((row) => row.name === 'Michael Ignatieff' && row.source === 'pdf_acknowledgements'));
+  assert.equal(people.rows.some((row) => row.name === 'Michael Ignatieff' && row.source === 'metadata'), false);
+});
+
+test('API supervisors remain authoritative over acknowledgement inferences', async () => {
+  await ensureStorage();
+  const docId = `api-supervisor-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const doc = {
+    id: docId,
+    title: 'API supervisor precedence',
+    supervisors: ['Authoritative Person'],
+    supervisorsSource: 'api',
+  };
+  await saveDocumentMetadata(doc);
+  const { saveCommitteeMembers } = await import('../src/db.js');
+  await saveCommitteeMembers(docId, [
+    { name: 'Superseded API Person', role: 'Supervisor', affiliation: null },
+    { name: 'Old Acknowledgement Person', role: 'Supervisor', affiliation: null },
+  ], 'api');
+  await saveCommitteeMembers(docId, [
+    { name: 'Old Acknowledgement Person', role: 'Supervisor', affiliation: null },
+  ], 'pdf_acknowledgements');
+  const text = `ACKNOWLEDGEMENTS
+I thank my advisor, Inferred Person, for thoughtful guidance throughout this thesis.
+Friends, colleagues, and family also supported this research over many years.`;
+
+  await extractAndSaveParsedData(doc, text, null, { extractCommittee: true, extractCitations: false });
+
+  const committee = await loadCommitteeMembers(docId);
+  assert.deepEqual(committee.filter((member) => member.role === 'Supervisor').map((member) => [member.name, member.source]), [
+    ['Authoritative Person', 'api'],
+  ]);
+  assert.deepEqual(doc.supervisors, ['Authoritative Person']);
+  assert.equal(doc.supervisorsSource, 'api');
+});
+
+test('a degraded reparse does not erase an existing PDF-derived supervisor', async () => {
+  await ensureStorage();
+  const docId = `preserve-pdf-supervisor-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const doc = {
+    id: docId,
+    title: 'Preserve prior extraction',
+    supervisors: ['Previously Parsed'],
+    supervisorsSource: 'pdf_acknowledgements',
+  };
+  await saveDocumentMetadata(doc);
+  const { saveCommitteeMembers } = await import('../src/db.js');
+  await saveCommitteeMembers(docId, [
+    { name: 'Previously Parsed', role: 'Supervisor', affiliation: null },
+  ], 'pdf_acknowledgements');
+
+  await extractAndSaveParsedData(doc, 'A short degraded extraction with no acknowledgements section.', null, {
+    extractCommittee: true,
+    extractCitations: false,
+  });
+
+  const committee = await loadCommitteeMembers(docId);
+  assert.ok(committee.some((member) =>
+    member.name === 'Previously Parsed'
+      && member.role === 'Supervisor'
+      && member.source === 'pdf_acknowledgements'
+  ));
+  assert.deepEqual(doc.supervisors, ['Previously Parsed']);
+  assert.equal(doc.supervisorsSource, 'pdf_acknowledgements');
+});
+
+test('committee reparse targets missing supervisor roles and dry-run does not persist its diff', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const targetId = `reparse-target-${suffix}`;
+  const alreadySupervisedId = `reparse-complete-${suffix}`;
+  const pdfPath = path.join(testDataDir, `${targetId}.pdf`);
+  await writeTextPdf(pdfPath, [
+    'ACKNOWLEDGEMENTS',
+    'I thank my a d v i s o r, M i c h a e l Ignatieff, for patient guidance.',
+    'Friends colleagues archivists and family supported this project over many years.',
+  ]);
+  await saveDocumentMetadata({ id: targetId, title: 'Missing supervisor', supervisors: [], supervisorsSource: null });
+  await saveDocumentMetadata({ id: alreadySupervisedId, title: 'Existing supervisor', supervisors: [], supervisorsSource: null });
+  await saveFileMetric(targetId, { status: 'downloaded', pdfPath, contentSource: 'streamed_pdf' });
+  await saveFileMetric(alreadySupervisedId, { status: 'downloaded', pdfPath, contentSource: 'streamed_pdf' });
+  const { saveCommitteeMembers } = await import('../src/db.js');
+  await saveCommitteeMembers(targetId, [{ name: 'Existing Examiner', role: 'University Examiner' }], 'pdf');
+  await saveCommitteeMembers(alreadySupervisedId, [{ name: 'Existing Supervisor', role: 'Supervisor' }], 'pdf');
+
+  const dryJobId = await createAdminJob({
+    type: 'reparse_committee',
+    label: 'Dry-run missing supervisors',
+    params: { docIds: [targetId, alreadySupervisedId], dryRun: true, maxDocuments: 10 },
+  });
+  const dryResult = await runImportPdfAdminJob(await getAdminJob(dryJobId));
+  assert.equal(dryResult.processed, 1);
+  assert.equal(dryResult.supervisorsFound, 1);
+  assert.equal(dryResult.ocrRecovered, 1);
+  assert.deepEqual(dryResult.proposedAdditions, [{
+    docId: targetId,
+    supervisors: [{ name: 'Michael Ignatieff', role: 'Supervisor', source: 'pdf_acknowledgements' }],
+  }]);
+  assert.equal((await loadCommitteeMembers(targetId)).some((member) => member.name === 'Michael Ignatieff'), false);
+
+  const applyJobId = await createAdminJob({
+    type: 'reparse_committee',
+    label: 'Apply missing supervisors',
+    params: { docIds: [targetId], dryRun: false, maxDocuments: 10 },
+  });
+  const applyResult = await runImportPdfAdminJob(await getAdminJob(applyJobId));
+  assert.equal(applyResult.processed, 1);
+  assert.equal(applyResult.supervisorsFound, 1);
+  assert.ok((await loadCommitteeMembers(targetId)).some((member) =>
+    member.name === 'Michael Ignatieff' && member.source === 'pdf_acknowledgements'
+  ));
 });
 
 test('incremental PatternRank reuses checkpoints and rebuilds changed documents only', async () => {
