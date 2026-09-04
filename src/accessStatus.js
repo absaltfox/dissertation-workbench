@@ -14,6 +14,7 @@ const EMBARGO_PLACEHOLDER_PATTERNS = [
   // These intentionally require a repository-style full-text availability
   // statement. An abstract that discusses an embargo as a research topic is
   // not an access notice, even if it uses words such as "available".
+  /\bthe\s+full\s+abstract\s+for\s+this\s+(?:thesis|dissertation|item)\b.{0,160}\bwill\s+be\s+available\s+when\s+the\s+embargo\s+expires\b/is,
   /\b(?:the\s+)?full\s+text(?:\s+of\s+(?:this\s+)?(?:item|thesis|dissertation))?\b.{0,100}(?:will be|will become|is to be|becomes?)\s+available.{0,100}\b(?:embargo|restriction)\b.{0,40}\b(?:expires?|ends?|lifts?)\b/is,
   /\b(?:embargo|restriction)\b.{0,40}\b(?:expires?|ends?|lifts?)\b.{0,100}\b(?:the\s+)?full\s+text\b.{0,100}\b(?:will be|becomes?)\s+available\b/is,
   /\b(?:the\s+)?full\s+text\b.{0,100}\bavailable\s+(?:after|when|once)\b.{0,40}\b(?:embargo|restriction)\b.{0,30}\b(?:expires?|ends?|lifts?)\b/is,

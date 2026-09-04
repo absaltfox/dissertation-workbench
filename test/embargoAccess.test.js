@@ -61,6 +61,11 @@ test('embargo detection is conservative and elapsed dates reopen only for verifi
     false,
     'scholarly discussion of embargoes is not a repository access notice'
   );
+  assert.equal(
+    isEmbargoPlaceholder('The full abstract for this thesis is available in the body of the thesis, and will be available when the embargo expires.'),
+    true,
+    'the exact UBC embargo placeholder is recognized'
+  );
   assert.equal(deriveAccessState({ description: 'PDF missing from repository' }).accessStatus, 'unknown');
 
   const elapsed = deriveAccessState({

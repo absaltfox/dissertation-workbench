@@ -990,7 +990,7 @@ function embargoCleanupStatements(docId, now = new Date().toISOString()) {
 async function backfillDocumentAccessStatus(client) {
   const migrationState = await client.execute({
     sql: 'SELECT projection_value FROM serving_projection_state WHERE projection_key = ?',
-    args: ['document_access_v1'],
+    args: ['document_access_v2'],
   });
   if (migrationState.rows[0]?.projection_value === 'complete') return;
   let cursor = '';
@@ -1040,7 +1040,7 @@ async function backfillDocumentAccessStatus(client) {
   }
   await client.execute({
     sql: `INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
-          VALUES ('document_access_v1', 'complete', ?)
+          VALUES ('document_access_v2', 'complete', ?)
           ON CONFLICT(projection_key) DO UPDATE SET
             projection_value = excluded.projection_value, updated_at = excluded.updated_at`,
     args: [new Date().toISOString()],
