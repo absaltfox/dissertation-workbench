@@ -34,3 +34,16 @@ test('selectSample oversamples the target degrees and caps reference', () => {
   assert.equal(manifest.length, 15);
   assert.ok(manifest.every((m) => m.degree === 'MA (Plan)'));
 });
+
+test('selectSample is deterministic and decorrelated from input order', () => {
+  const mk = (id, year) => buildManifestEntry(id, { degree: 'MA (Plan)', program: 'P', year, title: 't', author: 'a', originalRecordUrl: 'u' });
+  const base = [];
+  for (let i = 0; i < 30; i++) base.push(mk(`core-${i}`, 2010));
+  const opts = { degrees: ['MA (Plan)'], targetCore: 10, perReference: 5 };
+  const a = selectSample(base, opts).manifest.map((m) => m.docId).sort();
+  const b = selectSample([...base].reverse(), opts).manifest.map((m) => m.docId).sort();
+  assert.deepEqual(a, b, 'same docIds selected regardless of input order (deterministic)');
+  // Not merely the first 10 in input order:
+  const firstTen = base.slice(0, 10).map((m) => m.docId).sort();
+  assert.notDeepEqual(a, firstTen, 'selection is not just the first-N in input order');
+});

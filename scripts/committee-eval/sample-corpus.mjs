@@ -18,7 +18,13 @@ function multi(flag) {
 }
 function num(flag, def) {
   const i = argv.indexOf(flag);
-  return i === -1 ? def : Number(argv[i + 1]);
+  if (i === -1) return def;
+  const v = Number(argv[i + 1]);
+  if (!Number.isFinite(v) || v <= 0) {
+    console.error(`${flag} requires a positive number (got: ${argv[i + 1] ?? 'nothing'}).`);
+    process.exit(1);
+  }
+  return v;
 }
 
 if (!TURSO_DATABASE_URL && !has('--allow-local')) {

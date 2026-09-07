@@ -19,8 +19,24 @@ export function buildManifestEntry(docId, metadata = {}) {
   };
 }
 
+// Deterministic, reproducible ordering key decorrelated from ingestion/doc_id order.
+// FNV-1a over the docId string → stable across runs, no external deps, no randomness.
+function orderKey(docId) {
+  let h = 0x811c9dc5;
+  const s = String(docId);
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
 function take(list, n) {
   return list.slice(0, Math.max(0, n));
+}
+
+function byOrderKey(a, b) {
+  return orderKey(a.docId) - orderKey(b.docId);
 }
 
 export function selectSample(entries, { degrees, targetCore, perReference }) {
@@ -29,10 +45,11 @@ export function selectSample(entries, { degrees, targetCore, perReference }) {
   const core = target.filter((e) => !e.certificateSignalGuess);
   const reference = target.filter((e) => e.certificateSignalGuess);
 
-  // Prefer an even era split within core (all core is pre2018 by construction of the guess,
-  // but a doc can be pre-2018 yet 2018+ metadata-less; keep the split logic explicit and stable).
-  const corePicked = take(core, targetCore).map((e) => ({ ...e, stratum: `core:${e.era}` }));
-  const refPicked = take(reference, perReference).map((e) => ({ ...e, stratum: `reference:${e.era}` }));
+  // core = target-degree docs with no certificate-page signal (the failure population).
+  // Ordered by a stable docId hash so the capped sample is reproducible but not
+  // biased by ingestion/id order. reference = certificate-signal docs, capped small.
+  const corePicked = take([...core].sort(byOrderKey), targetCore).map((e) => ({ ...e, stratum: `core:${e.era}` }));
+  const refPicked = take([...reference].sort(byOrderKey), perReference).map((e) => ({ ...e, stratum: `reference:${e.era}` }));
 
   const manifest = [...corePicked, ...refPicked];
   return { manifest, counts: { core: corePicked.length, reference: refPicked.length, total: manifest.length } };
