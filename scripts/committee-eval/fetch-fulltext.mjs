@@ -1,0 +1,69 @@
+// Reads manifest.json, fetches OC full text (PDF fallback on miss) into the cache,
+// writes coverage.json. Requires prod connectivity.
+// Usage: node scripts/committee-eval/fetch-fulltext.mjs
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { writeFile, unlink } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { loadDocumentMetadata } from '../../src/db.js';
+import { fetchFullTextForDocument, fetchPdfForDocument, analyzePdfAtPath } from '../../src/pdf.js';
+import { assessTextQuality } from './lib/quality.mjs';
+
+const EVAL_DIR = 'data/committee-eval';
+const TEXT_DIR = path.join(EVAL_DIR, 'fulltext');
+mkdirSync(TEXT_DIR, { recursive: true });
+
+// `fetchPdfForDocument` returns raw PDF bytes (`.bytes`), not extracted text —
+// there is no `.fullText` on its result. Text extraction from a downloaded PDF
+// is a separate, existing pipeline step (`analyzePdfAtPath`, used by
+// `analyzeDocumentFile`), which shells out to `pdftotext` against a file path.
+// So the fallback here stages the bytes to a scratch temp file and reuses that
+// existing extractor rather than inventing a new one.
+async function extractTextFromPdfBytes(bytes) {
+  const tmpPath = path.join(os.tmpdir(), `committee-eval-pdf-${Date.now()}-${crypto.randomUUID()}.pdf`);
+  try {
+    await writeFile(tmpPath, bytes);
+    const analysis = await analyzePdfAtPath(tmpPath, bytes);
+    return analysis?.fullText || null;
+  } finally {
+    await unlink(tmpPath).catch(() => {});
+  }
+}
+
+const manifest = JSON.parse(readFileSync('test/fixtures/committee-eval/manifest.json', 'utf8'));
+const coverage = [];
+
+for (const entry of manifest) {
+  const meta = await loadDocumentMetadata(entry.docId);
+  if (!meta) { coverage.push({ docId: entry.docId, textSource: 'unavailable', degraded: false, byteLength: 0, reason: 'no-metadata' }); continue; }
+  const doc = { ...meta, id: entry.docId };
+
+  let text = null;
+  let textSource = null;
+  const ft = await fetchFullTextForDocument(doc, null, { persistFullText: false });
+  if (ft && ft.fullText) { text = ft.fullText; textSource = 'dspace_text'; }
+  else {
+    // Derivative missing/too-short — download the PDF and extract text via the
+    // existing pdftotext-backed pipeline (see extractTextFromPdfBytes above).
+    const pdf = await fetchPdfForDocument(doc, {});
+    if (pdf && pdf.bytes) {
+      const pdfText = await extractTextFromPdfBytes(pdf.bytes);
+      if (pdfText) { text = pdfText; textSource = 'pdf_fallback'; }
+    }
+  }
+
+  if (!text) { coverage.push({ docId: entry.docId, textSource: 'unavailable', degraded: false, byteLength: 0, reason: 'no-text-no-pdf' }); continue; }
+
+  const q = assessTextQuality(text);
+  writeFileSync(path.join(TEXT_DIR, `${entry.docId}.txt`), text);
+  coverage.push({ docId: entry.docId, textSource, degraded: q.degraded, byteLength: q.byteLength, reason: q.reason });
+}
+
+writeFileSync(path.join(EVAL_DIR, 'coverage.json'), JSON.stringify(coverage, null, 2) + '\n');
+const roll = coverage.reduce((a, c) => {
+  a[c.textSource] = (a[c.textSource] || 0) + 1;
+  if (c.degraded) a.degraded += 1;
+  return a;
+}, { degraded: 0 });
+console.log('Coverage:', JSON.stringify(roll));
