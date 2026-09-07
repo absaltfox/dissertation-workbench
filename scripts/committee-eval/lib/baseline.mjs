@@ -14,7 +14,12 @@ export function extractBaseline(fullText, { parseCommittee, parseAcknowledgement
     const ackOthers = committee.length ? [] : ack.filter((m) => !SUPERVISOR_ROLES.has(m.role));
     members.push(...ackSupervisors, ...ackOthers);
   }
-  // Dedupe by lowercased name, keeping first occurrence.
+  // Two intentional, harmless simplifications vs production here: (a) dedupe below is by
+  // lowercased name rather than production's `dedupeSupervisorNames` — equivalent-or-better
+  // for name-set scoring; (b) `hasSupervisor` above uses a plain role-membership check rather
+  // than production's name-normalized `supervisorsFromCommittee(...).length` — differs only
+  // for a supervisor-role member with an unnormalizable name (negligible for parseCommittee
+  // output). Dedupe by lowercased name, keeping first occurrence.
   const seen = new Set();
   return members.filter((m) => {
     const key = String(m.name || '').toLowerCase().trim();

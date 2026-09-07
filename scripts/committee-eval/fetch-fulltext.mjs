@@ -9,10 +9,28 @@ import crypto from 'node:crypto';
 import { loadDocumentMetadata } from '../../src/db.js';
 import { fetchFullTextForDocument, fetchPdfForDocument, analyzePdfAtPath } from '../../src/pdf.js';
 import { assessTextQuality } from './lib/quality.mjs';
+import { PDF_DOWNLOAD_RATE_PER_MIN } from '../../src/config.js';
 
 const EVAL_DIR = 'data/committee-eval';
 const TEXT_DIR = path.join(EVAL_DIR, 'fulltext');
 mkdirSync(TEXT_DIR, { recursive: true });
+
+// Politeness throttle for streaming PDFs from OC (spec §7): honor the same
+// PDF_DOWNLOAD_RATE_PER_MIN budget the production pipeline uses. 0 = unlimited.
+const _pdfFetchTimes = [];
+async function throttlePdfFetch() {
+  if (!PDF_DOWNLOAD_RATE_PER_MIN) return;
+  const windowMs = 60_000;
+  const now = Date.now();
+  while (_pdfFetchTimes.length && _pdfFetchTimes[0] < now - windowMs) _pdfFetchTimes.shift();
+  if (_pdfFetchTimes.length >= PDF_DOWNLOAD_RATE_PER_MIN) {
+    const waitMs = _pdfFetchTimes[0] + windowMs - Date.now();
+    if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+    const t = Date.now();
+    while (_pdfFetchTimes.length && _pdfFetchTimes[0] < t - windowMs) _pdfFetchTimes.shift();
+  }
+  _pdfFetchTimes.push(Date.now());
+}
 
 // `fetchPdfForDocument` returns raw PDF bytes (`.bytes`), not extracted text —
 // there is no `.fullText` on its result. Text extraction from a downloaded PDF
@@ -46,6 +64,7 @@ for (const entry of manifest) {
   else {
     // Derivative missing/too-short — download the PDF and extract text via the
     // existing pdftotext-backed pipeline (see extractTextFromPdfBytes above).
+    await throttlePdfFetch();
     const pdf = await fetchPdfForDocument(doc, {});
     if (pdf && pdf.bytes) {
       const pdfText = await extractTextFromPdfBytes(pdf.bytes);

@@ -25,3 +25,15 @@ weighted toward the MA (Plan)/History MA failure population. Nothing here modifi
 Lead with the **FAILURE POPULATION (nocert)** table. The **cert** table is harness validation only
 (parseCommittee scored against parseCommittee-derived gold) — never average the two. Record the
 nocert recall as the bar Phase 2 (GLiNER shadow) must beat.
+
+## Known limitations
+- The pre-fetch certificate signal used for sampling is a proxy:
+  `certificateSignalGuess = (year >= 2018)`, because the standardized approval page is a ~2018+
+  artifact. Consequently the hand-labeled **core** sample is always pre-2018; a genuine **2018+
+  thesis with no approval page** is placed in the (small, capped) `reference` bucket rather than
+  the core. Scoring remains honest — such a doc is still scored and lands in the
+  `nocert:2018plus:*` stratum — but the core sample under-represents it. **When reviewing the
+  generated `manifest.json` during the live run, manually add any 2018+ certificate-absent
+  MA(Plan)/History docs you care about to the core sample.** A fully general fix would require
+  two-pass sampling (fetch text, then stratify on the real certificate signal), which is
+  intentionally out of scope for this phase.
