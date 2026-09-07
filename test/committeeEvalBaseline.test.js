@@ -19,6 +19,25 @@ test('extractBaseline skips acknowledgements when committee already has a superv
   assert.equal(out.length, 1);
 });
 
+test('extractBaseline gates ack non-supervisors on empty committee', () => {
+  const ack = () => ({ members: [
+    { name: 'Ack Super', role: 'Supervisor' },
+    { name: 'Ack Other', role: 'Supervisory Committee Member' },
+  ]});
+  // Committee has examiners but NO supervisor -> ack supervisors merged, ack others DROPPED
+  const withExaminers = extractBaseline('x', {
+    parseCommittee: () => [{ name: 'Cert Examiner', role: 'University Examiner' }],
+    parseAcknowledgementsDetailed: ack,
+  });
+  assert.deepEqual(withExaminers.map((m) => m.name), ['Cert Examiner', 'Ack Super']);
+  // Empty committee -> ack supervisors AND ack others merged
+  const emptyCommittee = extractBaseline('x', {
+    parseCommittee: () => [],
+    parseAcknowledgementsDetailed: ack,
+  });
+  assert.deepEqual(emptyCommittee.map((m) => m.name), ['Ack Super', 'Ack Other']);
+});
+
 test('aggregate computes precision/recall per stratum', () => {
   const perDoc = [
     { stratumKey: 'core:pre2018', score: { nameTP: 1, nameFP: 1, nameFN: 0, roleTP: 1, roleFP: 1, roleFN: 0, exactCase: false, negativeViolations: 1 } },

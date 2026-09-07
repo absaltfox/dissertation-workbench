@@ -13,7 +13,6 @@ const manifest = JSON.parse(readFileSync('test/fixtures/committee-eval/manifest.
 const gold = JSON.parse(readFileSync('test/fixtures/committee-eval/gold.json', 'utf8'));
 const coverage = existsSync(path.join(EVAL_DIR, 'coverage.json'))
   ? JSON.parse(readFileSync(path.join(EVAL_DIR, 'coverage.json'), 'utf8')) : [];
-const goldByDoc = new Map(gold.map((g) => [g.docId, g]));
 const manifestByDoc = new Map(manifest.map((m) => [m.docId, m]));
 const coverageByDoc = new Map(coverage.map((c) => [c.docId, c]));
 

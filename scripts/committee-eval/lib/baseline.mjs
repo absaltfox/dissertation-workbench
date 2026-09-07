@@ -6,7 +6,13 @@ export function extractBaseline(fullText, { parseCommittee, parseAcknowledgement
   const members = [...committee];
   if (!hasSupervisor) {
     const ack = parseAcknowledgementsDetailed(fullText)?.members || [];
-    for (const a of ack) members.push(a);
+    const ackSupervisors = ack.filter((m) => SUPERVISOR_ROLES.has(m.role));
+    // Mirror production (src/pdf.js:2126): ack non-supervisor members are merged
+    // only when the certificate page yielded no committee at all. When the cert
+    // page listed examiners (committee.length > 0) but no supervisor, production
+    // keeps those examiners + only the ack SUPERVISORS, dropping ack non-supervisors.
+    const ackOthers = committee.length ? [] : ack.filter((m) => !SUPERVISOR_ROLES.has(m.role));
+    members.push(...ackSupervisors, ...ackOthers);
   }
   // Dedupe by lowercased name, keeping first occurrence.
   const seen = new Set();
