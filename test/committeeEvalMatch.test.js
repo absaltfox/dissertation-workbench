@@ -44,3 +44,22 @@ test('scoreDoc flags negative violations and exactCase', () => {
   assert.equal(dirty.negativeViolations, 1);
   assert.equal(dirty.exactCase, false);
 });
+
+test('scoreDoc: role-level FP/FN are joint-tuple (over full sets, name-gated TP)', () => {
+  const predicted = [
+    { name: 'Deirdre M. Kelly', role: 'Supervisor' },       // name+role match
+    { name: 'Bob Stranger', role: 'Co-Supervisor' },         // name FP
+    { name: 'Ghost Person', role: 'Supervisor' },            // name FP
+  ];
+  const gold = {
+    members: [
+      { name: 'Deirdre Kelly', role: 'Supervisor' },         // matched by first predicted, role agrees
+      { name: 'Alice Wong', role: 'Supervisory Committee Member' }, // unrecovered
+    ],
+    negatives: [],
+  };
+  const s = scoreDoc(predicted, gold);
+  assert.equal(s.roleTP, 1);                       // only Kelly/Supervisor is a full tuple match
+  assert.equal(s.roleFP, predicted.length - s.roleTP); // = 2
+  assert.equal(s.roleFN, gold.members.length - s.roleTP); // = 1
+});

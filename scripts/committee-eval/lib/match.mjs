@@ -1,4 +1,4 @@
-import { normalizePersonName, supervisorNameKey, namesCompatible } from '../../../src/supervisors.js';
+import { supervisorNameKey, namesCompatible } from '../../../src/supervisors.js';
 
 export function namesMatch(a, b) {
   const ka = supervisorNameKey(a);
@@ -36,6 +36,9 @@ export function scoreDoc(predicted, gold) {
   for (const { pIndex, gIndex } of pairs) {
     if (predicted[pIndex].role === goldMembers[gIndex].role) roleTP += 1;
   }
+  // Joint-tuple role metric: a role-level TP requires BOTH name and role correct
+  // (roleTP is name-gated above). So every non-matching prediction is a role-FP and
+  // every unrecovered gold member is a role-FN — role precision/recall are strictly ≤ name-level.
   const roleFP = predicted.length - roleTP;
   const roleFN = goldMembers.length - roleTP;
 
