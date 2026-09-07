@@ -39,18 +39,41 @@ function byOrderKey(a, b) {
   return orderKey(a.docId) - orderKey(b.docId);
 }
 
-export function selectSample(entries, { degrees, targetCore, perReference }) {
-  const targetSet = new Set(degrees);
-  const target = entries.filter((e) => targetSet.has(e.degree));
-  const core = target.filter((e) => !e.certificateSignalGuess);
-  const reference = target.filter((e) => e.certificateSignalGuess);
+// A target is a {degree, program} pair. `program: null` matches the degree
+// regardless of program (fine when the degree string is already unique, e.g.
+// "Master of Arts in Planning - MA (Plan)"). A non-null program narrows to that
+// program, which is required to isolate targets sharing a generic degree — e.g.
+// History is degree "Master of Arts - MA" + program "History", shared with other
+// MA programs, so it MUST be matched on program too.
+function matchesTarget(entry, target) {
+  if (entry.degree !== target.degree) return false;
+  return target.program == null || entry.program === target.program;
+}
 
-  // core = target-degree docs with no certificate-page signal (the failure population).
-  // Ordered by a stable docId hash so the capped sample is reproducible but not
-  // biased by ingestion/id order. reference = certificate-signal docs, capped small.
-  const corePicked = take([...core].sort(byOrderKey), targetCore).map((e) => ({ ...e, stratum: `core:${e.era}` }));
-  const refPicked = take([...reference].sort(byOrderKey), perReference).map((e) => ({ ...e, stratum: `reference:${e.era}` }));
-
-  const manifest = [...corePicked, ...refPicked];
-  return { manifest, counts: { core: corePicked.length, reference: refPicked.length, total: manifest.length } };
+// Sample up to `perEra` docs for EACH (target × era) cell, so both the pre-2018
+// failure population and the 2018+ certificate-bearing regime are deliberately
+// represented (the report's cert/nocert strata are only as populated as the
+// sample). Ordering within a cell is a stable docId hash: reproducible, and
+// decorrelated from ingestion/id order. A doc matching multiple targets is
+// counted once (first target wins).
+export function selectSample(entries, { targets, perEra }) {
+  const seen = new Set();
+  const manifest = [];
+  const counts = { total: 0, byCell: {} };
+  for (const target of targets) {
+    const label = target.program ? `${target.degree} / ${target.program}` : target.degree;
+    const matches = entries.filter((e) => matchesTarget(e, target));
+    for (const era of ['pre2018', '2018plus']) {
+      const inEra = matches.filter((e) => e.era === era && !seen.has(e.docId));
+      const picked = take([...inEra].sort(byOrderKey), perEra);
+      for (const e of picked) {
+        seen.add(e.docId);
+        manifest.push({ ...e, stratum: era, matchedTarget: label });
+        const cell = `${label} · ${era}`;
+        counts.byCell[cell] = (counts.byCell[cell] || 0) + 1;
+        counts.total += 1;
+      }
+    }
+  }
+  return { manifest, counts };
 }

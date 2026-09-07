@@ -1,7 +1,13 @@
 // scripts/committee-eval/sample-corpus.mjs
 // Usage:
 //   node scripts/committee-eval/sample-corpus.mjs --discover
-//   node scripts/committee-eval/sample-corpus.mjs --degrees "MA (Plan)" "History MA" --target-core 45 --per-reference 15
+//   node scripts/committee-eval/sample-corpus.mjs \
+//     --targets "Master of Arts in Planning - MA (Plan)" "Master of Arts - MA::History" \
+//     --per-era 25
+// A --targets value is a degree, optionally narrowed to a program with "::Program".
+// Use "Degree::Program" when the degree string is shared across programs (e.g.
+// History is "Master of Arts - MA::History"). --per-era caps docs per (target × era),
+// so both the pre-2018 and 2018+ regimes are deliberately sampled.
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { getDb } from '../../src/db.js';
 import { TURSO_DATABASE_URL } from '../../src/config.js';
@@ -46,13 +52,18 @@ if (has('--discover')) {
   process.exit(0);
 }
 
-const degrees = multi('--degrees');
-if (!degrees.length) {
-  console.error('Provide --degrees "MA (Plan)" "History MA" (confirm exact strings with --discover first).');
+// Each --targets value is "Degree" or "Degree::Program".
+const targets = multi('--targets').map((s) => {
+  const idx = s.indexOf('::');
+  return idx === -1
+    ? { degree: s.trim(), program: null }
+    : { degree: s.slice(0, idx).trim(), program: s.slice(idx + 2).trim() || null };
+});
+if (!targets.length) {
+  console.error('Provide --targets "Degree" "Degree::Program" ... (confirm exact strings with --discover first).');
   process.exit(1);
 }
-const targetCore = num('--target-core', 45);
-const perReference = num('--per-reference', 15);
+const perEra = num('--per-era', 25);
 
 const rs = await db.execute({ sql: 'SELECT doc_id, metadata_json FROM documents', args: [] });
 const entries = rs.rows.map((row) => {
@@ -61,8 +72,9 @@ const entries = rs.rows.map((row) => {
   return buildManifestEntry(String(row.doc_id), meta);
 });
 
-const { manifest, counts } = selectSample(entries, { degrees, targetCore, perReference });
+const { manifest, counts } = selectSample(entries, { targets, perEra });
 mkdirSync('test/fixtures/committee-eval', { recursive: true });
 writeFileSync('test/fixtures/committee-eval/manifest.json', JSON.stringify(manifest, null, 2) + '\n');
-console.log(`Wrote manifest: ${counts.total} docs (core=${counts.core}, reference=${counts.reference}).`);
+console.log(`Wrote manifest: ${counts.total} docs`);
+for (const [cell, n] of Object.entries(counts.byCell)) console.log(`  ${cell}: ${n}`);
 process.exit(0);

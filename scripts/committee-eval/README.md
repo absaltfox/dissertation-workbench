@@ -10,8 +10,12 @@ weighted toward the MA (Plan)/History MA failure population. Nothing here modifi
 ## Pipeline
 1. **Discover real degree strings (do this first):**
    `node scripts/committee-eval/sample-corpus.mjs --discover`
-2. **Sample** (confirm exact strings from step 1):
-   `node scripts/committee-eval/sample-corpus.mjs --degrees "MA (Plan)" "History MA" --target-core 45 --per-reference 15`
+2. **Sample** (confirm exact strings from step 1). Each `--targets` value is a degree,
+   optionally narrowed to a program with `::Program` — required when a degree string is
+   shared across programs (History is `Master of Arts - MA::History`). `--per-era` caps docs
+   per (target × era), so both the pre-2018 failure population and the 2018+ certificate-bearing
+   regime are deliberately sampled:
+   `node scripts/committee-eval/sample-corpus.mjs --targets "Master of Arts in Planning - MA (Plan)" "Master of Arts - MA::History" --per-era 25`
 3. **Fetch full text** (+ PDF fallback): `node scripts/committee-eval/fetch-fulltext.mjs`
 4. **Build worksheet:** `node scripts/committee-eval/build-gold.mjs`
    → hand-review `data/committee-eval/gold-worksheet.csv` (fill `keep`, `true_role`, `is_negative`;
