@@ -1559,7 +1559,7 @@ function isPlausibleBareAdvisorName(raw) {
 const PAT_PLURAL_SUPERVISORS = new RegExp(
   `my\\s+supervisors?,?\\s+${TITLE_RE}\\s+${DR_CAP}\\s+and\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
 const PAT_MY_SUPERVISOR = new RegExp(
-  `(?:my|the|research)\\s+(?:(?:thesis|graduate|doctoral|dissertation|academic|research|senior)\\s+)?(co-?)?(?:supervisor|advis(?:or|er))s?,?\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
+  `(?:my|the|research)\\s+(?:(?:thesis|doctoral|dissertation)\\s+)?(co-?)?(?:supervisor|advis(?:or|er))s?,?\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
 const PAT_COMMITTEE_CHAIR = new RegExp(
   `Committee\\s+Chair\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
 const PAT_TITLE_ROLE_PARENS = new RegExp(

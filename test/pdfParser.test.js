@@ -529,6 +529,22 @@ test('parseAcknowledgements does not over-broaden the adjective-infix supervisor
   }
 });
 
+test('parseAcknowledgements does not mistake graduate/academic advisor (administrative staff) for the thesis supervisor', () => {
+  const negatives = [
+    'I am grateful to the graduate advisor, Dr. Jane Smith, for her assistance with administrative matters.',
+    'I would like to thank my academic advisor, Dr. John Lee, for help navigating course registration and paperwork.',
+  ];
+  for (const sentence of negatives) {
+    const text = `ACKNOWLEDGEMENTS\n${sentence}, and I am thankful for it.\nI remain grateful to friends and family whose generous support made this long project possible.`;
+    const members = parseAcknowledgements(text);
+    assert.equal(
+      members.some((m) => ['Supervisor', 'Co-Supervisor'].includes(m.role)),
+      false,
+      sentence
+    );
+  }
+});
+
 test('parseAcknowledgements does not infer bare advisors from ambiguous prose or institutions', () => {
   const negatives = [
     'The advisor Michael suggested that I speak to the archive staff.',
