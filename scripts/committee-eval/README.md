@@ -20,7 +20,10 @@ weighted toward the MA (Plan)/History MA failure population. Nothing here modifi
 4. **Build worksheet:** `node scripts/committee-eval/build-gold.mjs`
    → hand-review `data/committee-eval/gold-worksheet.csv` (fill `keep`, `true_role`, `is_negative`;
    add member rows for certificate-absent docs using the `ack_slice` column), save back to
-   `data/committee-eval/gold-worksheet.json`.
+   `data/committee-eval/gold-worksheet.json`. The `oc_url` column links each row to its Open
+   Collections item page (`open.library.ubc.ca/collections/ubctheses/items/<docId>`) so you can
+   open and verify the PDF directly. Docs with no auto-detected committee/supervisor appear as a
+   single placeholder row (`source=none`) so the failure population stays visible for labeling.
 5. **Finalize gold:** `node scripts/committee-eval/build-gold.mjs --finalize`
 6. **Score baseline:** `node scripts/committee-eval/score-baseline.mjs`
 7. **Report:** `node scripts/committee-eval/report.mjs`

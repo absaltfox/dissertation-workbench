@@ -29,6 +29,10 @@ const coverage = existsSync(path.join(EVAL_DIR, 'coverage.json'))
   : [];
 const coverageByDoc = new Map(coverage.map((c) => [c.docId, c]));
 
+// Human-facing Open Collections item/viewer page (same pattern as src/api.js);
+// derivable from docId alone, lets the reviewer open and verify the PDF directly.
+const ocUrl = (id) => `https://open.library.ubc.ca/collections/ubctheses/items/${encodeURIComponent(id)}`;
+
 const rows = [];
 for (const entry of manifest) {
   const textPath = path.join(TEXT_DIR, `${entry.docId}.txt`);
@@ -42,11 +46,11 @@ for (const entry of manifest) {
   // Attach the acknowledgements text slice for hand-labeling certificate-absent docs.
   const ackIdx = fullText.search(/acknowledg/i);
   const ackSlice = ackIdx === -1 ? '' : fullText.slice(ackIdx, ackIdx + 1500).replace(/\s+/g, ' ');
-  for (const r of docRows) rows.push({ ...r, era: entry.era, degraded: coverageByDoc.get(entry.docId)?.degraded ?? '', ack_slice: r.source === 'certificate' ? '' : ackSlice });
+  for (const r of docRows) rows.push({ ...r, oc_url: ocUrl(entry.docId), era: entry.era, degraded: coverageByDoc.get(entry.docId)?.degraded ?? '', ack_slice: r.source === 'certificate' ? '' : ackSlice });
 }
 
 writeFileSync(WORKSHEET_JSON, JSON.stringify(rows, null, 2) + '\n');
-const header = ['docId', 'name', 'proposed_role', 'on_certificate', 'source', 'era', 'degraded', 'keep', 'true_role', 'is_negative', 'ack_slice'];
+const header = ['docId', 'oc_url', 'name', 'proposed_role', 'on_certificate', 'source', 'era', 'degraded', 'keep', 'true_role', 'is_negative', 'ack_slice'];
 const csv = [header.join(',')].concat(
   rows.map((r) => header.map((h) => `"${String(r[h] ?? '').replace(/"/g, '""')}"`).join(',')),
 ).join('\n');
