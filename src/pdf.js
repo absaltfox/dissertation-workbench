@@ -1574,6 +1574,14 @@ const PAT_CO_ADVISOR_PREFIX = new RegExp(
 // plus punctuation.  This avoids interpreting ordinary prose such as
 // "the advisor Michael suggested" as an asserted supervisory relationship.
 const PAT_BARE_ADVISOR_PREFIX = /\bmy\s+(?:(?:research|thesis|academic)\s+)?(co[- ]?)?advis(?:or|er)\s*[,;:–—-]\s*([^\n!?;:]{3,100})/giu;
+// Untitled advisor with NO trailing punctuation: "my thesis advisor Joy Dixon",
+// "my advisor Leslie Paris".  The role word is followed directly by a capitalized
+// name.  Infix is restricted to thesis|doctoral|dissertation (or none) — matching
+// Lever A — so administrative "my academic advisor …" / "my graduate advisor …"
+// cannot match this path.  The capitalized-start requirement rejects "my advisor
+// was …" / "my advisor and …", and isPlausibleBareAdvisorName (2+ substantive
+// capitalized tokens) rejects single-token / stop-word captures.
+const PAT_BARE_ADVISOR_UNTITLED = /\bmy\s+(?:(?:thesis|doctoral|dissertation)\s+)?(co[- ]?)?advis(?:or|er)\s+([A-ZÀ-ɏ][^\n!?;:]{2,100})/giu;
 const PAT_AS_SUPERVISOR = new RegExp(
   `${TITLE_RE}\\s+${DR_CAP}[^.]{0,150}as\\s+(?:my\\s+)?(?:(co-?))?supervisor`, 'gi');
 const PAT_TITLED_NAME = new RegExp(`${TITLE_RE}\\s+${DR_CAP}`, 'g');
@@ -1678,6 +1686,13 @@ export function parseAcknowledgementsDetailed(fullText) {
   // Unlike the titled patterns, this path uses strict two-to-four-token name
   // validation and requires punctuation before the candidate.
   for (const pm of section.matchAll(PAT_BARE_ADVISOR_PREFIX)) {
+    const name = isPlausibleBareAdvisorName(pm[2]);
+    if (name) addMember(name, pm[1] ? 'Co-Supervisor' : 'Supervisor');
+  }
+
+  // "my thesis advisor Joy Dixon" / "my advisor Leslie Paris" — untitled, no
+  // trailing punctuation.  Infix restricted to thesis|doctoral|dissertation.
+  for (const pm of section.matchAll(PAT_BARE_ADVISOR_UNTITLED)) {
     const name = isPlausibleBareAdvisorName(pm[2]);
     if (name) addMember(name, pm[1] ? 'Co-Supervisor' : 'Supervisor');
   }

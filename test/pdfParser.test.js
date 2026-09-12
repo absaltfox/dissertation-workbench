@@ -558,6 +558,47 @@ test('parseAcknowledgements does not infer bare advisors from ambiguous prose or
   }
 });
 
+test('parseAcknowledgements recognizes untitled advisor without trailing punctuation (Lever B)', () => {
+  const PAD = 'I am deeply grateful to the many people who made this long and difficult project possible over the years. ';
+  const positives = [
+    // doc 1.0090378: infix + untitled + no punctuation
+    ['I am in gratitude to my thesis advisor Joy Dixon for reading countless drafts', 'Joy Dixon', 'Supervisor'],
+    // doc 1.0340537: untitled, sentence period after the name
+    ['Most of all, I thank my advisor Leslie Paris. She helped me develop', 'Leslie Paris', 'Supervisor'],
+    // doc 1.0100786: untitled WITH comma (existing punctuation path should handle)
+    ['I would like to thank my advisor, Joy Dixon, for her patience', 'Joy Dixon', 'Supervisor'],
+  ];
+  for (const [sentence, name, role] of positives) {
+    const text = `\nACKNOWLEDGEMENTS\n\n${PAD}${sentence} ${PAD}\n`;
+    const members = parseAcknowledgements(text);
+    assert.ok(
+      members.some((m) => m.name === name && m.role === role),
+      `${sentence} -> expected ${name}/${role}; got ${JSON.stringify(members)}`
+    );
+  }
+});
+
+test('parseAcknowledgements does not extract untitled advisors from ambiguous or administrative prose (Lever B)', () => {
+  const PAD = 'I am deeply grateful to the many people who made this long and difficult project possible over the years. ';
+  const negatives = [
+    'my advisor was extremely generous with her time',
+    'my advisor and I met every week to discuss progress',
+    'the advisor Michael suggested I revise the chapter',
+    'my advisor at the consulting firm, before graduate school, taught me',
+    'my academic advisor Jane Smith helped with course registration',
+    'my graduate advisor Bob Jones handled my paperwork',
+  ];
+  for (const sentence of negatives) {
+    const text = `\nACKNOWLEDGEMENTS\n\n${PAD}${sentence} ${PAD}\n`;
+    const members = parseAcknowledgements(text);
+    assert.equal(
+      members.some((m) => ['Supervisor', 'Co-Supervisor'].includes(m.role)),
+      false,
+      `${sentence} -> unexpectedly extracted ${JSON.stringify(members)}`
+    );
+  }
+});
+
 test('parseCommittee parses different layout structures from exam cert pages', () => {
   // Test case 1: Pre-2016 format (name above role label)
   const committeeText1 = `The following individuals certify that they have read, and recommend to the Faculty of Graduate and Postdoctoral Studies...
