@@ -62,6 +62,49 @@ text extractor can close it. Size the investment to that ceiling.
 
 ---
 
+## F-2b — "academic/graduate advisor, <Name>" (punctuated, untitled) misfiled as Supervisor
+
+**Status:** open (deferred) · **Component:** `src/pdf.js` `PAT_BARE_ADVISOR_PREFIX` (its infix still
+includes `academic`) · **Severity:** important (precision) · **Pre-existing; NOT introduced or
+amplified by Levers A/B.**
+
+**Evidence:** `"my academic advisor, Jane Smith, for help with course registration"` currently
+extracts `Jane Smith / Supervisor`. "Academic advisor" (and "graduate advisor") are typically
+*administrative* staff, not the thesis supervisor. (`"my graduate advisor, Bob Jones"` correctly
+returns nothing — `graduate` isn't in that pattern's infix; only `academic` is.)
+
+**Why it wasn't fixed with Lever A/B:** the naive fix — drop `academic` from
+`PAT_BARE_ADVISOR_PREFIX` — breaks a legitimate existing positive:
+`"my academic co-adviser — J. R. Smith"` → `Co-Supervisor` (test `pdfParser.test.js` "accepts
+conservative advisor variants"). The real differentiator is the **`co-` prefix**: `co-adviser`
+is supervisory; a bare `academic/graduate advisor` (no `co-`) is administrative. A correct fix must
+distinguish on the full role phrase (reject `{academic|graduate} advisor` only when there is no
+`co-`), not on the infix word alone. Deferred because it needs that role-phrase disambiguation and
+is outside the Lever A/B scope, and the no-`co-` admin form is only reached via the older punctuated
+pattern (Lever B's untitled pattern uses infix `thesis|doctoral|dissertation`, so it does not widen
+this).
+
+**Related mitigation already shipped:** `isPlausibleBareAdvisorName` now rejects institution/
+geography names (e.g. "National Science Foundation", "Statistics Canada") so orgs following
+"my advisor" are no longer misfiled as supervisors (Lever B precision guard).
+
+## F-2c — acknowledgements section detection / OCR limits recall on some clean-phrasing docs
+
+**Status:** open (Lever C, deferred) · **Component:** `src/pdf.js` `parseAcknowledgementsDetailed`
+section slicing + OCR-spacing repair · **Severity:** important (recall on the failure population).
+
+**Evidence (live gold, rows 1-50):** after Levers A+B, name-level recall on the labeled failure
+docs rose from **16% → 37%**. Several remaining misses have the supervisor **cleanly phrased and in
+text, with an ACKNOWLEDGEMENTS heading present, yet nothing is extracted** — the mention falls
+outside the sliced section window:
+- `1.0090378` "my thesis advisor Joy Dixon for reading" — extracts in isolation, misses in-doc.
+- `1.0100786` "my advisor, Joy Dixon, for her patience" — same.
+- `1.0091408` — OCR-spaced name "Professor Wi l l iam Wray" defeats name capture (OCR repair gap).
+
+**Recommendation:** improve heading detection for OCR-spaced/variant headings and widen/repair the
+section window; strengthen `normalizeAcknowledgementOcrSpacing` for partial-glyph runs. This is the
+"Lever C" work deliberately scoped out of the Levers A/B pass.
+
 ## Related non-`src` limitations (already handled in the harness, noted for context)
 - **Sampling by degree alone** missed program-scoped targets (History = degree
   `Master of Arts - MA` + program `History`). Fixed: program-level `--targets` + per-era
