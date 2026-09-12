@@ -10,6 +10,13 @@ export function buildWorksheetRows(docId, { committee = [], acknowledgement = []
     if (onCert) continue; // already represented by its certificate row
     rows.push({ docId, name: a.name, proposed_role: a.role, on_certificate: false, source: 'acknowledgement', keep: '', true_role: '', is_negative: certificatePresent ? 'Y' : '' });
   }
+  // A doc with no auto-detected candidates is exactly the failure case we most
+  // need hand-labeled. Emit one empty placeholder row so the doc stays VISIBLE
+  // in the worksheet (build-gold attaches its ack_slice) — otherwise the whole
+  // certificate-absent failure population silently vanishes from the sheet.
+  if (rows.length === 0) {
+    rows.push({ docId, name: '', proposed_role: '', on_certificate: false, source: 'none', keep: '', true_role: '', is_negative: '' });
+  }
   return rows;
 }
 

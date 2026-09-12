@@ -15,6 +15,34 @@ test('buildWorksheetRows marks off-certificate ack names as negative candidates'
   assert.ok(kelly);
 });
 
+test('buildWorksheetRows emits a placeholder row when a doc has no candidates (keeps failure docs visible)', () => {
+  const rows = buildWorksheetRows('1.0999', { committee: [], acknowledgement: [], certificatePresent: false });
+  assert.equal(rows.length, 1, 'exactly one placeholder row');
+  assert.equal(rows[0].docId, '1.0999');
+  assert.equal(rows[0].name, '');
+  assert.equal(rows[0].source, 'none');
+  assert.equal(rows[0].on_certificate, false);
+  assert.equal(rows[0].is_negative, '');
+});
+
+test('buildWorksheetRows does NOT add a placeholder when candidates exist', () => {
+  const rows = buildWorksheetRows('1.0001', {
+    committee: [{ name: 'A Person', role: 'Supervisor' }], acknowledgement: [], certificatePresent: true,
+  });
+  assert.equal(rows.length, 1);
+  assert.ok(rows.every((r) => r.source !== 'none'), 'no placeholder alongside real candidates');
+});
+
+test('finalizeGold leaves a placeholder-only doc present with empty members/negatives', () => {
+  const gold = finalizeGold([
+    { docId: '1.0999', name: '', proposed_role: '', keep: '', true_role: '', is_negative: '' },
+  ]);
+  const d = gold.find((g) => g.docId === '1.0999');
+  assert.ok(d, 'doc still represented in gold');
+  assert.deepEqual(d.members, []);
+  assert.deepEqual(d.negatives, []);
+});
+
 test('finalizeGold groups reviewed rows into members and negatives', () => {
   const reviewed = [
     { docId: '1.0001', name: 'Deirdre Kelly', proposed_role: 'Supervisor', keep: 'Y', true_role: '', is_negative: '' },
