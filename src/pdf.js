@@ -1632,7 +1632,13 @@ export function parseAcknowledgementsDetailed(fullText) {
 
   const rawSection = text.slice(ackMatch.index + ackMatch[0].length, ackMatch.index + ackMatch[0].length + 3000);
   const normalizedSection = normalizeAcknowledgementOcrSpacing(rawSection);
-  const section = normalizedSection.text;
+  // Lever C1: within the bounded section only, collapse intra-section line-wrap
+  // newlines (and resulting whitespace runs) into single spaces so names/phrases
+  // that pdftotext wrapped across a line break — e.g. "my advisor, Joy \nDixon" —
+  // become contiguous for the PAT_* matchers instead of truncating at the newline.
+  // No text is deleted. Sentence terminators (. ! ? ; :) are preserved, so a match
+  // still cannot run across a sentence boundary (patterns use those, not \n).
+  const section = normalizedSection.text.replace(/\s+/g, ' ');
 
   const members = [];
   const seen = new Set();

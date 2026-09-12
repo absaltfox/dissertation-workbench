@@ -636,6 +636,42 @@ test('parseAcknowledgements still extracts person names after the org/place guar
   }
 });
 
+test('parseAcknowledgements collapses intra-section line-wraps so wrapped names are not truncated (Lever C1)', () => {
+  const PAD = 'I am deeply grateful to the many people who made this long and difficult project possible over the years. ';
+  const positives = [
+    // doc 1.0100786: pdftotext wraps "Joy \nDixon" across a line break
+    ['I would like to thank my advisor, Joy \nDixon, for her patience and encouragement.', 'Joy Dixon', 'Supervisor'],
+    // titled + wrapped across the line break
+    ['I thank my thesis supervisor, Professor Peter \nBoothroyd, who guided this work.', 'Peter Boothroyd', 'Supervisor'],
+  ];
+  for (const [sentence, name, role] of positives) {
+    const text = `\nACKNOWLEDGEMENTS\n\n${PAD}${sentence} ${PAD}\n`;
+    const members = parseAcknowledgements(text);
+    assert.ok(
+      members.some((m) => m.name === name && m.role === role),
+      `${sentence} -> expected ${name}/${role}; got ${JSON.stringify(members)}`
+    );
+  }
+});
+
+test('parseAcknowledgements newline-collapse does not create cross-sentence matches (Lever C1 precision)', () => {
+  const PAD = 'I am deeply grateful to the many people who made this long and difficult project possible over the years. ';
+  const negatives = [
+    // Period boundary must still block; Smith is not the supervisor.
+    'I thank my supervisor.\nDr. Smith gave a guest lecture that year.',
+    'I thank the members of my committee.\nJohn Doe attended the defense as an observer.',
+  ];
+  for (const sentence of negatives) {
+    const text = `\nACKNOWLEDGEMENTS\n\n${PAD}${sentence} ${PAD}\n`;
+    const members = parseAcknowledgements(text);
+    assert.equal(
+      members.length,
+      0,
+      `${sentence} -> unexpectedly extracted ${JSON.stringify(members)}`
+    );
+  }
+});
+
 test('parseCommittee parses different layout structures from exam cert pages', () => {
   // Test case 1: Pre-2016 format (name above role label)
   const committeeText1 = `The following individuals certify that they have read, and recommend to the Faculty of Graduate and Postdoctoral Studies...
