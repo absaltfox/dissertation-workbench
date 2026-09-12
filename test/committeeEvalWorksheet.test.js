@@ -2,21 +2,49 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { buildWorksheetRows, finalizeGold } from '../scripts/committee-eval/lib/worksheet.mjs';
 
-test('buildWorksheetRows marks off-certificate ack names as negative candidates', () => {
+test('buildWorksheetRows: when the certificate already names a supervisor, the ack path is NOT surfaced (mirrors production gating)', () => {
   const rows = buildWorksheetRows('1.0001', {
     committee: [{ name: 'Deirdre Kelly', role: 'Supervisor' }],
     acknowledgement: [{ name: 'Deirdre Kelly', role: 'Supervisor' }, { name: 'My Boss', role: 'Supervisor' }],
-    certificatePresent: true,
   });
-  const boss = rows.find((r) => r.name === 'My Boss');
-  assert.equal(boss.on_certificate, false);
-  assert.equal(boss.is_negative, 'Y');
-  const kelly = rows.find((r) => r.name === 'Deirdre Kelly' && r.source === 'certificate');
-  assert.ok(kelly);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].source, 'certificate');
+  assert.equal(rows[0].name, 'Deirdre Kelly');
+  assert.ok(!rows.some((r) => r.source === 'acknowledgement'), 'no ack rows when the cert page has a supervisor');
+});
+
+test('buildWorksheetRows: ack IS surfaced when the committee has no supervisor, and is not auto-flagged negative', () => {
+  // certificate-absent doc (empty committee) — the failure population
+  const rows = buildWorksheetRows('1.0002', {
+    committee: [],
+    acknowledgement: [{ name: 'Jane Advisor', role: 'Supervisor' }],
+  });
+  const ack = rows.find((r) => r.source === 'acknowledgement');
+  assert.ok(ack, 'ack candidate surfaced');
+  assert.equal(ack.name, 'Jane Advisor');
+  assert.equal(ack.is_negative, '', 'surfaced ack candidates are not pre-flagged as negatives (human decides)');
+});
+
+test('buildWorksheetRows: examiners-only certificate (no supervisor) still consults ack for the missing supervisor', () => {
+  const rows = buildWorksheetRows('1.0003', {
+    committee: [{ name: 'Ex Aminer', role: 'University Examiner' }],
+    acknowledgement: [{ name: 'Real Super', role: 'Supervisor' }],
+  });
+  assert.ok(rows.some((r) => r.source === 'certificate' && r.name === 'Ex Aminer'));
+  assert.ok(rows.some((r) => r.source === 'acknowledgement' && r.name === 'Real Super'));
+});
+
+test('buildWorksheetRows: ack name matching a certificate member is de-duped (not repeated)', () => {
+  const rows = buildWorksheetRows('1.0004', {
+    committee: [{ name: 'Al Examiner', role: 'University Examiner' }], // no supervisor → ack consulted
+    acknowledgement: [{ name: 'Al Examiner', role: 'University Examiner' }, { name: 'New Name', role: 'Supervisor' }],
+  });
+  assert.equal(rows.filter((r) => r.name === 'Al Examiner').length, 1, 'Al Examiner appears once (certificate row)');
+  assert.ok(rows.some((r) => r.source === 'acknowledgement' && r.name === 'New Name'));
 });
 
 test('buildWorksheetRows emits a placeholder row when a doc has no candidates (keeps failure docs visible)', () => {
-  const rows = buildWorksheetRows('1.0999', { committee: [], acknowledgement: [], certificatePresent: false });
+  const rows = buildWorksheetRows('1.0999', { committee: [], acknowledgement: [] });
   assert.equal(rows.length, 1, 'exactly one placeholder row');
   assert.equal(rows[0].docId, '1.0999');
   assert.equal(rows[0].name, '');
@@ -27,7 +55,7 @@ test('buildWorksheetRows emits a placeholder row when a doc has no candidates (k
 
 test('buildWorksheetRows does NOT add a placeholder when candidates exist', () => {
   const rows = buildWorksheetRows('1.0001', {
-    committee: [{ name: 'A Person', role: 'Supervisor' }], acknowledgement: [], certificatePresent: true,
+    committee: [{ name: 'A Person', role: 'Supervisor' }], acknowledgement: [],
   });
   assert.equal(rows.length, 1);
   assert.ok(rows.every((r) => r.source !== 'none'), 'no placeholder alongside real candidates');

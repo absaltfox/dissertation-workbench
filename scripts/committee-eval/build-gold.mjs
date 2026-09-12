@@ -34,10 +34,11 @@ for (const entry of manifest) {
   const textPath = path.join(TEXT_DIR, `${entry.docId}.txt`);
   if (!existsSync(textPath)) continue;
   const fullText = readFileSync(textPath, 'utf8');
-  const certificatePresent = /the following individuals certify/i.test(fullText);
   const committee = parseCommittee(fullText);
   const acknowledgement = parseAcknowledgementsDetailed(fullText).members;
-  const docRows = buildWorksheetRows(entry.docId, { committee, acknowledgement, certificatePresent });
+  // buildWorksheetRows gates the ack path on committee having no supervisor (mirrors
+  // production), so it derives the certificate signal from the parsed committee itself.
+  const docRows = buildWorksheetRows(entry.docId, { committee, acknowledgement });
   // Attach the acknowledgements text slice for hand-labeling certificate-absent docs.
   const ackIdx = fullText.search(/acknowledg/i);
   const ackSlice = ackIdx === -1 ? '' : fullText.slice(ackIdx, ackIdx + 1500).replace(/\s+/g, ' ');
