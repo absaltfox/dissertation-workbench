@@ -1492,7 +1492,9 @@ function extractNameFromCapture(raw) {
     // Reject common pronouns/articles that appear after a sentence boundary
     if (/^(He|She|They|We|I|It|His|Her|Their|This|That|The|A|An)$/.test(stripped)) break;
     // Sentence-ending period (word length > 2 means NOT a middle initial like "J.")
-    const endsWithSentencePeriod = /\.$/.test(stripped) && stripped.length > 2;
+    // Compact multi-initial tokens like "R.A.J." are also not sentence-ending.
+    const isMultiInitial = /^(?:[A-Z]\.){2,}$/.test(stripped);
+    const endsWithSentencePeriod = /\.$/.test(stripped) && stripped.length > 2 && !isMultiInitial;
     // Push with period stripped from non-initial words
     parts.push(endsWithSentencePeriod ? stripped.slice(0, -1) : stripped);
     if (parts.length >= 4) break;
@@ -1557,7 +1559,7 @@ function isPlausibleBareAdvisorName(raw) {
 const PAT_PLURAL_SUPERVISORS = new RegExp(
   `my\\s+supervisors?,?\\s+${TITLE_RE}\\s+${DR_CAP}\\s+and\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
 const PAT_MY_SUPERVISOR = new RegExp(
-  `(?:my|research)\\s+(co-?)?supervisor,?\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
+  `(?:my|the|research)\\s+(?:(?:thesis|graduate|doctoral|dissertation|academic|research|senior)\\s+)?(co-?)?(?:supervisor|advis(?:or|er))s?,?\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
 const PAT_COMMITTEE_CHAIR = new RegExp(
   `Committee\\s+Chair\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
 const PAT_TITLE_ROLE_PARENS = new RegExp(

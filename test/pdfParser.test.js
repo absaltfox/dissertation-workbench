@@ -496,6 +496,39 @@ test('parseAcknowledgements accepts conservative advisor variants and complex na
   }
 });
 
+test('parseAcknowledgements recognizes thesis/graduate adjective infix and titled advisor (Lever A)', () => {
+  const positives = [
+    ['my thesis supervisor, Professor Peter Boothroyd', 'Supervisor', 'Boothroyd'],
+    ['my thesis advisor, Prof. R.A.J. McDonald', 'Supervisor', 'McDonald'],
+    ['my research supervisor, Dr. Jane Smith', 'Supervisor', 'Smith'],
+    ['my supervisor, Dr. John Doe', 'Supervisor', 'Doe'],
+  ];
+  for (const [phrase, role, surname] of positives) {
+    const text = `ACKNOWLEDGEMENTS\n\nI am deeply grateful to ${phrase}, whose thoughtful guidance made this work possible.\nThe support of colleagues and friends sustained the project over many years and made a real difference.\n`;
+    const members = parseAcknowledgements(text);
+    assert.ok(
+      members.some((m) => m.role === role && m.name.split(/\s+/).pop() === surname),
+      `${phrase} -> expected surname ${surname}; got ${JSON.stringify(members)}`
+    );
+  }
+});
+
+test('parseAcknowledgements does not over-broaden the adjective-infix supervisor pattern', () => {
+  const negatives = [
+    'my supervisor was extremely generous with her time',
+    'the supervisor Michael suggested edits',
+  ];
+  for (const sentence of negatives) {
+    const text = `ACKNOWLEDGEMENTS\n${sentence}, and I am thankful for it.\nI remain grateful to friends and family whose generous support made this long project possible.`;
+    const members = parseAcknowledgements(text);
+    assert.equal(
+      members.some((m) => ['Supervisor', 'Co-Supervisor'].includes(m.role)),
+      false,
+      sentence
+    );
+  }
+});
+
 test('parseAcknowledgements does not infer bare advisors from ambiguous prose or institutions', () => {
   const negatives = [
     'The advisor Michael suggested that I speak to the archive staff.',
