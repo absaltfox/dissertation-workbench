@@ -105,6 +105,33 @@ outside the sliced section window:
 section window; strengthen `normalizeAcknowledgementOcrSpacing` for partial-glyph runs. This is the
 "Lever C" work deliberately scoped out of the Levers A/B pass.
 
+## F-2d — greedy name-capture can merge two adjacent names (amplified by Lever C1)
+
+**Status:** open (tracked; deterministic fix not safe) · **Component:** `src/pdf.js`
+`extractNameFromCapture` + `PAT_BARE_ADVISOR_PREFIX`/`PAT_BARE_ADVISOR_UNTITLED` · **Severity:**
+important (precision) · **Pre-existing; blast radius widened by Lever C1's whitespace collapse.**
+
+**Evidence:** `"my advisor, Joy \nDixon Peter Parker was also present"` → extracts
+`"Joy Dixon Peter Parker" / Supervisor` (two people merged into one bogus name). Reproduces
+identically on a single line (`"my advisor, Joy Dixon Peter Parker was..."`), so the root defect is
+pre-existing: `extractNameFromCapture` greedily accepts up to 4 capitalized tokens, stopping only at
+a lowercase word or sentence terminator. Lever C1 (collapsing intra-section line-wraps) removed a
+`\n` that previously fire-walled this whenever the unrelated capitalized run began on the next line.
+
+**Why it is NOT fixed deterministically:** the naive guard (cap the capture at 2 tokens) would
+regress legitimate multi-token names this project just added support for — `R. A. J. McDonald`,
+`Francis L. F. Lee` (4 tokens each). Capitalization alone cannot distinguish one 3–4-token name
+(`Mary Jane Watson`) from two adjacent names (`Joy Dixon Peter Parker`). This is the deterministic
+parser's genuine ceiling — and the **clearest concrete case for a span-grounded model** (GLiNER
+shadow proposer, design §5), which resolves name boundaries from learned span structure rather than
+capitalization runs.
+
+**Mitigating facts:** on the real eval gold this never triggered (recall rose 37%→42% with zero
+false positives / zero negative-set violations); the failing shape (a wrapped name immediately
+followed by an unrelated capitalized name with no comma/period/lowercase between them) is rare in
+natural acknowledgement prose, where a supervisor name is almost always followed by `,`/`for`/`who`/
+a period. Shipped on that basis; revisit if a model layer is introduced.
+
 ## Related non-`src` limitations (already handled in the harness, noted for context)
 - **Sampling by degree alone** missed program-scoped targets (History = degree
   `Master of Arts - MA` + program `History`). Fixed: program-level `--targets` + per-era
