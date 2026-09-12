@@ -1540,6 +1540,18 @@ const ADVISOR_NAME_STOP_WORDS = new Set([
   'thesis', 'support', 'guidance', 'encouragement', 'assistance',
 ]);
 
+// Strong organization / geography signals.  A candidate whose tokens include any
+// of these is an institution or place ("National Science Foundation",
+// "Statistics Canada", "Vancouver General Hospital"), not a person, so reject it.
+// Kept to unambiguous org/place words so ordinary human names are never rejected.
+const ADVISOR_NAME_ORG_PLACE_WORDS = new Set([
+  'university', 'college', 'institute', 'foundation', 'hospital', 'association',
+  'council', 'ministry', 'department', 'society', 'commission', 'bureau',
+  'agency', 'corporation', 'company', 'museum', 'library', 'laboratory',
+  'centre', 'center', 'nations', 'statistics', 'canada', 'america', 'national',
+  'international', 'federal', 'science',
+]);
+
 function isPlausibleBareAdvisorName(raw) {
   const name = extractNameFromCapture(raw);
   const tokens = name.split(/\s+/).filter(Boolean);
@@ -1549,6 +1561,7 @@ function isPlausibleBareAdvisorName(raw) {
     const bare = token.replace(/[.'’\-]/g, '');
     if (NAME_PARTICLES.has(bare.toLowerCase())) continue;
     if (ADVISOR_NAME_STOP_WORDS.has(bare.toLowerCase())) return '';
+    if (ADVISOR_NAME_ORG_PLACE_WORDS.has(bare.toLowerCase())) return '';
     if (!/^\p{Lu}[\p{L}\p{M}'’.-]*$/u.test(token)) return '';
     substantive += 1;
   }
