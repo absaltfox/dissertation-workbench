@@ -1519,16 +1519,75 @@ const TITLE_RE = '(?:Dr\\.|Prof(?:essor)?\\.?)';
 const BARE_NAME = '[A-Z\\u00C0-\\u024F][a-zA-Z\\u00C0-\\u024F]+(?:\\s+[A-Z\\u00C0-\\u024F][a-zA-Z\\u00C0-\\u024F]+){1,2}';
 
 // pdftotext/OCR sometimes emits words one glyph at a time ("a d v i s o r",
-// "M i c h a e l").  Repair only runs against the bounded acknowledgements
-// slice and only joins runs of four or more letters, preserving initials such
-// as "J R R" and avoiding any mutation of citations or the thesis body.
+// "M i c h a e l") or in short/variable fragments ("M y", "Wi l l iam",
+// "Al l ison").  Repair only runs against the bounded acknowledgements slice, so
+// it never touches citations or the thesis body.
+//
+// The hard constraint is to reconstruct split words WITHOUT corrupting legitimate
+// spaced initials ("J. R. R. Tolkien", "R. A. J. McDonald", "U. S.").  Two surface
+// features make that safe:
+//   1. Runs are matched only across single horizontal-space separators with NO
+//      period adjacent, so period-separated initials ("J. R. R.", "R.A.J.") never
+//      form a run in the first place.
+//   2. A run is segmented into word-groups at each uppercase-initial token, and a
+//      group is glued only when it carries an OCR-split "signature": a single
+//      LOWERCASE fragment letter (excluding the article "a").  Sequences of
+//      all-uppercase single letters ("J R R", "U S") become singleton groups and
+//      are left untouched.
+// A trailing multi-letter lowercase token is treated as a word continuation only
+// when the group's first token is itself a multi-letter uppercase fragment
+// ("Wi"->William, "Al"->Allison); otherwise it is an intact following word ("M y
+// dog" -> "My dog", never "Mydog") and is left in place.
+function isOcrFragmentLetter(token) {
+  return token.length === 1 && /\p{Ll}/u.test(token) && token.toLowerCase() !== 'a';
+}
+
+function glueOcrGroup(tokens) {
+  if (tokens.length < 2 || !tokens.some(isOcrFragmentLetter)) return tokens.join(' ');
+  const kept = tokens.slice();
+  // Trim leading intact words: a multi-letter LOWERCASE token is a preceding word
+  // ("my a d v i s o r" -> "my advisor"), not a capitalized word-start fragment.
+  const leadPrefix = [];
+  while (kept.length > 1 && kept[0].length >= 2 && /^\p{Ll}/u.test(kept[0])) {
+    leadPrefix.push(kept.shift());
+  }
+  // Trailing intact-word trim: a >=2-letter lowercase tail is a separate following
+  // word ("M y dog" -> "My dog") UNLESS the word-start is a multi-letter uppercase
+  // fragment ("Wi"->William, "Al"->Allison), in which case it is a continuation.
+  const firstIsMultiUpper = kept[0].length >= 2 && /^\p{Lu}/u.test(kept[0]);
+  const trailSuffix = [];
+  if (!firstIsMultiUpper) {
+    while (kept.length > 1 && kept[kept.length - 1].length >= 2 && /^\p{Ll}/u.test(kept[kept.length - 1])) {
+      trailSuffix.unshift(kept.pop());
+    }
+  }
+  if (kept.length < 2 || !kept.some(isOcrFragmentLetter)) return tokens.join(' ');
+  return [...leadPrefix, kept.join(''), ...trailSuffix].join(' ');
+}
+
+function glueOcrRun(run) {
+  const tokens = run.split(/[ \t]+/).filter(Boolean);
+  if (tokens.length < 2) return run;
+  const groups = [];
+  for (const token of tokens) {
+    if (groups.length === 0 || /^\p{Lu}/u.test(token)) groups.push([token]);
+    else groups[groups.length - 1].push(token);
+  }
+  return groups.map(glueOcrGroup).join(' ');
+}
+
 function normalizeAcknowledgementOcrSpacing(value) {
   let changed = false;
+  // A candidate run is a sequence of >=2 short (1-4 letter) tokens joined only by
+  // horizontal whitespace, with no letter/period abutting either boundary.  The
+  // 1-4 length cap plus the boundary lookahead keep intact words ("supervisor")
+  // and their partial prefixes out of the run.
   const text = String(value || '').replace(
-    /(?<![\p{L}\p{M}])(?:[\p{L}\p{M}]\s+){3,}[\p{L}\p{M}](?![\p{L}\p{M}])/gu,
+    /(?<![\p{L}\p{M}.])(?:[\p{L}\p{M}]{1,4}(?:[ \t]+[\p{L}\p{M}]{1,4})+)(?![\p{L}\p{M}.])/gu,
     (match) => {
-      changed = true;
-      return match.replace(/\s+/g, '');
+      const repaired = glueOcrRun(match);
+      if (repaired !== match) changed = true;
+      return repaired;
     }
   );
   return { text, changed };
