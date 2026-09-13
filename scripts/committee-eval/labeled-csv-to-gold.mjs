@@ -24,19 +24,55 @@ const CSV_PATH = join(REPO_ROOT, 'data/committee-eval/gold-worksheet.csv');
 const OUT_PATH = join(REPO_ROOT, 'test/fixtures/committee-eval/gold.json');
 
 // ---- CLI args ----
+// Default: the single original worksheet, capped at --max-rows (50). To widen the gold
+// across batches WITHOUT re-labeling, pass --inputs, each "path[:maxRows]" (omit :maxRows
+// to take all rows). Merged by recovered docId; batches are disjoint by construction.
+//   --inputs data/committee-eval/gold-worksheet.csv:50 data/committee-eval/gold-worksheet-widen.csv
 function parseArgs(argv) {
   let maxRows = 50;
+  const inputs = [];
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--max-rows') {
       const v = Number(argv[i + 1]);
-      if (!Number.isFinite(v) || v <= 0) {
-        throw new Error(`Invalid --max-rows value: ${argv[i + 1]}`);
-      }
+      if (!Number.isFinite(v) || v <= 0) throw new Error(`Invalid --max-rows value: ${argv[i + 1]}`);
       maxRows = v;
       i++;
+    } else if (argv[i] === '--inputs') {
+      for (let j = i + 1; j < argv.length && !argv[j].startsWith('--'); j++) {
+        const [p, rows] = argv[j].split(':');
+        inputs.push({ path: p, maxRows: rows != null && rows !== '' ? Number(rows) : Infinity });
+      }
     }
   }
-  return { maxRows };
+  return { maxRows, inputs };
+}
+
+// Read one labeled CSV and merge its rows (up to maxRows data rows) into docsByTrueId.
+function ingestCsv(path, maxRows, docsByTrueId, order, warnings) {
+  const allRows = parseCsv(readFileSync(path, 'utf8')).filter((r) => r.length > 1 || r[0] !== '');
+  const header = allRows[0];
+  const cap = Number.isFinite(maxRows) ? 1 + maxRows : allRows.length;
+  const dataRows = allRows.slice(1, cap);
+  const idx = {
+    docId: header.indexOf('docId'), ocUrl: header.indexOf('oc_url'),
+    name: header.indexOf('name'), proposedRole: header.indexOf('proposed_role'),
+    isNegative: header.indexOf('is_negative'),
+  };
+  for (const [key, i] of Object.entries(idx)) {
+    if (i === -1) throw new Error(`${path}: CSV missing expected column: ${key}`);
+  }
+  for (const row of dataRows) {
+    const trueDocId = recoverDocId(row[idx.ocUrl] || '', row[idx.docId] || '');
+    const name = (row[idx.name] || '').trim();
+    const isNegative = /^y$/i.test((row[idx.isNegative] || '').trim());
+    if (!docsByTrueId.has(trueDocId)) { docsByTrueId.set(trueDocId, { members: [], negatives: [] }); order.push(trueDocId); }
+    const doc = docsByTrueId.get(trueDocId);
+    if (name) {
+      if (isNegative) doc.negatives.push(name);
+      else doc.members.push({ name, role: normalizeRole(row[idx.proposedRole] || '', trueDocId, warnings) });
+    }
+  }
+  return dataRows.length;
 }
 
 // ---- RFC-4180 CSV parser ----
@@ -170,51 +206,18 @@ function recoverDocId(ocUrl, fallback) {
 }
 
 function main() {
-  const { maxRows } = parseArgs(process.argv.slice(2));
-
-  const csvText = readFileSync(CSV_PATH, 'utf8');
-  const allRows = parseCsv(csvText).filter((r) => r.length > 1 || r[0] !== '');
-  const header = allRows[0];
-  const dataRows = allRows.slice(1, 1 + maxRows);
-
-  const idx = {
-    docId: header.indexOf('docId'),
-    ocUrl: header.indexOf('oc_url'),
-    name: header.indexOf('name'),
-    proposedRole: header.indexOf('proposed_role'),
-    isNegative: header.indexOf('is_negative'),
-  };
-  for (const [key, i] of Object.entries(idx)) {
-    if (i === -1) throw new Error(`CSV missing expected column: ${key}`);
-  }
+  const { maxRows, inputs } = parseArgs(process.argv.slice(2));
+  // Default to the single original worksheet (backward compatible) when --inputs is absent.
+  const sources = inputs.length ? inputs : [{ path: CSV_PATH, maxRows }];
 
   const warnings = [];
   const docsByTrueId = new Map(); // trueDocId -> { members: [], negatives: [] }
-  const order = []; // preserve first-seen order (not strictly needed since we sort)
-
-  for (const row of dataRows) {
-    const rawDocId = row[idx.docId] || '';
-    const ocUrl = row[idx.ocUrl] || '';
-    const trueDocId = recoverDocId(ocUrl, rawDocId);
-
-    const name = (row[idx.name] || '').trim();
-    const proposedRole = row[idx.proposedRole] || '';
-    const isNegative = /^y$/i.test((row[idx.isNegative] || '').trim());
-
-    if (!docsByTrueId.has(trueDocId)) {
-      docsByTrueId.set(trueDocId, { members: [], negatives: [] });
-      order.push(trueDocId);
-    }
-    const doc = docsByTrueId.get(trueDocId);
-
-    if (name) {
-      const role = normalizeRole(proposedRole, trueDocId, warnings);
-      if (isNegative) {
-        doc.negatives.push(name);
-      } else {
-        doc.members.push({ name, role });
-      }
-    }
+  const order = [];
+  let totalRows = 0;
+  for (const { path, maxRows: cap } of sources) {
+    const n = ingestCsv(path, cap, docsByTrueId, order, warnings);
+    totalRows += n;
+    console.log(`Ingested ${n} data rows from ${path}${Number.isFinite(cap) ? ` (cap ${cap})` : ''}`);
   }
 
   const gold = Array.from(docsByTrueId.entries())
@@ -230,7 +233,7 @@ function main() {
   const rolesUsed = new Set();
   for (const d of gold) for (const m of d.members) rolesUsed.add(m.role);
 
-  console.log(`Rows read from CSV (data rows, capped at --max-rows=${maxRows}): ${dataRows.length}`);
+  console.log(`Total data rows ingested across ${sources.length} input(s): ${totalRows}`);
   console.log(`Docs: ${gold.length}`);
   console.log(`Docs with >=1 member: ${docsWithMembers}`);
   console.log(`Total members: ${totalMembers}`);
