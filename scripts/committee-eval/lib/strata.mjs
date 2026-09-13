@@ -56,13 +56,17 @@ function matchesTarget(entry, target) {
 // sample). Ordering within a cell is a stable docId hash: reproducible, and
 // decorrelated from ingestion/id order. A doc matching multiple targets is
 // counted once (first target wins).
-export function selectSample(entries, { targets, perEra }) {
+export function selectSample(entries, { targets, perEra, exclude }) {
+  // `exclude` (a Set/array of docIds already sampled in a prior batch) makes a new
+  // batch DISJOINT from earlier ones, so widening the gold never re-samples — and
+  // therefore never asks a human to re-label — a doc already in an earlier batch.
+  const excludeSet = exclude instanceof Set ? exclude : new Set(exclude || []);
   const seen = new Set();
   const manifest = [];
   const counts = { total: 0, byCell: {} };
   for (const target of targets) {
     const label = target.program ? `${target.degree} / ${target.program}` : target.degree;
-    const matches = entries.filter((e) => matchesTarget(e, target));
+    const matches = entries.filter((e) => matchesTarget(e, target) && !excludeSet.has(e.docId));
     for (const era of ['pre2018', '2018plus']) {
       const inEra = matches.filter((e) => e.era === era && !seen.has(e.docId));
       const picked = take([...inEra].sort(byOrderKey), perEra);

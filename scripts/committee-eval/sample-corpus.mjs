@@ -8,13 +8,15 @@
 // Use "Degree::Program" when the degree string is shared across programs (e.g.
 // History is "Master of Arts - MA::History"). --per-era caps docs per (target × era),
 // so both the pre-2018 and 2018+ regimes are deliberately sampled.
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import path from 'node:path';
 import { getDb } from '../../src/db.js';
 import { TURSO_DATABASE_URL } from '../../src/config.js';
 import { buildManifestEntry, selectSample } from './lib/strata.mjs';
 
 const argv = process.argv.slice(2);
 const has = (f) => argv.includes(f);
+function str(flag, def) { const i = argv.indexOf(flag); return i === -1 ? def : argv[i + 1]; }
 function multi(flag) {
   const i = argv.indexOf(flag);
   if (i === -1) return [];
@@ -65,6 +67,14 @@ if (!targets.length) {
 }
 const perEra = num('--per-era', 25);
 
+// --exclude <manifest.json>: docIds already sampled in a prior batch, so a widening
+// batch stays DISJOINT (never re-samples/re-labels a doc). --out overrides the manifest path.
+const excludePath = str('--exclude', null);
+const exclude = excludePath
+  ? new Set(JSON.parse(readFileSync(excludePath, 'utf8')).map((e) => String(e.docId)))
+  : new Set();
+const outPath = str('--out', 'test/fixtures/committee-eval/manifest.json');
+
 const rs = await db.execute({ sql: 'SELECT doc_id, metadata_json FROM documents', args: [] });
 const entries = rs.rows.map((row) => {
   let meta = {};
@@ -72,9 +82,9 @@ const entries = rs.rows.map((row) => {
   return buildManifestEntry(String(row.doc_id), meta);
 });
 
-const { manifest, counts } = selectSample(entries, { targets, perEra });
-mkdirSync('test/fixtures/committee-eval', { recursive: true });
-writeFileSync('test/fixtures/committee-eval/manifest.json', JSON.stringify(manifest, null, 2) + '\n');
-console.log(`Wrote manifest: ${counts.total} docs`);
+const { manifest, counts } = selectSample(entries, { targets, perEra, exclude });
+mkdirSync(path.dirname(outPath), { recursive: true });
+writeFileSync(outPath, JSON.stringify(manifest, null, 2) + '\n');
+console.log(`Wrote manifest: ${counts.total} docs${excludePath ? ` (excluding ${exclude.size} prior)` : ''} -> ${outPath}`);
 for (const [cell, n] of Object.entries(counts.byCell)) console.log(`  ${cell}: ${n}`);
 process.exit(0);

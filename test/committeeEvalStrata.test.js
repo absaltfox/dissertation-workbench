@@ -71,6 +71,18 @@ test('selectSample is deterministic and decorrelated from input order', () => {
   assert.notDeepEqual(a, firstTen, 'selection is not just the first-N in input order');
 });
 
+test('selectSample honors exclude (disjoint batches for gold widening)', () => {
+  const entries = [];
+  for (let i = 0; i < 10; i++) entries.push(mk(`h-${i}`, 'Master of Arts - MA', 'History', 2010));
+  const opts = { targets: [{ degree: 'Master of Arts - MA', program: 'History' }], perEra: 5 };
+  const first = selectSample(entries, opts).manifest.map((m) => m.docId);
+  const exclude = new Set(first);
+  const second = selectSample(entries, { ...opts, exclude }).manifest.map((m) => m.docId);
+  assert.equal(first.length, 5);
+  assert.equal(second.length, 5, 'a second batch of 5 from the remaining 5');
+  assert.equal(second.filter((id) => exclude.has(id)).length, 0, 'no overlap with the excluded first batch');
+});
+
 test('selectSample dedupes a doc that matches two overlapping targets', () => {
   const entries = [mk('d1', 'Master of Arts - MA', 'History', 2010)];
   const { manifest } = selectSample(entries, {

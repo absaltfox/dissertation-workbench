@@ -23,7 +23,15 @@ if (argv.includes('--finalize')) {
   process.exit(0);
 }
 
-const manifest = JSON.parse(readFileSync('test/fixtures/committee-eval/manifest.json', 'utf8'));
+// --manifest <path> selects input docs; --out <basename> writes to a separate worksheet
+// (e.g. gold-worksheet-widen) so a widening batch never overwrites an already-labeled sheet.
+const arg = (flag, def) => { const i = argv.indexOf(flag); return i === -1 ? def : argv[i + 1]; };
+const MANIFEST = arg('--manifest', 'test/fixtures/committee-eval/manifest.json');
+const OUT_BASE = arg('--out', path.join(EVAL_DIR, 'gold-worksheet'));
+const OUT_JSON = `${OUT_BASE}.json`;
+const OUT_CSV = `${OUT_BASE}.csv`;
+
+const manifest = JSON.parse(readFileSync(MANIFEST, 'utf8'));
 const coverage = existsSync(path.join(EVAL_DIR, 'coverage.json'))
   ? JSON.parse(readFileSync(path.join(EVAL_DIR, 'coverage.json'), 'utf8'))
   : [];
@@ -49,10 +57,11 @@ for (const entry of manifest) {
   for (const r of docRows) rows.push({ ...r, oc_url: ocUrl(entry.docId), era: entry.era, degraded: coverageByDoc.get(entry.docId)?.degraded ?? '', ack_slice: r.source === 'certificate' ? '' : ackSlice });
 }
 
-writeFileSync(WORKSHEET_JSON, JSON.stringify(rows, null, 2) + '\n');
+writeFileSync(OUT_JSON, JSON.stringify(rows, null, 2) + '\n');
 const header = ['docId', 'oc_url', 'name', 'proposed_role', 'on_certificate', 'source', 'era', 'degraded', 'keep', 'true_role', 'is_negative', 'ack_slice'];
 const csv = [header.join(',')].concat(
   rows.map((r) => header.map((h) => `"${String(r[h] ?? '').replace(/"/g, '""')}"`).join(',')),
 ).join('\n');
-writeFileSync(WORKSHEET_CSV, csv + '\n');
+writeFileSync(OUT_CSV, csv + '\n');
+console.log(`Wrote ${rows.length} worksheet rows (${new Set(rows.map((r) => r.docId)).size} docs) -> ${OUT_CSV}`);
 console.log(`Wrote ${rows.length} worksheet rows for ${manifest.length} docs.`);

@@ -1,7 +1,7 @@
 // Reads manifest.json, fetches OC full text (PDF fallback on miss) into the cache,
 // writes coverage.json. Requires prod connectivity.
 // Usage: node scripts/committee-eval/fetch-fulltext.mjs
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import { writeFile, unlink } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -49,7 +49,12 @@ async function extractTextFromPdfBytes(bytes) {
   }
 }
 
-const manifest = JSON.parse(readFileSync('test/fixtures/committee-eval/manifest.json', 'utf8'));
+// --manifest <path> selects the input manifest (default the main one); the text cache and
+// coverage.json are shared across batches so widening accumulates rather than overwrites.
+const argv = process.argv.slice(2);
+const manifestArg = (() => { const i = argv.indexOf('--manifest'); return i === -1 ? 'test/fixtures/committee-eval/manifest.json' : argv[i + 1]; })();
+const manifest = JSON.parse(readFileSync(manifestArg, 'utf8'));
+const coveragePath = path.join(EVAL_DIR, 'coverage.json');
 const coverage = [];
 
 for (const entry of manifest) {
@@ -79,7 +84,15 @@ for (const entry of manifest) {
   coverage.push({ docId: entry.docId, textSource, degraded: q.degraded, byteLength: q.byteLength, reason: q.reason });
 }
 
-writeFileSync(path.join(EVAL_DIR, 'coverage.json'), JSON.stringify(coverage, null, 2) + '\n');
+// Merge into any existing coverage (upsert by docId) so a widening batch preserves
+// earlier batches' coverage entries rather than clobbering them.
+let merged = coverage;
+if (existsSync(coveragePath)) {
+  const prior = JSON.parse(readFileSync(coveragePath, 'utf8'));
+  const now = new Map(coverage.map((c) => [c.docId, c]));
+  merged = [...prior.filter((c) => !now.has(c.docId)), ...coverage];
+}
+writeFileSync(coveragePath, JSON.stringify(merged, null, 2) + '\n');
 const roll = coverage.reduce((a, c) => {
   a[c.textSource] = (a[c.textSource] || 0) + 1;
   if (c.degraded) a.degraded += 1;
