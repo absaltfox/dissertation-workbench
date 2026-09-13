@@ -132,6 +132,31 @@ followed by an unrelated capitalized name with no comma/period/lowercase between
 natural acknowledgement prose, where a supervisor name is almost always followed by `,`/`for`/`who`/
 a period. Shipped on that basis; revisit if a model layer is introduced.
 
+## F-2e — the failure population's ceiling: ~45% of docs name no supervisor at all
+
+**Status:** characterized (not a defect — a hard ceiling) · **Source:** manual + Claude-vision review
+of the 20 pre-2018 History "failure" docs (rows added in the gold-widening batch), under the
+explicit-role standard ([[gold-labeling-explicit-role-standard]]).
+
+Breakdown of the 20 certificate-absent pre-2018 History docs:
+- **~35% (7/20) — explicit supervisor recoverable in the OC text** ("my supervisor Coll Thrush",
+  "advisors, Professors Conway and Hill", "my advisor, Dr. Harvey Mitchell", etc.). These are the
+  legitimately addressable extraction targets.
+- **~45% (9/20) — no supervisor in the document at all.** Confirmed by reading the PDFs (vision) across
+  eras (1970, 2002, 2007): these theses have **no acknowledgements section and no typed committee/
+  approval page** (the "We accept this thesis…" page carries signatures, not typed names). The
+  supervisor exists only in UBC's metadata/committee records, never in the PDF. **No extractor — regex,
+  GLiNER, or vision — can recover what is not in the document.** This is a metadata-join problem.
+- **~20% (4/20) — inference-only** (emphasis / "mentorship" / "guidance"): rejected under the strict
+  standard, correctly excluded from gold.
+
+**Implication for the recall metric and the model decision:** the denominator that any extractor can
+move is the ~35% explicit-in-text slice, not the whole failure population. On the widened gold
+(93 docs), deterministic baseline is **37.9% name recall at 100% precision** on the failure cell
+(clean 43%, degraded 17%). So the realistic headroom is: OCR repair (F-2c/C3, lifts the 17% degraded)
++ the clean-text boundary/list/no-heading cases (GLiNER shadow). The ~45% not-in-document ceiling is
+immovable by extraction and should frame expectations for a supervisor-coverage target.
+
 ## Related non-`src` limitations (already handled in the harness, noted for context)
 - **Sampling by degree alone** missed program-scoped targets (History = degree
   `Master of Arts - MA` + program `History`). Fixed: program-level `--targets` + per-era
