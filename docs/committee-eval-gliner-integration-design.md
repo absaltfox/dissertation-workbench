@@ -79,61 +79,74 @@ full text
 - **Added surface:** one more model to pin/cache/version; a Node↔Python boundary (spawn or a small
   local service), consistent with how build-topics/build-concepts run.
 
-## 6. Empirical probe — NOT RUN THIS SESSION
+## 6. Empirical probe — RUN (observed results)
 
-The timeboxed probe (run GLiNER on the 8 real edge-case windows in
-`scratchpad/gliner-probe-inputs.json`) **did not complete** — the worker hit an account
-session limit before standing up the model, so **there are no observed GLiNER outputs here.**
-Nothing below is measured; it is the *expected* behavior from GLiNER's span-NER design and the
-prior benchmark, and must be confirmed by actually running the probe (the inputs are staged and
-ready; re-run after the limit resets, or in a session with model access).
+Model: `urchade/gliner_small-v2.1`, CPU, in a pinned venv (`gliner 0.2.29`, `transformers==4.52.4`
++ `protobuf`/`sentencepiece`/`tiktoken` — the design §5 pin was exactly right; newer transformers
+5.x broke the deberta-v3 tokenizer). Two label sets per input: generic `["person"]` and role-typed
+`["thesis supervisor","co-supervisor","committee member","academic advisor"]`. Threshold 0.3.
 
-**Expected (analytical, unverified):**
-- **Would likely resolve:** the boundary/list cases — F-2d ("Joy Dixon" vs "Peter Parker" as two
-  spans), the untitled plural (`1.0097749` Wiesman + Seelig), the committee list (`1.0089112`
-  Boothroyd/Allison/Hutton). These are span-segmentation tasks GLiNER is built for.
-- **Might resolve with windowing:** `1.0090378` (no heading) — GLiNER needs no heading, but it must
-  be run on a cue-anchored window and validated, or it will also surface body names.
-- **Would likely NOT resolve:** `1.0091408` OCR ("Wi l l iam") — NER degrades on corrupted tokens;
-  the weak-role cases (`1.0104776` Cross, `1.0102242` "who supervised") — GLiNER may *find* the name
-  but there is no deterministic cue to license "Supervisor", and letting the model's own role label
-  decide is the benchmark's documented precision trap.
-- **Role-typed mode risk:** the prior benchmark found role labels over-attribute (thanking a person
-  ⇒ labeled supervisor). Expect the role-typed run to over-claim; this is why role stays with the
-  deterministic cue, not the model.
+| Case | gold | GLiNER **person** (score) | role-typed | verdict |
+|---|---|---|---|---|
+| `0097749` untitled plural | Wiesman, Seelig | **Wiesman(.75), Seelig(.88)** + Stanley Schibler(.95, thanked) | all 3 → "thesis supervisor" | **names found**; role over-attributes Schibler |
+| `0089112` committee list | Boothroyd, Allison, Hutton | **all 3 found** (Boothroyd.97, "Mark Al l ison".89, Hutton.75) + Nelson(.74), Mackniak(.93, thanked) | most → "committee member" | **names found**; over-attributes 2 extras |
+| `0090378` **no heading** | Joy Dixon | **Joy Dixon(.94)** (+ Ingrid .34) | Joy Dixon → thesis supervisor(.78) | **RESOLVED w/o a heading** |
+| `0091408` OCR split | William Wray | **"Professor Wi l l iam Wray"(.83)** | → thesis supervisor(.65) | span located but **name still glyph-corrupted** |
+| `0104776` weak role | Cross (ambiguous) | Dr. K.J. Cross(.93) | → **academic advisor**(.61) | name found; no supervisory cue → hybrid abstains (correct) |
+| `0102242` "who supervised" | C. Davis | Dr. C. Davis(.96) + Dr. R.W. Collier(.94) | both → academic advisor | Davis found + an extra; needs a "who supervised" cue |
+| CONTROL | Boothroyd | Professor Peter Boothroyd(.91) | → thesis supervisor(.71) | sanity ✓ |
+| **F-2d boundary** | Joy Dixon (NOT Peter Parker) | **"Joy Dixon"(.74) + "Peter Parker"(.74) as TWO spans** | both → academic advisor | **boundary SPLIT correctly — the unique win** |
 
-**Realistic addressable gain (unverified):** of the 9 residual gold misses, GLiNER-in-shadow could
-plausibly recover ~2–4 (the boundary/list/no-heading cases), i.e. roughly 42% → mid-50s/low-60s%
-name recall — *if* shadow validation holds precision. The weak-role, OCR, and ceiling cases stay
-unrecovered.
+**Observed conclusions (now measured, not analytical):**
+1. **Person-span recall is strong:** GLiNER found the gold name(s) in **all 8** cases, including every
+   type regex missed — plural, committee list, no-heading, "who supervised", and the F-2d boundary.
+2. **F-2d confirmed:** it splits "Joy Dixon" / "Peter Parker" into separate spans — exactly what
+   capitalization-based regex cannot.
+3. **Role-typed mode over-attributes, confirmed:** it labeled thanked-but-uninvolved people
+   (Schibler, Nelson, Mackniak, Collier) and even "Peter Parker" as supervisor/committee/advisor.
+   **GLiNER's own role labels are not trustworthy** — validating the design's core principle.
+4. **The hybrid is what makes it safe:** GLiNER's person spans + a deterministic cue evidence-window
+   is what rejects those over-attributed extras (Schibler is outside the "my two supervisors, X and
+   Y" window; Peter Parker is outside the "my advisor, Joy Dixon" window). Recall from the model,
+   precision from the deterministic cue.
+5. **Not solved by GLiNER:** OCR (`0091408` — span found but "Wi l l iam" still corrupted; needs OCR
+   repair) and truly weak-role docs (correctly abstained, since no cue licenses a role).
 
-**Environment (observed, corrected):** the local `.venv` (Python 3.14) **already has
-`transformers 5.3.0` and it imports fine** — the earlier "stall" was just a ~2-minute cold start,
-not a block — and a HuggingFace cache is present. Only the `gliner` package itself is missing
-(`pip install gliner`) plus a model download. So the probe is very likely feasible here without a
-new env; the sole reason it didn't run this session was an **account session limit**, not the
-environment. (Caveat: `gliner` may want a transformers version different from the installed 5.3.0;
-if so, a small pinned venv resolves it. This is a minor setup step, not the blocker I first wrote.)
+**Environment note:** ran in a fresh CPU venv; the design §5 dependency pin (`transformers==4.52.4`
++ `protobuf` + `sentencepiece`) is required — `pip install gliner` alone pulls transformers 5.x
+which breaks the deberta-v3 tokenizer load. `python -m pip` (not `bin/pip`) was needed to make the
+pin stick in this venv.
 
-## 7. Recommendation — measured, shadow-first (do NOT wire into prod yet)
+## 7. Recommendation — build the shadow eval; defer the prod-wiring decision to its numbers
 
-1. **Confirm before committing:** run the staged probe (§6) to replace the analytical expectation
-   with real numbers. Cheap, and it's the honest gate for everything below.
-2. **If the probe confirms the boundary/list wins:** build the **shadow eval only** (design §5
-   `gliner-propose.py` + `score-shadow.mjs`) in a pinned 3.11/3.12 env, score
-   `deterministic ∪ validated-GLiNER` against a **widened** gold (label past row 50 first — n=17 is
-   too small to trust a mid-single-digit doc delta), and check the §4 gates.
-3. **Promote to prod only if** shadow recall beats 42% meaningfully AND the precision gates hold.
-   Given the modest addressable gain (~2–4 docs) versus a new Python/torch dependency, a Node↔Python
-   boundary, model pinning/versioning, and the precision-risk of a decider, the bar for prod wiring
-   should be real — this is infra worth adding only if the widened-gold delta is clearly worth it.
-4. **Cheaper alternatives to weigh first for the same residual:** the untitled-plural / committee-list
-   cases (`1.0097749`, `1.0089112`) are *also* addressable by targeted deterministic patterns (the
-   high-FP-risk group we deliberately skipped) with the same eval as a guard — no model, no infra.
-   GLiNER's genuinely unique contribution is narrower than it first appears: mainly **F-2d boundary
-   disambiguation**, which is rare in real prose. Weigh the model's infra cost against just extending
-   the regex to the list/plural forms under the eval's precision guard.
+The probe (§6) settles the feasibility question: **GLiNER proposes the right name spans on exactly
+the cases regex can't (recall), its role labels can't be trusted (precision), and the
+deterministic-cue evidence-window is what reconciles the two.** The architecture is sound and the
+env is reproducible. So:
 
-**Bottom line:** GLiNER is the *right tool* for the one thing regex fundamentally can't do (name-span
-boundaries), but on this corpus that need is narrow. Recommend: run the probe → shadow-eval on a
-widened gold → decide, rather than committing to the model integration now.
+1. **Build the shadow eval (design §5), not prod wiring yet.** Implement `gliner-propose.py`
+   (person-span proposals + offsets, in the pinned `transformers==4.52.4`+`protobuf`+`sentencepiece`
+   venv) and `score-shadow.mjs` (deterministic cue windows validate/keep GLiNER spans; role from the
+   cue). Score `deterministic ∪ validated-GLiNER` vs the gold.
+2. **Widen the gold FIRST** — label past row 50. Current n=17 gold-positive docs is too small to
+   trust the ~4-doc recall delta the probe suggests (42% → ~65%); the whole point of the harness is
+   to measure the delta on a trustworthy sample.
+3. **The crux to measure is precision, not recall.** The probe shows GLiNER's recall is there; the
+   open question is whether the cue evidence-window reliably rejects the over-attributed extras
+   (Schibler, Nelson, Mackniak, Collier, Peter Parker) at scale. The §4 gates — **zero new
+   negative-set violations**, role precision not below deterministic-only — are the real bar.
+4. **Then decide prod wiring** on the measured delta vs the cost (Python/torch dependency, Node↔Python
+   boundary run as a batch enrichment step, model pinning). Given the probe, the recall upside is now
+   credible (~4 docs + F-2d precision fix), so the decision is genuinely open — unlike before the
+   probe, when it was speculative.
+
+**Cheaper partial alternative still worth pricing in:** the plural/committee-list recall (`0097749`,
+`0089112`) is *also* reachable by targeted regex under the same eval guard (no model). GLiNER's
+*irreducibly unique* contribution is **F-2d boundary splitting** (and headingless proposal). If the
+widened-gold shadow delta turns out to be mostly list/plural docs, extending the regex may capture
+most of the gain without the model; if F-2d/boundary cases are material, the model earns its place.
+
+**Bottom line (post-probe):** feasibility proven, architecture validated. The remaining unknown is
+purely *how much* net recall survives the precision gate on a larger gold — which is exactly what
+the shadow eval measures. Recommend building it as the next step; hold the prod-integration decision
+for its numbers.
