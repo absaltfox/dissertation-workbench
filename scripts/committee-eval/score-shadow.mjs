@@ -50,7 +50,8 @@ const COMMITTEE = 'Supervisory Committee Member';
 // role rank for resolving a span that overlaps multiple cue windows
 const ROLE_RANK = { [SUP]: 3, [COSUP]: 2, [COMMITTEE]: 1 };
 
-const CUE_DEFS = [
+// First-person supervisory cues, shared by both hybrid configs.
+const SUP_CUES = [
   // "my [thesis|doctoral|dissertation|research] [co-]supervisor/advisor/adviser[s]"
   {
     re: /my\s+(?:(?:thesis|doctoral|dissertation|research)\s+)?(co-?\s*)?(supervisors?|advisors?|advisers?)/gi,
@@ -73,17 +74,33 @@ const CUE_DEFS = [
     role: () => SUP,
     back: 60, fwd: 8,
   },
-  // "committee" / "committee member(s)" — names follow (list)
-  {
-    re: /committee/gi,
-    role: () => COMMITTEE,
-    back: 5, fwd: 120,
-  },
   // certificate anchor (cert docs; validation-only stratum)
   {
     re: /the following individuals certify/gi,
     role: () => COMMITTEE,
     back: 0, fwd: 280,
+  },
+];
+
+// NAIVE hybrid: supervisory cues + a BARE "committee" cue (fires on any committee
+// mention in prose — Senate/House committees, book-editor footnotes, etc.).
+const CUE_DEFS_NAIVE = [
+  ...SUP_CUES,
+  {
+    re: /committee/gi,
+    role: () => COMMITTEE,
+    back: 5, fwd: 120,
+  },
+];
+
+// TIGHTENED hybrid: supervisory cues + a NARROW committee cue restricted to
+// thesis-supervisory phrasing. Bare "committee" is dropped entirely.
+const CUE_DEFS_TIGHT = [
+  ...SUP_CUES,
+  {
+    re: /supervisory\s+committee|committee\s+members?|member\s+of\s+my\s+(?:thesis|supervisory)\s+committee|my\s+committee[:,]/gi,
+    role: () => COMMITTEE,
+    back: 5, fwd: 120,
   },
 ];
 
@@ -103,9 +120,9 @@ function clampToSentence(text, cueStart, cueEnd, ws, we) {
   return [s, e];
 }
 
-function buildCueWindows(text) {
+function buildCueWindows(text, cueDefs) {
   const windows = [];
-  for (const def of CUE_DEFS) {
+  for (const def of cueDefs) {
     def.re.lastIndex = 0;
     let m;
     while ((m = def.re.exec(text)) !== null) {
@@ -157,6 +174,7 @@ function dedupeByName(members) {
 const perDocDet = [];
 const perDocGli = [];
 const perDocHyb = [];
+const perDocHybT = [];
 const details = [];
 let missingSpans = 0;
 
@@ -179,33 +197,43 @@ for (const g of gold) {
   // (2) GLiNER-only: raw span texts as names (role irrelevant → name metrics only)
   const gliOnly = dedupeByName(glinerSpans.map((s) => ({ name: s.text, role: SUP })));
 
-  // (3) hybrid: deterministic ∪ cue-validated GLiNER spans
-  const windows = buildCueWindows(fullText);
-  const validated = validateSpans(glinerSpans, windows);
+  // (3) hybrid-naive: deterministic ∪ cue-validated GLiNER spans (bare "committee")
+  const windowsNaive = buildCueWindows(fullText, CUE_DEFS_NAIVE);
+  const validatedNaive = validateSpans(glinerSpans, windowsNaive);
   // union: deterministic keeps what it found; add validated GLiNER names not
   // already present (dedupe det first so det roles win).
-  const hybrid = dedupeByName([...det, ...validated]);
+  const hybrid = dedupeByName([...det, ...validatedNaive]);
+
+  // (4) hybrid-tightened: same, but with the NARROW committee cue (no bare "committee")
+  const windowsTight = buildCueWindows(fullText, CUE_DEFS_TIGHT);
+  const validatedTight = validateSpans(glinerSpans, windowsTight);
+  const hybridT = dedupeByName([...det, ...validatedTight]);
 
   const sDet = scoreDoc(det, g);
   const sGli = scoreDoc(gliOnly, g);
   const sHyb = scoreDoc(hybrid, g);
+  const sHybT = scoreDoc(hybridT, g);
   perDocDet.push({ stratumKey, score: sDet });
   perDocGli.push({ stratumKey, score: sGli });
   perDocHyb.push({ stratumKey, score: sHyb });
+  perDocHybT.push({ stratumKey, score: sHybT });
 
-  // which gold names the hybrid recovered that deterministic missed
+  // which gold names each hybrid recovered that deterministic missed
   const detNames = det.map((m) => m.name);
   const hybNames = hybrid.map((m) => m.name);
-  const newlyRecovered = (g.members || [])
+  const hybTNames = hybridT.map((m) => m.name);
+  const recoveredBy = (names) => (g.members || [])
     .map((gm) => gm.name)
-    .filter((gn) => hybNames.some((hn) => namesMatch(hn, gn)) && !detNames.some((dn) => namesMatch(dn, gn)));
+    .filter((gn) => names.some((hn) => namesMatch(hn, gn)) && !detNames.some((dn) => namesMatch(dn, gn)));
+  const newlyRecovered = recoveredBy(hybNames);
+  const newlyRecoveredTight = recoveredBy(hybTNames);
 
   details.push({
     docId: g.docId, stratumKey,
     gold: (g.members || []).map((m) => m.name),
-    det: detNames, hybrid: hybNames, glinerOnly: gliOnly.map((m) => m.name),
-    newlyRecovered,
-    score: { det: sDet, glinerOnly: sGli, hybrid: sHyb },
+    det: detNames, hybrid: hybNames, hybridTightened: hybTNames, glinerOnly: gliOnly.map((m) => m.name),
+    newlyRecovered, newlyRecoveredTight,
+    score: { det: sDet, glinerOnly: sGli, hybrid: sHyb, hybridTightened: sHybT },
   });
 }
 
@@ -213,6 +241,7 @@ const byStratum = {
   deterministic: aggregate(perDocDet),
   glinerOnly: aggregate(perDocGli),
   hybrid: aggregate(perDocHyb),
+  hybridTightened: aggregate(perDocHybT),
 };
 
 writeFileSync(
@@ -237,9 +266,16 @@ const pct = (x) => `${(x * 100).toFixed(1)}%`;
 const isNocert = (k) => k.startsWith('nocert:');
 const isCert = (k) => k.startsWith('cert:');
 
+const MODELS = [
+  ['deterministic', perDocDet],
+  ['GLiNER-only', perDocGli],
+  ['hybrid-naive', perDocHyb],
+  ['hybrid-tight', perDocHybT],
+];
+
 console.log('\n=== FAILURE POPULATION (nocert) — the headline ===');
 console.log('model            recall   precision   nameTP/FP/FN   neg-viol   docs');
-for (const [label, perDoc] of [['deterministic', perDocDet], ['GLiNER-only', perDocGli], ['hybrid', perDocHyb]]) {
+for (const [label, perDoc] of MODELS) {
   const r = rollup(perDoc, isNocert);
   console.log(
     `${label.padEnd(15)}  ${pct(r.recall).padStart(6)}   ${pct(r.precision).padStart(8)}   `
@@ -251,22 +287,27 @@ console.log('\n--- nocert by stratum ---');
 const nocertKeys = [...new Set(perDocDet.filter((d) => isNocert(d.stratumKey)).map((d) => d.stratumKey))].sort();
 for (const key of nocertKeys) {
   console.log(`\n[${key}]`);
-  for (const [label, perDoc] of [['deterministic', perDocDet], ['GLiNER-only', perDocGli], ['hybrid', perDocHyb]]) {
+  for (const [label, perDoc] of MODELS) {
     const r = rollup(perDoc, (k) => k === key);
     console.log(`  ${label.padEnd(15)} recall ${pct(r.recall).padStart(6)}  prec ${pct(r.precision).padStart(6)}  TP/FP/FN ${r.nameTP}/${r.nameFP}/${r.nameFN}  neg ${r.neg}  docs ${r.docs}`);
   }
 }
 
 console.log('\n=== cert (validation-only) ===');
-for (const [label, perDoc] of [['deterministic', perDocDet], ['GLiNER-only', perDocGli], ['hybrid', perDocHyb]]) {
+for (const [label, perDoc] of MODELS) {
   const r = rollup(perDoc, isCert);
   console.log(`  ${label.padEnd(15)} recall ${pct(r.recall).padStart(6)}  prec ${pct(r.precision).padStart(6)}  TP/FP/FN ${r.nameTP}/${r.nameFP}/${r.nameFN}  neg ${r.neg}  docs ${r.docs}`);
 }
 
 const newly = details.filter((d) => isNocert(d.stratumKey) && d.newlyRecovered.length);
-console.log('\n=== nocert docs the HYBRID newly recovered (vs deterministic) ===');
+console.log('\n=== nocert docs HYBRID-NAIVE newly recovered (vs deterministic) ===');
 if (!newly.length) console.log('  (none)');
 for (const d of newly) console.log(`  ${d.docId} [${d.stratumKey}] +${d.newlyRecovered.join(', ')}`);
+
+const newlyT = details.filter((d) => isNocert(d.stratumKey) && d.newlyRecoveredTight.length);
+console.log('\n=== nocert docs HYBRID-TIGHTENED newly recovered (vs deterministic) ===');
+if (!newlyT.length) console.log('  (none)');
+for (const d of newlyT) console.log(`  ${d.docId} [${d.stratumKey}] +${d.newlyRecoveredTight.join(', ')}`);
 
 const goldNegTotal = gold.reduce((a, g) => a + (g.negatives?.length || 0), 0);
 console.log(`\nNote: gold has ${goldNegTotal} negative-set names total; negative-violation gate is trivially 0 across all models when 0.`);
