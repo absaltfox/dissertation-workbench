@@ -107,9 +107,13 @@ plausibly recover ~2–4 (the boundary/list/no-heading cases), i.e. roughly 42% 
 name recall — *if* shadow validation holds precision. The weak-role, OCR, and ceiling cases stay
 unrecovered.
 
-**Environment blocker (observed):** the local `.venv` is Python 3.14; the GLiNER/torch stack has
-poor 3.14 wheel support and the import stalled. A dedicated pinned Python 3.11/3.12 env is required
-to run GLiNER at all — a real setup cost to budget.
+**Environment (observed, corrected):** the local `.venv` (Python 3.14) **already has
+`transformers 5.3.0` and it imports fine** — the earlier "stall" was just a ~2-minute cold start,
+not a block — and a HuggingFace cache is present. Only the `gliner` package itself is missing
+(`pip install gliner`) plus a model download. So the probe is very likely feasible here without a
+new env; the sole reason it didn't run this session was an **account session limit**, not the
+environment. (Caveat: `gliner` may want a transformers version different from the installed 5.3.0;
+if so, a small pinned venv resolves it. This is a minor setup step, not the blocker I first wrote.)
 
 ## 7. Recommendation — measured, shadow-first (do NOT wire into prod yet)
 
