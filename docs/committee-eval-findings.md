@@ -157,6 +157,49 @@ move is the ~35% explicit-in-text slice, not the whole failure population. On th
 + the clean-text boundary/list/no-heading cases (GLiNER shadow). The ~45% not-in-document ceiling is
 immovable by extraction and should frame expectations for a supervisor-coverage target.
 
+## F-2f — deterministic OCR glyph-split repair is not safely achievable (C3 reverted)
+
+**Status:** closed as ceiling · **Component:** `src/pdf.js` `normalizeAcknowledgementOcrSpacing` ·
+**Decision:** attempted (C3) and **reverted** on a precision-first basis.
+
+A repair to join OCR glyph-splits ("Wi l l iam"→"William", "M y"→"My", "Al l ison"→"Allison") was
+built (recovered 2 failure docs: 1.0091408 Wray, 1.0089112 Allison; baseline 37.9%→41.4%) but it
+could not be made precision-safe. Root ambiguity: a repaired fragment is indistinguishable by surface
+form from an ordinary short capitalized word, so the glue either corrupted prose ("In a l l my
+years…"→"Inallmy years…") or, after two fix rounds, absorbed a glyph-sprayed word into an adjacent
+extracted name via greedy `extractNameFromCapture` ("Professor In s o m e Wray"→"Insome Wray" — a
+false supervisor name; same greedy-capture root as [[F-2d]]). Given the eval's precision-first
+standard ([[gold-labeling-explicit-role-standard]]), the +2 recall did not justify the residual
+false-name risk. **Reverted** (restored `src/pdf.js`/`test/pdfParser.test.js` to pre-C3). OCR-split
+name recovery is a genuine deterministic ceiling; a span-grounded model (which segments names by
+learned structure, not glyph runs) is the only plausible route, and even that leaves the OCR
+corruption in the span text.
+
+## F-2g — GLiNER shadow-eval: recall gain real, precision gate not met (do not wire to prod)
+
+**Status:** measured (shadow-eval tooling committed; NOT integrated into `src/`) ·
+**Tooling:** `scripts/committee-eval/gliner-propose.py` + `score-shadow.mjs` (offline eval only).
+
+Measured `urchade/gliner_small-v2.1` as a shadow proposer validated by deterministic role cues,
+against the 93-doc gold, failure population (independently recomputed):
+
+| config | name recall | precision | false positives |
+|---|---|---|---|
+| deterministic (baseline) | 37.9% | **100%** | 0 |
+| GLiNER-only | 79.3% | 1.2% | 1866 |
+| hybrid (naive cues) | 72.4% | 17.6% | 98 |
+| hybrid (tightened cues) | 65.5% | 45.2% | 23 |
+
+GLiNER genuinely finds the names deterministic misses (boundary/list/no-heading cases — F-2d, Joy
+Dixon no-heading, "who supervised" Davis), lifting recall to 65–72%. But **precision collapses**
+because supervisory language is polysemous: the bare `committee` cue alone drove ~75% of false
+positives (matching "Senate Committee", "Un-American Activities Committee", book editors cited near
+cues). Tightening cues (drop bare `committee`) more than doubled precision (17.6%→45.2%, FP 98→23)
+but still falls far short of the 100% deterministic bar — and loses the committee-list recovery.
+**Conclusion:** confirms the design principle empirically — GLiNER is viable only as an advisory/
+shadow proposer, never as a prod decider on this precision-first task. The recall it unlocks is real
+but its role attribution cannot be made trustworthy via deterministic cues at acceptable precision.
+
 ## Related non-`src` limitations (already handled in the harness, noted for context)
 - **Sampling by degree alone** missed program-scoped targets (History = degree
   `Master of Arts - MA` + program `History`). Fixed: program-level `--targets` + per-era
