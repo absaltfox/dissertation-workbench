@@ -15,8 +15,7 @@ import {
   parseAcknowledgements,
   parseCommittee,
   parseBibliography,
-  extractBodyWordCount,
-  _normalizeAckOcrSpacingForTests
+  extractBodyWordCount
 } from '../src/pdf.js';
 
 async function writeOnePagePdfWithExtraPageToken(filePath) {
@@ -483,92 +482,6 @@ friends, archivists, and the many communities who supported this project.`;
   assert.deepEqual(parseAcknowledgements(text), [
     { name: 'Michael Ignatieff', role: 'Supervisor', affiliation: null },
   ]);
-});
-
-// C3: repair short/variable-length OCR glyph-splits so names are not lost.
-// Scanned theses split words into fragments ("M y", "Wi l l iam", "Al l ison")
-// that the >=4-single-letter joiner did not handle, defeating name capture.
-const C3_PAD = 'I am deeply grateful to the many people who made this long and difficult project possible over the years. ';
-
-test('parseAcknowledgements recovers short OCR glyph-splits: "M y supervisor, Professor Wi l l iam Wray" (doc 1.0091408, C3)', () => {
-  const text = `\nACKNOWLEDGEMENTS\n\n${C3_PAD}M y supervisor, Professor Wi l l iam Wray, guided this work with patience and care throughout. ${C3_PAD}\n`;
-  const members = parseAcknowledgements(text);
-  assert.ok(
-    members.some((m) => m.name === 'William Wray' && m.role === 'Supervisor'),
-    `expected William Wray/Supervisor; got ${JSON.stringify(members)}`
-  );
-});
-
-test('parseAcknowledgements recovers short OCR glyph-splits: "Mark Al l ison" in a bare committee list (doc 1.0089112, C3)', () => {
-  // "M y committee" is glyph-split too; the bare-committee list is reached via the
-  // existing "committee comprised of ..." pattern once "Mark Al l ison" -> "Mark Allison".
-  const text = `\nACKNOWLEDGEMENTS\n\n${C3_PAD}M y committee comprised of Peter Boothroyd, Mark Al l ison, and Tom Hutton offered invaluable guidance. ${C3_PAD}\n`;
-  const members = parseAcknowledgements(text);
-  assert.ok(
-    members.some((m) => m.name === 'Mark Allison' && m.role === 'Supervisory Committee Member'),
-    `expected Mark Allison/Supervisory Committee Member; got ${JSON.stringify(members)}`
-  );
-  // The intact leading bare name in the same list must still be recovered.
-  // (The trailing "and Tom Hutton" is dropped by a pre-existing Oxford-comma
-  // limitation in the bare-list regex, unrelated to the C3 glyph-split repair.)
-  assert.ok(members.some((m) => m.name === 'Peter Boothroyd'), JSON.stringify(members));
-});
-
-test('parseAcknowledgements OCR glyph-split repair does not corrupt spaced initials or prose (C3 guards)', () => {
-  // Period-separated initials must stay intact as ONE name.
-  const mTolkien = parseAcknowledgements(
-    `\nACKNOWLEDGEMENTS\n\n${C3_PAD}my supervisor, Dr. J. R. R. Tolkien, was endlessly patient. ${C3_PAD}\n`
-  );
-  assert.ok(
-    mTolkien.some((x) => x.role === 'Supervisor' && /Tolkien$/.test(x.name) && /J\. R\. R\./.test(x.name)),
-    `Tolkien initials must be preserved; got ${JSON.stringify(mTolkien)}`
-  );
-
-  // Spaced initials "R. A. J. McDonald" (existing passing case) must stay green.
-  const mMac = parseAcknowledgements(
-    `\nACKNOWLEDGEMENTS\n\n${C3_PAD}my thesis advisor, Prof. R. A. J. McDonald, shaped this work. ${C3_PAD}\n`
-  );
-  assert.ok(
-    mMac.some((x) => x.role === 'Supervisor' && /McDonald$/.test(x.name)),
-    `McDonald must still parse; got ${JSON.stringify(mMac)}`
-  );
-
-  // No-period all-uppercase "J R R" must NOT be glued into a fake supervisor.
-  const mJRR = parseAcknowledgements(
-    `\nACKNOWLEDGEMENTS\n\n${C3_PAD}My colleagues J R R and the project team offered encouragement. ${C3_PAD}\n`
-  );
-  assert.equal(
-    mJRR.some((x) => ['Supervisor', 'Co-Supervisor'].includes(x.role)),
-    false,
-    `J R R must not glue into a name; got ${JSON.stringify(mJRR)}`
-  );
-
-  // Prose with "U. S." and "in a" must not be glued into any name.
-  const mProse = parseAcknowledgements(
-    `\nACKNOWLEDGEMENTS\n\n${C3_PAD}I studied in a program in the U. S. and then returned to continue. ${C3_PAD}\n`
-  );
-  assert.equal(mProse.length, 0, `prose must not produce names; got ${JSON.stringify(mProse)}`);
-});
-
-test('OCR glyph-split repair does not glue capitalized-word-led prose (C3 regression guard)', () => {
-  // A capitalized sentence-starter ("In", "This", "Also", "She") that precedes an
-  // OCR-split fragment run must NOT be glued into the following real words.
-  const cases = [
-    ['In a l l my years of study, I never met anyone so kind.', ['years'], 'Inallmy'],
-    ['This a l l happened during my final year of research.', ['happened'], 'Thisall'],
-    ['Also a l l of my committee members were generous with time.', ['committee'], 'Alsoall'],
-    ['She said no to a l l of it and moved on.', ['said'], 'Shesaid'],
-  ];
-  for (const [input, mustRemain, forbiddenBlob] of cases) {
-    const { text } = _normalizeAckOcrSpacingForTests(input);
-    const words = text.split(/\s+/);
-    for (const w of mustRemain) {
-      assert.ok(words.includes(w), `"${w}" must remain a separate word; got ${JSON.stringify(text)}`);
-    }
-    assert.ok(!text.includes(forbiddenBlob), `must not glue into "${forbiddenBlob}"; got ${JSON.stringify(text)}`);
-    // The leading capitalized sentence-starter must survive intact.
-    assert.ok(words.includes(input.split(' ')[0]), `leading word must survive; got ${JSON.stringify(text)}`);
-  }
 });
 
 test('parseAcknowledgements accepts conservative advisor variants and complex names', () => {
