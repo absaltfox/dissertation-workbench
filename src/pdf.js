@@ -1542,13 +1542,28 @@ function isOcrFragmentLetter(token) {
   return token.length === 1 && /\p{Ll}/u.test(token) && token.toLowerCase() !== 'a';
 }
 
+// A leading token belongs to the glued word only when it is itself a single-letter
+// fragment ("M" in "M y") OR a fragment PREFIX immediately followed by a single-letter
+// fragment ("Wi" then "l" -> William, "Al" then "l" -> Allison).  Any other leading
+// token is an ordinary preceding word — a lowercase word ("my"), a capitalized
+// sentence-starter ("In", "This", "Also", "She"), or the article "a" that opens a
+// separate word — and must be trimmed off, never glued.  This is what distinguishes a
+// name fragment from a complete capitalized word: only the fragment is butted directly
+// against a single-letter glyph split.
+function leadingIsIntactWord(kept) {
+  if (isOcrFragmentLetter(kept[0])) return false;          // single-letter fragment: part of the core
+  if (kept.length >= 2 && isOcrFragmentLetter(kept[1])) return false; // fragment prefix (Wi|Al + l)
+  return true;                                             // ordinary preceding word
+}
+
 function glueOcrGroup(tokens) {
   if (tokens.length < 2 || !tokens.some(isOcrFragmentLetter)) return tokens.join(' ');
   const kept = tokens.slice();
-  // Trim leading intact words: a multi-letter LOWERCASE token is a preceding word
-  // ("my a d v i s o r" -> "my advisor"), not a capitalized word-start fragment.
+  // Trim leading intact words. Critically, a capitalized token is only kept as a
+  // name-start fragment when a single-letter glyph split abuts it; a plausible
+  // complete word ("In a l l ..." -> "In all ...", never "Inall...") is trimmed.
   const leadPrefix = [];
-  while (kept.length > 1 && kept[0].length >= 2 && /^\p{Ll}/u.test(kept[0])) {
+  while (kept.length > 1 && leadingIsIntactWord(kept)) {
     leadPrefix.push(kept.shift());
   }
   // Trailing intact-word trim: a >=2-letter lowercase tail is a separate following
@@ -1591,6 +1606,12 @@ function normalizeAcknowledgementOcrSpacing(value) {
     }
   );
   return { text, changed };
+}
+
+// Test hook: exposes the OCR glyph-split repair so prose-preservation guards can
+// assert on the transformed text directly.
+export function _normalizeAckOcrSpacingForTests(value) {
+  return normalizeAcknowledgementOcrSpacing(value);
 }
 
 const ADVISOR_NAME_STOP_WORDS = new Set([

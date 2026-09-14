@@ -15,7 +15,8 @@ import {
   parseAcknowledgements,
   parseCommittee,
   parseBibliography,
-  extractBodyWordCount
+  extractBodyWordCount,
+  _normalizeAckOcrSpacingForTests
 } from '../src/pdf.js';
 
 async function writeOnePagePdfWithExtraPageToken(filePath) {
@@ -547,6 +548,27 @@ test('parseAcknowledgements OCR glyph-split repair does not corrupt spaced initi
     `\nACKNOWLEDGEMENTS\n\n${C3_PAD}I studied in a program in the U. S. and then returned to continue. ${C3_PAD}\n`
   );
   assert.equal(mProse.length, 0, `prose must not produce names; got ${JSON.stringify(mProse)}`);
+});
+
+test('OCR glyph-split repair does not glue capitalized-word-led prose (C3 regression guard)', () => {
+  // A capitalized sentence-starter ("In", "This", "Also", "She") that precedes an
+  // OCR-split fragment run must NOT be glued into the following real words.
+  const cases = [
+    ['In a l l my years of study, I never met anyone so kind.', ['years'], 'Inallmy'],
+    ['This a l l happened during my final year of research.', ['happened'], 'Thisall'],
+    ['Also a l l of my committee members were generous with time.', ['committee'], 'Alsoall'],
+    ['She said no to a l l of it and moved on.', ['said'], 'Shesaid'],
+  ];
+  for (const [input, mustRemain, forbiddenBlob] of cases) {
+    const { text } = _normalizeAckOcrSpacingForTests(input);
+    const words = text.split(/\s+/);
+    for (const w of mustRemain) {
+      assert.ok(words.includes(w), `"${w}" must remain a separate word; got ${JSON.stringify(text)}`);
+    }
+    assert.ok(!text.includes(forbiddenBlob), `must not glue into "${forbiddenBlob}"; got ${JSON.stringify(text)}`);
+    // The leading capitalized sentence-starter must survive intact.
+    assert.ok(words.includes(input.split(' ')[0]), `leading word must survive; got ${JSON.stringify(text)}`);
+  }
 });
 
 test('parseAcknowledgements accepts conservative advisor variants and complex names', () => {
