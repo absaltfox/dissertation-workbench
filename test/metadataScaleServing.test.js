@@ -106,6 +106,29 @@ test('metadata-scale bootstrap aggregates remain corpus-complete and compact', a
   assert.equal(JSON.stringify(summary).length < 10_000, true);
 });
 
+test('summary supervisor count includes non-metadata sources and co-supervisors', async () => {
+  // The headline count must match how supervisors are actually counted elsewhere
+  // (role IN Supervisor/Co-Supervisor, any source), not just metadata-sourced
+  // Supervisors — otherwise PDF/committee-derived supervisors are silently dropped.
+  const SYNC = 'sup-source-count';
+  await saveDocumentMetadataBatch([
+    { doc: { id: 'supsrc-a', title: 'A', degree: 'PhD', supervisors: ['Meta Sup'] }, syncKey: SYNC },
+    { doc: { id: 'supsrc-b', title: 'B', degree: 'PhD', supervisors: [] }, syncKey: SYNC },
+  ]);
+  const client = await getDb();
+  const now = new Date().toISOString();
+  await client.batch([
+    { sql: `INSERT INTO document_people (doc_id, person_key, name, role, affiliation, source, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)`, args: ['supsrc-b', 'pdf-sup-key', 'Pdf Sup', 'Supervisor', null, 'pdf', now] },
+    { sql: `INSERT INTO document_people (doc_id, person_key, name, role, affiliation, source, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)`, args: ['supsrc-b', 'co-sup-key', 'Co Sup', 'Co-Supervisor', null, 'pdf', now] },
+  ], 'write');
+
+  const summary = await getDocumentServingSummary({ syncKey: SYNC });
+  // Meta Sup (metadata/Supervisor) + Pdf Sup (pdf/Supervisor) + Co Sup (pdf/Co-Supervisor)
+  assert.equal(summary.supervisors, 3);
+});
+
 test('filtered search and sorting are applied before the document page is materialized', async () => {
   const page = await queryCachedDocumentPage({
     syncKey: SYNC_KEY,

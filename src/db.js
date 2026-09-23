@@ -1650,7 +1650,7 @@ export async function getDocumentServingSummary({ syncKey = null } = {}) {
       FROM document_people p
       JOIN documents d ON d.doc_id = p.doc_id
       ${analyticsFilters.where}
-      AND p.source = 'metadata' AND p.role = 'Supervisor'
+      AND p.role IN ('Supervisor', 'Co-Supervisor')
     `, analyticsFilters.args),
   ]);
   return {
