@@ -1464,6 +1464,13 @@ const ROLE_PATTERNS = [
 ];
 const SUPERVISOR_ROLES = new Set(['Supervisor', 'Co-Supervisor']);
 
+// Leading academic honorific that precedes a real name on certificate pages,
+// e.g. "Professor Shigenori Matsui" or "Dr. Jane Roe". Stripped before name
+// validation so the honorific is not mistaken for a bare title/header line.
+// Requires trailing whitespace + a name, so a bare "Professor" line does not
+// match and is still rejected as a non-name.
+const LEADING_HONORIFIC = /^(?:(?:Associate|Assistant|Assoc\.?|Asst\.?)\s+)?(?:Professor|Prof\.?|Dr\.?)\s+/i;
+
 // Known lowercase name particles (Dutch, French, Spanish, German, etc.)
 const NAME_PARTICLES = new Set(['de', 'du', 'da', 'di', 'van', 'von', 'le', 'la', 'el', 'al', 'den', 'der', 'dos', 'das', 'ter', 'ten']);
 
@@ -1511,7 +1518,15 @@ function extractNameFromCapture(raw) {
 // The fuzzy fallback ACKNOW[A-Z]{4,12} captures OCR/transcription typos such as
 // "ACKNOWDLEGMENTS" (D/L transposition) and American vs British spelling variants
 // that the exact spellings miss. "ACKNOW" is the safe common prefix for all variants.
-const ACK_HEADING_RE = /(?:^|\n|\f)(ACKNOWLEDGEMENTS?|Acknowledgements?|ACKNOWLEDG[A-Z]{2,10}|ACKNOW[A-Z]{4,12})\s*\n/g;
+// Tolerates two scanned-thesis variants the original missed:
+//   - OCR letter-spacing in the heading itself ("A C K N O W L E D G E M E N T S"),
+//     via optional single spaces/tabs between letters;
+//   - a suffix on the heading line ("ACKNOWLEDGEMENTS AND DEDICATION").
+// Still anchored at line start and still requires the heading to end its line
+// (\n|$), which is what distinguishes a real heading from a run-in TOC row
+// ("Acknowledgements (^0 …"). The optional "E" before "MENT" covers the American
+// spelling ("ACKNOWLEDGMENTS"); the fuzzy fallbacks catch run-together OCR typos.
+const ACK_HEADING_RE = /(?:^|\n|\f)[^\S\n]*(A[ \t]?C[ \t]?K[ \t]?N[ \t]?O[ \t]?W[ \t]?L[ \t]?E[ \t]?D[ \t]?G[ \t]?E?[ \t]?M[ \t]?E[ \t]?N[ \t]?T[ \t]?S?|ACKNOWLEDG[A-Z]{2,10}|ACKNOW[A-Z]{4,12})(?:\s+AND\s+DEDICATION)?[^\S\n]*(?:\n|$)/gi;
 // Capture group: 1–4 tokens each starting with uppercase, including \S* tail and optional trailing space
 const DR_CAP = '((?:[A-Z\\u00C0-\\u024F]\\S*\\s*){1,4})';
 // Title prefix: Dr. or Prof/Professor (period optional for Prof/Professor)
@@ -1604,11 +1619,39 @@ const PAT_BARE_COMMITTEE_MEMBER_SUFFIX = new RegExp(
   `(${BARE_NAME})\\s+was\\s+the\\s+(?:third|final|other|remaining)\\s+member\\s+of\\s+my\\s+thesis\\s+committee\\b`, 'g');
 const PAT_DRS_ADVISORY_COMMITTEE = new RegExp(
   `(?:Advisory|Supervisory|Thesis)\\s+Committee\\s*[-:–—]\\s*Drs?\\.\\s+(${BARE_NAME}(?:,\\s*${BARE_NAME})*(?:,?\\s+and\\s+${BARE_NAME})?)`, 'g');
+// Comma-free name capture: stops before the comma / role clause that follows the
+// name. Used for phrasings where the supervisory role trails the name rather than a
+// title preceding it (§5b R2/R3), so the capture never swallows ", who …" or ", Q.C.".
+const NAME_NC = "([A-Z\\u00C0-\\u024F][A-Za-z.'\\u00C0-\\u024F-]*(?:\\s+[A-Z\\u00C0-\\u024F][A-Za-z.'\\u00C0-\\u024F-]*){0,3})";
+// R1 — untitled supervisor named after "my [thesis] supervisor". Mirrors the two
+// PAT_BARE_ADVISOR_* patterns (punctuation-delimited and untitled), but for
+// "supervisor". The (?!Dr|Prof) lookahead defers titled names to PAT_MY_SUPERVISOR
+// so a "Dr."/"Prof." never leaks into the captured name.
+const PAT_BARE_SUPERVISOR_PREFIX = /\bmy\s+(?:(?:research|thesis|academic)\s+)?(co[- ]?)?supervisors?\s*[,;:–—-]\s*(?!(?:Dr\b|Dr\.|Prof))([^\n!?;:]{3,100})/giu;
+const PAT_BARE_SUPERVISOR_UNTITLED = /\bmy\s+(?:(?:thesis|doctoral|dissertation)\s+)?(co[- ]?)?supervisors?\s+(?!(?:Dr\b|Dr\.|Prof))([A-ZÀ-ɏ][^\n!?;:]{2,100})/giu;
+// R2 — "Professor X … supervision of (this|the) thesis" (title precedes the name).
+const PAT_TITLED_SUPERVISION_OF_THESIS = new RegExp(
+  `${TITLE_RE}\\s+${NAME_NC}[^.]{0,60}?\\bsupervision of (?:this|the) thesis`, 'gi');
+// R3 — "Professor X[, Q.C.], who [both] supervised … thesis" (relative clause).
+const PAT_TITLED_WHO_SUPERVISED = new RegExp(
+  `${TITLE_RE}\\s+${NAME_NC}(?:\\s*,\\s*Q\\.?C\\.?)?\\s*,?\\s*who\\s+(?:both\\s+)?supervised\\b[^.]{0,40}thesis`, 'gi');
+// R4 (committee) — "my Advisory/Supervisory/Thesis Committee, Prof. X and Prof. Y".
+// Bounded to the titled names immediately adjacent to the phrase (not a wide forward
+// scan) so a later "such as Prof. Z" mention is not swept in as a committee member.
+// Case-sensitive ('g', not 'gi'): BARE_NAME relies on real uppercase to stop at
+// lowercase connectors like "and"; the i-flag would let [A-Z] match "and" and
+// truncate the list. Committee keywords appear title-cased inline ("my Advisory
+// Committee, …") so case-sensitivity does not lose real matches.
+const PAT_ADVISORY_COMMITTEE_TITLED = new RegExp(
+  `(?:[Mm]y|[Tt]he)\\s+(?:Advisory|Supervisory|Thesis)\\s+Committee\\s*[,:]\\s+(${TITLE_RE}\\s+${BARE_NAME}(?:\\s+and\\s+${TITLE_RE}\\s+${BARE_NAME})*)`, 'g');
 
 export function parseAcknowledgementsDetailed(fullText) {
   if (!fullText) return { members: [], ocrSpacingNormalized: false };
 
-  // Normalize form feeds so they appear as newlines to the heading regex
+  // Normalize form feeds so they appear as newlines to the heading regex. OCR
+  // letter-spacing inside the heading itself is tolerated by ACK_HEADING_RE; the
+  // section body is de-spaced separately below. (De-spacing the whole document here
+  // would deflate the substantive-section word count and hide short real sections.)
   const text = fullText.replace(/\f/g, '\n');
 
   // Use the first *substantive* occurrence — TOC entries have dotted leaders and few words
@@ -1721,6 +1764,26 @@ export function parseAcknowledgementsDetailed(fullText) {
     addMember(pm[1], pm[2] ? 'Co-Supervisor' : 'Supervisor');
   }
 
+  // R1: untitled supervisor — "my supervisor, Steve Wexler" / "my thesis supervisor Karin Mickelson"
+  for (const pm of section.matchAll(PAT_BARE_SUPERVISOR_PREFIX)) {
+    const name = isPlausibleBareAdvisorName(pm[2]);
+    if (name) addMember(name, pm[1] ? 'Co-Supervisor' : 'Supervisor');
+  }
+  for (const pm of section.matchAll(PAT_BARE_SUPERVISOR_UNTITLED)) {
+    const name = isPlausibleBareAdvisorName(pm[2]);
+    if (name) addMember(name, pm[1] ? 'Co-Supervisor' : 'Supervisor');
+  }
+
+  // R2: "Professor X ... supervision of this thesis"
+  for (const pm of section.matchAll(PAT_TITLED_SUPERVISION_OF_THESIS)) {
+    addMember(pm[1], 'Supervisor');
+  }
+
+  // R3: "Professor X, who [both] supervised ... this thesis"
+  for (const pm of section.matchAll(PAT_TITLED_WHO_SUPERVISED)) {
+    addMember(pm[1], 'Supervisor');
+  }
+
   // "Don Fisher and Kjell Rubenson, my research cosupervisors"
   for (const pm of section.matchAll(PAT_BARE_SUPERVISORS_SUFFIX)) {
     addMember(pm[1], 'Co-Supervisor');
@@ -1748,6 +1811,13 @@ export function parseAcknowledgementsDetailed(fullText) {
   // "Advisory Committee - Drs. Tom Sork, Shauna Butterwick, and Jim Frankish - ..."
   for (const cm of section.matchAll(PAT_DRS_ADVISORY_COMMITTEE)) {
     addBareNamesFromList(cm[1], 'Supervisory Committee Member');
+  }
+
+  // "my Advisory Committee, Prof. X and Prof. Y" — committee members, not a supervisor.
+  for (const cm of section.matchAll(PAT_ADVISORY_COMMITTEE_TITLED)) {
+    for (const dm of cm[1].matchAll(PAT_TITLED_NAME)) {
+      addMember(dm[1], 'Supervisory Committee Member');
+    }
   }
 
   // Bare committee list: "committee consisting of Name1, Name2 and Name3"
@@ -1895,6 +1965,9 @@ export function parseCommittee(fullText) {
         name = name.replace(/\s*[–—-]\s*(Professor|Assistant|Associate|Instructor).*$/i, '').trim();
         name = name.replace(/\s+(Thank|You|Sessional\s+Le[ct].*|Senior\s+Inst.*)$/i, '').trim();
         name = name.replace(/-$/, '').trim();
+        // Strip a leading honorific ("Professor X", "Dr. X") so the real name
+        // survives the bare-title reject below.
+        name = name.replace(LEADING_HONORIFIC, '').trim();
         // Skip label lines captured as names
         if (/^(additional|examining)\s+/i.test(name) || /committee\s+member/i.test(name)) continue;
         // Reject institution/department fragments, bare role words, and page artifacts

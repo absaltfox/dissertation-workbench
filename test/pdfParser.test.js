@@ -705,6 +705,103 @@ Bob Dylan (Supervisor)`;
   assert.ok(res3.some((m) => m.name === 'Bob Dylan' && m.role === 'Supervisor'));
 });
 
+test('parseCommittee extracts a supervisor whose name carries a "Professor" honorific', () => {
+  // Regression (doc 1.0396863): UBC certificate pages often list the supervisor
+  // as "Professor <Name>". The leading honorific must be stripped, not treated
+  // as a bare-title reject — otherwise the whole Supervisor entry is dropped and
+  // the thesis ends up with a committee member but no supervisor.
+  const committeeText = `The following individuals certify that they have read, and recommend to the Faculty of Graduate and Postdoctoral Studies for acceptance, the thesis entitled:
+Is Global Convergence of Competition Law the Answer?
+submitted by Thomas Martin
+Examining Committee:
+Professor Shigenori Matsui, Peter A. Allard School of Law, UBC
+Supervisor
+John Kim, Peter A. Allard School of Law, UBC
+Supervisory Committee Member`;
+
+  const res = parseCommittee(committeeText);
+  assert.ok(
+    res.some((m) => m.name === 'Shigenori Matsui' && m.role === 'Supervisor'),
+    `expected Shigenori Matsui as Supervisor, got ${JSON.stringify(res)}`
+  );
+  assert.ok(res.some((m) => m.name === 'John Kim' && m.role === 'Supervisory Committee Member'));
+});
+
+test('parseAcknowledgements extracts an untitled supervisor named after "my supervisor,"', () => {
+  // Regression (doc 1.0077471): "my supervisor, Steve Wexler" — no Dr./Prof. title.
+  const text = `ACKNOWLEDGEMENTS
+I would like to thank my supervisor, Steve Wexler, and second reader, Richard Paisley. Their patience, guidance and invaluable advice have made my graduate study possible and enjoyable this year.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'Steve Wexler' && m.role === 'Supervisor'),
+    `expected Steve Wexler as Supervisor, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements extracts an untitled name after "my thesis supervisor"', () => {
+  // Regression (doc 1.0077517): "my thesis supervisor Karin Mickelson" — untitled, no comma.
+  const text = `ACKNOWLEDGEMENTS
+I would like to acknowledge the suggestions, commentaries and guidance of my thesis supervisor Karin Mickelson and my external reader Richard Paisley. Both of them were extremely patient reviewing the draft versions of this thesis.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'Karin Mickelson' && m.role === 'Supervisor'),
+    `expected Karin Mickelson as Supervisor, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements extracts a supervisor from "for the supervision of this thesis"', () => {
+  // Regression (doc 1.0077661): "Professor A.R. Thompson, not only for the supervision of this thesis".
+  const text = `ACKNOWLEDGEMENTS
+I wish to express my thanks to Professor A.R. Thompson, not only for the supervision of this thesis, but also for his guidance and assistance generally throughout my time in the graduate program.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'A.R. Thompson' && m.role === 'Supervisor'),
+    `expected A.R. Thompson as Supervisor, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements extracts a supervisor from "Professor X, who supervised ... this thesis"', () => {
+  // Regression (docs 1.0077436, 1.0077618): relative-clause attribution.
+  const text = `ACKNOWLEDGEMENTS
+Special thanks are due to Professor Peter Burns, who both supervised and facilitated this thesis with great patience, and to the second reader for his insightful comments throughout the process.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'Peter Burns' && m.role === 'Supervisor'),
+    `expected Peter Burns as Supervisor, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements finds the section when the heading is OCR letter-spaced', () => {
+  // Regression (doc 1.0077650): "A C K N O W L E D G E M E N T S" defeats heading detection.
+  const text = `A C K N O W L E D G E M E N T S
+This project would never have even begun without the insight and clear thinking of my advisor Susan B. Boyd, who waded through my multiple proposals to find one that was workable.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'Susan B. Boyd' && m.role === 'Supervisor'),
+    `expected Susan B. Boyd as Supervisor, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements finds the section when the heading has a suffix', () => {
+  // Regression (doc 1.0077618): "ACKNOWLEDGEMENTS AND DEDICATION" defeats heading detection.
+  const text = `ACKNOWLEDGEMENTS AND DEDICATION
+The author would like to thank Professor Peter Burns, Q.C., who supervised and facilitated this thesis, and Mr. Daniel Prefontaine, second reader, for his thoughtful comments on the material.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'Peter Burns' && m.role === 'Supervisor'),
+    `expected Peter Burns as Supervisor, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements extracts committee members from "my Advisory Committee, Prof. X and Prof. Y"', () => {
+  // Regression (doc 1.0077585): committee members present, no supervisor stated.
+  const text = `A C K N O W L E D G E M E N T S
+It is my wish to express my gratitude to all of those who have supported this work. The members of my Advisory Committee, Prof. Bruce MacDougall and Prof. William Black, have devoted time and energy to this work.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'Bruce MacDougall' && m.role === 'Supervisory Committee Member'),
+    `expected Bruce MacDougall as committee member, got ${JSON.stringify(res)}`);
+  assert.ok(res.some((m) => m.name === 'William Black' && m.role === 'Supervisory Committee Member'));
+  assert.ok(!res.some((m) => m.role === 'Supervisor' || m.role === 'Co-Supervisor'),
+    `no supervisor should be inferred, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements does NOT infer a supervisor from gratitude/guidance alone', () => {
+  // Guardrail (docs 1.0077655, 1.0077608): "guidance of Professor X" with no role word
+  // must not be promoted to a supervisor.
+  const text = `ACKNOWLEDGEMENTS
+The thesis itself could not have been written without the encouragement and expert guidance of Professor M. J. O'Keefe. I also wish to gratefully acknowledge the invaluable guidance and support of Professor Pitman B. Potter throughout this work.`;
+  const res = parseAcknowledgements(text);
+  assert.deepEqual(res, [], `expected no supervisor from guidance alone, got ${JSON.stringify(res)}`);
+});
+
 test('parseBibliography extracts lists of references and cleans OCR spacing artifacts', () => {
   const bibText = `Some introductory text about education.
 REFERENCES
