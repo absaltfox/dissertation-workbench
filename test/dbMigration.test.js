@@ -331,3 +331,20 @@ test('tryExec rethrows a non-tolerated migration error', async () => {
     /invalid migration SQL/
   );
 });
+
+test('document_terms table and indexes are created', async () => {
+  const { getDb, ensureStorage } = await import('../src/db.js');
+  await ensureStorage();
+  const db = await getDb();
+  const tbl = await db.execute(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='document_terms'"
+  );
+  assert.equal(tbl.rows.length, 1);
+  const idx = await db.execute(
+    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='document_terms' ORDER BY name"
+  );
+  const names = idx.rows.map((r) => r.name);
+  assert.ok(names.includes('idx_document_terms_kind_term'));
+  assert.ok(names.includes('idx_document_terms_kind_termlower'));
+  assert.ok(names.includes('idx_document_terms_doc'));
+});

@@ -292,6 +292,13 @@ async function ensureSchema(client) {
       PRIMARY KEY (doc_id, person_key, role, source)
     );
 
+    CREATE TABLE IF NOT EXISTS document_terms (
+      doc_id TEXT NOT NULL,
+      kind   TEXT NOT NULL,
+      term   TEXT NOT NULL,
+      PRIMARY KEY (doc_id, kind, term)
+    );
+
     CREATE TABLE IF NOT EXISTS serving_projection_state (
       projection_key TEXT PRIMARY KEY,
       projection_value TEXT NOT NULL,
@@ -792,6 +799,11 @@ async function ensureSchema(client) {
   // scope_where() in build-concepts.py filters every automatic partition by
   // degree plus a year range on each PatternRank run.
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree_year ON documents(degree, year)');
+
+  // document_terms projection table indexes for efficient term lookups
+  await tryExec(client, "CREATE INDEX IF NOT EXISTS idx_document_terms_kind_term ON document_terms(kind, term)");
+  await tryExec(client, "CREATE INDEX IF NOT EXISTS idx_document_terms_kind_termlower ON document_terms(kind, lower(term))");
+  await tryExec(client, "CREATE INDEX IF NOT EXISTS idx_document_terms_doc ON document_terms(doc_id, kind)");
 
   await backfillCitationMatchKeys(client);
   await backfillDocumentAccessStatus(client);
