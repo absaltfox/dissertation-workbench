@@ -801,9 +801,9 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree_year ON documents(degree, year)');
 
   // document_terms projection table indexes for efficient term lookups
-  await tryExec(client, "CREATE INDEX IF NOT EXISTS idx_document_terms_kind_term ON document_terms(kind, term)");
-  await tryExec(client, "CREATE INDEX IF NOT EXISTS idx_document_terms_kind_termlower ON document_terms(kind, lower(term))");
-  await tryExec(client, "CREATE INDEX IF NOT EXISTS idx_document_terms_doc ON document_terms(doc_id, kind)");
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_kind_term ON document_terms(kind, term)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_kind_termlower ON document_terms(kind, lower(term))');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_doc ON document_terms(doc_id, kind)');
 
   await backfillCitationMatchKeys(client);
   await backfillDocumentAccessStatus(client);

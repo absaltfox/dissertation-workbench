@@ -333,18 +333,51 @@ test('tryExec rethrows a non-tolerated migration error', async () => {
 });
 
 test('document_terms table and indexes are created', async () => {
-  const { getDb, ensureStorage } = await import('../src/db.js');
-  await ensureStorage();
-  const db = await getDb();
-  const tbl = await db.execute(
-    "SELECT name FROM sqlite_master WHERE type='table' AND name='document_terms'"
-  );
-  assert.equal(tbl.rows.length, 1);
-  const idx = await db.execute(
-    "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='document_terms' ORDER BY name"
-  );
-  const names = idx.rows.map((r) => r.name);
-  assert.ok(names.includes('idx_document_terms_kind_term'));
-  assert.ok(names.includes('idx_document_terms_kind_termlower'));
-  assert.ok(names.includes('idx_document_terms_doc'));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-document-terms-'));
+  const sqlitePath = path.join(tempDir, 'test.sqlite');
+
+  const dbModuleUrl = pathToFileURL(path.resolve('src/db.js')).href;
+  const childSource = `
+    const db = await import(${JSON.stringify(dbModuleUrl)});
+    await db.ensureStorage();
+    const client = await db.getDb();
+    const tbl = await client.execute(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='document_terms'"
+    );
+    const idx = await client.execute(
+      "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='document_terms' ORDER BY name"
+    );
+    const names = idx.rows.map((r) => r.name);
+    process.stdout.write(JSON.stringify({
+      tableExists: tbl.rows.length === 1,
+      hasKindTerm: names.includes('idx_document_terms_kind_term'),
+      hasKindTermlower: names.includes('idx_document_terms_kind_termlower'),
+      hasDoc: names.includes('idx_document_terms_doc'),
+    }));
+    await db.closeDb();
+  `;
+  try {
+    const childOptions = {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        APP_DATA_DIR: path.join(tempDir, 'data'),
+        SQLITE_PATH: sqlitePath,
+        TURSO_DATABASE_URL: '',
+        SKIP_LOCAL_ENV: '1',
+      },
+    };
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      ['--input-type=module', '-e', childSource],
+      childOptions
+    );
+    const result = JSON.parse(stdout.trim().split('\n').at(-1));
+    assert.equal(result.tableExists, true, 'document_terms table should exist');
+    assert.equal(result.hasKindTerm, true, 'idx_document_terms_kind_term should exist');
+    assert.equal(result.hasKindTermlower, true, 'idx_document_terms_kind_termlower should exist');
+    assert.equal(result.hasDoc, true, 'idx_document_terms_doc should exist');
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
 });
