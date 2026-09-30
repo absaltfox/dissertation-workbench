@@ -1108,6 +1108,38 @@ function metadataPeopleStatements(doc, now = new Date().toISOString()) {
   return statements;
 }
 
+const DOCUMENT_TERM_KINDS = [
+  ['theme', 'themes'],
+  ['concept', 'conceptTerms'],
+  ['methodology', 'methodologies'],
+];
+
+function metadataTermsStatements(doc, now = new Date().toISOString()) {
+  const statements = [{
+    sql: 'DELETE FROM document_terms WHERE doc_id = ?',
+    args: [doc.id],
+  }];
+  // Restricted docs have their term arrays wiped from the stored metadata_json
+  // (see saveDocumentStatement embargo branch); project nothing so the table
+  // matches the stored blob.
+  if (isAccessRestricted(doc)) return statements;
+  for (const [kind, field] of DOCUMENT_TERM_KINDS) {
+    const seen = new Set();
+    const values = Array.isArray(doc?.[field]) ? doc[field] : [];
+    for (const raw of values) {
+      const term = String(raw ?? '').trim();
+      if (!term || seen.has(term)) continue;
+      seen.add(term);
+      statements.push({
+        sql: `INSERT INTO document_terms (doc_id, kind, term) VALUES (?, ?, ?)
+              ON CONFLICT(doc_id, kind, term) DO NOTHING`,
+        args: [doc.id, kind, term],
+      });
+    }
+  }
+  return statements;
+}
+
 async function backfillDocumentPeopleProjection(client) {
   let total = 0;
   while (true) {
@@ -1246,6 +1278,7 @@ export async function saveDocumentMetadata(doc, { syncKey = null, source = null 
     await client.batch([
       saveDocumentStatement(doc, { syncKey, source }, now),
       ...metadataPeopleStatements(doc, now),
+      ...metadataTermsStatements(doc, now),
       ...(isAccessRestricted(doc) ? embargoCleanupStatements(doc.id, now) : []),
     ], 'write');
   }, { label: 'saveDocumentMetadata' });
@@ -1261,7 +1294,7 @@ function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now 
         access_status, available_at, access_status_reason,
         source_json, source_updated_at, synced_at, serving_projection_version, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?)
       ON CONFLICT(doc_id) DO UPDATE SET
         metadata_json = CASE
           WHEN documents.access_status IN ('embargoed', 'verification_due')
@@ -1356,6 +1389,7 @@ export async function saveDocumentMetadataBatch(items) {
           source: item.source || null,
         }, now),
         ...metadataPeopleStatements(doc, now),
+        ...metadataTermsStatements(doc, now),
         ...(isAccessRestricted(doc) ? embargoCleanupStatements(doc.id, now) : []),
       ];
     }),
