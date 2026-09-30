@@ -7,7 +7,8 @@ import {
   CITATION_SCAN_NIGHTLY_ENABLED, CITATION_SCAN_NIGHTLY_HOUR_LOCAL, validateRuntimeSecrets
 } from './config.js';
 import {
-  checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb
+  checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb,
+  initDocumentTermsReadiness, isDocumentTermsReady, runDocumentTermsBackfillOnce
 } from './db.js';
 import { ensureDefaultAdmin } from './auth.js';
 import { createBoundedCache } from './boundedCache.js';
@@ -203,6 +204,11 @@ export async function start() {
   const server = app.listen(PORT, () => {
     logger.info(`Dissertation Workbench running at http://localhost:${PORT}`);
   });
+
+  initDocumentTermsReadiness()
+    .then(() => (isDocumentTermsReady() ? null : runDocumentTermsBackfillOnce()))
+    .then(() => logger.info('document_terms projection ready'))
+    .catch((e) => logger.warn('document_terms backfill failed; using json_each fallback', { error: e.message }));
 
   const warmWorkbenchCache = async (trigger = 'scheduled') => {
     const apiKey = await getConfiguredApiKey();

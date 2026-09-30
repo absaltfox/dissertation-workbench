@@ -1140,6 +1140,38 @@ function metadataTermsStatements(doc, now = new Date().toISOString()) {
   return statements;
 }
 
+let documentTermsReady = false;
+export function isDocumentTermsReady() { return documentTermsReady; }
+export function __setDocumentTermsReadyForTesting(value) { documentTermsReady = Boolean(value); }
+
+export async function initDocumentTermsReadiness() {
+  const pending = await get('SELECT COUNT(*) AS c FROM documents WHERE serving_projection_version < 2');
+  documentTermsReady = Number(pending?.c || 0) === 0;
+}
+
+export async function runDocumentTermsBackfillOnce() {
+  const client = await getDb();
+  while (true) {
+    const result = await client.execute(`
+      SELECT doc_id, metadata_json FROM documents
+      WHERE serving_projection_version < 2
+      ORDER BY doc_id LIMIT 500
+    `);
+    if (!result.rows.length) break;
+    const statements = [];
+    const now = new Date().toISOString();
+    for (const row of result.rows) {
+      let doc = null;
+      try { doc = JSON.parse(row.metadata_json); } catch { doc = { id: row.doc_id }; }
+      doc.id ||= row.doc_id;
+      statements.push(...metadataTermsStatements(doc, now));
+      statements.push({ sql: 'UPDATE documents SET serving_projection_version = 2 WHERE doc_id = ?', args: [row.doc_id] });
+    }
+    await client.batch(statements, 'write');
+  }
+  documentTermsReady = true;
+}
+
 async function backfillDocumentPeopleProjection(client) {
   let total = 0;
   while (true) {

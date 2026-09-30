@@ -42,3 +42,21 @@ test('re-writing the same doc is idempotent (no duplicate rows)', async () => {
   const rows = await db.execute("SELECT COUNT(*) c FROM document_terms WHERE doc_id='dt-2'");
   assert.equal(Number(rows.rows[0].c), 1);
 });
+
+test('backfill projects legacy rows (version<2) and flips readiness', async () => {
+  const db = await getDb();
+  const { runDocumentTermsBackfillOnce, initDocumentTermsReadiness, isDocumentTermsReady } = await import('../src/db.js');
+  // Simulate a legacy row: metadata present, terms not yet projected, version 1.
+  await db.execute({
+    sql: "INSERT INTO documents (doc_id, metadata_json, serving_projection_version, updated_at) VALUES (?, ?, 1, ?)",
+    args: ['legacy-1', JSON.stringify({ id: 'legacy-1', themes: ['Legacy Theme'], conceptTerms: [], methodologies: [] }), new Date().toISOString()],
+  });
+  await initDocumentTermsReadiness();
+  assert.equal(isDocumentTermsReady(), false); // legacy row pending
+  await runDocumentTermsBackfillOnce();
+  const rows = await db.execute("SELECT kind, term FROM document_terms WHERE doc_id='legacy-1'");
+  assert.deepEqual(rows.rows.map((r) => [r.kind, r.term]), [['theme', 'Legacy Theme']]);
+  const v = await db.execute("SELECT serving_projection_version v FROM documents WHERE doc_id='legacy-1'");
+  assert.equal(Number(v.rows[0].v), 2);
+  assert.equal(isDocumentTermsReady(), true);
+});
