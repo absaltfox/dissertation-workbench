@@ -2474,6 +2474,27 @@ export async function queryRelatedDocuments(doc, { syncKey = null, limit = 6 } =
   if (!doc?.id || !terms.length) return [];
   const values = terms.map(() => '(?)').join(', ');
   const syncClause = syncKey ? 'AND d.sync_key = ?' : '';
+  if (isDocumentTermsReady()) {
+    const rows = await all(`
+      WITH target_terms(term) AS (VALUES ${values})
+      SELECT d.doc_id, d.title, d.author, d.year, d.degree,
+             COUNT(DISTINCT target_terms.term) AS overlap
+      FROM documents d
+      JOIN document_terms dt
+        ON dt.doc_id = d.doc_id AND dt.kind IN ('theme','concept')
+      JOIN target_terms ON lower(dt.term) = target_terms.term
+      WHERE d.doc_id <> ? ${syncClause}
+        AND ${ACTIVE_ANALYTICS_ACCESS_SQL}
+      GROUP BY d.doc_id, d.title, d.author, d.year, d.degree
+      ORDER BY overlap DESC, d.year DESC, d.title ASC
+      LIMIT ?
+    `, [...terms, doc.id, ...(syncKey ? [syncKey] : []), Math.max(1, Math.min(25, Number(limit) || 6))]);
+    return rows.map((row) => ({
+      id: row.doc_id, title: row.title || '', author: row.author || '',
+      year: row.year == null ? null : Number(row.year),
+      degree: row.degree || '', overlap: Number(row.overlap || 0),
+    }));
+  }
   const rows = await all(`
     WITH target_terms(term) AS (VALUES ${values})
     SELECT d.doc_id, d.title, d.author, d.year, d.degree,
