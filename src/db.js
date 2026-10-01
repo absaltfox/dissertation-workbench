@@ -2087,6 +2087,41 @@ async function computeSupervisorNgramMatrixSql(filters, qualifier, topN = 12, to
   };
 }
 
+// Builds the SQL for the themes/conceptTerms/methodologies frequency
+// aggregates used by getDocumentServingAnalytics. When document_terms is
+// ready, joins the projection table (already-trimmed, non-empty terms,
+// per Task 2) grouped on dt.term; otherwise falls back to the legacy
+// json_each(metadata_json) expansion. Row shape is identical either way:
+// { term, count } (concept/theme kinds) with the caller responsible for
+// renaming to `methodology` where needed via the SELECT alias below.
+function termAggregateSql(kind, filters, qualifier, limitSql) {
+  if (isDocumentTermsReady()) {
+    return {
+      sql: `
+        SELECT dt.term AS term, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN document_terms dt ON dt.doc_id = d.doc_id AND dt.kind = ?
+        ${filters.where}
+        GROUP BY dt.term
+        ORDER BY count DESC, term ASC
+        ${limitSql}`,
+      args: [kind, ...filters.args],
+    };
+  }
+  const field = { theme: 'themes', concept: 'conceptTerms', methodology: 'methodologies' }[kind];
+  return {
+    sql: `
+      SELECT trim(CAST(term.value AS TEXT)) AS term, COUNT(DISTINCT d.doc_id) AS count
+      FROM documents d, json_each(d.metadata_json, '$.${field}') term
+      ${filters.where}
+      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
+      GROUP BY term
+      ORDER BY count DESC, term ASC
+      ${limitSql}`,
+    args: filters.args,
+  };
+}
+
 /**
  * Metadata-scale analytics computed as bounded SQL aggregates. This deliberately
  * returns no document collection; document rows have their own paginated API.
@@ -2127,33 +2162,12 @@ export async function getDocumentServingAnalytics({ syncKey = null, filters: req
     `, filters.args),
     aggregateNumericSeries({ filters, valueSql: activeWords, reliabilitySql: reliableWords }),
     aggregateNumericSeries({ filters, valueSql: 'fm.page_count', reliabilitySql: reliablePages }),
-    all(`
-      SELECT trim(CAST(term.value AS TEXT)) AS term, COUNT(DISTINCT d.doc_id) AS count
-      FROM documents d, json_each(d.metadata_json, '$.themes') term
-      ${filters.where}
-      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
-      GROUP BY term
-      ORDER BY count DESC, term ASC
-      LIMIT 70
-    `, filters.args),
-    all(`
-      SELECT trim(CAST(term.value AS TEXT)) AS term, COUNT(DISTINCT d.doc_id) AS count
-      FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
-      ${filters.where}
-      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
-      GROUP BY term
-      ORDER BY count DESC, term ASC
-      LIMIT ?
-    `, [...filters.args, Math.max(1, Math.min(100, Number(subjectLimit) || 25))]),
-    all(`
-      SELECT trim(CAST(term.value AS TEXT)) AS methodology, COUNT(DISTINCT d.doc_id) AS count
-      FROM documents d, json_each(d.metadata_json, '$.methodologies') term
-      ${filters.where}
-      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
-      GROUP BY methodology
-      ORDER BY count DESC, methodology ASC
-      LIMIT 100
-    `, filters.args),
+    (() => { const q = termAggregateSql('theme', filters, qualifier, 'LIMIT 70'); return all(q.sql, q.args); })(),
+    (() => {
+      const q = termAggregateSql('concept', filters, qualifier, 'LIMIT ?');
+      return all(q.sql, [...q.args, Math.max(1, Math.min(100, Number(subjectLimit) || 25))]);
+    })(),
+    (() => { const q = termAggregateSql('methodology', filters, qualifier, 'LIMIT 100'); return all(q.sql, q.args); })(),
     computeConceptTimelineSql(filters, qualifier),
     computeMethodologyConceptMatrixSql(filters, qualifier),
     hasTopics(),
@@ -2239,7 +2253,7 @@ export async function getDocumentServingAnalytics({ syncKey = null, filters: req
     },
     wordCloud: themes.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
     ngramCloud: concepts.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
-    methodologies: methodologies.map((row) => ({ methodology: row.methodology, count: Number(row.count || 0) })),
+    methodologies: methodologies.map((row) => ({ methodology: row.term, count: Number(row.count || 0) })),
     // #15: five of six panels are now real SQL-backed aggregates, computed
     // above next to the other bounded aggregates in this function.
     // termCooccurrence has no SQL port (see the comment above this
