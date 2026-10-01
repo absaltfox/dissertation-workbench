@@ -1888,15 +1888,25 @@ async function computeConceptTimelineSql(filters, qualifier, topN = 8) {
 }
 
 async function computeMethodologyConceptMatrixSql(filters, qualifier, topM = 10, topC = 10) {
-  const topMethodologies = await all(`
-    SELECT trim(CAST(m.value AS TEXT)) AS methodology, COUNT(*) AS count
-    FROM documents d, json_each(d.metadata_json, '$.methodologies') m
-    ${filters.where}
-    ${qualifier} trim(CAST(m.value AS TEXT)) <> ''
-    GROUP BY methodology
-    ORDER BY count DESC, methodology ASC
-    LIMIT ?
-  `, [...filters.args, topM]);
+  const topMethodologies = isDocumentTermsReady()
+    ? await all(`
+        SELECT m.term AS methodology, COUNT(*) AS count
+        FROM documents d
+        JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
+        ${filters.where}
+        GROUP BY methodology
+        ORDER BY count DESC, methodology ASC
+        LIMIT ?
+      `, [...filters.args, topM])
+    : await all(`
+        SELECT trim(CAST(m.value AS TEXT)) AS methodology, COUNT(*) AS count
+        FROM documents d, json_each(d.metadata_json, '$.methodologies') m
+        ${filters.where}
+        ${qualifier} trim(CAST(m.value AS TEXT)) <> ''
+        GROUP BY methodology
+        ORDER BY count DESC, methodology ASC
+        LIMIT ?
+      `, [...filters.args, topM]);
   if (!topMethodologies.length) {
     return { methodologies: [], concepts: [], conceptIds: [], matrix: [] };
   }
@@ -1907,37 +1917,81 @@ async function computeMethodologyConceptMatrixSql(filters, qualifier, topM = 10,
   // loop), so a document with 2 methodologies weights its concepts' ranking
   // score by 2, not 1. This only affects which concepts land in the top-C
   // set, not the final cross-tab values below.
-  const topConcepts = await all(`
-    SELECT trim(CAST(term.value AS TEXT)) AS concept,
-           SUM((SELECT COUNT(*) FROM json_each(d.metadata_json, '$.methodologies'))) AS weighted_count
-    FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
-    ${filters.where}
-    ${qualifier} term.key < 10
-      AND trim(CAST(term.value AS TEXT)) <> ''
-      AND EXISTS (SELECT 1 FROM json_each(d.metadata_json, '$.methodologies'))
-    GROUP BY concept
-    ORDER BY weighted_count DESC, concept ASC
-    LIMIT ?
-  `, [...filters.args, topC]);
+  //
+  // The term.key < 10 / term.rnk <= 10 cutoff here is the same
+  // dedup-sensitive "first 10 conceptTerms" boundary documented at
+  // LEGACY_CONCEPT_FIRST10_DISTINCT_SQL above (see the comment on that
+  // constant): the legacy branch reuses that derived table rather than a
+  // raw json_each + term.key < 10 so a duplicate conceptTerm inside a
+  // document's first 10 raw array positions can't make the legacy branch
+  // diverge from the document_terms projection (which is deduped on
+  // write). The methodologies SUM/EXISTS subqueries are a separate,
+  // non-dedup-sensitive conversion (mechanical json_each -> document_terms
+  // per the Task 6 rule) and stay verbatim json_each in the legacy branch.
+  const topConcepts = isDocumentTermsReady()
+    ? await all(`
+        SELECT term.term AS concept,
+               SUM((SELECT COUNT(*) FROM document_terms WHERE doc_id = d.doc_id AND kind = 'methodology')) AS weighted_count
+        FROM documents d
+        JOIN (
+          SELECT doc_id, term, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY rowid) AS ord
+          FROM document_terms WHERE kind = 'concept'
+        ) term ON term.doc_id = d.doc_id
+        ${filters.where}
+        ${qualifier} term.ord <= 10
+          AND EXISTS (SELECT 1 FROM document_terms WHERE doc_id = d.doc_id AND kind = 'methodology')
+        GROUP BY concept
+        ORDER BY weighted_count DESC, concept ASC
+        LIMIT ?
+      `, [...filters.args, topC])
+    : await all(`
+        SELECT term.value AS concept,
+               SUM((SELECT COUNT(*) FROM json_each(d.metadata_json, '$.methodologies'))) AS weighted_count
+        FROM documents d
+        JOIN ${LEGACY_CONCEPT_FIRST10_DISTINCT_SQL} term ON term.doc_id = d.doc_id
+        ${filters.where}
+        ${qualifier} term.rnk <= 10
+          AND EXISTS (SELECT 1 FROM json_each(d.metadata_json, '$.methodologies'))
+        GROUP BY concept
+        ORDER BY weighted_count DESC, concept ASC
+        LIMIT ?
+      `, [...filters.args, topC]);
   if (!topConcepts.length) {
     return { methodologies: topMethodologies.map((r) => r.methodology), concepts: [], conceptIds: [], matrix: [] };
   }
 
   const methList = topMethodologies.map((r) => r.methodology);
   const conceptList = topConcepts.map((r) => r.concept);
-  const cellRows = await all(`
-    SELECT trim(CAST(m.value AS TEXT)) AS methodology,
-           trim(CAST(term.value AS TEXT)) AS concept,
-           COUNT(*) AS count
-    FROM documents d,
-         json_each(d.metadata_json, '$.methodologies') m,
-         json_each(d.metadata_json, '$.conceptTerms') term
-    ${filters.where}
-    ${qualifier} term.key < 10
-      AND trim(CAST(m.value AS TEXT)) IN (SELECT value FROM json_each(?))
-      AND trim(CAST(term.value AS TEXT)) IN (SELECT value FROM json_each(?))
-    GROUP BY methodology, concept
-  `, [...filters.args, JSON.stringify(methList), JSON.stringify(conceptList)]);
+  const cellRows = isDocumentTermsReady()
+    ? await all(`
+        SELECT m.term AS methodology,
+               term.term AS concept,
+               COUNT(*) AS count
+        FROM documents d
+        JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
+        JOIN (
+          SELECT doc_id, term, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY rowid) AS ord
+          FROM document_terms WHERE kind = 'concept'
+        ) term ON term.doc_id = d.doc_id
+        ${filters.where}
+        ${qualifier} term.ord <= 10
+          AND m.term IN (SELECT value FROM json_each(?))
+          AND term.term IN (SELECT value FROM json_each(?))
+        GROUP BY methodology, concept
+      `, [...filters.args, JSON.stringify(methList), JSON.stringify(conceptList)])
+    : await all(`
+        SELECT trim(CAST(m.value AS TEXT)) AS methodology,
+               term.value AS concept,
+               COUNT(*) AS count
+        FROM documents d
+        JOIN ${LEGACY_CONCEPT_FIRST10_DISTINCT_SQL} term ON term.doc_id = d.doc_id
+        , json_each(d.metadata_json, '$.methodologies') m
+        ${filters.where}
+        ${qualifier} term.rnk <= 10
+          AND trim(CAST(m.value AS TEXT)) IN (SELECT value FROM json_each(?))
+          AND term.value IN (SELECT value FROM json_each(?))
+        GROUP BY methodology, concept
+      `, [...filters.args, JSON.stringify(methList), JSON.stringify(conceptList)]);
 
   const methIndex = new Map(methList.map((name, i) => [name, i]));
   const conceptIndex = new Map(conceptList.map((name, i) => [name, i]));
@@ -1958,15 +2012,25 @@ async function computeMethodologyConceptMatrixSql(filters, qualifier, topM = 10,
 }
 
 async function computeMethodologyTopicMatrixSql(filters, qualifier, topics) {
-  const topMethodologies = await all(`
-    SELECT trim(CAST(m.value AS TEXT)) AS methodology, COUNT(*) AS count
-    FROM documents d, json_each(d.metadata_json, '$.methodologies') m
-    ${filters.where}
-    ${qualifier} trim(CAST(m.value AS TEXT)) <> ''
-    GROUP BY methodology
-    ORDER BY count DESC, methodology ASC
-    LIMIT 10
-  `, filters.args);
+  const topMethodologies = isDocumentTermsReady()
+    ? await all(`
+        SELECT m.term AS methodology, COUNT(*) AS count
+        FROM documents d
+        JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
+        ${filters.where}
+        GROUP BY methodology
+        ORDER BY count DESC, methodology ASC
+        LIMIT 10
+      `, filters.args)
+    : await all(`
+        SELECT trim(CAST(m.value AS TEXT)) AS methodology, COUNT(*) AS count
+        FROM documents d, json_each(d.metadata_json, '$.methodologies') m
+        ${filters.where}
+        ${qualifier} trim(CAST(m.value AS TEXT)) <> ''
+        GROUP BY methodology
+        ORDER BY count DESC, methodology ASC
+        LIMIT 10
+      `, filters.args);
   const validTopics = topics.filter((t) => t.topicId !== -1).slice(0, 8);
   if (!topMethodologies.length || !validTopics.length) {
     return { methodologies: topMethodologies.map((r) => r.methodology), topics: validTopics.map((t) => ({ topicId: t.topicId, label: t.label })), matrix: [] };
@@ -1974,16 +2038,27 @@ async function computeMethodologyTopicMatrixSql(filters, qualifier, topics) {
 
   const methList = topMethodologies.map((r) => r.methodology);
   const topicIdList = validTopics.map((t) => t.topicId);
-  const cellRows = await all(`
-    SELECT dt.topic_id AS topic_id, trim(CAST(m.value AS TEXT)) AS methodology, COUNT(DISTINCT d.doc_id) AS count
-    FROM documents d
-    JOIN document_topics dt ON dt.doc_id = d.doc_id
-    , json_each(d.metadata_json, '$.methodologies') m
-    ${filters.where}
-    ${qualifier} dt.topic_id IN (SELECT value FROM json_each(?))
-      AND trim(CAST(m.value AS TEXT)) IN (SELECT value FROM json_each(?))
-    GROUP BY dt.topic_id, methodology
-  `, [...filters.args, JSON.stringify(topicIdList), JSON.stringify(methList)]);
+  const cellRows = isDocumentTermsReady()
+    ? await all(`
+        SELECT dt.topic_id AS topic_id, m.term AS methodology, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN document_topics dt ON dt.doc_id = d.doc_id
+        JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
+        ${filters.where}
+        ${qualifier} dt.topic_id IN (SELECT value FROM json_each(?))
+          AND m.term IN (SELECT value FROM json_each(?))
+        GROUP BY dt.topic_id, methodology
+      `, [...filters.args, JSON.stringify(topicIdList), JSON.stringify(methList)])
+    : await all(`
+        SELECT dt.topic_id AS topic_id, trim(CAST(m.value AS TEXT)) AS methodology, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN document_topics dt ON dt.doc_id = d.doc_id
+        , json_each(d.metadata_json, '$.methodologies') m
+        ${filters.where}
+        ${qualifier} dt.topic_id IN (SELECT value FROM json_each(?))
+          AND trim(CAST(m.value AS TEXT)) IN (SELECT value FROM json_each(?))
+        GROUP BY dt.topic_id, methodology
+      `, [...filters.args, JSON.stringify(topicIdList), JSON.stringify(methList)]);
 
   const methIndex = new Map(methList.map((name, i) => [name, i]));
   const topicIndex = new Map(topicIdList.map((id, i) => [id, i]));

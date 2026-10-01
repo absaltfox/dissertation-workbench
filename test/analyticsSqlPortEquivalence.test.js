@@ -267,7 +267,37 @@ test('Task 6a: conceptTimeline + supervisorNgramMatrix — document_terms projec
   }
 });
 
-test('Task 6a fix (round 1 review): supervisorNgramMatrix — legacy distinct-first-10 selection matches the document_terms projection when a document has a duplicate conceptTerm inside its first 10 raw array positions', async () => {
+test('Task 6b: methodologyConceptMatrix + methodologyTopicMatrix — document_terms projection equals legacy json_each', async () => {
+  const { __setDocumentTermsReadyForTesting } = await import('../src/db.js');
+  try {
+    __setDocumentTermsReadyForTesting(false);
+    const legacy = await getDocumentServingAnalytics({ syncKey: SYNC_KEY });
+
+    __setDocumentTermsReadyForTesting(true);
+    const projected = await getDocumentServingAnalytics({ syncKey: SYNC_KEY });
+
+    // Non-empty guards: deep-equaling two empty panels would be a vacuous pass.
+    assert.ok(legacy.methodologyConceptMatrix.methodologies.length > 0, 'methodologyConceptMatrix.methodologies must be non-empty');
+    assert.ok(legacy.methodologyConceptMatrix.concepts.length > 0, 'methodologyConceptMatrix.concepts must be non-empty');
+    assert.ok(
+      legacy.methodologyConceptMatrix.matrix.some((row) => row.some((v) => v > 0)),
+      'methodologyConceptMatrix.matrix must contain at least one nonzero cell'
+    );
+    assert.ok(legacy.methodologyTopicMatrix.methodologies.length > 0, 'methodologyTopicMatrix.methodologies must be non-empty');
+    assert.ok(legacy.methodologyTopicMatrix.topics.length > 0, 'methodologyTopicMatrix.topics must be non-empty');
+    assert.ok(
+      legacy.methodologyTopicMatrix.matrix.some((row) => row.some((v) => v > 0)),
+      'methodologyTopicMatrix.matrix must contain at least one nonzero cell'
+    );
+
+    assert.deepEqual(projected.methodologyConceptMatrix, legacy.methodologyConceptMatrix);
+    assert.deepEqual(projected.methodologyTopicMatrix, legacy.methodologyTopicMatrix);
+  } finally {
+    __setDocumentTermsReadyForTesting(false);
+  }
+});
+
+test('Task 6a/6b fix (round 1 review + Task 6b reuse): supervisorNgramMatrix + methodologyConceptMatrix — legacy distinct-first-10 selection matches the document_terms projection when a document has a duplicate conceptTerm inside its first 10 raw array positions', async () => {
   // Isolated in its own syncKey/doc, deliberately NOT added to the shared
   // 222-doc SYNC_KEY corpus: the JS reference path (buildSupervisorNgramMatrix
   // -> docConceptTerms -> rec.conceptTerms.slice(0, 10)) truncates by RAW
@@ -336,6 +366,23 @@ test('Task 6a fix (round 1 review): supervisorNgramMatrix — legacy distinct-fi
     assert.ok(!legacy.supervisorNgramMatrix.ngrams.includes('boundary x'), "'boundary x' (11th distinct term) must remain excluded");
 
     assert.deepEqual(projected.supervisorNgramMatrix, legacy.supervisorNgramMatrix);
+
+    // Task 6b reuses this exact fixture (same doc, same duplicate-in-first-10
+    // boundary) to prove computeMethodologyConceptMatrixSql's topConcepts
+    // query — which applies the identical term.key < 10 / term.rnk <= 10
+    // dedup-sensitive cutoff — doesn't regress the same way. The doc's lone
+    // methodology ('Qualitative') makes topMethodologies trivially
+    // single-valued, isolating the assertion to the conceptTerms cutoff.
+    assert.ok(legacy.methodologyConceptMatrix.methodologies.length > 0, 'methodologyConceptMatrix.methodologies must be non-empty');
+    assert.ok(legacy.methodologyConceptMatrix.concepts.length > 0, 'methodologyConceptMatrix.concepts must be non-empty');
+    assert.ok(
+      legacy.methodologyConceptMatrix.matrix.some((row) => row.some((v) => v > 0)),
+      'methodologyConceptMatrix.matrix must contain at least one nonzero cell'
+    );
+    assert.ok(legacy.methodologyConceptMatrix.concepts.includes('filler b'), "'filler b' (10th distinct term) must be selected under distinct-based first-10 counting in methodologyConceptMatrix");
+    assert.ok(!legacy.methodologyConceptMatrix.concepts.includes('boundary x'), "'boundary x' (11th distinct term) must remain excluded from methodologyConceptMatrix");
+
+    assert.deepEqual(projected.methodologyConceptMatrix, legacy.methodologyConceptMatrix);
   } finally {
     setDupReady(false);
   }
