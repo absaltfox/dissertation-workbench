@@ -208,6 +208,9 @@ export async function start() {
   initDocumentTermsReadiness()
     .then(() => (isDocumentTermsReady() ? null : runDocumentTermsBackfillOnce()))
     .then(() => logger.info('document_terms projection ready'))
+    .then(() => warmWorkbenchCache('post-projection').catch((e) => {
+      logger.warn('Workbench landing cache warmup failed', { trigger: 'post-projection', error: e.message });
+    }))
     .catch((e) => logger.warn('document_terms backfill failed; using json_each fallback', { error: e.message }));
 
   const warmWorkbenchCache = async (trigger = 'scheduled') => {
@@ -241,6 +244,8 @@ export async function start() {
       trigger,
       documents: payload?.bootstrap?.summary?.documents || 0,
       firstPage: payload?.documentPage?.documents?.length || 0,
+      analyticsDocuments: payload?.analytics?.documents?.length || 0,
+      visualizationsDocuments: payload?.visualizations?.documents?.length || 0,
     });
   };
   warmWorkbenchCache('startup').catch((e) => {
