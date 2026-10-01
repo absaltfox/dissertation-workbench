@@ -60,3 +60,18 @@ test('backfill projects legacy rows (version<2) and flips readiness', async () =
   assert.equal(Number(v.rows[0].v), 2);
   assert.equal(isDocumentTermsReady(), true);
 });
+
+test('backfill runs ANALYZE so the planner has fresh document_terms statistics', async () => {
+  const db = await getDb();
+  const { runDocumentTermsBackfillOnce, initDocumentTermsReadiness } = await import('../src/db.js');
+  await db.execute({
+    sql: "INSERT INTO documents (doc_id, metadata_json, serving_projection_version, updated_at) VALUES (?, ?, 1, ?)",
+    args: ['legacy-analyze-1', JSON.stringify({ id: 'legacy-analyze-1', themes: ['Stats Theme'], conceptTerms: ['stats concept'], methodologies: [] }), new Date().toISOString()],
+  });
+  await initDocumentTermsReadiness();
+  await runDocumentTermsBackfillOnce();
+  const statTable = await db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_stat1'");
+  assert.equal(statTable.rows.length, 1, 'ANALYZE should have created sqlite_stat1');
+  const stats = await db.execute("SELECT COUNT(*) AS c FROM sqlite_stat1 WHERE tbl = 'document_terms'");
+  assert.ok(Number(stats.rows[0].c) > 0, 'sqlite_stat1 should have an entry for document_terms after ANALYZE');
+});

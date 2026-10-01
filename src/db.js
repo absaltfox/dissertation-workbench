@@ -1169,6 +1169,21 @@ export async function runDocumentTermsBackfillOnce() {
     }
     await client.batch(statements, 'write');
   }
+  // Without fresh table statistics, the SQLite/libSQL query planner full-table-scans
+  // the document_terms joins instead of using the indexes (confirmed by the scale
+  // harness: 41s at 20k docs / 457s at 56k, worse than the pre-projection baseline,
+  // until ANALYZE was run after seeding). Run ANALYZE once the backfill completes so
+  // the very first production serving after rollout gets index-aware query plans.
+  // A whole-database ANALYZE populates sqlite_stat1, which persists across restarts.
+  // Best-effort: ANALYZE is an optimization, not correctness-critical, so a failure
+  // here must not block readiness/serving.
+  try {
+    await client.execute('ANALYZE');
+  } catch (err) {
+    logger.warn('ANALYZE after document_terms backfill failed; planner statistics may be stale', {
+      error: err?.message || String(err),
+    });
+  }
   documentTermsReady = true;
 }
 
