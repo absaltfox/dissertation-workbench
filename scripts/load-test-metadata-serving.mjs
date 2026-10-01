@@ -92,6 +92,31 @@ try {
       args: [size],
     });
 
+    // saveDocumentMetadataBatch already projects document_terms rows at serving_projection_version = 2,
+    // so after seeding there are no pending rows and this flips the in-memory readiness flag true with
+    // a single COUNT query — ensuring the measurements below exercise the document_terms-backed read
+    // paths (not the json_each fallback).
+    await db.initDocumentTermsReadiness();
+
+    // Without fresh planner statistics, SQLite can pick a catastrophic join
+    // order for the document_terms-backed analytics queries once the table
+    // has grown past a few thousand rows: a derived table built from a
+    // ROW_NUMBER() window over document_terms (used by
+    // computeMethodologyConceptMatrixSql / computeSupervisorNgramMatrixSql)
+    // gets scanned per outer row instead of via its automatic covering
+    // index, turning a sub-100ms query into one that takes tens of seconds
+    // (observed: ~41s at 20k docs, ~457s at 56k docs, confirmed via EXPLAIN
+    // QUERY PLAN to flip from "SEARCH term USING AUTOMATIC PARTIAL COVERING
+    // INDEX" to "SCAN term" when a low-cardinality sync_key equality filter
+    // is present and statistics are stale). ANALYZE after bulk seeding is
+    // what a real backfill/import operator would run before serving traffic
+    // off freshly loaded data, so this harness does the same here to
+    // measure the achievable path rather than a planner pitfall. See
+    // task-10-report.md for the full investigation; production's
+    // runDocumentTermsBackfillOnce()/startup backfill should likely do the
+    // same once it has written a meaningful number of rows.
+    await client.execute('ANALYZE');
+
     const measurements = [
       await time('summary', () => db.getDocumentServingSummary({ syncKey: 'metadata-serving-load' })),
       await time('documentPage', () => db.queryCachedDocumentPage({
