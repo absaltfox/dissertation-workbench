@@ -10,6 +10,7 @@ import {
   getDb,
   listCachedDocuments,
   loadDocumentMetadata,
+  queryCachedDocumentPage,
   recomputeStoredDocumentThemes,
   saveCitations,
   saveCommitteeMembers,
@@ -200,6 +201,76 @@ test('stored citation links can overlay freshly fetched metadata records', async
   await applyCitationCountsToDocuments(docs);
 
   assert.equal(docs[0].citationCount, 2);
+});
+
+test('citation counts on a page match a direct per-doc count', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const syncKey = `test-page-citation-count-${suffix}`;
+  const citedDocId = `test-page-cited-${suffix}`;
+  const uncitedDocId = `test-page-uncited-${suffix}`;
+
+  await saveDocumentMetadata({
+    id: citedDocId,
+    title: `Cited fixture ${suffix}`,
+    author: 'Example Author',
+    year: 2024,
+    degree: 'Doctor of Philosophy - PhD',
+    program: 'Education',
+    pages: 1,
+    pagesSource: 'estimated_from_metadata_words',
+    wordCount: 100,
+    wordCountSource: 'metadata_text',
+    bodyWordCount: null,
+    downloadUrl: null,
+    downloadStatus: 'not_attempted',
+    downloadError: null,
+  }, { syncKey });
+
+  await saveDocumentMetadata({
+    id: uncitedDocId,
+    title: `Uncited fixture ${suffix}`,
+    author: 'Example Author',
+    year: 2024,
+    degree: 'Doctor of Philosophy - PhD',
+    program: 'Education',
+    pages: 1,
+    pagesSource: 'estimated_from_metadata_words',
+    wordCount: 100,
+    wordCountSource: 'metadata_text',
+    bodyWordCount: null,
+    downloadUrl: null,
+    downloadStatus: 'not_attempted',
+    downloadError: null,
+  }, { syncKey });
+
+  await saveCitations(citedDocId, [
+    'Example, A. (2020). First reference.',
+    'Example, B. (2021). Second reference.',
+    'Example, C. (2022). Third reference.',
+  ], (text) => `test-${suffix}-${text}`);
+
+  const page = await queryCachedDocumentPage({ syncKey, limit: 50 });
+
+  const client = await getDb();
+  const citedDirect = await client.execute({
+    sql: 'SELECT COUNT(*) AS total FROM document_citations WHERE doc_id = ?',
+    args: [citedDocId],
+  });
+  const uncitedDirect = await client.execute({
+    sql: 'SELECT COUNT(*) AS total FROM document_citations WHERE doc_id = ?',
+    args: [uncitedDocId],
+  });
+
+  const citedPageDoc = page.documents.find((doc) => doc.id === citedDocId);
+  const uncitedPageDoc = page.documents.find((doc) => doc.id === uncitedDocId);
+
+  assert.ok(citedPageDoc, 'cited fixture should be present on the page');
+  assert.ok(uncitedPageDoc, 'uncited fixture should be present on the page');
+  assert.equal(citedPageDoc.citationCount, Number(citedDirect.rows[0].total));
+  assert.equal(uncitedPageDoc.citationCount, Number(uncitedDirect.rows[0].total));
+  assert.equal(citedPageDoc.citationCount, 3);
+  assert.equal(uncitedPageDoc.citationCount, 0);
 });
 
 test('stored committee and examiner roles can overlay freshly fetched metadata records', async () => {

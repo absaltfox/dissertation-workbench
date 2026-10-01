@@ -1637,32 +1637,36 @@ export async function queryCachedDocumentPage({
   const countRow = await get(`SELECT COUNT(*) AS total FROM documents d ${queryFilters.where}`, queryFilters.args);
   const sortExpression = DOCUMENT_PAGE_SORTS[sortKey] || 'COALESCE(d.year, 0)';
   const direction = sortKey ? (sortDir === 'asc' ? 'ASC' : 'DESC') : 'DESC';
+  // The whole-table citation aggregation below is only needed when the page is
+  // actually ORDER BY'd on citation count — that sort has to see every filtered
+  // row's count before LIMIT/OFFSET can apply. Every other sort (the common
+  // case) skips it entirely and gets counts afterward, bounded to just this
+  // page's doc_ids, via applyCitationCountsToDocuments.
+  const needsCitationSortJoin = sortKey === 'citationCount';
   const rows = await all(`
     SELECT d.doc_id, d.metadata_json,
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
-           fm.word_count_comparison_json,
-           COALESCE(dc.citation_count, 0) AS citation_count
+           fm.word_count_comparison_json
     FROM documents d
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
-    LEFT JOIN (
+    ${needsCitationSortJoin ? `LEFT JOIN (
       SELECT doc_id, COUNT(*) AS citation_count
       FROM document_citations
       GROUP BY doc_id
-    ) dc ON dc.doc_id = d.doc_id
+    ) dc ON dc.doc_id = d.doc_id` : ''}
     ${queryFilters.where}
     ORDER BY ${sortExpression} ${direction}, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
     LIMIT ? OFFSET ?
   `, [...queryFilters.args, Math.max(1, Number(limit) || 50), Math.max(0, Number(offset) || 0)]);
   const documents = rows.map((row) => {
     try {
-      const doc = applyStoredFileMetricToDocument(JSON.parse(row.metadata_json), row);
-      doc.citationCount = Number(row.citation_count || 0);
-      return doc;
+      return applyStoredFileMetricToDocument(JSON.parse(row.metadata_json), row);
     } catch {
       return null;
     }
   }).filter(Boolean);
+  await applyCitationCountsToDocuments(documents);
   return { total: Number(countRow?.total || 0), documents };
 }
 
