@@ -8,8 +8,8 @@ import {
 import {
   applyCitationCountsToDocuments, applyCommitteeMembersToDocuments,
   applyStoredFileMetricsToDocuments, getDocumentCacheStats, getDocumentServingAnalytics, getDocumentServingSummary,
-  hasTopics, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics,
-  queryCachedDocumentPage, queryCitationDocumentPage, queryPeoplePage, queryPersonDetailPage,
+  hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics,
+  queryCachedDocumentPage, queryCitationDocumentPage, queryConceptTermsByDoc, queryPeoplePage, queryPersonDetailPage,
   queryRelatedDocuments, queryTopicDocumentPage
 } from '../db.js';
 import { authenticate } from '../auth.js';
@@ -556,22 +556,39 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       });
       // #15 termCooccurrence: the one panel of the six that isn't a
       // straight SQL port (pairwise term combinatorics — the same
-      // unbounded-self-join shape #25/#26 already had to bound). Shipped as
-      // a bounded-sample real answer instead of null: reuse the same
-      // VISUALIZATION_DOCUMENT_LIMIT-sized sample pattern already proven
-      // for /workbench/visualizations' supervisorNetwork/citationCooccurrence,
-      // now safe to run at this size thanks to #26's scaled threshold and
-      // term-vocabulary cap. The sampling is disclosed via
+      // unbounded-self-join shape #25/#26 already had to bound). Once the
+      // document_terms projection is ready, it's a full-corpus real answer
+      // built directly from the kind='concept' rows (no metadata_json
+      // transfer at all — see queryConceptTermsByDoc). Until then, it falls
+      // back to the bounded-sample pattern already proven for
+      // /workbench/visualizations' supervisorNetwork/citationCooccurrence.
+      // The sampling (or lack thereof) is disclosed via
       // source.termCooccurrenceSampled/SampleSize/SampleOf — distinct from
       // the other five panels' "not computed above N" language, since this
-      // one *is* computed, just on a sample rather than the full corpus.
-      const termSample = await queryCachedDocumentPage({
-        syncKey: documentCache.syncKey,
-        filters,
-        limit: VISUALIZATION_DOCUMENT_LIMIT,
-        offset: 0,
-      });
-      const termCooccurrence = buildTermCooccurrence(enrichDocumentSignals(termSample.documents));
+      // one *is* computed, just on a sample when the projection isn't ready.
+      let termCooccurrence, termMeta;
+      if (isDocumentTermsReady()) {
+        const records = await queryConceptTermsByDoc({ syncKey: documentCache.syncKey, filters });
+        termCooccurrence = buildTermCooccurrence(records);
+        termMeta = {
+          termCooccurrenceSampled: false,
+          termCooccurrenceSampleSize: records.length,
+          termCooccurrenceSampleOf: records.length,
+        };
+      } else {
+        const termSample = await queryCachedDocumentPage({
+          syncKey: documentCache.syncKey,
+          filters,
+          limit: VISUALIZATION_DOCUMENT_LIMIT,
+          offset: 0,
+        });
+        termCooccurrence = buildTermCooccurrence(enrichDocumentSignals(termSample.documents));
+        termMeta = {
+          termCooccurrenceSampled: true,
+          termCooccurrenceSampleSize: termSample.documents.length,
+          termCooccurrenceSampleOf: termSample.total,
+        };
+      }
       return {
         generatedAt: new Date().toISOString(),
         source: {
@@ -582,9 +599,7 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
           documentsReturned: documentSample.documents.length,
           documentsTruncated: documentSample.total > documentSample.documents.length,
           detailedAnalyticsRecordLimit: DETAILED_ANALYTICS_RECORD_LIMIT,
-          termCooccurrenceSampled: true,
-          termCooccurrenceSampleSize: termSample.documents.length,
-          termCooccurrenceSampleOf: termSample.total,
+          ...termMeta,
           readOnlyFileEnrichment: true,
         },
         ...aggregate,

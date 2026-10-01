@@ -1712,6 +1712,30 @@ export async function queryTopicDocumentPage({
   return { total: Number(countRow?.total || 0), documents };
 }
 
+/**
+ * Full-corpus per-document concept term lists from the document_terms
+ * projection (kind='concept'), for feeding buildTermCooccurrence() without
+ * transferring the whole metadata_json blob for every document. Docs that
+ * have no projected concept rows (e.g. restricted docs, or none stored) are
+ * simply absent — buildTermCooccurrence doesn't need them either way.
+ */
+export async function queryConceptTermsByDoc({ syncKey = null, filters = {} } = {}) {
+  const f = analyticalDocumentFilters({ syncKey, ...filters });
+  const rows = await all(`
+    SELECT dt.doc_id AS doc_id, dt.term AS term
+    FROM documents d
+    JOIN document_terms dt ON dt.doc_id = d.doc_id AND dt.kind = 'concept'
+    ${f.where}
+    ORDER BY dt.doc_id
+  `, f.args);
+  const byDoc = new Map();
+  for (const r of rows) {
+    if (!byDoc.has(r.doc_id)) byDoc.set(r.doc_id, []);
+    byDoc.get(r.doc_id).push(r.term);
+  }
+  return Array.from(byDoc.values()).map((conceptTerms) => ({ conceptTerms }));
+}
+
 /** Small, database-side bootstrap aggregates for metadata-scale landing pages. */
 export async function getDocumentServingSummary({ syncKey = null } = {}) {
   const filters = documentServingFilters({ syncKey });
