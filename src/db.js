@@ -2040,6 +2040,38 @@ async function computeTopicDataByYearSql(filters, qualifier, topics, hierarchy) 
 // This does not affect *who* is counted or their doc counts, only which
 // spelling variant is displayed when sources disagree — disclosed here
 // rather than silently assumed correct.
+// The legacy json_each `term.key < 10` cutoff (used below for "first 10
+// conceptTerms") counts RAW array positions, including duplicate values. The
+// document_terms projection it's being compared against is deduped on write
+// (metadataTermsStatements keeps a per-kind `seen` Set, and the table has
+// PRIMARY KEY (doc_id, kind, term) with ON CONFLICT DO NOTHING), so for a
+// document whose first 10 raw conceptTerms contain a repeat, `key < 10`
+// would select a *different* set of terms than the deduped projection's
+// first 10. To keep both branches provably byte-identical for every input
+// (not just duplicate-free ones), this derived table makes the legacy
+// branch select "first 10 DISTINCT conceptTerms by earliest array
+// position" instead of "first 10 raw array slots" — i.e. the same
+// dedup-then-truncate semantics the projection gets for free from
+// document_terms. This is the one place the legacy SQL is intentionally
+// NOT kept byte-for-byte verbatim: exact raw-position equivalence is
+// impossible to recover from an already-deduped table, and the production
+// concept pipeline (docConceptTerms) always emits distinct terms, so
+// distinct-first-10 matches production for every realistic input — it only
+// normalizes the malformed-duplicate-data edge case to agree with the
+// projection.
+const LEGACY_CONCEPT_FIRST10_DISTINCT_SQL = `
+  (
+    SELECT doc_id, value,
+           ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY first_key ASC) AS rnk
+    FROM (
+      SELECT dd.doc_id AS doc_id, trim(CAST(te.value AS TEXT)) AS value, MIN(te.key) AS first_key
+      FROM documents dd, json_each(dd.metadata_json, '$.conceptTerms') te
+      WHERE trim(CAST(te.value AS TEXT)) <> ''
+      GROUP BY dd.doc_id, trim(CAST(te.value AS TEXT))
+    )
+  )
+`;
+
 async function computeSupervisorNgramMatrixSql(filters, qualifier, topN = 12, topM = 10) {
   const supervisorFilters = filters.where
     ? `${filters.where} AND p.role IN ('Supervisor', 'Co-Supervisor')`
@@ -2083,11 +2115,11 @@ async function computeSupervisorNgramMatrixSql(filters, qualifier, topN = 12, to
         LIMIT ?
       `, [...filters.args, topM])
     : await all(`
-        SELECT trim(CAST(term.value AS TEXT)) AS concept, COUNT(DISTINCT d.doc_id) AS count
-        FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
+        SELECT term.value AS concept, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN ${LEGACY_CONCEPT_FIRST10_DISTINCT_SQL} term ON term.doc_id = d.doc_id
         ${filters.where}
-        ${qualifier} term.key < 10
-          AND trim(CAST(term.value AS TEXT)) <> ''
+        ${qualifier} term.rnk <= 10
           AND EXISTS (
             SELECT 1 FROM document_people p
             WHERE p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
@@ -2121,14 +2153,14 @@ async function computeSupervisorNgramMatrixSql(filters, qualifier, topN = 12, to
         GROUP BY p.person_key, concept
       `, [...filters.args, JSON.stringify(supKeyList), JSON.stringify(ngramList)])
     : await all(`
-        SELECT p.person_key AS person_key, trim(CAST(term.value AS TEXT)) AS concept, COUNT(DISTINCT d.doc_id) AS count
+        SELECT p.person_key AS person_key, term.value AS concept, COUNT(DISTINCT d.doc_id) AS count
         FROM documents d
         JOIN document_people p ON p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
-        , json_each(d.metadata_json, '$.conceptTerms') term
+        JOIN ${LEGACY_CONCEPT_FIRST10_DISTINCT_SQL} term ON term.doc_id = d.doc_id
         ${filters.where}
-        ${qualifier} term.key < 10
+        ${qualifier} term.rnk <= 10
           AND p.person_key IN (SELECT value FROM json_each(?))
-          AND trim(CAST(term.value AS TEXT)) IN (SELECT value FROM json_each(?))
+          AND term.value IN (SELECT value FROM json_each(?))
         GROUP BY p.person_key, concept
       `, [...filters.args, JSON.stringify(supKeyList), JSON.stringify(ngramList)]);
 

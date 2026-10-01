@@ -266,3 +266,77 @@ test('Task 6a: conceptTimeline + supervisorNgramMatrix — document_terms projec
     __setDocumentTermsReadyForTesting(false);
   }
 });
+
+test('Task 6a fix (round 1 review): supervisorNgramMatrix — legacy distinct-first-10 selection matches the document_terms projection when a document has a duplicate conceptTerm inside its first 10 raw array positions', async () => {
+  // Isolated in its own syncKey/doc, deliberately NOT added to the shared
+  // 222-doc SYNC_KEY corpus: the JS reference path (buildSupervisorNgramMatrix
+  // -> docConceptTerms -> rec.conceptTerms.slice(0, 10)) truncates by RAW
+  // array position with no dedup, so on a document with a duplicate in its
+  // first 10 positions it would disagree with the (correct, post-fix)
+  // distinct-based SQL truncation used by both branches here. That's a
+  // separate, pre-existing JS-vs-SQL semantic gap outside this task's scope
+  // (computeSupervisorNgramMatrixSql's two *SQL* branches, not the JS port);
+  // keeping this fixture off SYNC_KEY avoids corrupting the unrelated #15
+  // JS-vs-SQL cross-check above with that unrelated gap.
+  const dupSyncKey = 'sql-port-dup-boundary';
+  await saveDocumentMetadataBatch([{
+    doc: {
+      id: 'sqlport-dup-0001',
+      title: 'Duplicate-in-first-10 boundary fixture',
+      author: 'Author Dup',
+      year: 2016,
+      degree: 'PhD',
+      program: 'Education',
+      affiliation: ['UBC'],
+      supervisors: ['Solo Supervisor'],
+      abstract: 'abstract dup',
+      subjects: ['education'],
+      // 'filler a' repeats at raw positions 0 and 1. A raw-position cutoff
+      // (the old `term.key < 10`) wastes a slot on the repeat, so 'filler b'
+      // (raw position 10) falls outside the first-10 *raw* window and is
+      // wrongly excluded. A distinct-by-earliest-position cutoff (the fix)
+      // does not waste that slot on the repeat, so 'filler b' — the 10th
+      // *distinct* value — is correctly pulled IN. 'boundary x' (raw
+      // position 11, the 11th distinct value either way) stays excluded
+      // under both schemes: it's the control proving the fix doesn't just
+      // admit everything past the old cutoff.
+      conceptTerms: [
+        'filler a', 'filler a',
+        'term02', 'term03', 'term04', 'term05', 'term06', 'term07', 'term08', 'term09',
+        'filler b', 'boundary x',
+      ],
+      methodologies: ['Qualitative'],
+      charCount: 777,
+    },
+    syncKey: dupSyncKey,
+  }]);
+
+  const { __setDocumentTermsReadyForTesting: setDupReady } = await import('../src/db.js');
+  try {
+    setDupReady(false);
+    const legacy = await getDocumentServingAnalytics({ syncKey: dupSyncKey });
+    setDupReady(true);
+    const projected = await getDocumentServingAnalytics({ syncKey: dupSyncKey });
+
+    assert.ok(legacy.supervisorNgramMatrix.supervisors.length > 0, 'supervisors must be non-empty');
+    assert.ok(legacy.supervisorNgramMatrix.ngrams.length > 0, 'ngrams must be non-empty');
+    assert.ok(
+      legacy.supervisorNgramMatrix.matrix.some((row) => row.some((v) => v > 0)),
+      'matrix must contain at least one nonzero cell'
+    );
+
+    // The fix's load-bearing assertions: this is the exact scenario the
+    // round-1 review flagged as a hole. Before the fix, legacy's raw
+    // term.key < 10 would have excluded 'filler b' here while the
+    // document_terms projection (deduped on write) included it —
+    // diverging. Confirm the (now-fixed) legacy branch agrees with
+    // production's distinct-term intent, and that the boundary control
+    // term stays excluded on both sides.
+    assert.ok(legacy.supervisorNgramMatrix.ngrams.includes('filler b'), "'filler b' (10th distinct term) must be selected under distinct-based first-10 counting");
+    assert.ok(!legacy.supervisorNgramMatrix.ngrams.includes('boundary x'), "'boundary x' (11th distinct term) must remain excluded");
+
+    assert.deepEqual(projected.supervisorNgramMatrix, legacy.supervisorNgramMatrix);
+  } finally {
+    setDupReady(false);
+  }
+});
