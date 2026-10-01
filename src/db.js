@@ -1736,6 +1736,11 @@ export async function queryTopicDocumentPage({
  */
 export async function queryConceptTermsByDoc({ syncKey = null, filters = {} } = {}) {
   const f = analyticalDocumentFilters({ syncKey, ...filters });
+  // Rows feed buildTermCooccurrence() -> docConceptTerms(rec, 20), which does
+  // slice(0, 20). We only order by dt.doc_id (not array/rowid order) within a
+  // doc, which is safe only because normalizeRecord caps stored conceptTerms
+  // at 12 (< 20), so the slice keeps every term regardless of order. If that
+  // cap is ever raised above 20, this will need a deterministic within-doc order.
   const rows = await all(`
     SELECT dt.doc_id AS doc_id, dt.term AS term
     FROM documents d

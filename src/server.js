@@ -205,14 +205,6 @@ export async function start() {
     logger.info(`Dissertation Workbench running at http://localhost:${PORT}`);
   });
 
-  initDocumentTermsReadiness()
-    .then(() => (isDocumentTermsReady() ? null : runDocumentTermsBackfillOnce()))
-    .then(() => logger.info('document_terms projection ready'))
-    .then(() => warmWorkbenchCache('post-projection').catch((e) => {
-      logger.warn('Workbench landing cache warmup failed', { trigger: 'post-projection', error: e.message });
-    }))
-    .catch((e) => logger.warn('document_terms backfill failed; using json_each fallback', { error: e.message }));
-
   const warmWorkbenchCache = async (trigger = 'scheduled') => {
     const apiKey = await getConfiguredApiKey();
     // Mirror public/index.html defaults after public guardrails are applied.
@@ -251,6 +243,15 @@ export async function start() {
   warmWorkbenchCache('startup').catch((e) => {
     logger.warn('Workbench landing cache warmup failed', { trigger: 'startup', error: e.message });
   });
+
+  initDocumentTermsReadiness()
+    .then(() => (isDocumentTermsReady() ? null : runDocumentTermsBackfillOnce()))
+    .then(() => logger.info('document_terms projection ready'))
+    .then(() => warmWorkbenchCache('post-projection').catch((e) => {
+      logger.warn('Workbench landing cache warmup failed', { trigger: 'post-projection', error: e.message });
+    }))
+    .catch((e) => logger.warn('document_terms backfill failed; using json_each fallback', { error: e.message }));
+
   const workbenchCacheWarmupTimer = setInterval(() => {
     warmWorkbenchCache('scheduled').catch((e) => {
       logger.warn('Workbench landing cache warmup failed', { trigger: 'scheduled', error: e.message });
