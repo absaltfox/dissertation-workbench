@@ -1832,27 +1832,48 @@ async function aggregateNumericSeries({ filters, valueSql, reliabilitySql }) {
 
 async function computeConceptTimelineSql(filters, qualifier, topN = 8) {
   const blocklistJson = JSON.stringify([...COOCCURRENCE_BLOCKLIST]);
-  const topConcepts = await all(`
-    SELECT trim(CAST(term.value AS TEXT)) AS concept, COUNT(DISTINCT d.doc_id) AS total_docs
-    FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
-    ${filters.where}
-    ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
-      AND trim(CAST(term.value AS TEXT)) NOT IN (SELECT value FROM json_each(?))
-    GROUP BY concept
-    ORDER BY total_docs DESC, concept ASC
-    LIMIT ?
-  `, [...filters.args, blocklistJson, topN]);
+  const topConcepts = isDocumentTermsReady()
+    ? await all(`
+        SELECT term.term AS concept, COUNT(DISTINCT d.doc_id) AS total_docs
+        FROM documents d
+        JOIN document_terms term ON term.doc_id = d.doc_id AND term.kind = 'concept'
+        ${filters.where}
+        ${qualifier} term.term NOT IN (SELECT value FROM json_each(?))
+        GROUP BY concept
+        ORDER BY total_docs DESC, concept ASC
+        LIMIT ?
+      `, [...filters.args, blocklistJson, topN])
+    : await all(`
+        SELECT trim(CAST(term.value AS TEXT)) AS concept, COUNT(DISTINCT d.doc_id) AS total_docs
+        FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
+        ${filters.where}
+        ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
+          AND trim(CAST(term.value AS TEXT)) NOT IN (SELECT value FROM json_each(?))
+        GROUP BY concept
+        ORDER BY total_docs DESC, concept ASC
+        LIMIT ?
+      `, [...filters.args, blocklistJson, topN]);
   if (!topConcepts.length) return [];
 
   const conceptListJson = JSON.stringify(topConcepts.map((row) => row.concept));
-  const yearRows = await all(`
-    SELECT trim(CAST(term.value AS TEXT)) AS concept, d.year AS year, COUNT(DISTINCT d.doc_id) AS count
-    FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
-    ${filters.where}
-    ${qualifier} d.year IS NOT NULL
-      AND trim(CAST(term.value AS TEXT)) IN (SELECT value FROM json_each(?))
-    GROUP BY concept, d.year
-  `, [...filters.args, conceptListJson]);
+  const yearRows = isDocumentTermsReady()
+    ? await all(`
+        SELECT term.term AS concept, d.year AS year, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN document_terms term ON term.doc_id = d.doc_id AND term.kind = 'concept'
+        ${filters.where}
+        ${qualifier} d.year IS NOT NULL
+          AND term.term IN (SELECT value FROM json_each(?))
+        GROUP BY concept, d.year
+      `, [...filters.args, conceptListJson])
+    : await all(`
+        SELECT trim(CAST(term.value AS TEXT)) AS concept, d.year AS year, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
+        ${filters.where}
+        ${qualifier} d.year IS NOT NULL
+          AND trim(CAST(term.value AS TEXT)) IN (SELECT value FROM json_each(?))
+        GROUP BY concept, d.year
+      `, [...filters.args, conceptListJson]);
 
   const yearsByConcept = new Map();
   for (const row of yearRows) {
@@ -2034,20 +2055,47 @@ async function computeSupervisorNgramMatrixSql(filters, qualifier, topN = 12, to
   `, [...filters.args, topN]);
   if (!topSupervisors.length) return { supervisors: [], ngrams: [], conceptIds: [], matrix: [] };
 
-  const topNgrams = await all(`
-    SELECT trim(CAST(term.value AS TEXT)) AS concept, COUNT(DISTINCT d.doc_id) AS count
-    FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
-    ${filters.where}
-    ${qualifier} term.key < 10
-      AND trim(CAST(term.value AS TEXT)) <> ''
-      AND EXISTS (
-        SELECT 1 FROM document_people p
-        WHERE p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
-      )
-    GROUP BY concept
-    ORDER BY count DESC, concept ASC
-    LIMIT ?
-  `, [...filters.args, topM]);
+  // term.key < 10 in the legacy json_each form restricts candidates to the
+  // first 10 conceptTerms in metadata_json array order (docConceptTerms can
+  // emit up to 12 — see src/metrics.js). document_terms has no stored
+  // ordinal, so the projected branch reconstructs that same array-order
+  // position via ROW_NUMBER() PARTITION BY doc_id ORDER BY rowid: rows for
+  // a given doc are (re)inserted in metadata_json array order by
+  // metadataTermsStatements (full DELETE+INSERT per write, never a partial
+  // update), so rowid order within a doc_id reproduces array order exactly.
+  // ord <= 10 (1-based) is therefore equivalent to key < 10 (0-based).
+  const topNgrams = isDocumentTermsReady()
+    ? await all(`
+        SELECT term.term AS concept, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN (
+          SELECT doc_id, term, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY rowid) AS ord
+          FROM document_terms WHERE kind = 'concept'
+        ) term ON term.doc_id = d.doc_id
+        ${filters.where}
+        ${qualifier} term.ord <= 10
+          AND EXISTS (
+            SELECT 1 FROM document_people p
+            WHERE p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
+          )
+        GROUP BY concept
+        ORDER BY count DESC, concept ASC
+        LIMIT ?
+      `, [...filters.args, topM])
+    : await all(`
+        SELECT trim(CAST(term.value AS TEXT)) AS concept, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
+        ${filters.where}
+        ${qualifier} term.key < 10
+          AND trim(CAST(term.value AS TEXT)) <> ''
+          AND EXISTS (
+            SELECT 1 FROM document_people p
+            WHERE p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
+          )
+        GROUP BY concept
+        ORDER BY count DESC, concept ASC
+        LIMIT ?
+      `, [...filters.args, topM]);
   if (!topNgrams.length) {
     return {
       supervisors: topSupervisors.map((r) => r.name),
@@ -2057,17 +2105,32 @@ async function computeSupervisorNgramMatrixSql(filters, qualifier, topN = 12, to
 
   const supKeyList = topSupervisors.map((r) => r.person_key);
   const ngramList = topNgrams.map((r) => r.concept);
-  const cellRows = await all(`
-    SELECT p.person_key AS person_key, trim(CAST(term.value AS TEXT)) AS concept, COUNT(DISTINCT d.doc_id) AS count
-    FROM documents d
-    JOIN document_people p ON p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
-    , json_each(d.metadata_json, '$.conceptTerms') term
-    ${filters.where}
-    ${qualifier} term.key < 10
-      AND p.person_key IN (SELECT value FROM json_each(?))
-      AND trim(CAST(term.value AS TEXT)) IN (SELECT value FROM json_each(?))
-    GROUP BY p.person_key, concept
-  `, [...filters.args, JSON.stringify(supKeyList), JSON.stringify(ngramList)]);
+  const cellRows = isDocumentTermsReady()
+    ? await all(`
+        SELECT p.person_key AS person_key, term.term AS concept, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN document_people p ON p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
+        JOIN (
+          SELECT doc_id, term, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY rowid) AS ord
+          FROM document_terms WHERE kind = 'concept'
+        ) term ON term.doc_id = d.doc_id
+        ${filters.where}
+        ${qualifier} term.ord <= 10
+          AND p.person_key IN (SELECT value FROM json_each(?))
+          AND term.term IN (SELECT value FROM json_each(?))
+        GROUP BY p.person_key, concept
+      `, [...filters.args, JSON.stringify(supKeyList), JSON.stringify(ngramList)])
+    : await all(`
+        SELECT p.person_key AS person_key, trim(CAST(term.value AS TEXT)) AS concept, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN document_people p ON p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
+        , json_each(d.metadata_json, '$.conceptTerms') term
+        ${filters.where}
+        ${qualifier} term.key < 10
+          AND p.person_key IN (SELECT value FROM json_each(?))
+          AND trim(CAST(term.value AS TEXT)) IN (SELECT value FROM json_each(?))
+        GROUP BY p.person_key, concept
+      `, [...filters.args, JSON.stringify(supKeyList), JSON.stringify(ngramList)]);
 
   const supIndex = new Map(supKeyList.map((key, i) => [key, i]));
   const ngramIndex = new Map(ngramList.map((label, i) => [label, i]));

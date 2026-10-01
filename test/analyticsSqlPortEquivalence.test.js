@@ -85,6 +85,49 @@ test.before(async () => {
     ], 'committee');
   }
 
+  // Task 6a: one extra doc with 12 conceptTerms (docConceptTerms can emit up
+  // to 12 in production — see src/metrics.js), exercising the
+  // `term.key < 10` ordinal cutoff that computeSupervisorNgramMatrixSql's
+  // legacy json_each form applies. document_terms has no stored array
+  // position, so the projected branch reconstructs it via ROW_NUMBER()
+  // OVER (PARTITION BY doc_id ORDER BY rowid).
+  //
+  // Positions 0-9 reuse the fixture's 8 existing high-count concept names
+  // plus exactly 2 brand-new names ('filler a'/'filler b') — exactly
+  // filling the two open slots left in the topM=10 ranking (8 existing +
+  // 2 new = 10, no surplus, so no tie-break ambiguity is introduced for
+  // the unrelated #15 JS-vs-SQL cross-check below).
+  // Positions 10-11 ('boundary x'/'boundary y') are two more brand-new
+  // names placed *past* the cutoff. If the projected branch's ROW_NUMBER
+  // ordinal were off by even one position, these would leak into the
+  // topM=10 ranking (now 12 count=1 candidates for 2 slots) while the
+  // legacy branch correctly excludes them (exactly 10, no surplus) —
+  // producing a content-level mismatch between readiness modes that the
+  // Task 6a deep-equal test below would catch.
+  await saveDocumentMetadataBatch([{
+    doc: {
+      id: 'sqlport-0220',
+      title: 'SQL port fixture 220 (ordinal boundary)',
+      author: 'Author 220',
+      year: 2015,
+      degree: 'PhD',
+      program: 'Education',
+      affiliation: ['UBC'],
+      supervisors: ['Metadata Supervisor 0'],
+      abstract: 'abstract 220',
+      subjects: ['education'],
+      conceptTerms: [
+        'filler a', 'filler b',
+        'concept alpha', 'concept beta', 'concept gamma 0', 'concept gamma 1',
+        'concept gamma 2', 'concept gamma 3', 'concept gamma 4', 'concept gamma 5',
+        'boundary x', 'boundary y',
+      ],
+      methodologies: ['Qualitative'],
+      charCount: 999,
+    },
+    syncKey: SYNC_KEY,
+  }]);
+
   // A real topic hierarchy: 14 leaf topics merged down to 10 parent
   // clusters (4 merges), so topicData.byYear's parent-cluster resolution is
   // genuinely exercised (not the "N <= targetK, no merges" trivial case).
@@ -193,4 +236,33 @@ test('#15 cross-check: topicData.byYear — SQL port resolves to parent-cluster 
     `(max total ${maxTotal}, single-leaf approx ${singleLeafApprox}) — otherwise this fixture ` +
     `doesn't actually exercise the merge path`
   );
+});
+
+test('Task 6a: conceptTimeline + supervisorNgramMatrix — document_terms projection equals legacy json_each', async () => {
+  const { __setDocumentTermsReadyForTesting } = await import('../src/db.js');
+  try {
+    __setDocumentTermsReadyForTesting(false);
+    const legacy = await getDocumentServingAnalytics({ syncKey: SYNC_KEY });
+
+    __setDocumentTermsReadyForTesting(true);
+    const projected = await getDocumentServingAnalytics({ syncKey: SYNC_KEY });
+
+    // Non-empty guard: deep-equaling two empty panels would be a vacuous pass.
+    assert.ok(legacy.conceptTimeline.length > 0, 'conceptTimeline must be non-empty for this fixture');
+    assert.ok(
+      legacy.conceptTimeline.some((row) => row.data.length > 0 && row.totalDocs > 0),
+      'conceptTimeline must have at least one concept with year data'
+    );
+    assert.ok(legacy.supervisorNgramMatrix.supervisors.length > 0, 'supervisorNgramMatrix.supervisors must be non-empty');
+    assert.ok(legacy.supervisorNgramMatrix.ngrams.length > 0, 'supervisorNgramMatrix.ngrams must be non-empty');
+    assert.ok(
+      legacy.supervisorNgramMatrix.matrix.some((row) => row.some((v) => v > 0)),
+      'supervisorNgramMatrix.matrix must contain at least one nonzero cell'
+    );
+
+    assert.deepEqual(projected.conceptTimeline, legacy.conceptTimeline);
+    assert.deepEqual(projected.supervisorNgramMatrix, legacy.supervisorNgramMatrix);
+  } finally {
+    __setDocumentTermsReadyForTesting(false);
+  }
 });
