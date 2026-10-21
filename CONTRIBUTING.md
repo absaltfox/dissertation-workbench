@@ -138,6 +138,16 @@ Comment frontend code when:
 - Sanitization or escaping is needed before rendering external data.
 - Client-side analytics intentionally differ from server-side analytics.
 
+## Checks
+
+CI (`.github/workflows/ci.yml`) runs three jobs on every PR and on pushes to `main`/`v2`, on Node 22 to match the production image:
+
+- `npm test` — the `node:test` unit suite. `scripts/run-tests.mjs` gives every test-file process its own temp data dir, so tests never touch `./data/metrics.sqlite`. Needs `pdftotext` (poppler) and `python3` on PATH.
+- `npm run lint` — ESLint 9 flat config (`eslint.config.js`). Prefer fixing the code or adjusting a shared rule over per-line disables.
+- `npm run test:e2e` — Playwright smoke tests (Chromium) against a seeded, network-isolated server (`e2e/start-server.mjs`). First local run needs `npx playwright install chromium`. Add fixture docs in `e2e/seed.mjs` when a new view needs data to render.
+
+Run all three before deploying with `flyctl deploy`.
+
 ## Review Checklist
 
 Before opening a change, check:
