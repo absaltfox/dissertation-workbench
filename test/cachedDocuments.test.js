@@ -140,6 +140,16 @@ test('stored themes can be manually recomputed across documents', async () => {
   const stored = await loadDocumentMetadata(docId);
   assert.ok(!stored.themes.includes('stale'));
   assert.ok(stored.themes.includes('community') || stored.themes.includes('literacy'));
+
+  // The document_terms projection (read by theme facets and related-docs once
+  // ready) must be refreshed in step with metadata_json.
+  const client = await getDb();
+  const projected = (await client.execute({
+    sql: "SELECT term FROM document_terms WHERE doc_id = ? AND kind = 'theme' ORDER BY term",
+    args: [docId],
+  })).rows.map((r) => r.term);
+  assert.deepEqual(projected, [...new Set(stored.themes)].sort());
+  assert.ok(!projected.includes('stale'));
 });
 
 test('stored file metrics can overlay freshly fetched metadata records', async () => {

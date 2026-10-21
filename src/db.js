@@ -1520,10 +1520,18 @@ export async function recomputeStoredDocumentThemes({ limit = null, docIds = nul
       // normal metadata write path. Otherwise an embargoed record can regain
       // derived terms after the migration has deliberately removed them.
       const next = withStoredThemes(doc, { recompute: true });
-      await client.execute({
-        sql: 'UPDATE documents SET metadata_json = ?, updated_at = ? WHERE doc_id = ?',
-        args: [JSON.stringify(next), new Date().toISOString(), row.doc_id],
-      });
+      const now = new Date().toISOString();
+      next.id ||= row.doc_id;
+      // One atomic batch: the blob and the document_terms projection (read by
+      // theme facets and related-docs) must never diverge. Access-restricted
+      // docs project nothing, same as every other metadataTermsStatements caller.
+      await client.batch([
+        {
+          sql: 'UPDATE documents SET metadata_json = ?, updated_at = ? WHERE doc_id = ?',
+          args: [JSON.stringify(next), now, row.doc_id],
+        },
+        ...metadataTermsStatements(next, now),
+      ], 'write');
       updated += 1;
     } catch {
       failed += 1;
