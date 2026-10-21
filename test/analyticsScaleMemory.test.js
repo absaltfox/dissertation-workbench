@@ -88,6 +88,7 @@ function conceptTermFixture(n) {
   return records;
 }
 
+// Serialized into a child process via Function.toString — keep self-contained.
 function supervisorFixture(n) {
   const pool = Math.max(60, Math.ceil(n / 50)); // always far more than the top-30 cut
   const records = new Array(n);
@@ -101,6 +102,7 @@ function supervisorFixture(n) {
   return records;
 }
 
+// Serialized into a child process via Function.toString — keep self-contained.
 function heapDeltaBytes(fn, samples = 3) {
   const deltas = [];
   for (let i = 0; i < samples; i++) {
@@ -268,7 +270,11 @@ test('#27: buildSupervisorNetwork two-pass output matches the original single-pa
 // process and 8.26 after the #26 tests). With a 1 MB semi-space, garbage is
 // scavenged throughout the call, so the delta is dominated by what the
 // function actually keeps alive (promoted state) — the peak-live footprint
-// this test is about — and is identical run to run.
+// this test is about. The delta is much less noisy than in-process sampling
+// but NOT identical run to run: measured ratios ranged 1.38-4.86, and the
+// gate only narrowly separates pre-fix code (6.98-7.30) from the threshold
+// (6.72). Treat this as a coarse backstop; the deterministic allocation-proxy
+// test above is the primary guard for this regression.
 function supervisorNetworkHeapDeltasInFreshProcess() {
   const metricsUrl = new URL('../src/metrics.js', import.meta.url).href;
   const script = `

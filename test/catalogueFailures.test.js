@@ -468,28 +468,31 @@ test('collectOrphanedCitations deletes via SEARCH on the primary key, not a full
   );
 
   // Plan the captured statements on a dedicated read connection. With the
-  // bundled libsql native build (0.5.29), `all()` on an EXPLAIN statement leaves
+  // bundled libsql native build (0.5.29), running an EXPLAIN statement leaves
   // it "in progress" on the connection that ran it, so a later write transaction
   // on the shared client fails to commit with SQLITE_BUSY ("SQL statements in
   // progress"). Keeping EXPLAIN off the shared connection avoids poisoning the
   // tests that follow; no production path issues EXPLAIN.
   const planClient = createClient({ url: `file:${process.env.SQLITE_PATH}` });
-  for (const { sql, args } of captured) {
-    // eslint-disable-next-line no-await-in-loop
-    const plan = await planClient.execute({ sql: `EXPLAIN QUERY PLAN ${sql}`, args });
-    const details = plan.rows.map((row) => String(row.detail));
-    for (const detail of details) {
+  try {
+    for (const { sql, args } of captured) {
+      // eslint-disable-next-line no-await-in-loop
+      const plan = await planClient.execute({ sql: `EXPLAIN QUERY PLAN ${sql}`, args });
+      const details = plan.rows.map((row) => String(row.detail));
+      for (const detail of details) {
+        assert.ok(
+          !/^SCAN (citations|catalogue_lookups)\b/.test(detail),
+          `orphan-collection DELETE fell back to a full table scan (the pre-B-02 global NOT IN anti-join shape): ${detail}\nSQL: ${sql}`
+        );
+      }
       assert.ok(
-        !/^SCAN (citations|catalogue_lookups)\b/.test(detail),
-        `orphan-collection DELETE fell back to a full table scan (the pre-B-02 global NOT IN anti-join shape): ${detail}\nSQL: ${sql}`
+        details.some((detail) => /^SEARCH (citations|catalogue_lookups) USING INTEGER PRIMARY KEY/.test(detail)),
+        `orphan-collection DELETE did not SEARCH on the integer primary key: ${details.join(' | ')}\nSQL: ${sql}`
       );
     }
-    assert.ok(
-      details.some((detail) => /^SEARCH (citations|catalogue_lookups) USING INTEGER PRIMARY KEY/.test(detail)),
-      `orphan-collection DELETE did not SEARCH on the integer primary key: ${details.join(' | ')}\nSQL: ${sql}`
-    );
+  } finally {
+    planClient.close();
   }
-  planClient.close();
 });
 
 test('collectOrphanedCitations only removes ids it is given, and only if unlinked', async () => {
