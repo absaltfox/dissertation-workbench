@@ -136,6 +136,14 @@ async function waitFor(predicate, timeoutMs = 1000) {
   assert.equal(await predicate(), true);
 }
 
+// Lifecycle tests drive fake child processes, so while terminateChild waits
+// the only pending work is its deliberately unref'd grace timer. Node 22's
+// test runner (production runtime) treats an otherwise-empty event loop as
+// "promise still pending" and cancels that test and every one after it; Node
+// 24+ keeps the loop alive itself. A real ChildProcess handle keeps the loop
+// alive in production, so hold a ref'd handle for the file's duration here.
+const eventLoopKeepAlive = setInterval(() => {}, 1 << 30);
+
 test.before(async () => {
   testDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-worker-tests-'));
   process.env.SKIP_LOCAL_ENV = '1';
@@ -195,6 +203,7 @@ test.before(async () => {
 });
 
 test.after(async () => {
+  clearInterval(eventLoopKeepAlive);
   await closeDb?.();
   if (testDataDir) await fs.rm(testDataDir, { recursive: true, force: true });
 });
