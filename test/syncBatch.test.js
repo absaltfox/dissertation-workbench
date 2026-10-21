@@ -497,14 +497,65 @@ test('explicit PDF full-text fallback counts as successful enrichment', async ()
     }
     if (url.includes('/rest/handle/2429/pdf-fallback-success')) {
       return new Response(JSON.stringify({
+        bitstreams: [{ id: 451, bundleName: 'TEXT', mimeType: 'text/plain', name: 'fallback.pdf.txt' }],
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/rest/bitstreams/451/retrieve')) {
+      return new Response(fullText, { headers: { 'content-type': 'text/plain' } });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  setDownloadSafetyOptions({ allowOriginalPdfRetrieval: true });
+  try {
+    const result = await runDocumentSync({
+      mode: 'sync_missing_pdfs',
+      baseUrl: 'https://oc-index.test',
+      term: 'degree.raw,PDF Fallback',
+      source: 'id,title,author,digitalResourceOriginalRecord',
+      pageSize: 100,
+      scanLimit: 100,
+      syncMaxRecords: 100,
+      pdfBatchSize: 1,
+      contentMode: 'pdf_stream',
+      contentFallback: 'full_text',
+      downloadFiles: true,
+    });
+    const stored = await loadStoredFileMetric(docId);
+    assert.equal(result.totalEnriched, 1);
+    assert.equal(result.totalEnrichmentFailed, 0);
+    assert.equal(stored.status, 'full_text_fallback');
+    assert.equal(stored.error, null);
+  } finally {
+    setDownloadSafetyOptions(null);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('explicit PDF full-text fallback after an unavailable listed PDF counts as successful enrichment', async () => {
+  const originalFetch = globalThis.fetch;
+  const docId = `1.${String(Date.now()).slice(-7)}8`;
+  const fullText = `Fallback extracted thesis text\n${'education systems research '.repeat(300)}`;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes('/search/8.5')) {
+      return new Response(JSON.stringify({
+        data: { hits: { total: 1, hits: [{ _source: {
+          id: docId,
+          title: 'PDF Fallback 404 Fixture',
+          author: 'Fallback Tester',
+          digitalResourceOriginalRecord: 'https://circle.library.ubc.ca/rest/handle/2429/pdf-fallback-404',
+        } }] } },
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/rest/handle/2429/pdf-fallback-404')) {
+      return new Response(JSON.stringify({
         bitstreams: [
           { id: 450, bundleName: 'ORIGINAL', mimeType: 'application/pdf', name: 'fallback.pdf' },
           { id: 451, bundleName: 'TEXT', mimeType: 'text/plain', name: 'fallback.pdf.txt' },
         ],
       }), { headers: { 'content-type': 'application/json' } });
     }
-    // The PDF is listed but permanently unavailable. The attempt is what lets a
-    // PDF-preferring rule accept the configured full-text fallback (e27dfd7).
+    // The PDF is listed but permanently unavailable.
     if (url.includes('/rest/bitstreams/450/retrieve')) {
       return new Response('not found', { status: 404 });
     }
@@ -518,7 +569,7 @@ test('explicit PDF full-text fallback counts as successful enrichment', async ()
     const result = await runDocumentSync({
       mode: 'sync_missing_pdfs',
       baseUrl: 'https://oc-index.test',
-      term: 'degree.raw,PDF Fallback',
+      term: 'degree.raw,PDF Fallback 404',
       source: 'id,title,author,digitalResourceOriginalRecord',
       pageSize: 100,
       scanLimit: 100,

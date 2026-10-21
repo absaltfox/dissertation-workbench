@@ -96,7 +96,15 @@ export function hasCachedEnrichmentMetric(stored, contentMode, contentFallback =
     // with real page counts. Once a PDF request has actually been made, accepting
     // the configured full-text fallback prevents every later import from retrying
     // a permanently unavailable PDF.
-    return counted && (!pdfPreferred || Number(stored.original_pdf_request_count) > 0);
+    // A row the pipeline itself recorded as `full_text_fallback` is a terminal
+    // outcome: the PDF was tried, or none exists, so retrying cannot change it
+    // (docs/import-rule-content-controls.md). That includes records with no PDF
+    // bitstream, for which no original-PDF request is ever made.
+    return counted && (
+      !pdfPreferred
+      || stored.status === 'full_text_fallback'
+      || Number(stored.original_pdf_request_count) > 0
+    );
   }
   if (contentMode === 'pdf_cache') return Boolean(stored?.pdf_path);
   if (contentMode === 'pdf_stream') {

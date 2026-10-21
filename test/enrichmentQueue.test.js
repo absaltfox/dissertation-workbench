@@ -29,6 +29,10 @@ const METRIC_ROWS = [
     word_source: 'dspace_full_text', word_count: 80_000, page_count: 250,
     original_pdf_request_count: 1,
   },
+  // Explicit fallback outcome with no PDF request (record has no PDF bitstream).
+  { status: 'full_text_fallback', word_source: 'dspace_full_text', word_count: 80_000, page_count: 250 },
+  { status: 'full_text_fallback', word_source: 'dspace_full_text', word_count: 0, page_count: 250 },
+  { status: 'full_text', word_source: 'dspace_full_text', word_count: 80_000, page_count: 250 },
   { word_source: 'dspace_full_text', word_count: 0, page_count: 250 },
   { word_source: 'dspace_full_text', word_count: 80_000, page_count: 0 },
   { word_source: 'dspace_full_text', word_count: 80_000, page_count: 250, pdf_path: '/cache/doc.pdf' },
@@ -93,7 +97,7 @@ test('the queue SQL and hasCachedEnrichmentMetric agree for every content mode',
         row.content_source ?? null,
         row.content_checksum ?? null,
         row.original_pdf_request_count ?? 0,
-        'fixture',
+        row.status ?? 'fixture',
         new Date().toISOString(),
       ],
     });
@@ -164,6 +168,22 @@ test('PDF-preferring rules upgrade legacy estimated pages exactly once', async (
   ), false);
   assert.equal(hasCachedEnrichmentMetric(
     await db.loadStoredFileMetric('upgrade-attempted'), 'pdf_stream', 'full_text'
+  ), true);
+});
+
+test('a full_text_fallback record with no PDF bitstream is not re-queued', async () => {
+  const syncKey = 'queue-no-pdf-bitstream';
+  await db.saveDocumentMetadata({ id: 'no-pdf-fallback', title: 'No PDF exists' }, { syncKey });
+  await db.saveFileMetric('no-pdf-fallback', {
+    status: 'full_text_fallback', wordSource: 'dspace_full_text', wordCount: 80_000,
+    pageCount: 250, originalPdfRequestCount: 0,
+  });
+  const pending = await db.listDocumentsPendingEnrichment({
+    syncKey, contentMode: 'pdf_stream', contentFallback: 'full_text', limit: 10,
+  });
+  assert.deepEqual(pending, []);
+  assert.equal(hasCachedEnrichmentMetric(
+    await db.loadStoredFileMetric('no-pdf-fallback'), 'pdf_stream', 'full_text'
   ), true);
 });
 

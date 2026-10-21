@@ -3676,8 +3676,10 @@ export function enrichmentPolicySatisfiedSql(contentMode, contentFallback = null
   const counted = `COALESCE(${alias}.word_count, 0) > 0 AND COALESCE(${alias}.page_count, 0) > 0`;
   const pdfAttempted = `COALESCE(${alias}.original_pdf_request_count, 0) > 0`;
   const pdfPreferred = contentMode === 'pdf_cache' || contentMode === 'pdf_stream';
+  // Mirrors the JS: an explicit full_text_fallback row is terminal even when no
+  // original-PDF request was ever made (record has no PDF bitstream).
   const fullText = `${alias}.word_source = 'dspace_full_text' AND ${counted}`
-    + (pdfPreferred ? ` AND ${pdfAttempted}` : '');
+    + (pdfPreferred ? ` AND (${alias}.status = 'full_text_fallback' OR ${pdfAttempted})` : '');
   let byMode = '0';
   if (contentMode === 'pdf_cache') {
     byMode = `${alias}.pdf_path IS NOT NULL AND ${alias}.pdf_path <> ''`;
