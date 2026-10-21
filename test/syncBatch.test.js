@@ -497,8 +497,16 @@ test('explicit PDF full-text fallback counts as successful enrichment', async ()
     }
     if (url.includes('/rest/handle/2429/pdf-fallback-success')) {
       return new Response(JSON.stringify({
-        bitstreams: [{ id: 451, bundleName: 'TEXT', mimeType: 'text/plain', name: 'fallback.pdf.txt' }],
+        bitstreams: [
+          { id: 450, bundleName: 'ORIGINAL', mimeType: 'application/pdf', name: 'fallback.pdf' },
+          { id: 451, bundleName: 'TEXT', mimeType: 'text/plain', name: 'fallback.pdf.txt' },
+        ],
       }), { headers: { 'content-type': 'application/json' } });
+    }
+    // The PDF is listed but permanently unavailable. The attempt is what lets a
+    // PDF-preferring rule accept the configured full-text fallback (e27dfd7).
+    if (url.includes('/rest/bitstreams/450/retrieve')) {
+      return new Response('not found', { status: 404 });
     }
     if (url.includes('/rest/bitstreams/451/retrieve')) {
       return new Response(fullText, { headers: { 'content-type': 'text/plain' } });
