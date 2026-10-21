@@ -17,8 +17,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-// Only test-file child processes; the runner process itself never opens a DB.
-if (process.env.NODE_TEST_CONTEXT) {
+// Opt-in flag set by scripts/run-tests.mjs (not Node's undocumented
+// NODE_TEST_CONTEXT), so a Node internal rename cannot silently disable isolation.
+if (process.env.OC_TEST_ISOLATE === '1') {
   // Nest under the runner's dir when there is one, so the runner's own
   // cleanup also reclaims the dir of a test process that was killed.
   const parent = process.env.OC_TEST_DATA_ROOT || tmpdir();

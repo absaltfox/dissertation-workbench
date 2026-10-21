@@ -22,6 +22,7 @@ const child = spawn(process.execPath, ['--expose-gc', '--import', isolatePreload
   stdio: 'inherit',
   env: {
     ...process.env,
+    OC_TEST_ISOLATE: '1',
     OC_TEST_DATA_ROOT: dataDir,
     APP_DATA_DIR: dataDir,
     SQLITE_PATH: path.join(dataDir, 'metrics.sqlite'),
