@@ -145,10 +145,9 @@ test('#26: buildTermCooccurrence peak heap growth is sub-linear vs. corpus-size 
 // an effectively unlimited topN so the returned array size approximates the
 // full pairCounts map's surviving-pairs count, and compare directly instead
 // of relying on GC-timing-sensitive heap deltas for this specific claim.
-function originalUnboundedTermCooccurrence(records, dict, topN = 20) {
+function originalUnboundedTermCooccurrence(records, dict, _topN = 20) {
   const pairCounts = new Map();
   const termCounts = new Map();
-  const N = records.length;
   for (const rec of records) {
     const concepts = (rec.conceptTerms || []).slice(0, 20);
     if (concepts.length < 2) continue;

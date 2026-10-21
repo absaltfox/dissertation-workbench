@@ -70,12 +70,10 @@ export async function publishTerminalFailure({
     ['Failed to append terminal worker log', () => appendLog(`Worker ${status}: ${message}\n`)],
   ]) {
     try {
-      // eslint-disable-next-line no-await-in-loop
       await action();
     } catch (cleanupError) {
       cleanupErrors.push({ context, error: cleanupError });
       try {
-        // eslint-disable-next-line no-await-in-loop
         await onCleanupError(context, cleanupError);
       } catch {
         // Reporting a cleanup failure is itself best effort.

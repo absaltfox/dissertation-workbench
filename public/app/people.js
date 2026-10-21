@@ -8,7 +8,6 @@ import {
   state,
 } from './core.js';
 import {
-  getFilteredDocs,
   isPhoneView,
   openMatchesModal,
   openResponsivePanel,
@@ -19,8 +18,6 @@ import {
   loadPeopleData,
 } from './data.js';
 const {
-  docDetailsEl,
-  docModalOverlay,
   docModalTitleEl,
   methodologyConceptHeatmapEl,
   personCountEl,

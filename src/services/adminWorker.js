@@ -310,7 +310,6 @@ export async function dispatchAdminJobFollowups({ createJob = createAndStartAdmi
   const dispatched = [];
   for (const followup of followups) {
     try {
-      // eslint-disable-next-line no-await-in-loop
       const job = await createJob({
         type: followup.type,
         label: followup.label,
@@ -318,7 +317,6 @@ export async function dispatchAdminJobFollowups({ createJob = createAndStartAdmi
         singleInstance: true,
       });
       if (job.alreadyRunning) continue;
-      // eslint-disable-next-line no-await-in-loop
       const completed = await completeAdminJobFollowup(followup.type, followup.requestToken);
       dispatched.push({ type: followup.type, jobId: job.jobId, superseded: !completed });
     } catch {

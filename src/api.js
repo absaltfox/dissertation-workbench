@@ -52,7 +52,7 @@ function unique(values) {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
-export function collectCandidateUrls(doc, id, doi) {
+export function collectCandidateUrls(doc, id, _doi) {
   const candidates = [];
 
   for (const key of [

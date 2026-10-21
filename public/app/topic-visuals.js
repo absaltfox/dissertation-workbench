@@ -2,7 +2,6 @@ import {
   dom,
   ensureD3Library,
   escapeHtml,
-  formatNum,
   setStatus,
   state,
 } from './core.js';
@@ -18,7 +17,6 @@ import {
 } from './documents.js';
 
 const {
-  analyticsTabButtons,
   citationNetworkChartEl,
   citationNetworkContainerEl,
   citationNetworkPanelEl,
@@ -27,8 +25,6 @@ const {
   conceptNetworkContainerEl,
   conceptNetworkPanelEl,
   conceptNetworkTooltipEl,
-  conceptTimelineChartEl,
-  conceptTimelineLegendEl,
   methTopicBubbleChartEl,
   methTopicBubbleContainerEl,
   methTopicBubblePanelEl,
@@ -37,7 +33,6 @@ const {
   supervisorNetworkContainerEl,
   supervisorNetworkPanelEl,
   supervisorNetworkTooltipEl,
-  topicBarsEl,
   topicClusterChartEl,
   topicClusterContainerEl,
   topicClusterLegendEl,
@@ -47,14 +42,9 @@ const {
   topicDendrogramContainerEl,
   topicDendrogramPanelEl,
   topicDendrogramTooltipEl,
-  topicDistPanelEl,
-  topicModelMetaEl,
   topicSankeyChartEl,
   topicSankeyLegendEl,
   topicSankeyPanelEl,
-  topicTimelineChartEl,
-  topicTimelineLegendEl,
-  topicTimelinePanelEl,
 } = dom;
 
 let topicVisualsInitialized = false;
@@ -93,94 +83,6 @@ function renderVisualizations() {
 }
 
 
-let conceptTimelineChartInstance = null;
-
-function renderConceptTimeline() {
-  const data = getAnalytics()?.conceptTimeline || [];
-  if (!data.length || !conceptTimelineChartEl) {
-    if (conceptTimelineChartEl) conceptTimelineChartEl.innerHTML = '<p class="meta">No concept timeline data available.</p>';
-    if (conceptTimelineLegendEl) conceptTimelineLegendEl.innerHTML = '';
-    return;
-  }
-
-  const canvas = conceptTimelineChartEl.querySelector('canvas');
-  if (!canvas) return;
-
-  if (conceptTimelineChartInstance) {
-    conceptTimelineChartInstance.destroy();
-  }
-
-  // Collect all years and sort them
-  const allYears = new Set();
-  for (const series of data) {
-    for (const pt of series.data) {
-      allYears.add(pt.year);
-    }
-  }
-  const years = Array.from(allYears).sort((a, b) => a - b);
-  if (!years.length) {
-    conceptTimelineChartEl.innerHTML = '<p class="meta">No year data.</p>';
-    if (conceptTimelineLegendEl) conceptTimelineLegendEl.innerHTML = '';
-    return;
-  }
-
-  const hueStep = 360 / data.length;
-  const datasets = data.map((series, idx) => {
-    const hue = Math.round(idx * hueStep);
-    const color = `hsl(${hue}, 65%, 45%)`;
-    
-    // Create a map of year -> count for this series
-    const yearMap = new Map(series.data.map(pt => [pt.year, pt.count]));
-    const seriesData = years.map(yr => yearMap.get(yr) || 0);
-
-    return {
-      label: `${series.concept} (${series.totalDocs})`,
-      data: seriesData,
-      borderColor: color,
-      backgroundColor: `hsla(${hue}, 65%, 45%, 0.05)`,
-      borderWidth: 2,
-      tension: 0.15,
-      pointRadius: 3,
-      pointHoverRadius: 5
-    };
-  });
-
-  conceptTimelineChartInstance = new Chart(canvas, {
-    type: 'line',
-    data: {
-      labels: years,
-      datasets: datasets
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: {
-          display: true,
-          position: 'bottom',
-          labels: {
-            color: 'var(--fg)',
-            boxWidth: 12,
-            font: { size: 11 }
-          }
-        }
-      },
-      scales: {
-        x: { 
-          grid: { display: false },
-          ticks: { color: 'var(--fg)' }
-        },
-        y: { 
-          beginAtZero: true,
-          ticks: { color: 'var(--fg)' }
-        }
-      }
-    }
-  });
-
-  if (conceptTimelineLegendEl) conceptTimelineLegendEl.innerHTML = '';
-}
-
 // --- Topic Distribution ---
 
 function topicDisplayLabel(label) {
@@ -205,171 +107,7 @@ function wrapLabel(text, maxChars) {
   return lines.length ? lines : [text];
 }
 
-function renderTopicDistribution() {
-  const td = getAnalytics()?.topicData;
-  if (!td || !td.topics || !td.topics.length) {
-    if (topicDistPanelEl) topicDistPanelEl.hidden = true;
-    return;
-  }
-  topicDistPanelEl.hidden = false;
-  if (topicModelMetaEl) {
-    const modelName = td.topics.find((topic) => topic.modelName)?.modelName;
-    const createdAt = td.topics.find((topic) => topic.createdAt)?.createdAt;
-    const detail = [modelName, createdAt ? `run ${new Date(createdAt).toLocaleDateString()}` : '']
-      .filter(Boolean)
-      .join('; ');
-    topicModelMetaEl.textContent = `Topics discovered by BERTopic clustering of dissertation abstracts${detail ? ` (${detail})` : ''}.`;
-  }
-
-  // Show all topics except outliers at end
-  const regular = td.topics.filter((t) => t.topicId !== -1);
-  const outlier = td.topics.find((t) => t.topicId === -1);
-  const ordered = [...regular];
-  if (outlier) ordered.push(outlier);
-
-  const maxCount = Math.max(...ordered.map((t) => t.docCount), 1);
-
-  topicBarsEl.innerHTML = ordered
-    .map((topic) => {
-      const widthPct = (topic.docCount / maxCount) * 100;
-      const displayLabel = topic.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic.label);
-      const topTerms = topic.topicId === -1 ? '' : (topic.topTerms || []).slice(0, 3).map((pair) => Array.isArray(pair) ? pair[0] : pair).join(', ');
-      return `
-        <div class="bar-row">
-          <span class="bar-label" title="${escapeHtml(topic.label)}">
-            ${escapeHtml(displayLabel)}
-            ${topTerms ? `<span class="topic-terms">${escapeHtml(topTerms)}</span>` : ''}
-          </span>
-          <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
-          <button class="bar-value" data-topic-id="${topic.topicId}">${formatNum(topic.docCount)}</button>
-        </div>
-      `;
-    })
-    .join('');
-
-  for (const node of topicBarsEl.querySelectorAll('[data-topic-id]')) {
-    node.addEventListener('click', () => {
-      const topicId = Number(node.getAttribute('data-topic-id'));
-      const topic = td.topics.find((t) => t.topicId === topicId);
-      const label = topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || '');
-      openMatchesModal(`Topic: ${label}`, docsForTopic(topicId));
-    });
-  }
-}
-
-let topicTimelineChartInstance = null;
-
-function renderTopicTimeline() {
-  const td = getAnalytics()?.topicData;
-  if (!td || !td.byYear || !td.byYear.length) {
-    if (topicTimelinePanelEl) topicTimelinePanelEl.hidden = true;
-    return;
-  }
-  topicTimelinePanelEl.hidden = false;
-
-  const data = td.byYear;
-  const canvas = topicTimelineChartEl.querySelector('canvas');
-  if (!canvas) return;
-
-  if (topicTimelineChartInstance) {
-    topicTimelineChartInstance.destroy();
-  }
-
-  const allYears = new Set();
-  for (const series of data) {
-    for (const pt of series.data) {
-      allYears.add(pt.year);
-    }
-  }
-  const years = Array.from(allYears).sort((a, b) => a - b);
-  if (!years.length) {
-    topicTimelineChartEl.innerHTML = '<p class="meta">No year data.</p>';
-    if (topicTimelineLegendEl) topicTimelineLegendEl.innerHTML = '';
-    return;
-  }
-
-  const hueStep = 360 / data.length;
-  const datasets = data.map((series, idx) => {
-    const hue = Math.round(idx * hueStep);
-    const color = `hsl(${hue}, 65%, 45%)`;
-    
-    const yearMap = new Map(series.data.map(pt => [pt.year, pt.count]));
-    const seriesData = years.map(yr => yearMap.get(yr) || 0);
-
-    return {
-      label: topicDisplayLabel(series.label),
-      data: seriesData,
-      borderColor: color,
-      backgroundColor: `hsla(${hue}, 65%, 45%, 0.05)`,
-      borderWidth: 2,
-      tension: 0.15,
-      pointRadius: 3,
-      pointHoverRadius: 5
-    };
-  });
-
-  topicTimelineChartInstance = new Chart(canvas, {
-    type: 'line',
-    data: {
-      labels: years,
-      datasets: datasets
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: {
-          display: true,
-          position: 'bottom',
-          labels: {
-            color: 'var(--fg)',
-            boxWidth: 12,
-            font: { size: 11 }
-          }
-        }
-      },
-      scales: {
-        x: { 
-          grid: { display: false },
-          ticks: { color: 'var(--fg)' }
-        },
-        y: { 
-          beginAtZero: true,
-          ticks: { color: 'var(--fg)' }
-        }
-      }
-    }
-  });
-
-  if (topicTimelineLegendEl) topicTimelineLegendEl.innerHTML = '';
-}
-
 // --- Analytics sub-tabs ---
-
-async function setActiveAnalyticsTab(tabName) {
-  for (const btn of analyticsTabButtons) {
-    btn.classList.toggle('active', btn.dataset.analyticsTab === tabName);
-  }
-  for (const section of document.querySelectorAll('.analytics-tab-section')) {
-    section.classList.toggle('active', section.id === `analytics-${tabName}`);
-  }
-  if (tabName === 'visualizations' && state.payload) {
-    try {
-      await ensureD3Library();
-      await loadVisualizationData();
-    } catch (error) {
-      setStatus(`Failed to load visualizations: ${error.message}`, true);
-      return;
-    }
-    renderTopicCluster();
-    renderTopicDendrogram();
-    renderTopicSankey();
-    renderMethTopicBubble();
-    renderSupervisorNetwork();
-    renderCitationNetwork();
-    renderConceptNetwork();
-  }
-}
 
 // --- Topic Cluster Scatter Plot ---
 
@@ -545,19 +283,6 @@ function drag(simulation) {
     .on('start', dragstarted)
     .on('drag', dragged)
     .on('end', dragended);
-}
-
-function showNetTooltip(containerEl, tooltipEl, target, html) {
-  tooltipEl.hidden = false;
-  tooltipEl.innerHTML = html;
-  const rect = containerEl.getBoundingClientRect();
-  const tRect = target.getBoundingClientRect();
-  let left = tRect.left - rect.left + 14;
-  let top = tRect.top - rect.top - 10;
-  if (left + 200 > rect.width) left = tRect.left - rect.left - 200;
-  if (top < 0) top = tRect.bottom - rect.top + 6;
-  tooltipEl.style.left = left + 'px';
-  tooltipEl.style.top = top + 'px';
 }
 
 function renderTopicDendrogram() {
@@ -1137,7 +862,7 @@ function renderTopicSankey() {
     const total = periodTotals[pi];
     const scale = total > 0 ? availH / maxTotal : 0;
     let y0 = pad.t + (availH - total * scale) / 2;
-    return topicPeriods.map((t, ti) => {
+    return topicPeriods.map((t) => {
       const h = t.counts[pi] * scale;
       const entry = { y: y0, h };
       y0 += h;

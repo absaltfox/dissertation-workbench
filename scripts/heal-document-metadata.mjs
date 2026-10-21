@@ -10,7 +10,6 @@ import { normalizeRecord } from '../src/metrics.js';
 // corpus; re-deriving metadata now requires a live re-fetch from Open
 // Collections, not this cache-based path. Consider retiring this script.
 
-const PLACEHOLDER_TITLE = '';
 const PLACEHOLDER_AUTHOR = 'Unknown';
 
 function hasRealValue(value) {

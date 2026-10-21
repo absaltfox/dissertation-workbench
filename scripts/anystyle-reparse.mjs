@@ -11,7 +11,7 @@
 
 import fs from 'node:fs/promises';
 import { ensureStorage, getDb, reextractDocumentCitations, loadDocumentCitations } from '../src/db.js';
-import { analyzePdfAtPath, parseBibliographyWithAnyStyle, parseBibliography, normalizeCitation } from '../src/pdf.js';
+import { analyzePdfAtPath, parseBibliographyWithAnyStyle, normalizeCitation } from '../src/pdf.js';
 
 const dryRun = process.argv.includes('--dry-run');
 

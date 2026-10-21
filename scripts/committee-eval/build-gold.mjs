@@ -10,7 +10,6 @@ import { buildWorksheetRows, finalizeGold } from './lib/worksheet.mjs';
 const EVAL_DIR = 'data/committee-eval';
 const TEXT_DIR = path.join(EVAL_DIR, 'fulltext');
 const WORKSHEET_JSON = path.join(EVAL_DIR, 'gold-worksheet.json');
-const WORKSHEET_CSV = path.join(EVAL_DIR, 'gold-worksheet.csv');
 const GOLD = 'test/fixtures/committee-eval/gold.json';
 
 const argv = process.argv.slice(2);

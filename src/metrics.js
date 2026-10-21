@@ -12,7 +12,7 @@ import {
 } from './db.js';
 import {
   toArray, flattenText, extractYear, parsePageCount, buildWordCloud,
-  buildMethodologyStats, extractNgrams, detectMethodologies, isLowSignalConceptPhrase,
+  buildMethodologyStats, extractNgrams, detectMethodologies,
   isLowSignalConceptTerm, documentThemeTerms, COOCCURRENCE_BLOCKLIST
 } from './nlp.js';
 import { fetchPage, extractHits, resolveIndexName, collectCandidateUrls } from './api.js';
@@ -52,10 +52,6 @@ function firstPresent(obj, keys) {
     if (val !== undefined && val !== null && val !== '') return val;
   }
   return null;
-}
-
-function unique(values) {
-  return Array.from(new Set(values.filter(Boolean)));
 }
 
 const MIN_RELIABLE_WORD_COUNT = 1000;
@@ -289,46 +285,6 @@ function buildMetrics(records, subjectLimit) {
     avgPagesByYear,
     pageTrend
   };
-}
-
-function docNgrams(rec, limit = 8) {
-  const text = [rec.title, rec.abstract, rec.subjects.join(' ')].join(' ');
-  const counts = new Map();
-  for (const n of [2, 3, 4]) {
-    for (const ng of extractNgrams(text, n)) {
-      const normalized = canonicalizeDomainText(ng);
-      if (!normalized || isLowSignalConceptPhrase(normalized)) continue;
-      counts.set(normalized, (counts.get(normalized) || 0) + 1);
-    }
-  }
-  const entries = Array.from(counts.entries())
-    .map(([term, count]) => ({ term, count, tokens: term.split(' ') }))
-    .sort((a, b) => b.tokens.length - a.tokens.length || b.count - a.count);
-  const kept = [];
-  for (const entry of entries) {
-    const isSubphrase = kept.some((longer) => {
-      if (longer.tokens.length <= entry.tokens.length) return false;
-      const maxStart = longer.tokens.length - entry.tokens.length;
-      for (let start = 0; start <= maxStart; start++) {
-        let ok = true;
-        for (let i = 0; i < entry.tokens.length; i++) {
-          if (longer.tokens[start + i] !== entry.tokens[i]) {
-            ok = false;
-            break;
-          }
-        }
-        if (ok) return true;
-      }
-      return false;
-    });
-    if (!isSubphrase) kept.push(entry);
-  }
-
-  return kept
-    .filter((entry) => entry.tokens.length <= 3)
-    .sort((a, b) => b.count - a.count)
-    .slice(0, limit)
-    .map((entry) => entry.term);
 }
 
 const EMPTY_CONCEPT_DICT = {
@@ -852,7 +808,6 @@ async function buildCitationCooccurrenceNetwork(docIds = null) {
 
 function buildMethodologyTopicMatrix(records, topics) {
   const methCounts = new Map();
-  const topicMap = new Map(topics.map(t => [t.topicId, t.label]));
 
   for (const rec of records) {
     for (const m of (rec.methodologies || [])) {

@@ -1485,7 +1485,7 @@ function extractNameFromCapture(raw) {
   const parts = [];
   for (const word of raw.trim().split(/\s+/)) {
     // Strip trailing punctuation but keep periods for middle initials (e.g. "J.")
-    const stripped = word.replace(/[,;:()\[\]!?]+$/, '');
+    const stripped = word.replace(/[,;:()[\]!?]+$/, '');
     if (!stripped) break;
     // Must start with an uppercase letter (including accented uppercase)
     if (!/^[A-Z\u00C0-\u024F]/.test(stripped)) {
@@ -1573,7 +1573,7 @@ function isPlausibleBareAdvisorName(raw) {
   if (tokens.length < 2 || tokens.length > 4 || name.length > 60 || /\d/.test(name)) return '';
   let substantive = 0;
   for (const token of tokens) {
-    const bare = token.replace(/[.'’\-]/g, '');
+    const bare = token.replace(/[.'’-]/g, '');
     if (NAME_PARTICLES.has(bare.toLowerCase())) continue;
     if (ADVISOR_NAME_STOP_WORDS.has(bare.toLowerCase())) return '';
     if (ADVISOR_NAME_ORG_PLACE_WORDS.has(bare.toLowerCase())) return '';
@@ -2024,7 +2024,7 @@ function isLikelyCitationStart(line) {
 
   // Person-author starts: "Lastname, Firstname ..."
   // Exclude publisher-location patterns and common non-name words that appear on wrapped lines
-  if (/^[A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F'\u2019.\-]+,\s+[A-Z\u00C0-\u024F]/.test(text)) {
+  if (/^[A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F'\u2019.-]+,\s+[A-Z\u00C0-\u024F]/.test(text)) {
     if (/^[A-Z][A-Za-z\s]+,\s+[A-Z]{2}\s*:/.test(text)) return false;
     if (/^(Dissertation|Thesis|Theses|Journal|Computers?|University|Department|Faculty|Ministry|Province|Government|Report|Paper|Conference|School|Press|Association|Institute|Committee|Society|Museum|Archive|Archives|Magazine|Newsletter|Vol|Chapter|Retrieved|Available|Accessed|Edited|Translated|Published|Information|Education|Teacher|Teachers|Inc|York|Studies|Study|Distribution|Exceptional|December|January|February|March|April|May|June|July|August|September|October|November)\.?,/i.test(text)) return false;
     return true;

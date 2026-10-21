@@ -5,6 +5,7 @@ import {
   formatBytes,
   formatNum,
   getActiveAdminTab,
+  getCurrentParams,
   jsonHeaders,
   setActiveAdminTab as setActiveAdminTabShell,
   setStatus,

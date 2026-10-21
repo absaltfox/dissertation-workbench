@@ -153,7 +153,6 @@ test('getCatalogueLookupStats().pending matches countPendingLookups() and listPe
   const db = await import('../src/db.js');
   const client = await db.getDb();
   const hashFn = (text) => `m09-${text}`;
-  const now = new Date().toISOString();
 
   // A citation with no catalogue_lookups row at all (the NOT EXISTS arm).
   const [noLookupId] = await db.saveCitations('1.0800001', [
@@ -476,7 +475,6 @@ test('collectOrphanedCitations deletes via SEARCH on the primary key, not a full
   const planClient = createClient({ url: `file:${process.env.SQLITE_PATH}` });
   try {
     for (const { sql, args } of captured) {
-      // eslint-disable-next-line no-await-in-loop
       const plan = await planClient.execute({ sql: `EXPLAIN QUERY PLAN ${sql}`, args });
       const details = plan.rows.map((row) => String(row.detail));
       for (const detail of details) {

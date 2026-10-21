@@ -154,7 +154,6 @@ export async function withDbRetry(fn, {
   let lastError;
   for (let attempt = 0; attempt < Math.max(1, maxAttempts); attempt += 1) {
     try {
-      // eslint-disable-next-line no-await-in-loop
       return await fn();
     } catch (error) {
       lastError = error;
@@ -163,7 +162,6 @@ export async function withDbRetry(fn, {
       logger.warn('Retrying transient DB error', {
         label, attempt: attempt + 1, maxAttempts, error: error?.message || String(error),
       });
-      // eslint-disable-next-line no-await-in-loop
       await wait(backoff(attempt));
     }
   }
@@ -1114,7 +1112,7 @@ const DOCUMENT_TERM_KINDS = [
   ['methodology', 'methodologies'],
 ];
 
-function metadataTermsStatements(doc, now = new Date().toISOString()) {
+function metadataTermsStatements(doc, _now = new Date().toISOString()) {
   const statements = [{
     sql: 'DELETE FROM document_terms WHERE doc_id = ?',
     args: [doc.id],
@@ -3566,7 +3564,6 @@ export async function loadStoredFileMetrics(docIds = [], { includeRestrictedAcce
   for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
     const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
     const placeholders = chunk.map(() => '?').join(', ');
-    // eslint-disable-next-line no-await-in-loop
     const rows = await withDbRetry(() => all(`
       SELECT ${includeRestrictedAccess ? 'd.doc_id' : 'fm.doc_id'} AS doc_id,
              pdf_path, download_url, file_bytes, word_count, body_word_count,
@@ -3776,7 +3773,6 @@ export async function markEnrichmentAttempts(docIds = [], attemptedAt = new Date
   const chunkSize = 250;
   for (let i = 0; i < ids.length; i += chunkSize) {
     const chunk = ids.slice(i, i + chunkSize);
-    // eslint-disable-next-line no-await-in-loop
     await withDbRetry(() => client.batch(chunk.map((docId) => ({
       sql: `
         INSERT INTO enrichment_attempts (doc_id, attempted_at)
@@ -3797,7 +3793,6 @@ export async function loadEnrichmentAttempts(docIds = []) {
   for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
     const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
     const placeholders = chunk.map(() => '?').join(', ');
-    // eslint-disable-next-line no-await-in-loop
     const rows = await withDbRetry(() => all(
       `SELECT doc_id, attempted_at FROM enrichment_attempts WHERE doc_id IN (${placeholders})`,
       chunk
@@ -4499,10 +4494,8 @@ async function reserveImportRuleRequestSlotOnce(ruleId, limit, {
   let lastTimestamps = [];
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     if (attempt > 0) {
-      // eslint-disable-next-line no-await-in-loop
       await wait(backoff(attempt - 1, CAS_BACKOFF_OPTIONS));
     }
-    // eslint-disable-next-line no-await-in-loop
     const row = await get(
       'SELECT timestamps_json FROM import_rule_request_limits WHERE rule_id = ?',
       [ruleId]
@@ -4522,7 +4515,6 @@ async function reserveImportRuleRequestSlotOnce(ruleId, limit, {
     }
     const nextJson = JSON.stringify([...timestamps, nowMs].slice(-600));
     let result;
-    // eslint-disable-next-line no-await-in-loop
     if (row) {
       result = await run(`
         UPDATE import_rule_request_limits

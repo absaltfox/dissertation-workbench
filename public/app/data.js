@@ -156,7 +156,7 @@ function buildAnalytics(docs) {
   const conceptYearMap  = new Map();
 
   for (const doc of docs) {
-    const { year, pages, wordCount,
+    const { year, pages,
       themes = [], conceptTerms = [],
       methodologies: meths = [], supervisors: sups = [] } = doc;
     const reliableWords = hasReliableWordCount(doc);

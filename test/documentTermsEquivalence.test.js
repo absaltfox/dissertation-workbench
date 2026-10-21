@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import os from 'node:os'; import path from 'node:path'; import fs from 'node:fs/promises';
 
-let db, ensureStorage, getDb, closeDb, saveDocumentMetadataBatch,
+let ensureStorage, getDb, closeDb, saveDocumentMetadataBatch,
     queryRelatedDocuments, getDocumentServingAnalytics, __setDocumentTermsReadyForTesting, tempDir;
 
 test.before(async () => {
@@ -12,7 +12,7 @@ test.before(async () => {
   ({ ensureStorage, getDb, closeDb, saveDocumentMetadataBatch,
      queryRelatedDocuments, getDocumentServingAnalytics,
      __setDocumentTermsReadyForTesting } = await import('../src/db.js'));
-  await ensureStorage(); db = await getDb();
+  await ensureStorage(); await getDb();
   const docs = Array.from({ length: 40 }, (_, i) => ({ doc: {
     id: `rel-${i}`, title: `Doc ${i}`, author: `A${i}`, year: 2000 + (i % 10), degree: 'PhD',
     themes: [`theme ${i % 5}`, `theme ${(i + 1) % 5}`],

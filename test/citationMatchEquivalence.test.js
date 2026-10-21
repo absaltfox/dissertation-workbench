@@ -731,17 +731,8 @@ const PHASE2_GROUPS = [
 ];
 
 test('the five phase-2 fixture groups reach the +/-1 veto / tie-break logic and resolve as documented', async () => {
-  const client = await db.getDb();
-
   const totalCitations = async () =>
     Number((await db.getCitationStats()).total_citations);
-  const linkedId = async (docId) => {
-    const rows = await client.execute({
-      sql: 'SELECT citation_id FROM document_citations WHERE doc_id = ? ORDER BY citation_id',
-      args: [docId],
-    });
-    return rows.rows.map((row) => Number(row.citation_id));
-  };
 
   // Every group must be individually shown to reach phase 2 for its own probe,
   // and the three veto groups must be individually shown to fire the veto — a

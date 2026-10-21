@@ -191,7 +191,7 @@ function extractChicago(text) {
   // Many Chicago/Turabian citations place the year unparenthesized after the author.
   // Scan for the first bare 4-digit year and split on it.
   // Allow an optional period between the year/letter-suffix and the title word.
-  const bareYearMatch = text.match(/\b(1[89]\d\d|20\d\d)[a-z]?\.?\s+([A-Z\(].{5,})/);
+  const bareYearMatch = text.match(/\b(1[89]\d\d|20\d\d)[a-z]?\.?\s+([A-Z(].{5,})/);
   if (bareYearMatch) {
     const beforeYear = text.slice(0, bareYearMatch.index).replace(/[.\s]+$/, '');
     const author = extractAuthorSurname(beforeYear) || null;
@@ -331,7 +331,7 @@ export function runYazClient(commands, {
       if (size <= maxBuffer) chunks.push(chunk);
     });
 
-    child.on('close', (code) => {
+    child.on('close', () => {
       const stdout = Buffer.concat(chunks).toString('utf-8');
       // yaz-client exits non-zero even on success, so ignore exit code
       // and just check if we got parseable output
@@ -397,7 +397,6 @@ export async function lookupCitation(citationText, { signal, runClient = runYazC
 // --- Batch lookup ---
 
 export async function lookupCitationBatch(citationTexts, {
-  concurrency = 1,
   onProgress,
   structuredFieldsList,
   signal,

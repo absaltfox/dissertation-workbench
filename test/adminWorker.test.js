@@ -3559,7 +3559,6 @@ test('citation scan continuation drains a multi-batch backlog with O(1) params_j
     for (;;) {
       if (guard++ > 20) throw new Error('drain did not terminate');
       const jobId = await createAdminJob({ type: 'citation_scan', label: 'Drain', params, runnerType: 'local' });
-      // eslint-disable-next-line no-await-in-loop
       const result = await runImportPdfAdminJob(await getAdminJob(jobId));
       batches += 1;
       scanned += result.processed;
@@ -3570,7 +3569,6 @@ test('citation scan continuation drains a multi-batch backlog with O(1) params_j
       // seam. autoContinue is added only so the gate fires for this offline check;
       // the returned params carry only a fixed-width cursor forward (O(1)).
       let nextParams = null;
-      // eslint-disable-next-line no-await-in-loop
       await startCitationScanContinuation({ id: jobId, params: { ...params, autoContinue: true } }, result, null, {
         createContinuationJob: async (payload) => { nextParams = payload.params; return { jobId: jobId + 1 }; },
       });
@@ -3585,7 +3583,6 @@ test('citation scan continuation drains a multi-batch backlog with O(1) params_j
     assert.equal(scanned, total, 'every backlog document was scanned across batches');
     assert.ok(batches >= 3, 'expected the capped backlog to span multiple batches');
     for (const id of docIds) {
-      // eslint-disable-next-line no-await-in-loop
       assert.equal((await loadDocumentCitations(id)).length > 0, true);
     }
     // Every continuation carries the same bounded set of params keys -- nothing accumulates.

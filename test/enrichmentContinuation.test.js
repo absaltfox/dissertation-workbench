@@ -123,7 +123,6 @@ test('startContinuationJob keeps nextParams JSON size constant across many conti
       enrichmentCursors: { [rule.id]: cursor },
     };
     let nextParams = null;
-    // eslint-disable-next-line no-await-in-loop
     await startContinuationJob(job, result, null, {
       createContinuationJob: async (payload) => {
         nextParams = payload.params;
@@ -287,7 +286,6 @@ async function runBatches({ syncKey, contentMode = 'full_text_only', pdfBatchSiz
   const costs = [];
   for (let i = 0; i < batches; i += 1) {
     const counter = statementCounter(client);
-    // eslint-disable-next-line no-await-in-loop
     const result = await runDocumentSync({
       mode: 'sync_missing_pdfs',
       baseUrl: 'https://oc-index.test',
@@ -399,7 +397,6 @@ test('a sparse pending tail behind dense unrelated + satisfied documents still c
 
   await db.saveDocumentMetadataBatch(items);
   for (const id of satisfiedIds) {
-    // eslint-disable-next-line no-await-in-loop
     await db.saveFileMetric(id, {
       status: 'full_text', wordSource: 'dspace_full_text', wordCount: 500, pageCount: 5,
     });
