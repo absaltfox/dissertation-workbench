@@ -763,24 +763,33 @@ function buildMethodologyConceptMatrix(records, topM = 10, topC = 10) {
 // non-qualifying edge's `docs` array was fully populated for nothing. This
 // changes cost, not output: same top-N nodes, same qualifying edges, same
 // weights, same docs lists for the edges that survive.
-export function buildSupervisorNetwork(records, minEdge = 1, topN = 30) {
-  const nodeMap = new Map(); // name -> docCount
-  const perRecordPeople = new Array(records.length);
-
-  for (let i = 0; i < records.length; i++) {
-    const rec = records[i];
-    const people = [];
-    for (const s of (rec.supervisors || [])) people.push(s);
-    if (rec.committee) {
-      for (const m of rec.committee) {
-        if (m.role === 'Supervisor' || m.role === 'Co-Supervisor' || m.role === 'Committee Member') {
-          if (!people.includes(m.name)) people.push(m.name);
-        }
+//
+// Neither pass keeps anything per record: each record's people list is
+// rebuilt into one reused scratch array (pass 2 recomputes it from the
+// record rather than caching every record's list from pass 1, which would
+// hold O(records) arrays alive until the function returns). The only state
+// that grows with input is nodeMap (distinct people) and the docs lists of
+// top-N-qualifying edges.
+function collectNetworkPeople(rec, people) {
+  people.length = 0;
+  for (const s of (rec.supervisors || [])) people.push(s);
+  if (rec.committee) {
+    for (const m of rec.committee) {
+      if (m.role === 'Supervisor' || m.role === 'Co-Supervisor' || m.role === 'Committee Member') {
+        if (!people.includes(m.name)) people.push(m.name);
       }
     }
-    if (people.length === 0) continue;
+  }
+  return people;
+}
+
+export function buildSupervisorNetwork(records, minEdge = 1, topN = 30) {
+  const nodeMap = new Map(); // name -> docCount
+  const people = [];
+
+  for (const rec of records) {
+    collectNetworkPeople(rec, people);
     for (const p of people) nodeMap.set(p, (nodeMap.get(p) || 0) + 1);
-    perRecordPeople[i] = people;
   }
 
   const topNodes = Array.from(nodeMap.entries())
@@ -789,16 +798,16 @@ export function buildSupervisorNetwork(records, minEdge = 1, topN = 30) {
   const topSet = new Set(topNodes.map(([name]) => name));
 
   const edgeMap = new Map(); // "A|||B" -> { weight, docs } — only for topSet pairs
-  for (let i = 0; i < records.length; i++) {
-    const people = perRecordPeople[i];
-    if (!people) continue;
-    const qualifying = people.filter((p) => topSet.has(p));
+  const qualifying = [];
+  for (const rec of records) {
+    collectNetworkPeople(rec, people);
+    qualifying.length = 0;
+    for (const p of people) if (topSet.has(p)) qualifying.push(p);
     if (qualifying.length < 2) continue;
-    const rec = records[i];
-    const sorted = [...qualifying].sort();
-    for (let a = 0; a < sorted.length; a++) {
-      for (let b = a + 1; b < sorted.length; b++) {
-        const key = `${sorted[a]}|||${sorted[b]}`;
+    qualifying.sort();
+    for (let a = 0; a < qualifying.length; a++) {
+      for (let b = a + 1; b < qualifying.length; b++) {
+        const key = `${qualifying[a]}|||${qualifying[b]}`;
         if (!edgeMap.has(key)) edgeMap.set(key, { weight: 0, docs: [] });
         const e = edgeMap.get(key);
         e.weight += 1;

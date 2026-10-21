@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 // #26/#27: these two JS aggregators are the ones this phase found reachable
 // with a truly unbounded record count (via #24's now-fixed /api/metrics
@@ -258,12 +259,41 @@ test('#27: buildSupervisorNetwork two-pass output matches the original single-pa
   );
 });
 
-test('#27: buildSupervisorNetwork peak heap scales with top-N, not record count, between 5k and 56k', () => {
-  const smallRecords = supervisorFixture(SMALL_N);
-  const largeRecords = supervisorFixture(LARGE_N);
+// Sampled in a fresh child process with a fixed, small young generation
+// rather than in this test process. A heapUsed delta taken without a
+// collection afterwards counts whatever short-lived garbage has not yet been
+// scavenged, and how much that is depends on how far V8 has grown the young
+// generation — which the heavy #26 tests above grow, deterministically, in
+// this process (measured here: the very same code read ratio 3.56 in a fresh
+// process and 8.26 after the #26 tests). With a 1 MB semi-space, garbage is
+// scavenged throughout the call, so the delta is dominated by what the
+// function actually keeps alive (promoted state) — the peak-live footprint
+// this test is about — and is identical run to run.
+function supervisorNetworkHeapDeltasInFreshProcess() {
+  const metricsUrl = new URL('../src/metrics.js', import.meta.url).href;
+  const script = `
+    const { buildSupervisorNetwork } = await import(${JSON.stringify(metricsUrl)});
+    ${supervisorFixture.toString()}
+    ${heapDeltaBytes.toString()}
+    const smallRecords = supervisorFixture(${SMALL_N});
+    const largeRecords = supervisorFixture(${LARGE_N});
+    const smallDelta = heapDeltaBytes(() => buildSupervisorNetwork(smallRecords), 5);
+    const largeDelta = heapDeltaBytes(() => buildSupervisorNetwork(largeRecords), 5);
+    process.stdout.write(JSON.stringify({ smallDelta, largeDelta }));
+  `;
+  const env = { ...process.env };
+  delete env.NODE_TEST_CONTEXT; // the child is a plain script, not a test file
+  const child = spawnSync(
+    process.execPath,
+    ['--expose-gc', '--max-semi-space-size=1', '--input-type=module', '-e', script],
+    { env, encoding: 'utf-8' },
+  );
+  assert.equal(child.status, 0, `heap-sampling child failed: ${child.stderr}`);
+  return JSON.parse(child.stdout);
+}
 
-  const smallDelta = heapDeltaBytes(() => buildSupervisorNetwork(smallRecords));
-  const largeDelta = heapDeltaBytes(() => buildSupervisorNetwork(largeRecords));
+test('#27: buildSupervisorNetwork peak heap scales with top-N, not record count, between 5k and 56k', () => {
+  const { smallDelta, largeDelta } = supervisorNetworkHeapDeltasInFreshProcess();
 
   const ratio = largeDelta / Math.max(smallDelta, 1);
   assert.ok(
