@@ -954,7 +954,7 @@ function documentColumns(doc, syncKey = null, source = null) {
   };
 }
 
-function withStoredThemes(doc) {
+function withStoredThemes(doc, { recompute = false } = {}) {
   if (!doc || typeof doc !== 'object') return doc;
   if (isAccessRestricted(doc)) return {
     ...doc,
@@ -972,7 +972,7 @@ function withStoredThemes(doc) {
   const themes = Array.isArray(doc.themes)
     ? doc.themes.map((value) => String(value || '').trim()).filter(Boolean)
     : [];
-  if (themes.length) return doc;
+  if (themes.length && !recompute) return doc;
   return {
     ...doc,
     themes: documentThemeTerms(doc, 12),
@@ -1519,7 +1519,7 @@ export async function recomputeStoredDocumentThemes({ limit = null, docIds = nul
       // A manual theme rebuild must retain the same access boundary as the
       // normal metadata write path. Otherwise an embargoed record can regain
       // derived terms after the migration has deliberately removed them.
-      const next = withStoredThemes(doc);
+      const next = withStoredThemes(doc, { recompute: true });
       await client.execute({
         sql: 'UPDATE documents SET metadata_json = ?, updated_at = ? WHERE doc_id = ?',
         args: [JSON.stringify(next), new Date().toISOString(), row.doc_id],
