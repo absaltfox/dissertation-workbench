@@ -5868,18 +5868,34 @@ function pendingLookupOptions(limitOrOptions = 100) {
 }
 
 function pendingLookupScope({ syncKey = null, filters: requestedFilters = {} } = {}) {
+  const requested = documentServingFilters({ syncKey, ...requestedFilters });
   const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
-  if (!filters.where) return { sql: '', args: [] };
-  return {
-    sql: `AND EXISTS (
+  const linkedToActiveDocument = `EXISTS (
       SELECT 1
       FROM document_citations scoped_dc
       JOIN documents d ON d.doc_id = scoped_dc.doc_id
       WHERE scoped_dc.citation_id = c.id
         AND ${filters.where.replace(/^WHERE\s+/, '')}
+    )`;
+  // With no caller scope, the access rule (embargoed / verification-due documents
+  // are deferred) only excludes citations that are linked to documents and none
+  // of those are active. Citations with no catalogued document at all (no link,
+  // or a link to a document row that does not exist) are unlinked, not deferred,
+  // and stay pending so they are still looked up.
+  if (!requested.where) {
+    return {
+      sql: `AND (
+      NOT EXISTS (
+        SELECT 1 FROM document_citations unlinked_dc
+        JOIN documents d ON d.doc_id = unlinked_dc.doc_id
+        WHERE unlinked_dc.citation_id = c.id
+      )
+      OR ${linkedToActiveDocument}
     )`,
-    args: filters.args,
-  };
+      args: filters.args,
+    };
+  }
+  return { sql: `AND ${linkedToActiveDocument}`, args: filters.args };
 }
 
 export async function listPendingLookups(limitOrOptions = 100) {

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createClient } from '@libsql/client';
 
 let tempDir;
 let runPendingCatalogueLookups;
@@ -466,9 +467,16 @@ test('collectOrphanedCitations deletes via SEARCH on the primary key, not a full
     `expected exactly the catalogue_lookups and citations orphan DELETEs, captured: ${captured.map((c) => c.sql).join(' || ')}`
   );
 
+  // Plan the captured statements on a dedicated read connection. With the
+  // bundled libsql native build (0.5.29), `all()` on an EXPLAIN statement leaves
+  // it "in progress" on the connection that ran it, so a later write transaction
+  // on the shared client fails to commit with SQLITE_BUSY ("SQL statements in
+  // progress"). Keeping EXPLAIN off the shared connection avoids poisoning the
+  // tests that follow; no production path issues EXPLAIN.
+  const planClient = createClient({ url: `file:${process.env.SQLITE_PATH}` });
   for (const { sql, args } of captured) {
     // eslint-disable-next-line no-await-in-loop
-    const plan = await client.execute({ sql: `EXPLAIN QUERY PLAN ${sql}`, args });
+    const plan = await planClient.execute({ sql: `EXPLAIN QUERY PLAN ${sql}`, args });
     const details = plan.rows.map((row) => String(row.detail));
     for (const detail of details) {
       assert.ok(
@@ -481,6 +489,7 @@ test('collectOrphanedCitations deletes via SEARCH on the primary key, not a full
       `orphan-collection DELETE did not SEARCH on the integer primary key: ${details.join(' | ')}\nSQL: ${sql}`
     );
   }
+  planClient.close();
 });
 
 test('collectOrphanedCitations only removes ids it is given, and only if unlinked', async () => {
