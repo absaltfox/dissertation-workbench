@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures.js';
-import { FIXTURE_DOCS } from './seed.mjs';
+import { FIXTURE_DOCS } from './fixture-docs.mjs';
 
 const docRows = (page) => page.locator('#documentsTable tr.doc-row');
 
