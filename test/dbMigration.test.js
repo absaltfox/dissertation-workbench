@@ -381,3 +381,33 @@ test('document_terms table and indexes are created', async () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 });
+
+test('the schema pass on an up-to-date database takes no write lock', async () => {
+  // Every process (web server, worker, CLI) runs this pass at startup. If it
+  // writes even when there is nothing to migrate, concurrent cold starts
+  // contend for SQLite's single write lock, and libsql's 0 ms busy timeout
+  // turns that into SQLITE_BUSY churn that can starve a real writer.
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-schema-readonly-'));
+  const sqlitePath = path.join(tempDir, 'schema.sqlite');
+  const setup = createClient({ url: `file:${sqlitePath}` });
+  const writer = createClient({ url: `file:${sqlitePath}` });
+  const starter = createClient({ url: `file:${sqlitePath}` });
+  let held;
+  try {
+    await ensureSchemaWithRetry(setup, { maxAttempts: 1 });
+    // Another process mid-write: holds the RESERVED lock, readers still allowed.
+    held = await writer.transaction('write');
+    await held.execute("UPDATE documents SET title = title WHERE doc_id = 'none'");
+    await ensureSchemaWithRetry(starter, {
+      maxAttempts: 1,
+      wait: async () => { throw new Error('an up-to-date schema pass must not need a retry'); },
+    });
+  } finally {
+    await held?.rollback().catch(() => {});
+    held?.close();
+    setup.close();
+    writer.close();
+    starter.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});

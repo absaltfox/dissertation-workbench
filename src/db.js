@@ -908,12 +908,26 @@ export async function cleanupCommitteeArtifacts(dbInstance = null) {
       'supervisory committee',
       'committee members'
   `;
-  const result = await client.execute(`
-    DELETE FROM committee_members
-    WHERE lower(name) IN (${artifactNames})
+  // This runs in every process's startup schema pass. A DELETE opens a write
+  // transaction even when it matches nothing, so check first: an up-to-date
+  // database must not make concurrent cold starts contend for the write lock.
+  const pending = await client.execute(`
+    SELECT
+      EXISTS (SELECT 1 FROM committee_members WHERE lower(name) IN (${artifactNames})) AS committee,
+      EXISTS (SELECT 1 FROM document_people WHERE lower(name) IN (${artifactNames})) AS people
   `);
-  await client.execute(`DELETE FROM document_people WHERE lower(name) IN (${artifactNames})`);
-  return changes(result);
+  const { committee, people } = pending.rows[0] || {};
+  let removed = 0;
+  if (Number(committee)) {
+    removed = changes(await client.execute(`
+      DELETE FROM committee_members
+      WHERE lower(name) IN (${artifactNames})
+    `));
+  }
+  if (Number(people)) {
+    await client.execute(`DELETE FROM document_people WHERE lower(name) IN (${artifactNames})`);
+  }
+  return removed;
 }
 
 // --- Document functions ---
