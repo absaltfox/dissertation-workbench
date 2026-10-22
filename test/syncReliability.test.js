@@ -161,6 +161,13 @@ test('pdf_document completion progress counts are non-decreasing even when a lat
   const slowDocId = `1.${suffix}0`; // dispatched first (index 0), finishes LAST
   const fastDocId = `1.${suffix}1`; // dispatched second (index 1), finishes FIRST
   const fullText = `Monotonic progress fixture\n${'education research '.repeat(50)}`;
+  // The slow document's fetch is held until the fast document has reported
+  // completion, so the out-of-order finish does not depend on how long the
+  // fast document's parse and DB writes take (a fixed delay flaked on CI).
+  // The bounded fallback keeps a regression that serializes documents from
+  // hanging; the finish-order assertion below then fails instead.
+  let releaseSlow;
+  const fastFinished = new Promise((resolve) => { releaseSlow = resolve; });
 
   globalThis.fetch = async (input) => {
     const url = String(input);
@@ -188,9 +195,14 @@ test('pdf_document completion progress counts are non-decreasing even when a lat
       }), { headers: { 'content-type': 'application/json' } });
     }
     if (url.includes(`/rest/handle/2429/slow-${suffix}`)) {
-      // Artificial delay so the earlier-dispatched (index 0) document is the
-      // last to actually complete.
-      await new Promise((resolve) => setTimeout(resolve, 40));
+      // Hold the earlier-dispatched (index 0) document until the later one
+      // has finished.
+      let fallback;
+      await Promise.race([
+        fastFinished,
+        new Promise((resolve) => { fallback = setTimeout(resolve, 5_000); }),
+      ]);
+      clearTimeout(fallback);
       return new Response(JSON.stringify({
         bitstreams: [{ id: 501, bundleName: 'TEXT', mimeType: 'text/plain', name: 'slow.pdf.txt' }],
       }), { headers: { 'content-type': 'application/json' } });
@@ -220,7 +232,11 @@ test('pdf_document completion progress counts are non-decreasing even when a lat
       contentMode: 'full_text_only',
       contentConcurrency: 2,
       downloadFiles: false,
-      onProgress: async (event) => events.push(event),
+      onProgress: async (event) => {
+        events.push(event);
+        if (event.phase === 'pdf_document' && event.detail?.includes(fastDocId)
+          && (event.status === 'completed' || event.status === 'failed')) releaseSlow();
+      },
     });
     assert.equal(result.ok, true);
     assert.equal(result.totalEnrichmentAttempted, 2);
