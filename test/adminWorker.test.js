@@ -457,12 +457,21 @@ test('singleton lease admits one citation starter across independent SQLite clie
       SKIP_LOCAL_ENV: '1',
     },
   };
-  const children = await Promise.all(Array.from({ length: 4 }, () => execFileAsync(
+  // allSettled, not all: a failed child must not end the test while its
+  // siblings are still writing to the shared database, or their lock traffic
+  // fails unrelated later tests in this file.
+  const settled = await Promise.allSettled(Array.from({ length: 4 }, () => execFileAsync(
     process.execPath,
     ['--input-type=module', '-e', childSource],
-    childOptions
+    { ...childOptions, timeout: 60_000 }
   )));
-  const results = children.map(({ stdout }) => JSON.parse(stdout.trim().split('\n').at(-1)));
+  const failures = settled.filter((outcome) => outcome.status === 'rejected');
+  assert.deepEqual(
+    failures.map((outcome) => outcome.reason?.stderr?.split('\n').filter(Boolean).at(-1) || String(outcome.reason)),
+    [],
+    'every claimant process should exit cleanly'
+  );
+  const results = settled.map(({ value }) => JSON.parse(value.stdout.trim().split('\n').at(-1)));
   const created = results.filter((result) => result.created);
   assert.equal(created.length, 1);
   assert.ok(results.every((result) => result.jobId === created[0].jobId));
