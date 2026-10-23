@@ -434,6 +434,14 @@ test('singleton lease admits one citation starter across independent SQLite clie
   // the production topology too: independent Node processes, each with its
   // own client, contend for the same local SQLite lease row.
   await ensureStorage();
+  // WAL for this file's temporary database only. In the default rollback
+  // journal a reader blocks another process's COMMIT, and libsql 0.5.29 never
+  // resets a statement that failed with SQLITE_BUSY: the failed COMMIT keeps
+  // its read lock until garbage collection, so each loser blocks the others'
+  // retries and the claimants livelock for seconds (about 1 round in 7 on
+  // macOS). In WAL readers never block a commit. The lease logic under test is
+  // unchanged; production uses remote Turso, which has no local locks.
+  await (await getDb()).execute('PRAGMA journal_mode = WAL');
   const type = `citation_scan_cross_client_${Date.now()}`;
   const dbModuleUrl = new URL('../src/db.js', import.meta.url).href;
   const childSource = `
