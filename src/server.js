@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url';
 import {
   PORT, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT, EXPOSE_ERROR_DETAILS,
   DEFAULT_TERM, DEFAULT_SOURCE, TRUST_PROXY, WORKBENCH_CACHE_REFRESH_MS,
-  CITATION_SCAN_NIGHTLY_ENABLED, CITATION_SCAN_NIGHTLY_HOUR_LOCAL, validateRuntimeSecrets
+  CITATION_SCAN_NIGHTLY_ENABLED, CITATION_SCAN_NIGHTLY_HOUR_LOCAL, CONCEPT_REBUILD_NIGHTLY_ENABLED,
+  validateRuntimeSecrets
 } from './config.js';
 import {
   checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb,
@@ -269,8 +270,10 @@ export async function start() {
   const followupTimer = setInterval(dispatchFollowups, ADMIN_JOB_FOLLOWUP_INTERVAL_MS);
   stopAdminJobFollowupDispatcher = () => clearInterval(followupTimer);
 
-  stopDailyConceptScheduler = scheduleDailyConceptRebuildJob();
-  logger.info('Scheduled daily concept rebuild job', { hourLocal: DAILY_CONCEPT_REBUILD_HOUR_LOCAL });
+  if (CONCEPT_REBUILD_NIGHTLY_ENABLED) {
+    stopDailyConceptScheduler = scheduleDailyConceptRebuildJob();
+    logger.info('Scheduled daily concept rebuild job', { hourLocal: DAILY_CONCEPT_REBUILD_HOUR_LOCAL });
+  }
   if (CITATION_SCAN_NIGHTLY_ENABLED) {
     stopDailyCitationScanScheduler = scheduleDailyCitationScanJob();
     logger.info('Scheduled daily citation scan job', { hourLocal: CITATION_SCAN_NIGHTLY_HOUR_LOCAL });
