@@ -69,6 +69,7 @@ export const ADMIN_WORKER_GRACE_MS = Number(process.env.ADMIN_WORKER_GRACE_MS ||
 export const IMPORT_PDF_BATCH_SIZE = Number(process.env.IMPORT_PDF_BATCH_SIZE || 50);
 export const ADMIN_WORKER_MODE = process.env.ADMIN_WORKER_MODE || 'auto';
 export const WORKER_IMAGE = process.env.WORKER_IMAGE || process.env.FLY_IMAGE_REF || '';
+export const BERTOPIC_WORKER_IMAGE = process.env.BERTOPIC_WORKER_IMAGE || '';
 export const LABELER_WORKER_IMAGE = process.env.LABELER_WORKER_IMAGE || process.env.BERTOPIC_LABELER_IMAGE || '';
 export const WORKER_ARTIFACT_BASE_URL = process.env.WORKER_ARTIFACT_BASE_URL || '';
 export const WORKER_FORCE_ARTIFACT_API = /^(1|true|yes)$/i.test(process.env.WORKER_FORCE_ARTIFACT_API || '');

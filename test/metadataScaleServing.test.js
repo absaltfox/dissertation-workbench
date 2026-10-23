@@ -106,6 +106,29 @@ test('metadata-scale bootstrap aggregates remain corpus-complete and compact', a
   assert.equal(JSON.stringify(summary).length < 10_000, true);
 });
 
+test('summary supervisor count includes non-metadata sources and co-supervisors', async () => {
+  // The headline count must match how supervisors are actually counted elsewhere
+  // (role IN Supervisor/Co-Supervisor, any source), not just metadata-sourced
+  // Supervisors — otherwise PDF/committee-derived supervisors are silently dropped.
+  const SYNC = 'sup-source-count';
+  await saveDocumentMetadataBatch([
+    { doc: { id: 'supsrc-a', title: 'A', degree: 'PhD', supervisors: ['Meta Sup'] }, syncKey: SYNC },
+    { doc: { id: 'supsrc-b', title: 'B', degree: 'PhD', supervisors: [] }, syncKey: SYNC },
+  ]);
+  const client = await getDb();
+  const now = new Date().toISOString();
+  await client.batch([
+    { sql: `INSERT INTO document_people (doc_id, person_key, name, role, affiliation, source, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)`, args: ['supsrc-b', 'pdf-sup-key', 'Pdf Sup', 'Supervisor', null, 'pdf', now] },
+    { sql: `INSERT INTO document_people (doc_id, person_key, name, role, affiliation, source, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)`, args: ['supsrc-b', 'co-sup-key', 'Co Sup', 'Co-Supervisor', null, 'pdf', now] },
+  ], 'write');
+
+  const summary = await getDocumentServingSummary({ syncKey: SYNC });
+  // Meta Sup (metadata/Supervisor) + Pdf Sup (pdf/Supervisor) + Co Sup (pdf/Co-Supervisor)
+  assert.equal(summary.supervisors, 3);
+});
+
 test('filtered search and sorting are applied before the document page is materialized', async () => {
   const page = await queryCachedDocumentPage({
     syncKey: SYNC_KEY,
@@ -150,6 +173,56 @@ test('workbench switches to bounded database analytics above the detailed-corpus
   assert.equal(response.body.source.aggregateSource, 'database');
   assert.equal(response.body.source.documentsTruncated, true);
   assert.equal(response.body.documents.length, 100);
+});
+
+// #15 Gate A: every panel that renders below the threshold must either
+// return real SQL-backed data above it, or an explicit null + a
+// stated-reason signal — never a silent empty shape indistinguishable from
+// "no data". Five of the six panels are ported to SQL and must show real,
+// non-empty signal here (this fixture has genuine multi-doc supervisors,
+// concept terms, methodologies, and a topic assignment). The sixth,
+// termCooccurrence, is a disclosed bounded sample rather than null — this
+// fixture's concept terms are one-per-document by design (no pairs
+// possible), so it is legitimately empty (computed, no signal), which is
+// exactly the case the null-vs-empty distinction exists to preserve: an
+// empty array plus real sampling metadata, not a bare stub.
+test('workbench analytics above the detailed-corpus threshold returns real SQL-backed panels, not empty stubs', async () => {
+  const response = await request(app)
+    .get('/api/workbench/analytics?maxRecords=1')
+    .expect('content-type', /application\/json/)
+    .expect(200);
+  assert.equal(response.body.source.aggregateSource, 'database');
+  assert.equal(response.body.source.detailedAnalyticsRecordLimit, 5000);
+
+  const { supervisorNgramMatrix, conceptTimeline, methodologyConceptMatrix, methodologyTopicMatrix, topicData, termCooccurrence } = response.body;
+
+  assert.ok(supervisorNgramMatrix.supervisors.length > 0, 'supervisorNgramMatrix must have real supervisors, not an empty stub');
+  assert.ok(supervisorNgramMatrix.matrix.some((row) => row.some((cell) => cell > 0)), 'supervisorNgramMatrix must have real nonzero cells');
+
+  assert.ok(conceptTimeline.length > 0, 'conceptTimeline must have real concepts, not an empty stub');
+  assert.ok(conceptTimeline[0].data.length > 0);
+
+  assert.ok(methodologyConceptMatrix.methodologies.length > 0, 'methodologyConceptMatrix must have real methodologies');
+  assert.ok(methodologyConceptMatrix.matrix.some((row) => row.some((cell) => cell > 0)));
+
+  assert.ok(methodologyTopicMatrix.methodologies.length > 0);
+  assert.ok(methodologyTopicMatrix.topics.length > 0);
+
+  assert.notEqual(topicData, null, 'topicData must be real, not null, when topics exist');
+  assert.ok(topicData.topics.length > 0);
+  assert.ok(topicData.byYear.length > 0);
+  assert.ok(topicData.byYear[0].data.length > 0);
+
+  // Genuinely empty (computed, no signal — this fixture's docs each carry
+  // only one concept term) but disclosed as a real sample, not a silent stub.
+  assert.deepEqual(termCooccurrence, []);
+  assert.equal(response.body.source.termCooccurrenceSampled, true);
+  // TOTAL_DOCUMENTS (5100) exceeds VISUALIZATION_DOCUMENT_LIMIT (5000), so
+  // the sample itself is capped even though the corpus total is reported in
+  // full via termCooccurrenceSampleOf — this is the disclosed-sampling
+  // caveat the plan's #15 decision calls for, exercised for real.
+  assert.equal(response.body.source.termCooccurrenceSampleSize, 5000);
+  assert.equal(response.body.source.termCooccurrenceSampleOf, TOTAL_DOCUMENTS);
 });
 
 test('people projection merges references and paginates before returning rows', async () => {

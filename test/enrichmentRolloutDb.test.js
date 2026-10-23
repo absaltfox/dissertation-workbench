@@ -3,12 +3,52 @@ import assert from 'node:assert/strict';
 import {
   closeDb, createAdminJob, deleteImportRule, failEnrichmentRolloutForJob,
   finishEnrichmentRolloutPhase, getAdminJob, getEnrichmentRollout, hasRunningAdminJob,
-  importRuleRevision,
-  listEnrichmentRolloutEvidence, saveEnrichmentRolloutEvidence,
-  saveImportRule, startEnrichmentRolloutPhase, updateAdminJob
+  importRuleRevision, loadStoredFileMetric,
+  listEnrichmentRolloutEvidence, queryCachedDocumentPage, saveDocumentMetadata,
+  saveEnrichmentRolloutEvidence, saveFileMetric, saveImportRule, saveWordCountComparisonParadata,
+  startEnrichmentRolloutPhase, updateAdminJob
 } from '../src/db.js';
 
 test.after(async () => closeDb());
+
+test('word-count comparison paradata is durable on the document file metric', async () => {
+  const docId = `comparison-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const title = `Comparison paradata ${docId}`;
+  await saveDocumentMetadata({ id: docId, title });
+  await saveFileMetric(docId, {
+    wordCount: 50_000,
+    pageCount: 200,
+    wordSource: 'streamed_pdf_text',
+    status: 'streamed',
+  });
+  await saveWordCountComparisonParadata(docId, {
+    status: 'flagged',
+    baselineWordCount: 100_000,
+    baselineWordSource: 'dspace_full_text',
+    observedWordCount: 50_000,
+    observedWordSource: 'streamed_pdf_text',
+    relativeDifference: 0.5,
+    threshold: 0.15,
+    flagged: true,
+    ruleId: 'rule-1',
+    ruleRevision: 'revision-1',
+    jobId: 48,
+    phase: 'control',
+  });
+
+  const stored = await loadStoredFileMetric(docId);
+  const paradata = JSON.parse(stored.word_count_comparison_json);
+  assert.equal(paradata.status, 'flagged');
+  assert.equal(paradata.relativeDifference, 0.5);
+  assert.equal(paradata.baselineWordCount, 100_000);
+  assert.equal(paradata.observedWordCount, 50_000);
+  assert.equal(paradata.jobId, 48);
+  assert.match(paradata.comparedAt, /^\d{4}-\d{2}-\d{2}T/);
+
+  const page = await queryCachedDocumentPage({ q: title, limit: 1 });
+  assert.equal(page.documents[0].id, docId);
+  assert.deepEqual(page.documents[0].paradata.wordCountComparison, paradata);
+});
 
 test('rollout state advances only after durable phase evidence is evaluated', async () => {
   const rule = await saveImportRule({
@@ -97,7 +137,15 @@ test('changing or deleting an import rule cannot reuse its rollout approval', as
   await startEnrichmentRolloutPhase(rule.id, 'sample', 201, revision);
   await finishEnrichmentRolloutPhase(rule.id, 'sample', 201, { passed: true, phase: 'sample' });
 
-  await saveImportRule({ ...rule, degree: 'Degree B' });
+  const policyOnlyUpdate = await saveImportRule({
+    ...rule,
+    extractCitations: true,
+    runConcepts: false,
+  });
+  assert.equal(importRuleRevision(policyOnlyUpdate), revision);
+  assert.equal((await getEnrichmentRollout(rule.id)).status, 'awaiting_control');
+
+  await saveImportRule({ ...policyOnlyUpdate, degree: 'Degree B' });
   const invalidated = await getEnrichmentRollout(rule.id);
   assert.equal(invalidated.status, 'invalidated');
   assert.equal(invalidated.evaluation.reason, 'import_rule_changed');

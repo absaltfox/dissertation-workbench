@@ -57,6 +57,40 @@ test('PDF control compares the same documents against append-only derivative evi
   assert.ok(result.comparison.medianWordRelativeError < 0.1);
 });
 
+test('PDF word-count divergence is flagged per document without failing the control job', () => {
+  const derivative = Array.from({ length: 10 }, (_, index) => outcome(`divergent-${index}`));
+  const pdf = derivative.map((item, index) => outcome(item.docId, {
+    contentSource: 'streamed_pdf',
+    wordSource: 'streamed_pdf_text',
+    wordCount: index < 6 ? 5_000 : 9_900,
+  }));
+  const result = evaluateEnrichmentRun({
+    phase: 'control',
+    targetSize: 10,
+    outcomes: pdf,
+    controlOutcomes: derivative,
+    requestCounts: { originalPdf: 10 },
+    durationMs: 60_000,
+  });
+
+  assert.equal(result.checks.medianWordRelativeError, false);
+  assert.equal(result.checks.p90WordRelativeError, false);
+  assert.equal(result.blockingChecks.medianWordRelativeError, undefined);
+  assert.equal(result.passed, true);
+  assert.equal(result.warnings.wordCountDivergence, true);
+  assert.equal(result.comparison.flaggedDocuments, 6);
+  assert.deepEqual(result.comparison.documents[0], {
+    docId: 'divergent-0',
+    baselineWordCount: 10_000,
+    baselineWordSource: 'dspace_full_text',
+    observedWordCount: 5_000,
+    observedWordSource: 'streamed_pdf_text',
+    relativeDifference: 0.5,
+    threshold: 0.15,
+    flagged: true,
+  });
+});
+
 test('cohort gate blocks expansion on incomplete or operationally unsafe runs', () => {
   const result = evaluateEnrichmentRun({
     phase: 'cohort',
@@ -84,6 +118,55 @@ test('cohort gate enforces the repository request-rate ceiling', () => {
   assert.equal(result.passed, false);
   assert.equal(result.checks.repositoryRequestRate, false);
   assert.equal(result.repositoryRequestsPerMinute, 2000);
+});
+
+// --- #23: infra_error-tagged outcomes (reserveImportRuleRequestSlot's last-resort
+// RATE_LIMIT_STATE_CORRUPT throw) are excluded from the quality successRate ---
+
+test('an infra_error-tagged outcome does not count against the quality success rate', () => {
+  const good = Array.from({ length: 19 }, (_, index) => outcome(`good-${index}`));
+  const infra = {
+    docId: 'infra-1', error: 'Rate-limit state for import rule x is corrupt', outcomeKind: 'infra_error',
+  };
+  const withInfra = evaluateEnrichmentRun({
+    phase: 'cohort',
+    // targetSize matches the 19 real (quality) outcomes, not the 20 total —
+    // targetReached is intentionally based on quality attempts too, so this
+    // isolates the successRate assertion below from the unrelated
+    // targetReached check.
+    targetSize: 19,
+    outcomes: [...good, infra],
+    requestCounts: { fullText: 19 },
+    durationMs: 60_000,
+  });
+  // 19/19 real documents succeeded; the one infra_error entry is excluded from
+  // both the numerator and denominator, so successRate is 1, not 19/20.
+  assert.equal(withInfra.attempted, 19);
+  assert.equal(withInfra.completed, 19);
+  assert.equal(withInfra.successRate, 1);
+  assert.equal(withInfra.infraErrors, 1);
+  assert.equal(withInfra.checks.successRate, true);
+  assert.equal(withInfra.passed, true);
+});
+
+test('a mixed array of real parse failures still fails the success-rate check as before', () => {
+  const good = Array.from({ length: 10 }, (_, index) => outcome(`good-${index}`));
+  const bad = Array.from({ length: 10 }, (_, index) => ({
+    docId: `bad-${index}`, error: 'unparseable PDF', wordCount: 0, pageCount: 0,
+  }));
+  const result = evaluateEnrichmentRun({
+    phase: 'cohort',
+    targetSize: 20,
+    outcomes: [...good, ...bad],
+    requestCounts: { fullText: 20 },
+    durationMs: 60_000,
+  });
+  assert.equal(result.attempted, 20);
+  assert.equal(result.completed, 10);
+  assert.equal(result.infraErrors, 0);
+  assert.equal(result.successRate, 0.5);
+  assert.equal(result.checks.successRate, false);
+  assert.equal(result.passed, false);
 });
 
 test('an exhausted final cohort can pass below the normal batch target', () => {

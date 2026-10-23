@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createClient } from '@libsql/client';
 
 let tempDir;
 let runPendingCatalogueLookups;
@@ -144,6 +145,122 @@ test('reextractDocumentCitations preserves lookups and prunes stale links', asyn
   // An empty extraction clears the document's citations.
   await db.reextractDocumentCitations(docId, [], hashFn);
   assert.equal((await db.loadDocumentCitations(docId)).length, 0);
+});
+
+// --- #30 (M-09): getCatalogueLookupStats().pending must agree with countPendingLookups() ---
+
+test('getCatalogueLookupStats().pending matches countPendingLookups() and listPendingLookups().length, including after a partial citation delete', async () => {
+  const db = await import('../src/db.js');
+  const client = await db.getDb();
+  const hashFn = (text) => `m09-${text}`;
+
+  // A citation with no catalogue_lookups row at all (the NOT EXISTS arm).
+  const [noLookupId] = await db.saveCitations('1.0800001', [
+    'Habermas, J. (1984). The theory of communicative action. Boston: Beacon.',
+  ], hashFn);
+
+  // A citation with a catalogue_lookups row that is itself still pending
+  // (hits IS NULL AND query_title IS NOT NULL — the EXISTS arm).
+  const [pendingLookupId] = await db.saveCitations('1.0800002', [
+    'Foucault, M. (1975). Discipline and punish. Paris: Gallimard.',
+  ], hashFn);
+  await db.saveCatalogueLookup(pendingLookupId, { hits: null, queryAuthor: 'Foucault', queryTitle: 'Discipline and punish' });
+
+  // A citation that is resolved (not pending) — must not be counted.
+  const [resolvedId] = await db.saveCitations('1.0800003', [
+    'Bourdieu, P. (1990). The logic of practice. Stanford: SUP.',
+  ], hashFn);
+  await db.saveCatalogueLookup(resolvedId, { hits: 2, queryAuthor: 'Bourdieu', queryTitle: 'The logic of practice', bibId: 'b-1' });
+
+  // Partial-delete scenario: a catalogue_lookups row survives after its citations
+  // row is deleted, orphaning it outside the normal GC path (collectOrphanedCitations
+  // always deletes catalogue_lookups before citations) — citations and
+  // catalogue_lookups are no longer a strict subset relationship. This is exactly
+  // the referential-integrity gap the old arithmetic silently assumed away; this
+  // local sqlite backend enforces FK by default (unlike some remote libsql/Turso
+  // connections), so the pragma is toggled off only around this one delete to
+  // reproduce the dangling reference the fix must be robust to. This orphan must
+  // not appear as pending for either function, since countPendingLookups (and
+  // listPendingLookups) both drive from `citations c`.
+  const [strayId] = await db.saveCitations('1.0800004', [
+    'Arendt, H. (1963). On revolution. New York: Viking.',
+  ], hashFn);
+  await db.saveCatalogueLookup(strayId, { hits: null, queryAuthor: 'Arendt', queryTitle: 'On revolution' });
+  await client.execute('PRAGMA foreign_keys=OFF');
+  await client.execute({ sql: 'DELETE FROM citations WHERE id = ?', args: [strayId] });
+  await client.execute('PRAGMA foreign_keys=ON');
+
+  const [statsPending, countPending, listPending] = await Promise.all([
+    db.getCatalogueLookupStats().then((s) => s.pending),
+    db.countPendingLookups(),
+    db.listPendingLookups(100000),
+  ]);
+
+  assert.equal(statsPending, countPending,
+    `getCatalogueLookupStats().pending (${statsPending}) disagreed with countPendingLookups() (${countPending})`);
+  assert.equal(statsPending, listPending.length,
+    `getCatalogueLookupStats().pending (${statsPending}) disagreed with listPendingLookups().length (${listPending.length})`);
+
+  const pendingIds = new Set(listPending.map((row) => Number(row.id)));
+  assert.ok(pendingIds.has(noLookupId), 'citation with no catalogue_lookups row should be pending');
+  assert.ok(pendingIds.has(pendingLookupId), 'citation with a still-pending catalogue_lookups row should be pending');
+  assert.ok(!pendingIds.has(resolvedId), 'resolved citation must not be counted as pending');
+  assert.ok(!pendingIds.has(strayId), 'a deleted citation must not be counted as pending even if its catalogue_lookups row survives');
+});
+
+test('the pre-fix table-total arithmetic would have disagreed with the real predicate (regression pin)', async () => {
+  const db = await import('../src/db.js');
+  const client = await db.getDb();
+  const hashFn = (text) => `m09-arith-${text}`;
+
+  async function tableTotals() {
+    const [citationsRow, lookupsRow, pendingShapedRow] = await Promise.all([
+      client.execute('SELECT COUNT(*) AS n FROM citations'),
+      client.execute('SELECT COUNT(*) AS n FROM catalogue_lookups'),
+      client.execute('SELECT COUNT(*) AS n FROM catalogue_lookups WHERE hits IS NULL AND query_title IS NOT NULL'),
+    ]);
+    const citations = Number(citationsRow.rows[0].n);
+    const lookups = Number(lookupsRow.rows[0].n);
+    const pendingShaped = Number(pendingShapedRow.rows[0].n);
+    // Exact shape of the pre-fix getCatalogueLookupStats().pending arithmetic.
+    return citations - lookups + pendingShaped;
+  }
+
+  const realPendingBefore = await db.countPendingLookups();
+  const oldArithmeticBefore = await tableTotals();
+
+  // Orphan a *resolved* (not pending) catalogue_lookups row by deleting its
+  // citations row underneath it (FK toggled off around this one delete only,
+  // reproducing the dangling-reference condition a remote/production
+  // connection without FK enforcement can leave behind). The citation is now
+  // gone entirely, so the real predicate (driven off `citations c`) is
+  // unaffected. But the old arithmetic's COUNT(citations) term drops by one
+  // while COUNT(catalogue_lookups) stays the same (the orphaned row still
+  // physically exists) and the pending-shaped count is unaffected (hits=4,
+  // not NULL) -- so the old formula's result drops by one for a change that
+  // should have zero effect on the pending count.
+  const [resolvedStrayId] = await db.saveCitations('1.0900002', [
+    'Freire, P. (1968). Pedagogy of the oppressed. Rio de Janeiro: Paz e Terra.',
+  ], hashFn);
+  await db.saveCatalogueLookup(resolvedStrayId, { hits: 4, queryAuthor: 'Freire', queryTitle: 'Pedagogy of the oppressed', bibId: 'fr-1' });
+  await client.execute('PRAGMA foreign_keys=OFF');
+  await client.execute({ sql: 'DELETE FROM citations WHERE id = ?', args: [resolvedStrayId] });
+  await client.execute('PRAGMA foreign_keys=ON');
+
+  const realPendingAfter = await db.countPendingLookups();
+  const oldArithmeticAfter = await tableTotals();
+  const fixedStatsAfter = (await db.getCatalogueLookupStats()).pending;
+
+  assert.equal(realPendingAfter, realPendingBefore,
+    'deleting a citation whose lookup was already resolved must not change the real pending count');
+  assert.equal(oldArithmeticAfter, oldArithmeticBefore - 1,
+    'sanity: the pre-fix arithmetic is expected to drop by exactly one under this fixture');
+  assert.notEqual(oldArithmeticAfter, realPendingAfter,
+    'expected the pre-fix arithmetic to diverge from the real, unaffected pending predicate');
+
+  // The fixed function must track the real predicate, not the old arithmetic.
+  assert.equal(fixedStatsAfter, realPendingAfter,
+    'fixed getCatalogueLookupStats().pending must still track the real predicate, not the old arithmetic');
 });
 
 // --- B-02 (#12): orphan collection is scoped to the document being re-extracted ---
@@ -349,20 +466,30 @@ test('collectOrphanedCitations deletes via SEARCH on the primary key, not a full
     `expected exactly the catalogue_lookups and citations orphan DELETEs, captured: ${captured.map((c) => c.sql).join(' || ')}`
   );
 
-  for (const { sql, args } of captured) {
-    // eslint-disable-next-line no-await-in-loop
-    const plan = await client.execute({ sql: `EXPLAIN QUERY PLAN ${sql}`, args });
-    const details = plan.rows.map((row) => String(row.detail));
-    for (const detail of details) {
+  // Plan the captured statements on a dedicated read connection. With the
+  // bundled libsql native build (0.5.29), running an EXPLAIN statement leaves
+  // it "in progress" on the connection that ran it, so a later write transaction
+  // on the shared client fails to commit with SQLITE_BUSY ("SQL statements in
+  // progress"). Keeping EXPLAIN off the shared connection avoids poisoning the
+  // tests that follow; no production path issues EXPLAIN.
+  const planClient = createClient({ url: `file:${process.env.SQLITE_PATH}` });
+  try {
+    for (const { sql, args } of captured) {
+      const plan = await planClient.execute({ sql: `EXPLAIN QUERY PLAN ${sql}`, args });
+      const details = plan.rows.map((row) => String(row.detail));
+      for (const detail of details) {
+        assert.ok(
+          !/^SCAN (citations|catalogue_lookups)\b/.test(detail),
+          `orphan-collection DELETE fell back to a full table scan (the pre-B-02 global NOT IN anti-join shape): ${detail}\nSQL: ${sql}`
+        );
+      }
       assert.ok(
-        !/^SCAN (citations|catalogue_lookups)\b/.test(detail),
-        `orphan-collection DELETE fell back to a full table scan (the pre-B-02 global NOT IN anti-join shape): ${detail}\nSQL: ${sql}`
+        details.some((detail) => /^SEARCH (citations|catalogue_lookups) USING INTEGER PRIMARY KEY/.test(detail)),
+        `orphan-collection DELETE did not SEARCH on the integer primary key: ${details.join(' | ')}\nSQL: ${sql}`
       );
     }
-    assert.ok(
-      details.some((detail) => /^SEARCH (citations|catalogue_lookups) USING INTEGER PRIMARY KEY/.test(detail)),
-      `orphan-collection DELETE did not SEARCH on the integer primary key: ${details.join(' | ')}\nSQL: ${sql}`
-    );
+  } finally {
+    planClient.close();
   }
 });
 

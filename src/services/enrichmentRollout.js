@@ -35,10 +35,19 @@ export function evaluateEnrichmentRun({
   thresholds = ENRICHMENT_ROLLOUT_DEFAULTS,
 } = {}) {
   if (!ENRICHMENT_ROLLOUT_PHASES.has(phase)) throw new Error(`Unknown enrichment rollout phase: ${phase}`);
-  const completed = outcomes.filter((item) => (
+  // #23: an outcome tagged 'infra_error' (currently only reserveImportRuleRequestSlot's
+  // last-resort RATE_LIMIT_STATE_CORRUPT throw — ordinary limiter contention never
+  // throws after the primary fix, so this path should be essentially unreachable in
+  // practice) is infrastructure noise, not a document-quality signal. It is excluded
+  // from both the numerator and denominator of the quality successRate so contention
+  // cannot silently zero out the corpus's apparent quality, but it is still surfaced
+  // operationally via `infraErrors` below.
+  const qualityOutcomes = outcomes.filter((item) => item.outcomeKind !== 'infra_error');
+  const infraErrors = outcomes.length - qualityOutcomes.length;
+  const completed = qualityOutcomes.filter((item) => (
     Number(item.wordCount) > 0 && Number(item.pageCount) > 0 && !item.error
   ));
-  const attempted = outcomes.length;
+  const attempted = qualityOutcomes.length;
   const successRate = attempted ? completed.length / attempted : 0;
   const durationMinutes = Math.max(Number(durationMs) / 60_000, 1 / 60_000);
   const documentsPerMinute = attempted / durationMinutes;
@@ -61,42 +70,64 @@ export function evaluateEnrichmentRun({
   let comparison = null;
   if (phase === 'sample') {
     checks.noOriginalPdfRequests = Number(requestCounts.originalPdf || 0) === 0;
-    checks.derivativeOnly = outcomes.every((item) => (
+    checks.derivativeOnly = qualityOutcomes.every((item) => (
       item.contentSource === 'extracted_full_text' && item.wordSource === 'dspace_full_text'
     ));
   }
   if (phase === 'control') {
     const derivativeByDoc = new Map(controlOutcomes.map((item) => [String(item.docId), item]));
-    const pairs = outcomes.map((pdf) => {
+    const pairs = qualityOutcomes.map((pdf) => {
       const derivative = derivativeByDoc.get(String(pdf.docId));
       const wordRelativeError = derivative
         ? relativeDifference(pdf.wordCount, derivative.wordCount)
         : null;
-      return derivative ? { docId: pdf.docId, wordRelativeError } : null;
+      return derivative ? {
+        docId: String(pdf.docId),
+        baselineWordCount: Number(derivative.wordCount || 0),
+        baselineWordSource: derivative.wordSource || null,
+        observedWordCount: Number(pdf.wordCount || 0),
+        observedWordSource: pdf.wordSource || null,
+        relativeDifference: wordRelativeError,
+        threshold: thresholds.maximumMedianWordRelativeError,
+        flagged: Number.isFinite(wordRelativeError)
+          && wordRelativeError > thresholds.maximumMedianWordRelativeError,
+      } : null;
     }).filter(Boolean);
-    const errors = pairs.map((pair) => pair.wordRelativeError).filter(Number.isFinite).sort((a, b) => a - b);
+    const errors = pairs.map((pair) => pair.relativeDifference).filter(Number.isFinite).sort((a, b) => a - b);
     comparison = {
       pairedDocuments: pairs.length,
       pairRate: attempted ? pairs.length / attempted : 0,
       medianWordRelativeError: quantile(errors, 0.5),
       p90WordRelativeError: quantile(errors, 0.9),
+      flaggedDocuments: pairs.filter((pair) => pair.flagged).length,
+      documents: pairs,
     };
     checks.controlPairRate = comparison.pairRate >= thresholds.minimumControlPairRate;
     checks.medianWordRelativeError = comparison.medianWordRelativeError !== null
       && comparison.medianWordRelativeError <= thresholds.maximumMedianWordRelativeError;
     checks.p90WordRelativeError = comparison.p90WordRelativeError !== null
       && comparison.p90WordRelativeError <= thresholds.maximumP90WordRelativeError;
-    checks.pdfSource = outcomes.every((item) => ['streamed_pdf', 'cached_pdf'].includes(item.contentSource));
+    checks.pdfSource = qualityOutcomes.every((item) => ['streamed_pdf', 'cached_pdf'].includes(item.contentSource));
+  }
+
+  // Word-count divergence is document paradata, not an operational failure.
+  // Keep the aggregate checks visible as warnings, but only extraction safety,
+  // completeness, and infrastructure checks can block the job or rollout.
+  const blockingChecks = { ...checks };
+  if (phase === 'control') {
+    delete blockingChecks.medianWordRelativeError;
+    delete blockingChecks.p90WordRelativeError;
   }
 
   return {
-    passed: Object.values(checks).every(Boolean),
+    passed: Object.values(blockingChecks).every(Boolean),
     phase,
     exhausted: Boolean(exhausted),
     targetSize: Number(targetSize || 0),
     attempted,
     completed: completed.length,
     failed: Math.max(0, attempted - completed.length),
+    infraErrors,
     successRate,
     durationMs: Number(durationMs || 0),
     documentsPerMinute,
@@ -111,6 +142,11 @@ export function evaluateEnrichmentRun({
     repositoryRequestsPerMinute,
     comparison,
     checks,
+    blockingChecks,
+    warnings: phase === 'control' ? {
+      wordCountDivergence: Number(comparison?.flaggedDocuments || 0) > 0,
+      flaggedDocuments: Number(comparison?.flaggedDocuments || 0),
+    } : {},
     thresholds,
   };
 }

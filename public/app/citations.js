@@ -21,8 +21,6 @@ const {
   citationEntriesEl,
   citationListTitleEl,
   citationTabButtons,
-  docDetailsEl,
-  docModalOverlay,
   exportCitationBibTeXBtn,
   exportCitationRISBtn,
   foundationalWorksListEl,

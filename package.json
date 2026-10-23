@@ -10,8 +10,9 @@
     "test": "node scripts/run-tests.mjs",
     "test:metadata-scale": "node --expose-gc scripts/load-test-metadata-serving.mjs",
     "reset-admin": "node scripts/reset-admin.js",
-    "rebuild-concepts": "node scripts/rebuild-concepts.js",
-    "validate:concepts": "node scripts/validate-concepts.js"
+    "validate:concepts": "node scripts/validate-concepts.js",
+    "lint": "eslint .",
+    "test:e2e": "playwright test"
   },
   "engines": {
     "node": ">=22.5"
@@ -23,6 +24,10 @@
     "express": "^5.1.0"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@playwright/test": "^1.64.1",
+    "eslint": "^9.39.5",
+    "globals": "^17.13.0",
     "supertest": "^7.2.2"
   }
 }

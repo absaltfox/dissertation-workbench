@@ -313,7 +313,6 @@ async function runCitationSegment() {
     // production normalizeCitation hash (not a test stub), matching the
     // Phase 1 plan's warning about hashFn choice silently short-circuiting
     // the fuzzy matcher.
-    // eslint-disable-next-line no-await-in-loop
     await db.reextractDocumentCitations(docId, citations, normalizeCitation);
     const wallMs = performance.now() - t0;
     const statements = counter.count - before;
@@ -374,11 +373,9 @@ async function buildEnrichmentCorpus(ourSyncKey, noiseSyncKey) {
 
   const CHUNK = 1000;
   for (let i = 0; i < items.length; i += CHUNK) {
-    // eslint-disable-next-line no-await-in-loop
     await db.saveDocumentMetadataBatch(items.slice(i, i + CHUNK));
   }
   for (const id of satisfiedIds) {
-    // eslint-disable-next-line no-await-in-loop
     await db.saveFileMetric(id, {
       status: 'full_text', wordSource: 'dspace_full_text', wordCount: 500, pageCount: 5,
     });
@@ -443,7 +440,6 @@ async function runEnrichmentSegment() {
 
     const before = counter.count;
     const t0 = performance.now();
-    // eslint-disable-next-line no-await-in-loop
     const result = await runDocumentSync({
       mode: 'sync_missing_pdfs',
       baseUrl: 'https://oc-index.test',

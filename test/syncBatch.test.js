@@ -9,10 +9,13 @@ let closeDb;
 let createAdminJob;
 let ensureStorage;
 let getAdminJob;
+let getLatestSyncRun;
 let loadStoredFileMetric;
+let listEffectiveDocumentEligibility;
 let runDocumentSync;
 let runImportPdfAdminJob;
 let saveImportRule;
+let saveDocumentMetadata;
 let reserveImportRuleRequestSlot;
 let rulesForContinuation;
 let setDownloadSafetyOptions;
@@ -46,8 +49,11 @@ test.before(async () => {
     createAdminJob,
     ensureStorage,
     getAdminJob,
+    getLatestSyncRun,
     loadStoredFileMetric,
+    listEffectiveDocumentEligibility,
     reserveImportRuleRequestSlot,
+    saveDocumentMetadata,
     saveImportRule,
   } = await import('../src/db.js'));
   ({ runDocumentSync } = await import('../src/sync.js'));
@@ -83,6 +89,99 @@ test('durable per-rule request reservations are atomic across workers', async ()
     reserveImportRuleRequestSlot(rule.id, 2, { nowMs: 10_000, windowMs: 60_000 }),
   ]);
   assert.deepEqual(reservations.sort((left, right) => left - right), [0, 0, 60_000]);
+});
+
+test('a complete metadata import publishes rule eligibility while an incomplete retry preserves it', async () => {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const rule = await saveImportRule({
+    id: `projection-${suffix}`,
+    name: 'Import eligibility projection',
+    extractCitations: true,
+    runConcepts: false,
+  });
+  const ids = ['1.0999901', '1.0999902'];
+  const payload = {
+    data: {
+      hits: {
+        total: ids.length,
+        hits: ids.map((id, index) => ({
+          _source: { id, title: `Eligibility ${index + 1}`, author: 'Projection Tester' },
+        })),
+      },
+    },
+  };
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/search/8.5')) {
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+
+  try {
+    const complete = await runDocumentSync({
+      mode: 'import_all',
+      importRuleId: rule.id,
+      baseUrl: 'https://oc-index.test',
+      term: 'degree.raw,Eligibility',
+      source: 'id,title,author',
+      pageSize: 100,
+      scanLimit: 100,
+      syncMaxRecords: 100,
+    });
+    assert.equal(complete.runStatus, 'completed');
+    assert.equal(complete.eligibilityProjectionPublished, true);
+    assert.deepEqual(await listEffectiveDocumentEligibility({ docIds: ids }), ids.map((docId) => ({
+      docId,
+      citationEligible: true,
+      patternRankEligible: false,
+      matchingRuleCount: 1,
+    })));
+
+    const incomplete = await runDocumentSync({
+      mode: 'import_all',
+      importRuleId: rule.id,
+      baseUrl: 'https://oc-index.test',
+      term: 'degree.raw,Eligibility',
+      source: 'id,title,author',
+      pageSize: 100,
+      scanLimit: 100,
+      syncMaxRecords: 1,
+    });
+    assert.equal(incomplete.runStatus, 'incomplete');
+    assert.equal(incomplete.eligibilityProjectionPublished, false);
+    assert.deepEqual(
+      (await listEffectiveDocumentEligibility({ docIds: ids })).map((row) => row.docId),
+      ids
+    );
+
+    // Legacy maintenance modes operate on filtered subsets and therefore
+    // cannot prove the complete rule scope. They must leave the last published
+    // generation untouched rather than replacing it with that subset.
+    for (const mode of ['sync_differences', 'refresh_metadata']) {
+      const partial = await runDocumentSync({
+        mode,
+        importRuleId: rule.id,
+        baseUrl: 'https://oc-index.test',
+        term: 'degree.raw,Eligibility',
+        source: 'id,title,author',
+        pageSize: 100,
+        scanLimit: 100,
+        syncMaxRecords: 100,
+      });
+      assert.equal(partial.runStatus, 'completed');
+      assert.equal(partial.eligibilityProjectionPublished, false);
+      assert.deepEqual(
+        (await listEffectiveDocumentEligibility({ docIds: ids })).map((row) => row.docId),
+        ids
+      );
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('worker rejects invalid snapshotted content policies before network access', async () => {
@@ -229,6 +328,90 @@ test('sync_missing_pdfs batches missing PDF attempts and reports per-document pr
       downloadFiles: true,
     });
     assert.equal(scanLimited.enrichmentExhausted, false);
+    // #17: apiTotal (100) was never confirmed reached — maxRecords truncated
+    // the scan to 3 — so the persisted run status must be 'incomplete', not
+    // a blanket 'completed', per the plan's second verification bullet.
+    assert.equal(scanLimited.runStatus, 'incomplete');
+    assert.equal((await getLatestSyncRun(scanLimited.syncKey)).status, 'incomplete');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+// --- #17 (H-02): incomplete vs completed run status ---
+
+test('a fully upstream-exhausted scan reports status completed', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/search/8.5')) {
+      const payload = searchPayload();
+      payload.data.hits.total = 3;
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  try {
+    const result = await runDocumentSync({
+      mode: 'import_all',
+      baseUrl: 'https://oc-index.test',
+      term: 'degree.raw,Status-Completed-Fixture',
+      source: 'id,title,author',
+      pageSize: 100,
+      scanLimit: 100,
+      syncMaxRecords: 100,
+      downloadFiles: false,
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.totalSeen, 3);
+    assert.equal(result.runStatus, 'completed');
+    assert.equal((await getLatestSyncRun(result.syncKey)).status, 'completed');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('an underfilled local enrichment queue does not consume the upstream scan budget', async () => {
+  const originalFetch = globalThis.fetch;
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const source = {
+    mode: 'sync_missing_pdfs',
+    baseUrl: 'https://oc-index.test',
+    term: `degree.raw,Queue budget ${suffix}`,
+    source: 'id,title,author',
+    pageSize: 10,
+    scanLimit: 10,
+    syncMaxRecords: 2,
+    pdfBatchSize: 2,
+    downloadFiles: false,
+  };
+  const { getSyncKeyForOptions } = await import('../src/sync.js');
+  await saveDocumentMetadata({
+    id: `queue-local-${suffix}`, title: 'Local retry', author: 'Tester', supervisors: [],
+  }, { syncKey: getSyncKeyForOptions(source) });
+  const upstream = [
+    { id: `queue-upstream-a-${suffix}`, title: 'Upstream A', author: 'Tester' },
+    { id: `queue-upstream-b-${suffix}`, title: 'Upstream B', author: 'Tester' },
+  ];
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/search/8.5')) {
+      return new Response(JSON.stringify({
+        data: { hits: { total: upstream.length, hits: upstream.map((doc) => ({ _source: doc })) } },
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  try {
+    const result = await runDocumentSync(source);
+    assert.equal(result.localQueueSeen, 1);
+    assert.equal(result.upstreamUniqueSeen, 2);
+    assert.equal(result.totalSeen, 3);
+    assert.equal(result.runStatus, 'completed');
+    const persisted = await getLatestSyncRun(result.syncKey);
+    assert.equal(persisted.localQueueSeen, 1);
+    assert.equal(persisted.upstreamUniqueSeen, 2);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -328,6 +511,65 @@ test('explicit PDF full-text fallback counts as successful enrichment', async ()
       mode: 'sync_missing_pdfs',
       baseUrl: 'https://oc-index.test',
       term: 'degree.raw,PDF Fallback',
+      source: 'id,title,author,digitalResourceOriginalRecord',
+      pageSize: 100,
+      scanLimit: 100,
+      syncMaxRecords: 100,
+      pdfBatchSize: 1,
+      contentMode: 'pdf_stream',
+      contentFallback: 'full_text',
+      downloadFiles: true,
+    });
+    const stored = await loadStoredFileMetric(docId);
+    assert.equal(result.totalEnriched, 1);
+    assert.equal(result.totalEnrichmentFailed, 0);
+    assert.equal(stored.status, 'full_text_fallback');
+    assert.equal(stored.error, null);
+  } finally {
+    setDownloadSafetyOptions(null);
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('explicit PDF full-text fallback after an unavailable listed PDF counts as successful enrichment', async () => {
+  const originalFetch = globalThis.fetch;
+  const docId = `1.${String(Date.now()).slice(-7)}8`;
+  const fullText = `Fallback extracted thesis text\n${'education systems research '.repeat(300)}`;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes('/search/8.5')) {
+      return new Response(JSON.stringify({
+        data: { hits: { total: 1, hits: [{ _source: {
+          id: docId,
+          title: 'PDF Fallback 404 Fixture',
+          author: 'Fallback Tester',
+          digitalResourceOriginalRecord: 'https://circle.library.ubc.ca/rest/handle/2429/pdf-fallback-404',
+        } }] } },
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    if (url.includes('/rest/handle/2429/pdf-fallback-404')) {
+      return new Response(JSON.stringify({
+        bitstreams: [
+          { id: 450, bundleName: 'ORIGINAL', mimeType: 'application/pdf', name: 'fallback.pdf' },
+          { id: 451, bundleName: 'TEXT', mimeType: 'text/plain', name: 'fallback.pdf.txt' },
+        ],
+      }), { headers: { 'content-type': 'application/json' } });
+    }
+    // The PDF is listed but permanently unavailable.
+    if (url.includes('/rest/bitstreams/450/retrieve')) {
+      return new Response('not found', { status: 404 });
+    }
+    if (url.includes('/rest/bitstreams/451/retrieve')) {
+      return new Response(fullText, { headers: { 'content-type': 'text/plain' } });
+    }
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  setDownloadSafetyOptions({ allowOriginalPdfRetrieval: true });
+  try {
+    const result = await runDocumentSync({
+      mode: 'sync_missing_pdfs',
+      baseUrl: 'https://oc-index.test',
+      term: 'degree.raw,PDF Fallback 404',
       source: 'id,title,author,digitalResourceOriginalRecord',
       pageSize: 100,
       scanLimit: 100,

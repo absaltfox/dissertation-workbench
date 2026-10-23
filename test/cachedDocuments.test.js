@@ -10,6 +10,7 @@ import {
   getDb,
   listCachedDocuments,
   loadDocumentMetadata,
+  queryCachedDocumentPage,
   recomputeStoredDocumentThemes,
   saveCitations,
   saveCommitteeMembers,
@@ -139,6 +140,16 @@ test('stored themes can be manually recomputed across documents', async () => {
   const stored = await loadDocumentMetadata(docId);
   assert.ok(!stored.themes.includes('stale'));
   assert.ok(stored.themes.includes('community') || stored.themes.includes('literacy'));
+
+  // The document_terms projection (read by theme facets and related-docs once
+  // ready) must be refreshed in step with metadata_json.
+  const client = await getDb();
+  const projected = (await client.execute({
+    sql: "SELECT term FROM document_terms WHERE doc_id = ? AND kind = 'theme' ORDER BY term",
+    args: [docId],
+  })).rows.map((r) => r.term);
+  assert.deepEqual(projected, [...new Set(stored.themes)].sort());
+  assert.ok(!projected.includes('stale'));
 });
 
 test('stored file metrics can overlay freshly fetched metadata records', async () => {
@@ -200,6 +211,177 @@ test('stored citation links can overlay freshly fetched metadata records', async
   await applyCitationCountsToDocuments(docs);
 
   assert.equal(docs[0].citationCount, 2);
+});
+
+test('citation counts on a page match a direct per-doc count', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const syncKey = `test-page-citation-count-${suffix}`;
+  const citedDocId = `test-page-cited-${suffix}`;
+  const uncitedDocId = `test-page-uncited-${suffix}`;
+
+  await saveDocumentMetadata({
+    id: citedDocId,
+    title: `Cited fixture ${suffix}`,
+    author: 'Example Author',
+    year: 2024,
+    degree: 'Doctor of Philosophy - PhD',
+    program: 'Education',
+    pages: 1,
+    pagesSource: 'estimated_from_metadata_words',
+    wordCount: 100,
+    wordCountSource: 'metadata_text',
+    bodyWordCount: null,
+    downloadUrl: null,
+    downloadStatus: 'not_attempted',
+    downloadError: null,
+  }, { syncKey });
+
+  await saveDocumentMetadata({
+    id: uncitedDocId,
+    title: `Uncited fixture ${suffix}`,
+    author: 'Example Author',
+    year: 2024,
+    degree: 'Doctor of Philosophy - PhD',
+    program: 'Education',
+    pages: 1,
+    pagesSource: 'estimated_from_metadata_words',
+    wordCount: 100,
+    wordCountSource: 'metadata_text',
+    bodyWordCount: null,
+    downloadUrl: null,
+    downloadStatus: 'not_attempted',
+    downloadError: null,
+  }, { syncKey });
+
+  await saveCitations(citedDocId, [
+    'Example, A. (2020). First reference.',
+    'Example, B. (2021). Second reference.',
+    'Example, C. (2022). Third reference.',
+  ], (text) => `test-${suffix}-${text}`);
+
+  const page = await queryCachedDocumentPage({ syncKey, limit: 50 });
+
+  const client = await getDb();
+  const citedDirect = await client.execute({
+    sql: 'SELECT COUNT(*) AS total FROM document_citations WHERE doc_id = ?',
+    args: [citedDocId],
+  });
+  const uncitedDirect = await client.execute({
+    sql: 'SELECT COUNT(*) AS total FROM document_citations WHERE doc_id = ?',
+    args: [uncitedDocId],
+  });
+
+  const citedPageDoc = page.documents.find((doc) => doc.id === citedDocId);
+  const uncitedPageDoc = page.documents.find((doc) => doc.id === uncitedDocId);
+
+  assert.ok(citedPageDoc, 'cited fixture should be present on the page');
+  assert.ok(uncitedPageDoc, 'uncited fixture should be present on the page');
+  assert.equal(citedPageDoc.citationCount, Number(citedDirect.rows[0].total));
+  assert.equal(uncitedPageDoc.citationCount, Number(uncitedDirect.rows[0].total));
+  assert.equal(citedPageDoc.citationCount, 3);
+  assert.equal(uncitedPageDoc.citationCount, 0);
+});
+
+test('sortKey=citationCount orders the full filtered set before paginating, with correct counts', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const syncKey = `test-sort-citation-count-${suffix}`;
+
+  // Four docs with distinct citation counts (0, 1, 2, 3), seeded in an order
+  // that does not match citation count, title, or year, so a correct result
+  // can only come from an actual ORDER BY the whole-table join's count —
+  // not from insertion order or a tiebreaker column.
+  const docs = [
+    { id: `test-sort-c0-${suffix}`, title: `Sort fixture C0 ${suffix}`, citations: 0 },
+    { id: `test-sort-c3-${suffix}`, title: `Sort fixture C3 ${suffix}`, citations: 3 },
+    { id: `test-sort-c1-${suffix}`, title: `Sort fixture C1 ${suffix}`, citations: 1 },
+    { id: `test-sort-c2-${suffix}`, title: `Sort fixture C2 ${suffix}`, citations: 2 },
+  ];
+
+  for (const docFixture of docs) {
+    await saveDocumentMetadata({
+      id: docFixture.id,
+      title: docFixture.title,
+      author: 'Example Author',
+      year: 2024,
+      degree: 'Doctor of Philosophy - PhD',
+      program: 'Education',
+      pages: 1,
+      pagesSource: 'estimated_from_metadata_words',
+      wordCount: 100,
+      wordCountSource: 'metadata_text',
+      bodyWordCount: null,
+      downloadUrl: null,
+      downloadStatus: 'not_attempted',
+      downloadError: null,
+    }, { syncKey });
+  }
+
+  const citationTexts = [
+    'Example, A. (2020). First reference.',
+    'Example, B. (2021). Second reference.',
+    'Example, C. (2022). Third reference.',
+  ];
+  for (const docFixture of docs) {
+    if (docFixture.citations > 0) {
+      await saveCitations(
+        docFixture.id,
+        citationTexts.slice(0, docFixture.citations),
+        (text) => `test-${suffix}-${docFixture.id}-${text}`,
+      );
+    }
+  }
+
+  const client = await getDb();
+  const directCounts = new Map();
+  for (const docFixture of docs) {
+    const direct = await client.execute({
+      sql: 'SELECT COUNT(*) AS total FROM document_citations WHERE doc_id = ?',
+      args: [docFixture.id],
+    });
+    directCounts.set(docFixture.id, Number(direct.rows[0].total));
+  }
+  // Sanity check the fixture itself before trusting assertions built on it.
+  assert.deepEqual(docs.map((d) => directCounts.get(d.id)), [0, 3, 1, 2]);
+
+  // limit=2 forces the whole-table join's ORDER BY to decide page membership
+  // (not just in-page order): with 4 docs and a page size of 2, getting the
+  // "top 2" and "bottom 2" right by count is only possible if counts for the
+  // full filtered set were known before LIMIT/OFFSET applied.
+  const descPage1 = await queryCachedDocumentPage({
+    syncKey, sortKey: 'citationCount', sortDir: 'desc', limit: 2, offset: 0,
+  });
+  assert.equal(descPage1.total, 4);
+  assert.deepEqual(descPage1.documents.map((d) => d.id), [
+    `test-sort-c3-${suffix}`, `test-sort-c2-${suffix}`,
+  ]);
+  assert.deepEqual(descPage1.documents.map((d) => d.citationCount), [3, 2]);
+
+  const descPage2 = await queryCachedDocumentPage({
+    syncKey, sortKey: 'citationCount', sortDir: 'desc', limit: 2, offset: 2,
+  });
+  assert.deepEqual(descPage2.documents.map((d) => d.id), [
+    `test-sort-c1-${suffix}`, `test-sort-c0-${suffix}`,
+  ]);
+  assert.deepEqual(descPage2.documents.map((d) => d.citationCount), [1, 0]);
+
+  const ascPage1 = await queryCachedDocumentPage({
+    syncKey, sortKey: 'citationCount', sortDir: 'asc', limit: 2, offset: 0,
+  });
+  assert.deepEqual(ascPage1.documents.map((d) => d.id), [
+    `test-sort-c0-${suffix}`, `test-sort-c1-${suffix}`,
+  ]);
+  assert.deepEqual(ascPage1.documents.map((d) => d.citationCount), [0, 1]);
+
+  // Every returned doc's citationCount must match a direct per-doc count,
+  // confirming the retained whole-table join path still produces correct
+  // displayed counts (not just correct ordering).
+  for (const page of [descPage1, descPage2, ascPage1]) {
+    for (const doc of page.documents) {
+      assert.equal(doc.citationCount, directCounts.get(doc.id));
+    }
+  }
 });
 
 test('stored committee and examiner roles can overlay freshly fetched metadata records', async () => {

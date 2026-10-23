@@ -25,12 +25,16 @@ The web app is responsible for:
 
 The worker is responsible for:
 
-- claiming the job with `claimAdminJob(jobId, runnerId)`;
-- heartbeating while work is active;
-- writing progress updates at meaningful intervals;
+- claiming the job with `claimAdminJob(jobId, runnerId, executionId)` and retaining the returned opaque `executionId`;
+- heartbeating through the claimed-job API while work is active;
+- writing progress updates at meaningful intervals through the claimed-job API;
 - appending human-readable logs;
 - writing durable output;
-- finishing the job with `completed`, `failed`, `timed_out`, or `cancelled`.
+- finishing through `finishClaimedAdminJob` with `completed`, `failed`, `timed_out`, or `cancelled`.
+
+Worker progress and terminal writes must match both `execution_id` and the expected
+non-terminal `running` state. Administrative cancellation and stale-job reaping
+revoke the execution ID, so an orphaned worker cannot publish late success.
 
 New worker-backed job types should be routed through `src/jobWorker.js` or a Python worker entrypoint that follows the same database contract. Do not hide heavyweight work inside a synchronous HTTP handler.
 
@@ -180,7 +184,7 @@ The scan selects a bounded, optionally scoped page of documents that:
 - have no terminal citation record — neither a `completed` extraction row nor any `document_citations` rows; and
 - have no `failed` extraction row.
 
-Selection is parser-version-independent: it tests only whether a terminal state exists, not which parser version produced it. Failures are deliberately excluded so the nightly run never retries known-bad documents forever; only an explicit `retryFailures` run reconsiders them. Scanning is once-per-document: a scanned document (any `document_citations` rows, or a `completed` row — including a successful scan that found zero citations) is never reselected automatically, and a parser/GROBID version upgrade changes nothing about selection. Reprocessing happens only through an explicit forced `reprocess` run, which drops every gate and re-scans all streamable in-scope documents, replacing their citations. An operator may also pass `autoContinue` to chain batches and drain the whole backlog in one run; the nightly run stays a single bounded page.
+Selection is parser-version-independent: it tests only whether a terminal state exists, not which parser version produced it. Failures are deliberately excluded so the nightly run never retries known-bad documents forever; only an explicit `retryFailures` run reconsiders them. A failed state takes precedence over legacy partial citation links during an explicit retry. Scanning is once-per-document: a scanned document (any `document_citations` rows, or a `completed` row — including a successful scan that found zero citations) is never reselected automatically, and a parser/GROBID version upgrade changes nothing about selection. Reprocessing happens only through an explicit forced `reprocess` run, which drops every gate and re-scans all streamable in-scope documents, replacing their citations. Citation rows are staged first and the document's links are swapped transactionally, so a failed attempt preserves the previous known-good bibliography. An operator may also pass `autoContinue` to chain batches and drain the whole backlog in one run; the nightly run stays a single bounded page.
 
 For each selected document the job re-streams and parses the PDF through the standard `pdf_stream` path — subject to the same `PDF_DOWNLOAD_RATE_PER_MIN` limiter and Streamed Content Contract (temp directory per document, removed in `finally`, orphan cleanup on process start) — extracts and dedups citations, and never writes `pdf_path` or `full_text_path`. It records `completed` or `failed` state per document before advancing its cursor, counts a per-document failure without failing the whole batch, and starts no catalogue resolution. When the per-run cap is reached with documents still pending, a durable-cursor continuation drains the backlog across runs while `params_json` stays O(1) per batch. The nightly scheduler (`CITATION_SCAN_NIGHTLY_ENABLED`, `CITATION_SCAN_NIGHTLY_HOUR_LOCAL`) is staggered from the concept rebuild and guarded against overlapping itself.
 

@@ -7,8 +7,13 @@ import { logger } from './logger.js';
 import { dedupeSupervisorNames, normalizePersonName, stripMiddleInitials, supervisorNameKey } from './supervisors.js';
 import { encryptMfaSecret, decryptMfaSecret } from './secretCrypto.js';
 import { jaroWinkler } from './fuzzyMatch.js';
-import { documentThemeTerms } from './nlp.js';
+import { documentThemeTerms, COOCCURRENCE_BLOCKLIST } from './nlp.js';
+import { buildParentClusters, buildTopicsByYearFromCounts } from './topicHierarchy.js';
 import { normalizeImportRule } from './importRules.js';
+import {
+  ACTIVE_ANALYTICS_ACCESS_SQL, CONTENT_RETRY_ACCESS_SQL, deriveAccessState,
+  isAccessRestricted, isEmbargoPlaceholder,
+} from './accessStatus.js';
 
 let db;
 let schemaReady;
@@ -46,7 +51,12 @@ export async function getDb() {
     });
   }
   if (!schemaReady) {
-    schemaReady = ensureSchema(db);
+    // Separate local SQLite clients can arrive during a migration at the same
+    // time (for example, concurrent worker processes). Schema migrations are
+    // idempotent, so retry the complete startup pass on SQLITE_BUSY instead of
+    // letting a transient schema-read lock prevent a singleton claimant from
+    // reaching its durable lease.
+    schemaReady = ensureSchemaWithRetry(db);
   }
   await schemaReady;
   return db;
@@ -85,16 +95,112 @@ async function all(sql, args = []) {
   return result.rows;
 }
 
+// --- #18/#23: transient-DB retry classification and backoff ---
+//
+// A libsql connection blip (a closed websocket, a dropped HTTP round trip) can
+// surface at any statement. Retrying blindly is only safe for calls whose
+// underlying writes are provably idempotent (see the seven wrapped functions
+// below, `withDbRetry`'s own call sites) — this is deliberately NOT a blanket
+// wrap of `execute`/`client.batch`, since a non-idempotent write retried after
+// an ambiguous "did it commit" failure risks double-applying it.
+
+// Jittered exponential backoff: base * factor^attempt, ±jitterRatio jitter,
+// capped at capMs. `attempt` is 0-based (the delay *before* attempt N, N>=1).
+export function computeBackoffDelayMs(attempt, {
+  baseMs = 25, factor = 2, jitterRatio = 0.3, capMs = 5_000, random = Math.random,
+} = {}) {
+  const raw = Math.min(capMs, baseMs * (factor ** Math.max(0, attempt)));
+  const jitter = raw * jitterRatio * (random() * 2 - 1); // +/- jitterRatio
+  return Math.max(1, Math.round(raw + jitter));
+}
+
+const TRANSIENT_DB_CODES = new Set([
+  'HRANA_WEBSOCKET_ERROR', 'HRANA_CLOSED_ERROR', 'HRANA_PROTO_ERROR',
+  'SERVER_ERROR', 'INTERNAL_ERROR', 'UNKNOWN',
+]);
+const PERMANENT_DB_CODES = new Set(['PROTOCOL_VERSION_ERROR', 'TRANSACTION_CLOSED']);
+const TRANSIENT_MESSAGE_PATTERN = /ECONNRESET|ETIMEDOUT|EPIPE|fetch failed|socket hang up|network/i;
+
+// Classifies a caught error as 'transient' (worth retrying — a connection blip
+// with no evidence the statement committed) or 'permanent' (a schema/syntax/
+// data problem no retry can fix, or an error we cannot positively identify as
+// transient — defaulting an unrecognized error to permanent is deliberate:
+// masking a real bug as routine flakiness is worse than under-retrying).
+export function classifyDbError(error) {
+  const code = String(error?.code || '');
+  if (TRANSIENT_DB_CODES.has(code) || /^SQLITE_BUSY|^SQLITE_LOCKED/.test(code)) return 'transient';
+  if (PERMANENT_DB_CODES.has(code) || /^SQLITE_CONSTRAINT|^SQLITE_MISUSE|^SQLITE_ERROR/.test(code)) {
+    return 'permanent';
+  }
+  if (error?.name === 'MisuseError') return 'permanent';
+  if (!code) {
+    const message = `${error?.message || ''} ${error?.cause?.message || ''}`;
+    if (TRANSIENT_MESSAGE_PATTERN.test(message)) return 'transient';
+  }
+  return 'permanent';
+}
+
+const DB_RETRY_MAX_ATTEMPTS = Number(process.env.DB_RETRY_MAX_ATTEMPTS) || 4;
+
+// Retries `fn` only on a `classifyDbError(error) === 'transient'` result, with
+// jittered exponential backoff between attempts. A permanent error, or a
+// transient one that survives every retry, is re-thrown unwrapped so the
+// caller's own classification (e.g. sync.js's per-document vs. page-level
+// boundary) still sees the original error shape.
+export async function withDbRetry(fn, {
+  label = 'db-operation', maxAttempts = DB_RETRY_MAX_ATTEMPTS, wait = defaultRetryWait,
+  backoff = computeBackoffDelayMs,
+} = {}) {
+  let lastError;
+  for (let attempt = 0; attempt < Math.max(1, maxAttempts); attempt += 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      const isLastAttempt = attempt >= Math.max(1, maxAttempts) - 1;
+      if (isLastAttempt || classifyDbError(error) !== 'transient') throw error;
+      logger.warn('Retrying transient DB error', {
+        label, attempt: attempt + 1, maxAttempts, error: error?.message || String(error),
+      });
+      await wait(backoff(attempt));
+    }
+  }
+  throw lastError;
+}
+
+function defaultRetryWait(delayMs) {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
 async function exec(sql) {
   const client = await getDb();
   await client.executeMultiple(sql);
 }
 
-async function tryExec(client, sql) {
+// A few pre-IF-NOT-EXISTS migrations remain for databases that were created by
+// older releases.  Those statements may legitimately report that the named
+// schema object already exists.  Do not turn this into a general migration
+// error sink: a lock needs to reach ensureSchemaWithRetry, and any other error
+// (bad SQL, a missing table, an incompatible schema, etc.) must fail startup.
+function isAlreadyAppliedLegacyDdlError(error) {
+  const message = String(error?.message || '');
+  return /duplicate column name|(?:index|table)\s+.+\s+already exists/i.test(message);
+}
+
+export async function tryExec(client, sql, {
+  ignoreError = isAlreadyAppliedLegacyDdlError,
+} = {}) {
   try {
     await client.executeMultiple(sql);
-  } catch {
-    // Migration already applied or unsupported in the current database.
+    return true;
+  } catch (error) {
+    // Never swallow a database lock: getDb wraps the complete schema pass in
+    // a bounded retry, so this must propagate to that outer boundary.
+    if (classifyDbError(error) === 'transient') throw error;
+    if (ignoreError?.(error)) {
+      return false;
+    }
+    throw error;
   }
 }
 
@@ -126,6 +232,9 @@ async function ensureSchema(client) {
       year INTEGER,
       degree TEXT,
       program TEXT,
+      access_status TEXT NOT NULL DEFAULT 'unknown',
+      available_at TEXT,
+      access_status_reason TEXT,
       source_json TEXT,
       source_updated_at TEXT,
       synced_at TEXT,
@@ -155,6 +264,7 @@ async function ensureSchema(client) {
       full_text_request_count INTEGER DEFAULT 0,
       original_pdf_request_count INTEGER DEFAULT 0,
       retrieved_bytes INTEGER DEFAULT 0,
+      word_count_comparison_json TEXT,
       status TEXT,
       error TEXT,
       updated_at TEXT NOT NULL
@@ -180,6 +290,13 @@ async function ensureSchema(client) {
       PRIMARY KEY (doc_id, person_key, role, source)
     );
 
+    CREATE TABLE IF NOT EXISTS document_terms (
+      doc_id TEXT NOT NULL,
+      kind   TEXT NOT NULL,
+      term   TEXT NOT NULL,
+      PRIMARY KEY (doc_id, kind, term)
+    );
+
     CREATE TABLE IF NOT EXISTS serving_projection_state (
       projection_key TEXT PRIMARY KEY,
       projection_value TEXT NOT NULL,
@@ -200,6 +317,8 @@ async function ensureSchema(client) {
       source_json TEXT NOT NULL,
       status TEXT NOT NULL,
       total_seen INTEGER NOT NULL DEFAULT 0,
+      local_queue_seen INTEGER NOT NULL DEFAULT 0,
+      upstream_unique_seen INTEGER NOT NULL DEFAULT 0,
       total_saved INTEGER NOT NULL DEFAULT 0,
       api_total INTEGER,
       error TEXT,
@@ -224,9 +343,30 @@ async function ensureSchema(client) {
       cancelled_at TEXT,
       artifact_token_hash TEXT,
       claimed_at TEXT,
+      execution_id TEXT,
       progress_json TEXT,
       started_at TEXT NOT NULL,
       finished_at TEXT
+    );
+
+    -- A durable singleton lease for job types that must never overlap.  A
+    -- separate row (rather than a process-local check) makes the decision
+    -- safe when two HTTP replicas receive the same request at once.
+    CREATE TABLE IF NOT EXISTS admin_job_singletons (
+      type TEXT PRIMARY KEY,
+      job_id INTEGER NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    -- Durable reconciliation requests for singleton processors. If eligible
+    -- work appears after the active job has passed it, the web dispatcher
+    -- starts one fresh pass after the singleton lease becomes available.
+    CREATE TABLE IF NOT EXISTS admin_job_followups (
+      type TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      params_json TEXT,
+      request_token TEXT NOT NULL,
+      requested_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS users (
@@ -284,6 +424,45 @@ async function ensureSchema(client) {
       timestamps_json TEXT NOT NULL DEFAULT '[]',
       updated_at TEXT NOT NULL,
       FOREIGN KEY (rule_id) REFERENCES import_rules(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS import_rule_eligibility_projections (
+      rule_id TEXT PRIMARY KEY,
+      current_token TEXT,
+      completed_token TEXT,
+      rule_revision TEXT,
+      status TEXT NOT NULL DEFAULT 'idle',
+      started_at TEXT,
+      completed_at TEXT,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY (rule_id) REFERENCES import_rules(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS rule_document_processing_eligibility (
+      rule_id TEXT NOT NULL,
+      doc_id TEXT NOT NULL,
+      projection_token TEXT NOT NULL,
+      projected_at TEXT NOT NULL,
+      PRIMARY KEY (rule_id, doc_id, projection_token),
+      FOREIGN KEY (rule_id) REFERENCES import_rules(id) ON DELETE CASCADE,
+      FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS document_processing_state (
+      doc_id TEXT NOT NULL,
+      processor TEXT NOT NULL,
+      status TEXT NOT NULL,
+      content_checksum TEXT,
+      processor_version TEXT,
+      error TEXT,
+      attempted_at TEXT NOT NULL,
+      PRIMARY KEY (doc_id, processor),
+      FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS processing_eligibility_activation (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      activated_at TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS enrichment_rollouts (
@@ -493,6 +672,12 @@ async function ensureSchema(client) {
   `);
 
   await tryExec(client, 'ALTER TABLE catalogue_lookups ADD COLUMN bib_id TEXT');
+  // #17: These counters distinguish local enrichment retries from records
+  // observed during the upstream OC scan.  Use the verified, idempotent helper
+  // rather than tryExec so an actual migration failure cannot be mistaken for
+  // an already-applied column on a concurrently starting replica.
+  await addColumnIfMissing(client, 'sync_runs', 'local_queue_seen', 'INTEGER NOT NULL DEFAULT 0');
+  await addColumnIfMissing(client, 'sync_runs', 'upstream_unique_seen', 'INTEGER NOT NULL DEFAULT 0');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN runner_type TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN runner_id TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN runner_state TEXT');
@@ -501,6 +686,7 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN cancelled_at TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN artifact_token_hash TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN claimed_at TEXT');
+  await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN execution_id TEXT');
   await tryExec(client, 'ALTER TABLE admin_jobs ADD COLUMN progress_json TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN sync_key TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN title TEXT');
@@ -512,6 +698,9 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN source_updated_at TEXT');
   await tryExec(client, 'ALTER TABLE documents ADD COLUMN synced_at TEXT');
   await addColumnIfMissing(client, 'documents', 'serving_projection_version', 'INTEGER NOT NULL DEFAULT 0');
+  await addColumnIfMissing(client, 'documents', 'access_status', "TEXT NOT NULL DEFAULT 'unknown'");
+  await addColumnIfMissing(client, 'documents', 'available_at', 'TEXT');
+  await addColumnIfMissing(client, 'documents', 'access_status_reason', 'TEXT');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_secret TEXT');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_enabled INTEGER NOT NULL DEFAULT 0');
   await tryExec(client, 'ALTER TABLE users ADD COLUMN mfa_enabled_at TEXT');
@@ -535,6 +724,7 @@ async function ensureSchema(client) {
   await addColumnIfMissing(client, 'file_metrics', 'full_text_request_count', 'INTEGER DEFAULT 0');
   await addColumnIfMissing(client, 'file_metrics', 'original_pdf_request_count', 'INTEGER DEFAULT 0');
   await addColumnIfMissing(client, 'file_metrics', 'retrieved_bytes', 'INTEGER DEFAULT 0');
+  await addColumnIfMissing(client, 'file_metrics', 'word_count_comparison_json', 'TEXT');
   await addColumnIfMissing(client, 'import_rules', 'content_mode', "TEXT NOT NULL DEFAULT 'metadata_only'");
   await addColumnIfMissing(client, 'import_rules', 'content_fallback', "TEXT NOT NULL DEFAULT 'fail_document'");
   await addColumnIfMissing(client, 'import_rules', 'extract_citations', 'INTEGER NOT NULL DEFAULT 0');
@@ -543,6 +733,7 @@ async function ensureSchema(client) {
   await addColumnIfMissing(client, 'import_rules', 'max_content_bytes', 'INTEGER NOT NULL DEFAULT 209715200');
   await addColumnIfMissing(client, 'import_rules', 'content_concurrency', 'INTEGER NOT NULL DEFAULT 1');
   await addColumnIfMissing(client, 'import_rules', 'content_rate_limit', 'INTEGER NOT NULL DEFAULT 0');
+  await addColumnIfMissing(client, 'import_rule_eligibility_projections', 'rule_revision', 'TEXT');
   await addColumnIfMissing(client, 'enrichment_rollouts', 'rule_revision', 'TEXT');
   await addColumnIfMissing(client, 'enrichment_rollout_evidence', 'rule_revision', 'TEXT');
   // Citation match keys (M-06 / B-01). `year` is free text and the match year is a
@@ -572,6 +763,9 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_concept_partition_candidates_phrase ON concept_partition_candidates(phrase, partition_key)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_citation_extraction_status ON citation_extraction_state(status, extracted_at)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_import_rules_updated_at ON import_rules(updated_at)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_rule_document_eligibility_doc ON rule_document_processing_eligibility(doc_id, rule_id, projection_token)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_import_rules_processing_policy ON import_rules(extract_citations, run_concepts, id)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_processing_state_queue ON document_processing_state(processor, status, doc_id)');
   await client.execute('CREATE INDEX IF NOT EXISTS idx_enrichment_evidence_rule_phase ON enrichment_rollout_evidence(rule_id, phase, job_id)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_username ON password_reset_tokens(username)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires_at ON password_reset_tokens(expires_at)');
@@ -589,18 +783,118 @@ async function ensureSchema(client) {
   // checkCacheIntegrity reads only these two columns, so a partial covering index
   // turns its full table scan into an index scan over cached PDFs alone.
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_file_metrics_pdf_path ON file_metrics(doc_id, pdf_path) WHERE pdf_path IS NOT NULL');
-  // The citation scan selects streamable sources only; a partial index over the
-  // streamed_pdf rows keeps its scan bounded to that (shrinking) subset.
-  await tryExec(client, "CREATE INDEX IF NOT EXISTS idx_file_metrics_content_source ON file_metrics(content_source) WHERE content_source = 'streamed_pdf'");
+  // Cover the citation scan's streamable-source probe by doc id and checksum.
+  // The earlier content_source-only index stored the same constant in every row
+  // and did not shrink as scans completed, so it added little value.
+  await tryExec(client, 'DROP INDEX IF EXISTS idx_file_metrics_content_source');
+  await tryExec(client, `
+    CREATE INDEX IF NOT EXISTS idx_file_metrics_streamed_scan
+    ON file_metrics(doc_id, content_checksum)
+    WHERE content_source = 'streamed_pdf'
+      AND content_checksum IS NOT NULL
+      AND content_checksum <> ''
+  `);
   // scope_where() in build-concepts.py filters every automatic partition by
   // degree plus a year range on each PatternRank run.
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree_year ON documents(degree, year)');
 
+  // document_terms projection table indexes for efficient term lookups
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_kind_term ON document_terms(kind, term)');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_kind_termlower ON document_terms(kind, lower(term))');
+  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_doc ON document_terms(doc_id, kind)');
+
   await backfillCitationMatchKeys(client);
+  await backfillDocumentAccessStatus(client);
 
   const cleaned = await cleanupCommitteeArtifacts(client);
   if (cleaned > 0) logger.info(`Cleaned up ${cleaned} committee artefact rows`);
   await backfillDocumentPeopleProjection(client);
+  await backfillSourceJsonProvenance(client);
+}
+
+// Exported for migration tests and for callers that need to initialise a
+// separately constructed client.  Keeping the retry around the complete,
+// idempotent schema pass means a lock at any migration statement restarts from
+// a known boundary and remains bounded by withDbRetry's maxAttempts.
+export function ensureSchemaWithRetry(client, retryOptions = {}) {
+  return withDbRetry(() => ensureSchema(client), {
+    label: 'ensureSchema',
+    // Worker processes can cold-start together and each runs the idempotent
+    // migration pass. Give the winning process enough time to release its DDL
+    // lock before treating another worker as unhealthy.
+    maxAttempts: 10,
+    ...retryOptions,
+  });
+}
+
+const SOURCE_JSON_TRIM_STATE_KEY = 'source_json_trim';
+const SOURCE_JSON_TRIM_BATCH = 500;
+
+// #28 migration: rewrites every existing documents.source_json row (which may
+// currently hold the full upstream OC record, including a full_text/
+// transcript/text/ocr/body-shaped field) to the trimmed { id, sourceUpdatedAt }
+// provenance stub produced by trimmedSourceProvenance(). One-time and
+// idempotent: once serving_projection_state records 'source_json_trim' as
+// 'complete', later calls (every server startup runs ensureSchema) are a
+// single no-op read. Rows with NULL or malformed source_json are left
+// untouched rather than throwing — there is nothing to trim. This is
+// distinct from, and does not touch, sync_runs.source_json (a per-run
+// request-options record on a different table, not per-document upstream
+// data).
+export async function backfillSourceJsonProvenance(dbInstance = null) {
+  const client = dbInstance || await getDb();
+  const state = await client.execute({
+    sql: 'SELECT projection_value FROM serving_projection_state WHERE projection_key = ?',
+    args: [SOURCE_JSON_TRIM_STATE_KEY],
+  });
+  if (String(state.rows[0]?.projection_value || '') === 'complete') return 0;
+
+  let total = 0;
+  let cursor = '';
+  for (;;) {
+    const result = await client.execute({
+      sql: `
+        SELECT doc_id, source_json
+        FROM documents
+        WHERE doc_id > ? AND source_json IS NOT NULL
+        ORDER BY doc_id
+        LIMIT ?
+      `,
+      args: [cursor, SOURCE_JSON_TRIM_BATCH],
+    });
+    if (!result.rows.length) break;
+    const statements = [];
+    for (const row of result.rows) {
+      cursor = row.doc_id;
+      let parsed = null;
+      try { parsed = JSON.parse(row.source_json); } catch { parsed = null; }
+      if (!parsed || typeof parsed !== 'object') continue; // malformed JSON: leave unchanged
+      const trimmed = trimmedSourceProvenance(parsed);
+      const nextJson = trimmed ? JSON.stringify(trimmed) : null;
+      if (nextJson === row.source_json) continue; // already trimmed: no write needed
+      statements.push({
+        sql: 'UPDATE documents SET source_json = ? WHERE doc_id = ?',
+        args: [nextJson, row.doc_id],
+      });
+    }
+    if (statements.length) {
+      await client.batch(statements, 'write');
+      total += statements.length;
+    }
+  }
+
+  await client.execute({
+    sql: `
+      INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+      VALUES (?, 'complete', ?)
+      ON CONFLICT(projection_key) DO UPDATE SET
+        projection_value = excluded.projection_value,
+        updated_at = excluded.updated_at
+    `,
+    args: [SOURCE_JSON_TRIM_STATE_KEY, new Date().toISOString()],
+  });
+  if (total > 0) logger.info(`Trimmed source_json provenance for ${total} documents`);
+  return total;
 }
 
 export async function cleanupCommitteeArtifacts(dbInstance = null) {
@@ -614,17 +908,49 @@ export async function cleanupCommitteeArtifacts(dbInstance = null) {
       'supervisory committee',
       'committee members'
   `;
-  const result = await client.execute(`
-    DELETE FROM committee_members
-    WHERE lower(name) IN (${artifactNames})
+  // This runs in every process's startup schema pass. A DELETE opens a write
+  // transaction even when it matches nothing, so check first: an up-to-date
+  // database must not make concurrent cold starts contend for the write lock.
+  const pending = await client.execute(`
+    SELECT
+      EXISTS (SELECT 1 FROM committee_members WHERE lower(name) IN (${artifactNames})) AS committee,
+      EXISTS (SELECT 1 FROM document_people WHERE lower(name) IN (${artifactNames})) AS people
   `);
-  await client.execute(`DELETE FROM document_people WHERE lower(name) IN (${artifactNames})`);
-  return changes(result);
+  const { committee, people } = pending.rows[0] || {};
+  let removed = 0;
+  if (Number(committee)) {
+    removed = changes(await client.execute(`
+      DELETE FROM committee_members
+      WHERE lower(name) IN (${artifactNames})
+    `));
+  }
+  if (Number(people)) {
+    await client.execute(`DELETE FROM document_people WHERE lower(name) IN (${artifactNames})`);
+  }
+  return removed;
 }
 
 // --- Document functions ---
 
+// #28: documents.source_json is a provenance stub, never a full-record cache.
+// This is an allowlist, not a denylist: only `id`/`sourceUpdatedAt` are ever
+// read off `source` here, so `full_text`/`FullText`/`transcript`/`text`/`ocr`/
+// `body` (or any other upstream field) can never ride into source_json
+// through this path, regardless of what shape a caller passes as `source`.
+// This is a standing invariant enforced at the write path, not a one-time
+// cleanup — do not widen this to a spread or a denylist-based filter without
+// re-auditing every call site that constructs a `source` object.
+function trimmedSourceProvenance(source) {
+  if (!source || typeof source !== 'object') return null;
+  const id = source.id ?? source._id ?? source.identifier ?? source.Identifier ?? null;
+  const sourceUpdatedAt = source.sourceUpdatedAt ?? source.updatedAt ?? source.updated_at
+    ?? source.date_updated ?? source.dateModified ?? null;
+  if (id == null && sourceUpdatedAt == null) return null;
+  return { id, sourceUpdatedAt };
+}
+
 function documentColumns(doc, syncKey = null, source = null) {
+  const provenance = trimmedSourceProvenance(source);
   return {
     syncKey,
     title: doc.title || null,
@@ -632,21 +958,118 @@ function documentColumns(doc, syncKey = null, source = null) {
     year: doc.year ?? null,
     degree: doc.degree || null,
     program: doc.program || null,
-    sourceJson: source ? JSON.stringify(source) : null,
-    sourceUpdatedAt: source?.sourceUpdatedAt || source?.updatedAt || null,
+    accessStatus: doc.accessStatus || 'unknown',
+    availableAt: doc.availableAt || null,
+    accessStatusReason: doc.accessStatusReason || null,
+    sourceJson: provenance ? JSON.stringify(provenance) : null,
+    sourceUpdatedAt: provenance?.sourceUpdatedAt || null,
   };
 }
 
-function withStoredThemes(doc) {
+function withStoredThemes(doc, { recompute = false } = {}) {
   if (!doc || typeof doc !== 'object') return doc;
+  if (isAccessRestricted(doc)) return {
+    ...doc,
+    abstract: '',
+    themes: [],
+    conceptTerms: [],
+    methodologies: [],
+    pages: null,
+    pagesSource: null,
+    wordCount: null,
+    bodyWordCount: null,
+    wordCountSource: null,
+    charCount: null,
+  };
   const themes = Array.isArray(doc.themes)
     ? doc.themes.map((value) => String(value || '').trim()).filter(Boolean)
     : [];
-  if (themes.length) return doc;
+  if (themes.length && !recompute) return doc;
   return {
     ...doc,
     themes: documentThemeTerms(doc, 12),
   };
+}
+
+function embargoCleanupStatements(docId, now = new Date().toISOString()) {
+  return [
+    { sql: 'DELETE FROM document_topics WHERE doc_id = ?', args: [docId] },
+    { sql: 'DELETE FROM concept_document_state WHERE doc_id = ?', args: [docId] },
+    { sql: 'DELETE FROM document_citations WHERE doc_id = ?', args: [docId] },
+    { sql: "DELETE FROM committee_members WHERE doc_id = ? AND source <> 'api'", args: [docId] },
+    { sql: "DELETE FROM document_people WHERE doc_id = ? AND source <> 'metadata'", args: [docId] },
+    {
+      sql: `UPDATE file_metrics SET pdf_path = NULL, download_url = NULL, file_bytes = NULL,
+              full_text_path = NULL, full_text_bytes = NULL, full_text_source_url = NULL,
+              word_count = NULL, body_word_count = NULL, page_count = NULL,
+              word_source = NULL, page_source = NULL, content_source = NULL,
+              content_checksum = NULL, content_source_url = NULL, content_retrieved_at = NULL,
+              status = 'deferred_embargo', error = NULL, updated_at = ?
+            WHERE doc_id = ?`,
+      args: [now, docId],
+    },
+  ];
+}
+
+async function backfillDocumentAccessStatus(client) {
+  const migrationState = await client.execute({
+    sql: 'SELECT projection_value FROM serving_projection_state WHERE projection_key = ?',
+    args: ['document_access_v2'],
+  });
+  if (migrationState.rows[0]?.projection_value === 'complete') return;
+  let cursor = '';
+  let updated = 0;
+  while (true) {
+    const result = await client.execute({
+      sql: `SELECT doc_id, metadata_json FROM documents
+            WHERE doc_id > ? AND COALESCE(access_status, 'unknown') = 'unknown'
+            ORDER BY doc_id LIMIT 250`,
+      args: [cursor],
+    });
+    if (!result.rows.length) break;
+    const statements = [];
+    const now = new Date().toISOString();
+    for (const row of result.rows) {
+      cursor = String(row.doc_id);
+      let doc;
+      try { doc = JSON.parse(row.metadata_json); } catch { continue; }
+      // Some legacy normalized rows overloaded `date` with date_available,
+      // but most used it for the bibliographic/graduation date. A bare future
+      // bibliographic date must never suppress an otherwise ordinary thesis.
+      // Treat the ambiguous legacy field as availability evidence only when
+      // the same record has the narrow repository embargo placeholder.
+      const legacyDescription = doc.rawAbstract || doc.abstract;
+      const legacyAvailability = doc.availableAt || doc.accessEvidence?.dateAvailableRaw
+        || (isEmbargoPlaceholder(legacyDescription) ? doc.date : null);
+      const state = deriveAccessState({
+        date_available: legacyAvailability,
+        description: legacyDescription,
+      });
+      if (!isAccessRestricted(state)) continue;
+      const cleaned = withStoredThemes({
+        ...doc,
+        ...state,
+        rawAbstract: doc.rawAbstract || doc.abstract || undefined,
+      });
+      statements.push({
+        sql: `UPDATE documents SET metadata_json = ?, access_status = ?, available_at = ?,
+                access_status_reason = ?, updated_at = ? WHERE doc_id = ?`,
+        args: [JSON.stringify(cleaned), state.accessStatus, state.availableAt,
+          state.accessStatusReason, now, row.doc_id],
+      });
+      statements.push(...embargoCleanupStatements(row.doc_id, now));
+      updated += 1;
+    }
+    if (statements.length) await client.batch(statements, 'write');
+  }
+  await client.execute({
+    sql: `INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+          VALUES ('document_access_v2', 'complete', ?)
+          ON CONFLICT(projection_key) DO UPDATE SET
+            projection_value = excluded.projection_value, updated_at = excluded.updated_at`,
+    args: [new Date().toISOString()],
+  });
+  if (updated) logger.info('Backfilled embargo access status', { documents: updated });
 }
 
 function documentPersonKey(name) {
@@ -670,7 +1093,16 @@ function metadataPeopleStatements(doc, now = new Date().toISOString()) {
     sql: "DELETE FROM document_people WHERE doc_id = ? AND source = 'metadata'",
     args: [doc.id],
   }];
-  const names = dedupeSupervisorNames(Array.isArray(doc.supervisors) ? doc.supervisors : []);
+  // Only upstream supervisors belong in the metadata projection. PDF and
+  // acknowledgement inferences are projected transactionally from
+  // committee_members with their real source by saveCommitteeMembers().
+  // This also removes legacy mislabelled rows on the next metadata save.
+  // Legacy metadata records predate supervisorsSource; preserve their existing
+  // projection. Every PDF extraction path now assigns an explicit non-API
+  // source before saving, so inferred names cannot take this compatibility path.
+  const names = !doc?.supervisorsSource || doc.supervisorsSource === 'api'
+    ? dedupeSupervisorNames(Array.isArray(doc.supervisors) ? doc.supervisors : [])
+    : [];
   for (const name of names) {
     const key = documentPersonKey(name);
     if (!key) continue;
@@ -686,6 +1118,85 @@ function metadataPeopleStatements(doc, now = new Date().toISOString()) {
     });
   }
   return statements;
+}
+
+const DOCUMENT_TERM_KINDS = [
+  ['theme', 'themes'],
+  ['concept', 'conceptTerms'],
+  ['methodology', 'methodologies'],
+];
+
+function metadataTermsStatements(doc, _now = new Date().toISOString()) {
+  const statements = [{
+    sql: 'DELETE FROM document_terms WHERE doc_id = ?',
+    args: [doc.id],
+  }];
+  // Restricted docs have their term arrays wiped from the stored metadata_json
+  // (see saveDocumentStatement embargo branch); project nothing so the table
+  // matches the stored blob.
+  if (isAccessRestricted(doc)) return statements;
+  for (const [kind, field] of DOCUMENT_TERM_KINDS) {
+    const seen = new Set();
+    const values = Array.isArray(doc?.[field]) ? doc[field] : [];
+    for (const raw of values) {
+      const term = String(raw ?? '').trim();
+      if (!term || seen.has(term)) continue;
+      seen.add(term);
+      statements.push({
+        sql: `INSERT INTO document_terms (doc_id, kind, term) VALUES (?, ?, ?)
+              ON CONFLICT(doc_id, kind, term) DO NOTHING`,
+        args: [doc.id, kind, term],
+      });
+    }
+  }
+  return statements;
+}
+
+let documentTermsReady = false;
+export function isDocumentTermsReady() { return documentTermsReady; }
+export function __setDocumentTermsReadyForTesting(value) { documentTermsReady = Boolean(value); }
+
+export async function initDocumentTermsReadiness() {
+  const pending = await get('SELECT COUNT(*) AS c FROM documents WHERE serving_projection_version < 2');
+  documentTermsReady = Number(pending?.c || 0) === 0;
+}
+
+export async function runDocumentTermsBackfillOnce() {
+  const client = await getDb();
+  while (true) {
+    const result = await client.execute(`
+      SELECT doc_id, metadata_json FROM documents
+      WHERE serving_projection_version < 2
+      ORDER BY doc_id LIMIT 500
+    `);
+    if (!result.rows.length) break;
+    const statements = [];
+    const now = new Date().toISOString();
+    for (const row of result.rows) {
+      let doc = null;
+      try { doc = JSON.parse(row.metadata_json); } catch { doc = { id: row.doc_id }; }
+      doc.id ||= row.doc_id;
+      statements.push(...metadataTermsStatements(doc, now));
+      statements.push({ sql: 'UPDATE documents SET serving_projection_version = 2 WHERE doc_id = ?', args: [row.doc_id] });
+    }
+    await client.batch(statements, 'write');
+  }
+  // Without fresh table statistics, the SQLite/libSQL query planner full-table-scans
+  // the document_terms joins instead of using the indexes (confirmed by the scale
+  // harness: 41s at 20k docs / 457s at 56k, worse than the pre-projection baseline,
+  // until ANALYZE was run after seeding). Run ANALYZE once the backfill completes so
+  // the very first production serving after rollout gets index-aware query plans.
+  // A whole-database ANALYZE populates sqlite_stat1, which persists across restarts.
+  // Best-effort: ANALYZE is an optimization, not correctness-critical, so a failure
+  // here must not block readiness/serving.
+  try {
+    await client.execute('ANALYZE');
+  } catch (err) {
+    logger.warn('ANALYZE after document_terms backfill failed; planner statistics may be stale', {
+      error: err?.message || String(err),
+    });
+  }
+  documentTermsReady = true;
 }
 
 async function backfillDocumentPeopleProjection(client) {
@@ -813,14 +1324,23 @@ async function backfillDocumentPeopleProjection(client) {
   if (committeeRows) logger.info('Backfilled committee people projection', { rows: committeeRows });
 }
 
+// Retry-safe (#18 Layer A): one atomic client.batch() — a DELETE-then-upsert of
+// document_people rows plus the document upsert — so a full retry after an
+// ambiguous failure always re-runs the same leading DELETE and re-converges to
+// the same end state. Do not add a plain (non-upserting) INSERT to this
+// function without re-auditing this guarantee.
 export async function saveDocumentMetadata(doc, { syncKey = null, source = null } = {}) {
-  doc = withStoredThemes(doc);
-  const now = new Date().toISOString();
-  const client = await getDb();
-  await client.batch([
-    saveDocumentStatement(doc, { syncKey, source }, now),
-    ...metadataPeopleStatements(doc, now),
-  ], 'write');
+  return withDbRetry(async () => {
+    doc = withStoredThemes(doc);
+    const now = new Date().toISOString();
+    const client = await getDb();
+    await client.batch([
+      saveDocumentStatement(doc, { syncKey, source }, now),
+      ...metadataPeopleStatements(doc, now),
+      ...metadataTermsStatements(doc, now),
+      ...(isAccessRestricted(doc) ? embargoCleanupStatements(doc.id, now) : []),
+    ], 'write');
+  }, { label: 'saveDocumentMetadata' });
 }
 
 function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now = new Date().toISOString()) {
@@ -830,17 +1350,75 @@ function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now 
     sql: `
       INSERT INTO documents (
         doc_id, metadata_json, sync_key, title, author, year, degree, program,
+        access_status, available_at, access_status_reason,
         source_json, source_updated_at, synced_at, serving_projection_version, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?)
       ON CONFLICT(doc_id) DO UPDATE SET
-        metadata_json = excluded.metadata_json,
+        metadata_json = CASE
+          WHEN documents.access_status IN ('embargoed', 'verification_due')
+            AND excluded.access_status = 'unknown'
+          THEN json_set(
+            excluded.metadata_json,
+            '$.accessStatus', CASE
+              WHEN documents.access_status = 'embargoed'
+                AND documents.available_at IS NOT NULL
+                AND datetime(documents.available_at) > CURRENT_TIMESTAMP
+              THEN 'embargoed' ELSE 'verification_due' END,
+            '$.availableAt', COALESCE(excluded.available_at, documents.available_at),
+            '$.accessStatusSource', 'repository_metadata',
+            '$.accessStatusReason', CASE
+              WHEN documents.access_status = 'embargoed'
+                AND documents.available_at IS NOT NULL
+                AND datetime(documents.available_at) > CURRENT_TIMESTAMP
+              THEN COALESCE(documents.access_status_reason, 'future_repository_availability_date')
+              ELSE 'availability_date_reached_pending_verification' END,
+            '$.abstract', '',
+            '$.themes', json('[]'),
+            '$.conceptTerms', json('[]'),
+            '$.methodologies', json('[]'),
+            '$.pages', NULL,
+            '$.pagesSource', NULL,
+            '$.wordCount', NULL,
+            '$.bodyWordCount', NULL,
+            '$.wordCountSource', NULL,
+            '$.charCount', NULL
+          )
+          ELSE excluded.metadata_json
+        END,
         sync_key = COALESCE(excluded.sync_key, documents.sync_key),
         title = excluded.title,
         author = excluded.author,
         year = excluded.year,
         degree = excluded.degree,
         program = excluded.program,
+        access_status = CASE
+          WHEN documents.access_status IN ('embargoed', 'verification_due')
+            AND excluded.access_status = 'unknown'
+          THEN CASE
+            WHEN documents.access_status = 'embargoed'
+              AND documents.available_at IS NOT NULL
+              AND datetime(documents.available_at) > CURRENT_TIMESTAMP
+            THEN 'embargoed' ELSE 'verification_due' END
+          ELSE excluded.access_status
+        END,
+        available_at = CASE
+          WHEN documents.access_status IN ('embargoed', 'verification_due')
+            AND excluded.access_status = 'unknown'
+          THEN COALESCE(excluded.available_at, documents.available_at)
+          ELSE excluded.available_at
+        END,
+        access_status_reason = CASE
+          WHEN documents.access_status IN ('embargoed', 'verification_due')
+            AND excluded.access_status = 'unknown'
+          THEN CASE
+            WHEN documents.access_status = 'embargoed'
+              AND documents.available_at IS NOT NULL
+              AND datetime(documents.available_at) > CURRENT_TIMESTAMP
+            THEN COALESCE(documents.access_status_reason, 'future_repository_availability_date')
+            ELSE 'availability_date_reached_pending_verification' END
+          ELSE excluded.access_status_reason
+        END,
         source_json = COALESCE(excluded.source_json, documents.source_json),
         source_updated_at = COALESCE(excluded.source_updated_at, documents.source_updated_at),
         synced_at = COALESCE(excluded.synced_at, documents.synced_at),
@@ -849,7 +1427,8 @@ function saveDocumentStatement(doc, { syncKey = null, source = null } = {}, now 
     `,
     args: [
       doc.id, JSON.stringify(doc), cols.syncKey, cols.title, cols.author, cols.year,
-      cols.degree, cols.program, cols.sourceJson, cols.sourceUpdatedAt,
+      cols.degree, cols.program, cols.accessStatus, cols.availableAt, cols.accessStatusReason,
+      cols.sourceJson, cols.sourceUpdatedAt,
       syncKey ? now : null, now
     ]
   };
@@ -869,6 +1448,8 @@ export async function saveDocumentMetadataBatch(items) {
           source: item.source || null,
         }, now),
         ...metadataPeopleStatements(doc, now),
+        ...metadataTermsStatements(doc, now),
+        ...(isAccessRestricted(doc) ? embargoCleanupStatements(doc.id, now) : []),
       ];
     }),
     'write'
@@ -947,11 +1528,22 @@ export async function recomputeStoredDocumentThemes({ limit = null, docIds = nul
     processed += 1;
     try {
       const doc = JSON.parse(row.metadata_json);
-      const next = { ...doc, themes: documentThemeTerms(doc, 12) };
-      await client.execute({
-        sql: 'UPDATE documents SET metadata_json = ?, updated_at = ? WHERE doc_id = ?',
-        args: [JSON.stringify(next), new Date().toISOString(), row.doc_id],
-      });
+      // A manual theme rebuild must retain the same access boundary as the
+      // normal metadata write path. Otherwise an embargoed record can regain
+      // derived terms after the migration has deliberately removed them.
+      const next = withStoredThemes(doc, { recompute: true });
+      const now = new Date().toISOString();
+      next.id ||= row.doc_id;
+      // One atomic batch: the blob and the document_terms projection (read by
+      // theme facets and related-docs) must never diverge. Access-restricted
+      // docs project nothing, same as every other metadataTermsStatements caller.
+      await client.batch([
+        {
+          sql: 'UPDATE documents SET metadata_json = ?, updated_at = ? WHERE doc_id = ?',
+          args: [JSON.stringify(next), now, row.doc_id],
+        },
+        ...metadataTermsStatements(next, now),
+      ], 'write');
       updated += 1;
     } catch {
       failed += 1;
@@ -968,7 +1560,8 @@ export async function listCachedDocuments({ syncKey, limit = null, offset = 0 } 
   let sql = `
     SELECT d.doc_id, d.metadata_json,
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
-           fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error
+           fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+           fm.word_count_comparison_json
     FROM documents d
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
   `;
@@ -1048,6 +1641,16 @@ function documentServingFilters({ syncKey = null, degree = '', program = '', aff
   };
 }
 
+function analyticalDocumentFilters(options = {}) {
+  const filters = documentServingFilters(options);
+  return {
+    where: filters.where
+      ? `${filters.where} AND ${ACTIVE_ANALYTICS_ACCESS_SQL}`
+      : `WHERE ${ACTIVE_ANALYTICS_ACCESS_SQL}`,
+    args: filters.args,
+  };
+}
+
 const DOCUMENT_PAGE_SORTS = {
   title: 'lower(COALESCE(d.title, \'\'))',
   author: 'lower(COALESCE(d.author, \'\'))',
@@ -1069,31 +1672,36 @@ export async function queryCachedDocumentPage({
   const countRow = await get(`SELECT COUNT(*) AS total FROM documents d ${queryFilters.where}`, queryFilters.args);
   const sortExpression = DOCUMENT_PAGE_SORTS[sortKey] || 'COALESCE(d.year, 0)';
   const direction = sortKey ? (sortDir === 'asc' ? 'ASC' : 'DESC') : 'DESC';
+  // The whole-table citation aggregation below is only needed when the page is
+  // actually ORDER BY'd on citation count — that sort has to see every filtered
+  // row's count before LIMIT/OFFSET can apply. Every other sort (the common
+  // case) skips it entirely and gets counts afterward, bounded to just this
+  // page's doc_ids, via applyCitationCountsToDocuments.
+  const needsCitationSortJoin = sortKey === 'citationCount';
   const rows = await all(`
     SELECT d.doc_id, d.metadata_json,
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
-           COALESCE(dc.citation_count, 0) AS citation_count
+           fm.word_count_comparison_json
     FROM documents d
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
-    LEFT JOIN (
+    ${needsCitationSortJoin ? `LEFT JOIN (
       SELECT doc_id, COUNT(*) AS citation_count
       FROM document_citations
       GROUP BY doc_id
-    ) dc ON dc.doc_id = d.doc_id
+    ) dc ON dc.doc_id = d.doc_id` : ''}
     ${queryFilters.where}
     ORDER BY ${sortExpression} ${direction}, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
     LIMIT ? OFFSET ?
   `, [...queryFilters.args, Math.max(1, Number(limit) || 50), Math.max(0, Number(offset) || 0)]);
   const documents = rows.map((row) => {
     try {
-      const doc = applyStoredFileMetricToDocument(JSON.parse(row.metadata_json), row);
-      doc.citationCount = Number(row.citation_count || 0);
-      return doc;
+      return applyStoredFileMetricToDocument(JSON.parse(row.metadata_json), row);
     } catch {
       return null;
     }
   }).filter(Boolean);
+  await applyCitationCountsToDocuments(documents);
   return { total: Number(countRow?.total || 0), documents };
 }
 
@@ -1101,7 +1709,7 @@ export async function queryCachedDocumentPage({
 export async function queryTopicDocumentPage({
   syncKey = null, filters = {}, limit = 5000, offset = 0,
 } = {}) {
-  const queryFilters = documentServingFilters({ syncKey, ...filters });
+  const queryFilters = analyticalDocumentFilters({ syncKey, ...filters });
   const topicJoin = 'JOIN (SELECT DISTINCT doc_id FROM document_topics) dt ON dt.doc_id = d.doc_id';
   const countRow = await get(`
     SELECT COUNT(*) AS total
@@ -1113,6 +1721,7 @@ export async function queryTopicDocumentPage({
     SELECT d.doc_id, d.metadata_json,
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+           fm.word_count_comparison_json,
            COALESCE(dc.citation_count, 0) AS citation_count
     FROM documents d
     ${topicJoin}
@@ -1138,11 +1747,41 @@ export async function queryTopicDocumentPage({
   return { total: Number(countRow?.total || 0), documents };
 }
 
+/**
+ * Full-corpus per-document concept term lists from the document_terms
+ * projection (kind='concept'), for feeding buildTermCooccurrence() without
+ * transferring the whole metadata_json blob for every document. Docs that
+ * have no projected concept rows (e.g. restricted docs, or none stored) are
+ * simply absent — buildTermCooccurrence doesn't need them either way.
+ */
+export async function queryConceptTermsByDoc({ syncKey = null, filters = {} } = {}) {
+  const f = analyticalDocumentFilters({ syncKey, ...filters });
+  // Rows feed buildTermCooccurrence() -> docConceptTerms(rec, 20), which does
+  // slice(0, 20). We only order by dt.doc_id (not array/rowid order) within a
+  // doc, which is safe only because normalizeRecord caps stored conceptTerms
+  // at 12 (< 20), so the slice keeps every term regardless of order. If that
+  // cap is ever raised above 20, this will need a deterministic within-doc order.
+  const rows = await all(`
+    SELECT dt.doc_id AS doc_id, dt.term AS term
+    FROM documents d
+    JOIN document_terms dt ON dt.doc_id = d.doc_id AND dt.kind = 'concept'
+    ${f.where}
+    ORDER BY dt.doc_id
+  `, f.args);
+  const byDoc = new Map();
+  for (const r of rows) {
+    if (!byDoc.has(r.doc_id)) byDoc.set(r.doc_id, []);
+    byDoc.get(r.doc_id).push(r.term);
+  }
+  return Array.from(byDoc.values()).map((conceptTerms) => ({ conceptTerms }));
+}
+
 /** Small, database-side bootstrap aggregates for metadata-scale landing pages. */
 export async function getDocumentServingSummary({ syncKey = null } = {}) {
   const filters = documentServingFilters({ syncKey });
+  const analyticsFilters = analyticalDocumentFilters({ syncKey });
   const [summary, degrees, programs, affiliations, supervisors] = await Promise.all([
-    get(`SELECT COUNT(*) AS documents FROM documents d ${filters.where}`, filters.args),
+    get(`SELECT COUNT(*) AS documents FROM documents d ${analyticsFilters.where}`, analyticsFilters.args),
     all(`SELECT DISTINCT d.degree AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.degree IS NOT NULL AND trim(d.degree) <> '' ORDER BY value`, filters.args),
     all(`SELECT DISTINCT d.program AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.program IS NOT NULL AND trim(d.program) <> '' ORDER BY value`, filters.args),
     all(`
@@ -1156,9 +1795,9 @@ export async function getDocumentServingSummary({ syncKey = null } = {}) {
       SELECT COUNT(DISTINCT p.person_key) AS count
       FROM document_people p
       JOIN documents d ON d.doc_id = p.doc_id
-      ${filters.where}
-      ${filters.where ? 'AND' : 'WHERE'} p.source = 'metadata' AND p.role = 'Supervisor'
-    `, filters.args),
+      ${analyticsFilters.where}
+      AND p.role IN ('Supervisor', 'Co-Supervisor')
+    `, analyticsFilters.args),
   ]);
   return {
     documents: Number(summary?.documents || 0),
@@ -1174,7 +1813,7 @@ export async function getDocumentServingSummary({ syncKey = null } = {}) {
 export async function queryCitationDocumentPage({
   syncKey = null, filters = {}, q = '', sortKey = 'citationCount', sortDir = 'desc', limit = 50, offset = 0,
 } = {}) {
-  const queryFilters = documentServingFilters({ syncKey, ...filters, q });
+  const queryFilters = analyticalDocumentFilters({ syncKey, ...filters, q });
   const counts = await get(`
     SELECT COUNT(*) AS total,
            SUM(CASE WHEN COALESCE(dc.citation_count, 0) > 0 THEN 1 ELSE 0 END) AS with_citations
@@ -1246,18 +1885,493 @@ async function aggregateNumericSeries({ filters, valueSql, reliabilitySql }) {
   return rows.map((row) => ({ year: Number(row.year), ...numericStats(row) }));
 }
 
+// #15: SQL ports of five of the six panels that previously went silently
+// empty above DETAILED_ANALYTICS_RECORD_LIMIT. Each mirrors a JS aggregator
+// in metrics.js closely enough to be behaviorally equivalent on real
+// ingested data (docConceptTerms() short-circuits to the stored
+// `conceptTerms` array for every real document, so a direct
+// json_each(d.metadata_json, '$.conceptTerms') read reproduces it) — proven
+// per-panel by a JS-vs-SQL cross-check test on an identical fixture rather
+// than assumed. `termCooccurrence` (pairwise combinatorics, the same
+// unbounded-self-join shape #25/#26 already had to bound) is deliberately
+// NOT ported here — it is served as a bounded real sample at the route layer
+// (metricsRoutes.js), reusing buildTermCooccurrence from metrics.js, since
+// db.js cannot import metrics.js without a circular dependency.
+
+async function computeConceptTimelineSql(filters, qualifier, topN = 8) {
+  const blocklistJson = JSON.stringify([...COOCCURRENCE_BLOCKLIST]);
+  const topConcepts = isDocumentTermsReady()
+    ? await all(`
+        SELECT term.term AS concept, COUNT(DISTINCT d.doc_id) AS total_docs
+        FROM documents d
+        JOIN document_terms term ON term.doc_id = d.doc_id AND term.kind = 'concept'
+        ${filters.where}
+        ${qualifier} term.term NOT IN (SELECT value FROM json_each(?))
+        GROUP BY concept
+        ORDER BY total_docs DESC, concept ASC
+        LIMIT ?
+      `, [...filters.args, blocklistJson, topN])
+    : await all(`
+        SELECT trim(CAST(term.value AS TEXT)) AS concept, COUNT(DISTINCT d.doc_id) AS total_docs
+        FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
+        ${filters.where}
+        ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
+          AND trim(CAST(term.value AS TEXT)) NOT IN (SELECT value FROM json_each(?))
+        GROUP BY concept
+        ORDER BY total_docs DESC, concept ASC
+        LIMIT ?
+      `, [...filters.args, blocklistJson, topN]);
+  if (!topConcepts.length) return [];
+
+  const conceptListJson = JSON.stringify(topConcepts.map((row) => row.concept));
+  const yearRows = isDocumentTermsReady()
+    ? await all(`
+        SELECT term.term AS concept, d.year AS year, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN document_terms term ON term.doc_id = d.doc_id AND term.kind = 'concept'
+        ${filters.where}
+        ${qualifier} d.year IS NOT NULL
+          AND term.term IN (SELECT value FROM json_each(?))
+        GROUP BY concept, d.year
+      `, [...filters.args, conceptListJson])
+    : await all(`
+        SELECT trim(CAST(term.value AS TEXT)) AS concept, d.year AS year, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
+        ${filters.where}
+        ${qualifier} d.year IS NOT NULL
+          AND trim(CAST(term.value AS TEXT)) IN (SELECT value FROM json_each(?))
+        GROUP BY concept, d.year
+      `, [...filters.args, conceptListJson]);
+
+  const yearsByConcept = new Map();
+  for (const row of yearRows) {
+    if (!yearsByConcept.has(row.concept)) yearsByConcept.set(row.concept, []);
+    yearsByConcept.get(row.concept).push({ year: Number(row.year), count: Number(row.count || 0) });
+  }
+  return topConcepts.map((row) => ({
+    concept: row.concept,
+    totalDocs: Number(row.total_docs || 0),
+    data: (yearsByConcept.get(row.concept) || []).sort((a, b) => a.year - b.year),
+  }));
+}
+
+async function computeMethodologyConceptMatrixSql(filters, qualifier, topM = 10, topC = 10) {
+  const topMethodologies = isDocumentTermsReady()
+    ? await all(`
+        SELECT m.term AS methodology, COUNT(*) AS count
+        FROM documents d
+        JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
+        ${filters.where}
+        GROUP BY methodology
+        ORDER BY count DESC, methodology ASC
+        LIMIT ?
+      `, [...filters.args, topM])
+    : await all(`
+        SELECT trim(CAST(m.value AS TEXT)) AS methodology, COUNT(*) AS count
+        FROM documents d, json_each(d.metadata_json, '$.methodologies') m
+        ${filters.where}
+        ${qualifier} trim(CAST(m.value AS TEXT)) <> ''
+        GROUP BY methodology
+        ORDER BY count DESC, methodology ASC
+        LIMIT ?
+      `, [...filters.args, topM]);
+  if (!topMethodologies.length) {
+    return { methodologies: [], concepts: [], conceptIds: [], matrix: [] };
+  }
+
+  // Mirrors buildMethodologyConceptMatrix's own weighting exactly: a
+  // document's concept counts are incremented once per methodology on that
+  // document (the JS loop increments conceptCounts *inside* the methodology
+  // loop), so a document with 2 methodologies weights its concepts' ranking
+  // score by 2, not 1. This only affects which concepts land in the top-C
+  // set, not the final cross-tab values below.
+  //
+  // The term.key < 10 / term.rnk <= 10 cutoff here is the same
+  // dedup-sensitive "first 10 conceptTerms" boundary documented at
+  // LEGACY_CONCEPT_FIRST10_DISTINCT_SQL above (see the comment on that
+  // constant): the legacy branch reuses that derived table rather than a
+  // raw json_each + term.key < 10 so a duplicate conceptTerm inside a
+  // document's first 10 raw array positions can't make the legacy branch
+  // diverge from the document_terms projection (which is deduped on
+  // write). The methodologies SUM/EXISTS subqueries are a separate,
+  // non-dedup-sensitive conversion (mechanical json_each -> document_terms
+  // per the Task 6 rule) and stay verbatim json_each in the legacy branch.
+  const topConcepts = isDocumentTermsReady()
+    ? await all(`
+        SELECT term.term AS concept,
+               SUM((SELECT COUNT(*) FROM document_terms WHERE doc_id = d.doc_id AND kind = 'methodology')) AS weighted_count
+        FROM documents d
+        JOIN (
+          SELECT doc_id, term, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY rowid) AS ord
+          FROM document_terms WHERE kind = 'concept'
+        ) term ON term.doc_id = d.doc_id
+        ${filters.where}
+        ${qualifier} term.ord <= 10
+          AND EXISTS (SELECT 1 FROM document_terms WHERE doc_id = d.doc_id AND kind = 'methodology')
+        GROUP BY concept
+        ORDER BY weighted_count DESC, concept ASC
+        LIMIT ?
+      `, [...filters.args, topC])
+    : await all(`
+        SELECT term.value AS concept,
+               SUM((SELECT COUNT(*) FROM json_each(d.metadata_json, '$.methodologies'))) AS weighted_count
+        FROM documents d
+        JOIN ${LEGACY_CONCEPT_FIRST10_DISTINCT_SQL} term ON term.doc_id = d.doc_id
+        ${filters.where}
+        ${qualifier} term.rnk <= 10
+          AND EXISTS (SELECT 1 FROM json_each(d.metadata_json, '$.methodologies'))
+        GROUP BY concept
+        ORDER BY weighted_count DESC, concept ASC
+        LIMIT ?
+      `, [...filters.args, topC]);
+  if (!topConcepts.length) {
+    return { methodologies: topMethodologies.map((r) => r.methodology), concepts: [], conceptIds: [], matrix: [] };
+  }
+
+  const methList = topMethodologies.map((r) => r.methodology);
+  const conceptList = topConcepts.map((r) => r.concept);
+  const cellRows = isDocumentTermsReady()
+    ? await all(`
+        SELECT m.term AS methodology,
+               term.term AS concept,
+               COUNT(*) AS count
+        FROM documents d
+        JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
+        JOIN (
+          SELECT doc_id, term, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY rowid) AS ord
+          FROM document_terms WHERE kind = 'concept'
+        ) term ON term.doc_id = d.doc_id
+        ${filters.where}
+        ${qualifier} term.ord <= 10
+          AND m.term IN (SELECT value FROM json_each(?))
+          AND term.term IN (SELECT value FROM json_each(?))
+        GROUP BY methodology, concept
+      `, [...filters.args, JSON.stringify(methList), JSON.stringify(conceptList)])
+    : await all(`
+        SELECT trim(CAST(m.value AS TEXT)) AS methodology,
+               term.value AS concept,
+               COUNT(*) AS count
+        FROM documents d
+        JOIN ${LEGACY_CONCEPT_FIRST10_DISTINCT_SQL} term ON term.doc_id = d.doc_id
+        , json_each(d.metadata_json, '$.methodologies') m
+        ${filters.where}
+        ${qualifier} term.rnk <= 10
+          AND trim(CAST(m.value AS TEXT)) IN (SELECT value FROM json_each(?))
+          AND term.value IN (SELECT value FROM json_each(?))
+        GROUP BY methodology, concept
+      `, [...filters.args, JSON.stringify(methList), JSON.stringify(conceptList)]);
+
+  const methIndex = new Map(methList.map((name, i) => [name, i]));
+  const conceptIndex = new Map(conceptList.map((name, i) => [name, i]));
+  const matrix = methList.map(() => conceptList.map(() => 0));
+  for (const row of cellRows) {
+    const mi = methIndex.get(row.methodology);
+    const ci = conceptIndex.get(row.concept);
+    if (mi == null || ci == null) continue;
+    matrix[mi][ci] = Number(row.count || 0);
+  }
+
+  return {
+    methodologies: methList,
+    concepts: conceptList,
+    conceptIds: conceptList.map((label) => `c:${label.replace(/\s+/g, '_')}`),
+    matrix,
+  };
+}
+
+async function computeMethodologyTopicMatrixSql(filters, qualifier, topics) {
+  const topMethodologies = isDocumentTermsReady()
+    ? await all(`
+        SELECT m.term AS methodology, COUNT(*) AS count
+        FROM documents d
+        JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
+        ${filters.where}
+        GROUP BY methodology
+        ORDER BY count DESC, methodology ASC
+        LIMIT 10
+      `, filters.args)
+    : await all(`
+        SELECT trim(CAST(m.value AS TEXT)) AS methodology, COUNT(*) AS count
+        FROM documents d, json_each(d.metadata_json, '$.methodologies') m
+        ${filters.where}
+        ${qualifier} trim(CAST(m.value AS TEXT)) <> ''
+        GROUP BY methodology
+        ORDER BY count DESC, methodology ASC
+        LIMIT 10
+      `, filters.args);
+  const validTopics = topics.filter((t) => t.topicId !== -1).slice(0, 8);
+  if (!topMethodologies.length || !validTopics.length) {
+    return { methodologies: topMethodologies.map((r) => r.methodology), topics: validTopics.map((t) => ({ topicId: t.topicId, label: t.label })), matrix: [] };
+  }
+
+  const methList = topMethodologies.map((r) => r.methodology);
+  const topicIdList = validTopics.map((t) => t.topicId);
+  const cellRows = isDocumentTermsReady()
+    ? await all(`
+        SELECT dt.topic_id AS topic_id, m.term AS methodology, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN document_topics dt ON dt.doc_id = d.doc_id
+        JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
+        ${filters.where}
+        ${qualifier} dt.topic_id IN (SELECT value FROM json_each(?))
+          AND m.term IN (SELECT value FROM json_each(?))
+        GROUP BY dt.topic_id, methodology
+      `, [...filters.args, JSON.stringify(topicIdList), JSON.stringify(methList)])
+    : await all(`
+        SELECT dt.topic_id AS topic_id, trim(CAST(m.value AS TEXT)) AS methodology, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN document_topics dt ON dt.doc_id = d.doc_id
+        , json_each(d.metadata_json, '$.methodologies') m
+        ${filters.where}
+        ${qualifier} dt.topic_id IN (SELECT value FROM json_each(?))
+          AND trim(CAST(m.value AS TEXT)) IN (SELECT value FROM json_each(?))
+        GROUP BY dt.topic_id, methodology
+      `, [...filters.args, JSON.stringify(topicIdList), JSON.stringify(methList)]);
+
+  const methIndex = new Map(methList.map((name, i) => [name, i]));
+  const topicIndex = new Map(topicIdList.map((id, i) => [id, i]));
+  const matrix = methList.map(() => topicIdList.map(() => 0));
+  for (const row of cellRows) {
+    const mi = methIndex.get(row.methodology);
+    const ti = topicIndex.get(Number(row.topic_id));
+    if (mi == null || ti == null) continue;
+    matrix[mi][ti] = Number(row.count || 0);
+  }
+
+  return {
+    methodologies: methList,
+    topics: validTopics.map((t) => ({ topicId: t.topicId, label: t.label })),
+    matrix,
+  };
+}
+
+async function computeTopicDataByYearSql(filters, qualifier, topics, hierarchy) {
+  const parentInfo = hierarchy ? buildParentClusters(hierarchy, topics) : null;
+  const rows = await all(`
+    SELECT dt.topic_id AS topic_id, d.year AS year, COUNT(*) AS count
+    FROM documents d
+    JOIN document_topics dt ON dt.doc_id = d.doc_id
+    ${filters.where}
+    ${qualifier} d.year IS NOT NULL
+    GROUP BY dt.topic_id, d.year
+  `, filters.args);
+  const countRows = rows.map((row) => ({
+    topicId: Number(row.topic_id), year: Number(row.year), count: Number(row.count || 0),
+  }));
+  return parentInfo
+    ? buildTopicsByYearFromCounts(parentInfo.parentClusters, countRows, parentInfo.leafToParent)
+    : buildTopicsByYearFromCounts(topics, countRows);
+}
+
+// #15 supervisorNgramMatrix filter decision (per the plan's review
+// correction): role IN ('Supervisor', 'Co-Supervisor') regardless of
+// `source`, DISTINCT person_key. The JS path's `rec.supervisors` (what
+// buildSupervisorNgramMatrix in metrics.js actually counts) is populated by
+// applyCommitteeMembersToDocuments, which merges committee-derived
+// Supervisor/Co-Supervisor names into `rec.supervisors` alongside
+// metadata-sourced ones — those committee rows land in document_people with
+// source values other than 'metadata' ('api', 'pdf_fallback', 'committee').
+// A `source = 'metadata'`-only filter would silently undercount. DISTINCT is
+// required because the same person can have both a metadata row and a
+// committee row for the same document (differing `source`), which would
+// otherwise double-count that document for that person.
+//
+// Known simplification: a person's display name is taken as MIN(p.name)
+// across their rows, which is a deterministic but arbitrary tiebreak when
+// different sources spell the same person's name differently. The JS path's
+// name string is whichever source added them to `rec.supervisors` first.
+// This does not affect *who* is counted or their doc counts, only which
+// spelling variant is displayed when sources disagree — disclosed here
+// rather than silently assumed correct.
+// The legacy json_each `term.key < 10` cutoff (used below for "first 10
+// conceptTerms") counts RAW array positions, including duplicate values. The
+// document_terms projection it's being compared against is deduped on write
+// (metadataTermsStatements keeps a per-kind `seen` Set, and the table has
+// PRIMARY KEY (doc_id, kind, term) with ON CONFLICT DO NOTHING), so for a
+// document whose first 10 raw conceptTerms contain a repeat, `key < 10`
+// would select a *different* set of terms than the deduped projection's
+// first 10. To keep both branches provably byte-identical for every input
+// (not just duplicate-free ones), this derived table makes the legacy
+// branch select "first 10 DISTINCT conceptTerms by earliest array
+// position" instead of "first 10 raw array slots" — i.e. the same
+// dedup-then-truncate semantics the projection gets for free from
+// document_terms. This is the one place the legacy SQL is intentionally
+// NOT kept byte-for-byte verbatim: exact raw-position equivalence is
+// impossible to recover from an already-deduped table, and the production
+// concept pipeline (docConceptTerms) always emits distinct terms, so
+// distinct-first-10 matches production for every realistic input — it only
+// normalizes the malformed-duplicate-data edge case to agree with the
+// projection.
+const LEGACY_CONCEPT_FIRST10_DISTINCT_SQL = `
+  (
+    SELECT doc_id, value,
+           ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY first_key ASC) AS rnk
+    FROM (
+      SELECT dd.doc_id AS doc_id, trim(CAST(te.value AS TEXT)) AS value, MIN(te.key) AS first_key
+      FROM documents dd, json_each(dd.metadata_json, '$.conceptTerms') te
+      WHERE trim(CAST(te.value AS TEXT)) <> ''
+      GROUP BY dd.doc_id, trim(CAST(te.value AS TEXT))
+    )
+  )
+`;
+
+async function computeSupervisorNgramMatrixSql(filters, qualifier, topN = 12, topM = 10) {
+  const supervisorFilters = filters.where
+    ? `${filters.where} AND p.role IN ('Supervisor', 'Co-Supervisor')`
+    : `WHERE p.role IN ('Supervisor', 'Co-Supervisor')`;
+  const topSupervisors = await all(`
+    SELECT p.person_key AS person_key, MIN(p.name) AS name, COUNT(DISTINCT p.doc_id) AS count
+    FROM document_people p
+    JOIN documents d ON d.doc_id = p.doc_id
+    ${supervisorFilters}
+    GROUP BY p.person_key
+    ORDER BY count DESC, name ASC
+    LIMIT ?
+  `, [...filters.args, topN]);
+  if (!topSupervisors.length) return { supervisors: [], ngrams: [], conceptIds: [], matrix: [] };
+
+  // term.key < 10 in the legacy json_each form restricts candidates to the
+  // first 10 conceptTerms in metadata_json array order (docConceptTerms can
+  // emit up to 12 — see src/metrics.js). document_terms has no stored
+  // ordinal, so the projected branch reconstructs that same array-order
+  // position via ROW_NUMBER() PARTITION BY doc_id ORDER BY rowid: rows for
+  // a given doc are (re)inserted in metadata_json array order by
+  // metadataTermsStatements (full DELETE+INSERT per write, never a partial
+  // update), so rowid order within a doc_id reproduces array order exactly.
+  // ord <= 10 (1-based) is therefore equivalent to key < 10 (0-based).
+  const topNgrams = isDocumentTermsReady()
+    ? await all(`
+        SELECT term.term AS concept, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN (
+          SELECT doc_id, term, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY rowid) AS ord
+          FROM document_terms WHERE kind = 'concept'
+        ) term ON term.doc_id = d.doc_id
+        ${filters.where}
+        ${qualifier} term.ord <= 10
+          AND EXISTS (
+            SELECT 1 FROM document_people p
+            WHERE p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
+          )
+        GROUP BY concept
+        ORDER BY count DESC, concept ASC
+        LIMIT ?
+      `, [...filters.args, topM])
+    : await all(`
+        SELECT term.value AS concept, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN ${LEGACY_CONCEPT_FIRST10_DISTINCT_SQL} term ON term.doc_id = d.doc_id
+        ${filters.where}
+        ${qualifier} term.rnk <= 10
+          AND EXISTS (
+            SELECT 1 FROM document_people p
+            WHERE p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
+          )
+        GROUP BY concept
+        ORDER BY count DESC, concept ASC
+        LIMIT ?
+      `, [...filters.args, topM]);
+  if (!topNgrams.length) {
+    return {
+      supervisors: topSupervisors.map((r) => r.name),
+      ngrams: [], conceptIds: [], matrix: [],
+    };
+  }
+
+  const supKeyList = topSupervisors.map((r) => r.person_key);
+  const ngramList = topNgrams.map((r) => r.concept);
+  const cellRows = isDocumentTermsReady()
+    ? await all(`
+        SELECT p.person_key AS person_key, term.term AS concept, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN document_people p ON p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
+        JOIN (
+          SELECT doc_id, term, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY rowid) AS ord
+          FROM document_terms WHERE kind = 'concept'
+        ) term ON term.doc_id = d.doc_id
+        ${filters.where}
+        ${qualifier} term.ord <= 10
+          AND p.person_key IN (SELECT value FROM json_each(?))
+          AND term.term IN (SELECT value FROM json_each(?))
+        GROUP BY p.person_key, concept
+      `, [...filters.args, JSON.stringify(supKeyList), JSON.stringify(ngramList)])
+    : await all(`
+        SELECT p.person_key AS person_key, term.value AS concept, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN document_people p ON p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
+        JOIN ${LEGACY_CONCEPT_FIRST10_DISTINCT_SQL} term ON term.doc_id = d.doc_id
+        ${filters.where}
+        ${qualifier} term.rnk <= 10
+          AND p.person_key IN (SELECT value FROM json_each(?))
+          AND term.value IN (SELECT value FROM json_each(?))
+        GROUP BY p.person_key, concept
+      `, [...filters.args, JSON.stringify(supKeyList), JSON.stringify(ngramList)]);
+
+  const supIndex = new Map(supKeyList.map((key, i) => [key, i]));
+  const ngramIndex = new Map(ngramList.map((label, i) => [label, i]));
+  const matrix = supKeyList.map(() => ngramList.map(() => 0));
+  for (const row of cellRows) {
+    const si = supIndex.get(row.person_key);
+    const ni = ngramIndex.get(row.concept);
+    if (si == null || ni == null) continue;
+    matrix[si][ni] = Number(row.count || 0);
+  }
+
+  return {
+    supervisors: topSupervisors.map((r) => r.name),
+    ngrams: ngramList,
+    conceptIds: ngramList.map((label) => `c:${label.replace(/\s+/g, '_')}`),
+    matrix,
+  };
+}
+
+// Builds the SQL for the themes/conceptTerms/methodologies frequency
+// aggregates used by getDocumentServingAnalytics. When document_terms is
+// ready, joins the projection table (already-trimmed, non-empty terms,
+// per Task 2) grouped on dt.term; otherwise falls back to the legacy
+// json_each(metadata_json) expansion. Row shape is identical either way:
+// { term, count } (concept/theme kinds) with the caller responsible for
+// renaming to `methodology` where needed via the SELECT alias below.
+function termAggregateSql(kind, filters, qualifier, limitSql) {
+  if (isDocumentTermsReady()) {
+    return {
+      sql: `
+        SELECT dt.term AS term, COUNT(DISTINCT d.doc_id) AS count
+        FROM documents d
+        JOIN document_terms dt ON dt.doc_id = d.doc_id AND dt.kind = ?
+        ${filters.where}
+        GROUP BY dt.term
+        ORDER BY count DESC, term ASC
+        ${limitSql}`,
+      args: [kind, ...filters.args],
+    };
+  }
+  const field = { theme: 'themes', concept: 'conceptTerms', methodology: 'methodologies' }[kind];
+  return {
+    sql: `
+      SELECT trim(CAST(term.value AS TEXT)) AS term, COUNT(DISTINCT d.doc_id) AS count
+      FROM documents d, json_each(d.metadata_json, '$.${field}') term
+      ${filters.where}
+      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
+      GROUP BY term
+      ORDER BY count DESC, term ASC
+      ${limitSql}`,
+    args: filters.args,
+  };
+}
+
 /**
  * Metadata-scale analytics computed as bounded SQL aggregates. This deliberately
  * returns no document collection; document rows have their own paginated API.
  */
 export async function getDocumentServingAnalytics({ syncKey = null, filters: requestedFilters = {}, subjectLimit = 25 } = {}) {
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
   const activeWords = 'COALESCE(fm.body_word_count, fm.word_count)';
   const reliableWords = `${activeWords} >= 1000 AND COALESCE(fm.word_source, '') NOT IN ('metadata_text', 'degraded_pdf_text')`;
   const reliablePages = `fm.page_count >= 10 AND COALESCE(fm.page_source, '') NOT IN ('estimated_from_metadata_words', 'estimated_from_full_text_words')`;
 
-  const [overall, yearCounts, wordRows, pageRows, themes, concepts, methodologies] = await Promise.all([
+  const analyticsRows = await Promise.all([
     get(`
       SELECT COUNT(*) AS record_count,
              COUNT(CASE WHEN ${reliableWords} THEN 1 END) AS word_count,
@@ -1286,34 +2400,40 @@ export async function getDocumentServingAnalytics({ syncKey = null, filters: req
     `, filters.args),
     aggregateNumericSeries({ filters, valueSql: activeWords, reliabilitySql: reliableWords }),
     aggregateNumericSeries({ filters, valueSql: 'fm.page_count', reliabilitySql: reliablePages }),
-    all(`
-      SELECT trim(CAST(term.value AS TEXT)) AS term, COUNT(DISTINCT d.doc_id) AS count
-      FROM documents d, json_each(d.metadata_json, '$.themes') term
-      ${filters.where}
-      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
-      GROUP BY term
-      ORDER BY count DESC, term ASC
-      LIMIT 70
-    `, filters.args),
-    all(`
-      SELECT trim(CAST(term.value AS TEXT)) AS term, COUNT(DISTINCT d.doc_id) AS count
-      FROM documents d, json_each(d.metadata_json, '$.conceptTerms') term
-      ${filters.where}
-      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
-      GROUP BY term
-      ORDER BY count DESC, term ASC
-      LIMIT ?
-    `, [...filters.args, Math.max(1, Math.min(100, Number(subjectLimit) || 25))]),
-    all(`
-      SELECT trim(CAST(term.value AS TEXT)) AS methodology, COUNT(DISTINCT d.doc_id) AS count
-      FROM documents d, json_each(d.metadata_json, '$.methodologies') term
-      ${filters.where}
-      ${qualifier} trim(CAST(term.value AS TEXT)) <> ''
-      GROUP BY methodology
-      ORDER BY count DESC, methodology ASC
-      LIMIT 100
-    `, filters.args),
+    (() => { const q = termAggregateSql('theme', filters, qualifier, 'LIMIT 70'); return all(q.sql, q.args); })(),
+    (() => {
+      const q = termAggregateSql('concept', filters, qualifier, 'LIMIT ?');
+      return all(q.sql, [...q.args, Math.max(1, Math.min(100, Number(subjectLimit) || 25))]);
+    })(),
+    (() => { const q = termAggregateSql('methodology', filters, qualifier, 'LIMIT 100'); return all(q.sql, q.args); })(),
+    computeConceptTimelineSql(filters, qualifier),
+    computeMethodologyConceptMatrixSql(filters, qualifier),
+    hasTopics(),
   ]);
+  const [
+    overall, yearCounts, wordRows, pageRows, themes, concepts, methodologies,
+    conceptTimeline, methodologyConceptMatrix, topicsExist,
+  ] = analyticsRows;
+
+  // supervisorNgramMatrix, methodologyTopicMatrix, and topicData all need
+  // topics/hierarchy state that isn't known until hasTopics() resolves, so
+  // they run in a second, smaller wave rather than the main Promise.all
+  // above (which itself still runs everything independent of topic state
+  // concurrently, per #24's original layout).
+  const [supervisorNgramMatrix, methodologyTopicMatrixAndTopicData] = await Promise.all([
+    computeSupervisorNgramMatrixSql(filters, qualifier),
+    (async () => {
+      if (!topicsExist) return { methodologyTopicMatrix: { methodologies: [], topics: [], matrix: [] }, topicData: null };
+      const topics = await loadTopics();
+      const [methodologyTopicMatrix, hierarchy] = await Promise.all([
+        computeMethodologyTopicMatrixSql(filters, qualifier, topics),
+        loadTopicHierarchy(),
+      ]);
+      const byYear = await computeTopicDataByYearSql(filters, qualifier, topics, hierarchy);
+      return { methodologyTopicMatrix, topicData: { topics, byYear } };
+    })(),
+  ]);
+  const { methodologyTopicMatrix, topicData } = methodologyTopicMatrixAndTopicData;
 
   const wordStats = {
     count: Number(overall?.word_count || 0),
@@ -1371,13 +2491,18 @@ export async function getDocumentServingAnalytics({ syncKey = null, filters: req
     },
     wordCloud: themes.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
     ngramCloud: concepts.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
-    methodologies: methodologies.map((row) => ({ methodology: row.methodology, count: Number(row.count || 0) })),
-    supervisorNgramMatrix: { supervisors: [], ngrams: [], conceptIds: [], matrix: [] },
-    termCooccurrence: [],
-    conceptTimeline: [],
-    methodologyConceptMatrix: { methodologies: [], concepts: [], conceptIds: [], matrix: [] },
-    topicData: null,
-    methodologyTopicMatrix: { methodologies: [], topics: [], matrix: [] },
+    methodologies: methodologies.map((row) => ({ methodology: row.term, count: Number(row.count || 0) })),
+    // #15: five of six panels are now real SQL-backed aggregates, computed
+    // above next to the other bounded aggregates in this function.
+    // termCooccurrence has no SQL port (see the comment above this
+    // function) — it stays null here; the caller (metricsRoutes.js) is
+    // responsible for filling it with a bounded, disclosed-sample answer.
+    supervisorNgramMatrix,
+    termCooccurrence: null,
+    conceptTimeline,
+    methodologyConceptMatrix,
+    topicData,
+    methodologyTopicMatrix,
     documents: [],
   };
 }
@@ -1393,7 +2518,7 @@ export async function queryPeoplePage({
   syncKey = null, filters: requestedFilters = {}, q = '', role = '',
   sortKey = 'docCount', sortDir = 'desc', limit = 50, offset = 0,
 } = {}) {
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const extra = [];
   const extraArgs = [];
   if (q) {
@@ -1467,7 +2592,7 @@ export async function queryPersonDetailPage({
 } = {}) {
   const key = String(personKey || '').trim().toLowerCase();
   if (!key) return null;
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const filterClause = filters.where ? `${filters.where} AND` : 'WHERE';
   const relationArgs = [...filters.args, key];
   const relationWhere = `${filterClause} p.person_key = ?`;
@@ -1549,6 +2674,7 @@ export async function queryPersonDetailPage({
     SELECT d.doc_id, d.metadata_json, pd.person_roles,
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
+           fm.word_count_comparison_json,
            COALESCE(dc.citation_count, 0) AS citation_count,
            dt.topic_id, dt.probability
     FROM person_docs pd
@@ -1600,6 +2726,27 @@ export async function queryRelatedDocuments(doc, { syncKey = null, limit = 6 } =
   if (!doc?.id || !terms.length) return [];
   const values = terms.map(() => '(?)').join(', ');
   const syncClause = syncKey ? 'AND d.sync_key = ?' : '';
+  if (isDocumentTermsReady()) {
+    const rows = await all(`
+      WITH target_terms(term) AS (VALUES ${values})
+      SELECT d.doc_id, d.title, d.author, d.year, d.degree,
+             COUNT(DISTINCT target_terms.term) AS overlap
+      FROM documents d
+      JOIN document_terms dt
+        ON dt.doc_id = d.doc_id AND dt.kind IN ('theme','concept')
+      JOIN target_terms ON lower(dt.term) = target_terms.term
+      WHERE d.doc_id <> ? ${syncClause}
+        AND ${ACTIVE_ANALYTICS_ACCESS_SQL}
+      GROUP BY d.doc_id, d.title, d.author, d.year, d.degree
+      ORDER BY overlap DESC, d.year DESC, d.title ASC
+      LIMIT ?
+    `, [...terms, doc.id, ...(syncKey ? [syncKey] : []), Math.max(1, Math.min(25, Number(limit) || 6))]);
+    return rows.map((row) => ({
+      id: row.doc_id, title: row.title || '', author: row.author || '',
+      year: row.year == null ? null : Number(row.year),
+      degree: row.degree || '', overlap: Number(row.overlap || 0),
+    }));
+  }
   const rows = await all(`
     WITH target_terms(term) AS (VALUES ${values})
     SELECT d.doc_id, d.title, d.author, d.year, d.degree,
@@ -1615,6 +2762,7 @@ export async function queryRelatedDocuments(doc, { syncKey = null, limit = 6 } =
       )
     )
     WHERE d.doc_id <> ? ${syncClause}
+      AND ${ACTIVE_ANALYTICS_ACCESS_SQL}
     GROUP BY d.doc_id, d.title, d.author, d.year, d.degree
     ORDER BY overlap DESC, d.year DESC, d.title ASC
     LIMIT ?
@@ -1641,7 +2789,8 @@ export async function applyStoredFileMetricsToDocuments(documents = []) {
     const placeholders = chunk.map(() => '?').join(', ');
     const rows = await all(`
       SELECT doc_id, download_url, file_bytes, word_count, body_word_count,
-             page_count, word_source, page_source, status, error
+             page_count, word_source, page_source, status, error,
+             word_count_comparison_json
       FROM file_metrics
       WHERE doc_id IN (${placeholders})
     `, chunk);
@@ -1725,7 +2874,11 @@ export async function applyCommitteeMembersToDocuments(documents = []) {
             SUPERVISOR_COMMITTEE_ROLES.has(member.role) && member.source === 'api'
           )
             ? 'api'
-            : 'pdf_fallback';
+            : doc.committee.some((member) =>
+              SUPERVISOR_COMMITTEE_ROLES.has(member.role) && member.source === 'pdf_acknowledgements'
+            )
+              ? 'pdf_acknowledgements'
+              : 'pdf_fallback';
         }
       }
     }
@@ -1758,23 +2911,38 @@ function applyStoredFileMetricToDocument(doc, row) {
   if (row.error != null) {
     doc.downloadError = row.error;
   }
+  if (row.word_count_comparison_json) {
+    try {
+      const comparison = JSON.parse(row.word_count_comparison_json);
+      doc.paradata = { ...(doc.paradata || {}), wordCountComparison: comparison };
+    } catch {
+      // Invalid legacy paradata must not make the document itself unreadable.
+    }
+  }
   return doc;
 }
 
 export async function getDocumentCacheStats(syncKey = null) {
   const row = syncKey
     ? await get(`
-      SELECT COUNT(*) AS total, MAX(synced_at) AS last_synced_at
+      SELECT COUNT(*) AS total, MAX(synced_at) AS last_synced_at,
+             SUM(CASE WHEN access_status = 'embargoed'
+                       AND (available_at IS NULL OR datetime(available_at) > CURRENT_TIMESTAMP)
+                      THEN 1 ELSE 0 END) AS embargoed_deferred
       FROM documents
       WHERE sync_key = ?
     `, [syncKey])
     : await get(`
-      SELECT COUNT(*) AS total, MAX(synced_at) AS last_synced_at
+      SELECT COUNT(*) AS total, MAX(synced_at) AS last_synced_at,
+             SUM(CASE WHEN access_status = 'embargoed'
+                       AND (available_at IS NULL OR datetime(available_at) > CURRENT_TIMESTAMP)
+                      THEN 1 ELSE 0 END) AS embargoed_deferred
       FROM documents
     `);
   return {
     total: Number(row?.total || 0),
     lastSyncedAt: row?.last_synced_at || null,
+    embargoedDeferred: Number(row?.embargoed_deferred || 0),
   };
 }
 
@@ -1787,6 +2955,8 @@ export async function createSyncRun(syncKey, source) {
   return Number(result.lastInsertRowid || result.lastInsertRowId || 0);
 }
 
+// Retry-safe (#18 Layer A): a single `UPDATE ... WHERE id = ?`, idempotent by
+// primary key — re-applying the same patch after an ambiguous failure is safe.
 export async function updateSyncRun(id, patch) {
   if (!id) return;
   const fields = [];
@@ -1794,6 +2964,8 @@ export async function updateSyncRun(id, patch) {
   for (const [key, column] of Object.entries({
     status: 'status',
     totalSeen: 'total_seen',
+    localQueueSeen: 'local_queue_seen',
+    upstreamUniqueSeen: 'upstream_unique_seen',
     totalSaved: 'total_saved',
     apiTotal: 'api_total',
     error: 'error',
@@ -1806,7 +2978,10 @@ export async function updateSyncRun(id, patch) {
   }
   if (!fields.length) return;
   args.push(id);
-  await run(`UPDATE sync_runs SET ${fields.join(', ')} WHERE id = ?`, args);
+  return withDbRetry(
+    () => run(`UPDATE sync_runs SET ${fields.join(', ')} WHERE id = ?`, args),
+    { label: 'updateSyncRun' }
+  );
 }
 
 export async function getLatestSyncRun(syncKey = null) {
@@ -1820,6 +2995,8 @@ export async function getLatestSyncRun(syncKey = null) {
     source: (() => { try { return JSON.parse(row.source_json); } catch { return null; } })(),
     status: row.status,
     totalSeen: Number(row.total_seen || 0),
+    localQueueSeen: Number(row.local_queue_seen || 0),
+    upstreamUniqueSeen: Number(row.upstream_unique_seen || 0),
     totalSaved: Number(row.total_saved || 0),
     apiTotal: row.api_total == null ? null : Number(row.api_total),
     error: row.error || null,
@@ -1840,6 +3017,8 @@ export async function listRecentSyncRuns(limit = 25) {
     source: (() => { try { return JSON.parse(row.source_json); } catch { return null; } })(),
     status: row.status,
     totalSeen: Number(row.total_seen || 0),
+    localQueueSeen: Number(row.local_queue_seen || 0),
+    upstreamUniqueSeen: Number(row.upstream_unique_seen || 0),
     totalSaved: Number(row.total_saved || 0),
     apiTotal: row.api_total == null ? null : Number(row.api_total),
     error: row.error || null,
@@ -1871,6 +3050,7 @@ function parseAdminJobRow(row) {
     timeoutAt: row.timeout_at || null,
     cancelledAt: row.cancelled_at || null,
     claimedAt: row.claimed_at || null,
+    executionId: row.execution_id || null,
     startedAt: row.started_at,
     finishedAt: row.finished_at || null,
   };
@@ -1899,6 +3079,179 @@ export async function createAdminJob({
   return Number(result.lastInsertRowid || result.lastInsertRowId || 0);
 }
 
+export async function requestAdminJobFollowup({ type, label, params = null }) {
+  const now = new Date().toISOString();
+  const requestToken = crypto.randomUUID();
+  await run(`
+    INSERT INTO admin_job_followups (type, label, params_json, request_token, requested_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(type) DO UPDATE SET
+      label = excluded.label,
+      params_json = excluded.params_json,
+      request_token = excluded.request_token,
+      requested_at = excluded.requested_at
+  `, [type, label, params ? JSON.stringify(params) : null, requestToken, now]);
+  return { type, requestToken, requestedAt: now };
+}
+
+export async function listAdminJobFollowups() {
+  const result = await execute(`
+    SELECT type, label, params_json, request_token, requested_at
+    FROM admin_job_followups
+    ORDER BY requested_at, type
+  `);
+  return result.rows.map((row) => ({
+    type: String(row.type),
+    label: String(row.label),
+    params: (() => { try { return row.params_json ? JSON.parse(row.params_json) : null; } catch { return null; } })(),
+    requestToken: String(row.request_token),
+    requestedAt: String(row.requested_at),
+  }));
+}
+
+export async function completeAdminJobFollowup(type, requestToken) {
+  const result = await run(
+    'DELETE FROM admin_job_followups WHERE type = ? AND request_token = ?',
+    [type, requestToken]
+  );
+  return result.changes > 0;
+}
+
+// Atomically creates a running job only when this type has no running owner.
+// `admin_job_singletons` is deliberately a lease table instead of a partial
+// unique index on admin_jobs: a citation continuation is queued before its
+// current worker finishes, so the lease can be handed to the child without a
+// window in which a scheduled/manual request starts a competing scan.
+//
+// `replaceRunningJobId` is used solely by that continuation hand-off. It may
+// replace the lease only when the caller owns it; every other caller receives
+// the current job id. This works across local SQLite and multi-replica libSQL.
+export async function createAdminJobIfNotRunning({
+  type, label, params = null, artifactTokenHash = null, timeoutAt = null, runnerType = null,
+  replaceRunningJobId = null,
+}) {
+  // SQLite rejects a second simultaneous write transaction with SQLITE_BUSY;
+  // retrying the entire acquire-or-observe operation is safe because the
+  // singleton lease makes a committed first attempt observable as the same
+  // job on every later attempt.
+  return withDbRetry(() => createAdminJobIfNotRunningOnce({
+    type, label, params, artifactTokenHash, timeoutAt, runnerType, replaceRunningJobId,
+  }), {
+    label: `createAdminJobIfNotRunning:${type}`,
+    // A burst of independently starting workers may still be completing their
+    // schema passes. The singleton operation is idempotent and safe to retry.
+    maxAttempts: 10,
+  });
+}
+
+async function createAdminJobIfNotRunningOnce({
+  type, label, params = null, artifactTokenHash = null, timeoutAt = null, runnerType = null,
+  replaceRunningJobId = null,
+}) {
+  const client = await getDb();
+  const now = new Date().toISOString();
+  const singleton = await client.execute({
+    sql: 'SELECT job_id FROM admin_job_singletons WHERE type = ?', args: [type],
+  });
+  const leaseJobId = Number(singleton.rows[0]?.job_id || 0);
+  let expectedLeaseJobId = -1;
+  if (leaseJobId > 0) {
+    const current = await client.execute({
+      sql: `SELECT id, status, timeout_at, heartbeat_at, claimed_at, started_at
+            FROM admin_jobs WHERE id = ?`, args: [leaseJobId],
+    });
+    const row = current.rows[0];
+    const nowMs = Date.now();
+    const timedOut = row?.status === 'running' && (
+      (row.timeout_at && Date.parse(row.timeout_at) <= nowMs)
+      || (!row.timeout_at && Date.parse(row.heartbeat_at || row.claimed_at || row.started_at) <= nowMs - STALE_HEARTBEAT_MS)
+    );
+    if (timedOut) {
+      const staleCutoff = new Date(nowMs - STALE_HEARTBEAT_MS).toISOString();
+      await client.execute({
+        sql: `UPDATE admin_jobs
+              SET status = 'timed_out', runner_state = 'timed_out',
+                  error = COALESCE(error, 'Admin worker timed out or stopped heartbeating.'),
+                  finished_at = ?, artifact_token_hash = NULL
+              WHERE id = ? AND status = 'running'
+                AND (timeout_at <= ? OR (timeout_at IS NULL AND COALESCE(heartbeat_at, claimed_at, started_at) <= ?))`,
+        args: [now, leaseJobId, now, staleCutoff],
+      });
+    } else if (row?.status === 'running' && leaseJobId !== Number(replaceRunningJobId || 0)) {
+      return { jobId: leaseJobId, created: false };
+    }
+    // A completed/timed-out owner may be replaced. A continuation uses the
+    // same compare-and-swap path, but only if it still owns the current lease.
+    expectedLeaseJobId = leaseJobId;
+  } else {
+    // Databases upgraded while a job was already running have no lease yet.
+    // Observing that job is enough to preserve the no-overlap invariant; the
+    // next creation after it finishes establishes the durable lease.
+    const legacy = await client.execute({
+      sql: `SELECT id FROM admin_jobs
+            WHERE type = ? AND status = 'running'
+            ORDER BY started_at DESC LIMIT 1`,
+      args: [type],
+    });
+    const legacyJobId = Number(legacy.rows[0]?.id || 0);
+    if (legacyJobId && legacyJobId !== Number(replaceRunningJobId || 0)) {
+      return { jobId: legacyJobId, created: false };
+    }
+  }
+
+  // `batch(..., 'write')` is an atomic transaction on both adapters, without
+  // keeping SQLite SELECT cursors open through COMMIT. The temporary negative
+  // lease is private to this batch: only its owner may insert a job, then the
+  // final statement replaces it with that job id.
+  const provisionalLeaseId = -((Date.now() % 1_000_000_000) * 10_000 + Math.floor(Math.random() * 10_000) + 1);
+  const results = await client.batch([
+    {
+      sql: `INSERT INTO admin_job_singletons (type, job_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(type) DO UPDATE SET job_id = excluded.job_id, updated_at = excluded.updated_at
+            WHERE admin_job_singletons.job_id = ?`,
+      args: [type, provisionalLeaseId, now, expectedLeaseJobId],
+    },
+    {
+      sql: `
+        INSERT INTO admin_jobs (
+          type, label, status, params_json, artifact_token_hash, timeout_at,
+          runner_type, runner_state, started_at
+        )
+        SELECT ?, ?, 'running', ?, ?, ?, ?, ?, ?
+        WHERE EXISTS (
+          SELECT 1 FROM admin_job_singletons WHERE type = ? AND job_id = ?
+        )
+      `,
+      args: [
+        type,
+        label,
+        params ? JSON.stringify(params) : null,
+        artifactTokenHash,
+        timeoutAt,
+        runnerType,
+        runnerType ? 'queued' : null,
+        now,
+        type,
+        provisionalLeaseId,
+      ],
+    },
+    {
+      sql: `UPDATE admin_job_singletons
+            SET job_id = last_insert_rowid(), updated_at = ?
+            WHERE type = ? AND job_id = ?`,
+      args: [now, type, provisionalLeaseId],
+    },
+  ], 'write');
+  if (changes(results[1]) > 0) {
+    return { jobId: Number(results[1].lastInsertRowid || results[1].lastInsertRowId || 0), created: true };
+  }
+  const current = await client.execute({
+    sql: 'SELECT job_id FROM admin_job_singletons WHERE type = ?', args: [type],
+  });
+  return { jobId: Number(current.rows[0]?.job_id || 0), created: false };
+}
+
 export async function updateAdminJob(id, patch = {}) {
   if (!id) return;
   const fields = [];
@@ -1916,6 +3269,7 @@ export async function updateAdminJob(id, patch = {}) {
     cancelledAt: 'cancelled_at',
     artifactTokenHash: 'artifact_token_hash',
     claimedAt: 'claimed_at',
+    executionId: 'execution_id',
     progress: 'progress_json',
     finishedAt: 'finished_at',
   })) {
@@ -1933,10 +3287,111 @@ export async function updateAdminJob(id, patch = {}) {
   await run(`UPDATE admin_jobs SET ${fields.join(', ')} WHERE id = ?`, args);
 }
 
+export async function updateRunningAdminJob(id, patch = {}) {
+  if (!id) return false;
+  const fields = [];
+  const args = [];
+  for (const [key, column] of Object.entries({
+    runnerType: 'runner_type', runnerId: 'runner_id', runnerState: 'runner_state',
+    heartbeatAt: 'heartbeat_at', timeoutAt: 'timeout_at',
+  })) {
+    if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+    fields.push(`${column} = ?`);
+    args.push(patch[key]);
+  }
+  if (!fields.length) return false;
+  args.push(id);
+  const result = await run(`
+    UPDATE admin_jobs SET ${fields.join(', ')}
+    WHERE id = ? AND status = 'running' AND finished_at IS NULL
+  `, args);
+  return result.changes > 0;
+}
+
 export async function finishAdminJob(id, patch = {}) {
   await updateAdminJob(id, {
     ...patch,
     artifactTokenHash: null,
+    executionId: null,
+    finishedAt: patch.finishedAt || new Date().toISOString(),
+  });
+}
+
+export async function finishRunningAdminJob(id, patch = {}) {
+  if (!id) return false;
+  const terminalPatch = {
+    ...patch,
+    artifactTokenHash: null,
+    executionId: null,
+    finishedAt: patch.finishedAt || new Date().toISOString(),
+  };
+  const fields = [];
+  const args = [];
+  for (const [key, column] of Object.entries({
+    status: 'status', result: 'result_json', error: 'error', runnerState: 'runner_state',
+    cancelledAt: 'cancelled_at', artifactTokenHash: 'artifact_token_hash',
+    executionId: 'execution_id', finishedAt: 'finished_at',
+  })) {
+    if (!Object.prototype.hasOwnProperty.call(terminalPatch, key)) continue;
+    fields.push(`${column} = ?`);
+    args.push(key === 'result' && terminalPatch[key] != null
+      ? JSON.stringify(terminalPatch[key])
+      : terminalPatch[key]);
+  }
+  args.push(id);
+  const result = await run(`
+    UPDATE admin_jobs SET ${fields.join(', ')}
+    WHERE id = ? AND status = 'running' AND finished_at IS NULL
+  `, args);
+  return result.changes > 0;
+}
+
+// Worker writes are fenced by the opaque execution id installed at claim time.
+// Administrative writes intentionally continue to use updateAdminJob/finishAdminJob:
+// cancellation and the stale-job reaper must be able to revoke a lease without
+// knowing it. Once revoked (or once status leaves `running`), late worker writes
+// can no longer change progress or publish a terminal result.
+export async function updateClaimedAdminJob(id, executionId, patch = {}) {
+  if (!id || !executionId) return false;
+  const fields = [];
+  const args = [];
+  for (const [key, column] of Object.entries({
+    status: 'status',
+    result: 'result_json',
+    log: 'log',
+    error: 'error',
+    runnerType: 'runner_type',
+    runnerId: 'runner_id',
+    runnerState: 'runner_state',
+    heartbeatAt: 'heartbeat_at',
+    cancelledAt: 'cancelled_at',
+    artifactTokenHash: 'artifact_token_hash',
+    executionId: 'execution_id',
+    progress: 'progress_json',
+    finishedAt: 'finished_at',
+  })) {
+    if (!Object.prototype.hasOwnProperty.call(patch, key)) continue;
+    fields.push(`${column} = ?`);
+    const value = (key === 'result' || key === 'progress') && patch[key] != null
+      ? JSON.stringify(patch[key])
+      : patch[key];
+    args.push(value);
+  }
+  if (!fields.length) return false;
+  args.push(id, executionId);
+  const result = await run(`
+    UPDATE admin_jobs
+    SET ${fields.join(', ')}
+    WHERE id = ? AND execution_id = ? AND status = 'running' AND finished_at IS NULL
+  `, args);
+  return result.changes > 0;
+}
+
+export async function finishClaimedAdminJob(id, executionId, patch = {}) {
+  return updateClaimedAdminJob(id, executionId, {
+    ...patch,
+    artifactTokenHash: null,
+    executionId: null,
     finishedAt: patch.finishedAt || new Date().toISOString(),
   });
 }
@@ -1961,13 +3416,14 @@ export async function getAdminJob(id) {
   return parseAdminJobRow(row);
 }
 
-export async function claimAdminJob(id, runnerId = null) {
+export async function claimAdminJob(id, runnerId = null, executionId = crypto.randomUUID()) {
+  if (!executionId) return null;
   const now = new Date().toISOString();
   const result = await run(`
     UPDATE admin_jobs
-    SET claimed_at = ?, runner_id = COALESCE(?, runner_id), runner_state = 'running', heartbeat_at = ?
+    SET claimed_at = ?, execution_id = ?, runner_id = COALESCE(?, runner_id), runner_state = 'running', heartbeat_at = ?
     WHERE id = ? AND status = 'running' AND claimed_at IS NULL
-  `, [now, runnerId, now, id]);
+  `, [now, executionId, runnerId, now, id]);
   return result.changes > 0 ? getAdminJob(id) : null;
 }
 
@@ -1979,14 +3435,30 @@ export async function heartbeatAdminJob(id, runnerState = 'running') {
   await updateAdminJob(id, patch);
 }
 
-export async function updateAdminJobProgress(id, progress = {}) {
-  await updateAdminJob(id, {
+export async function heartbeatClaimedAdminJob(id, executionId, runnerState = 'running') {
+  const patch = { heartbeatAt: new Date().toISOString() };
+  if (runnerState != null) patch.runnerState = runnerState;
+  return updateClaimedAdminJob(id, executionId, patch);
+}
+
+function adminJobProgressPatch(progress = {}) {
+  return {
     progress: {
       ...progress,
       updatedAt: new Date().toISOString(),
     },
     heartbeatAt: new Date().toISOString(),
     runnerState: progress.currentTask || progress.phase || 'running',
+  };
+}
+
+export async function updateAdminJobProgress(id, progress = {}) {
+  await updateAdminJob(id, adminJobProgressPatch(progress));
+}
+
+export async function updateClaimedAdminJobProgress(id, executionId, progress = {}) {
+  return updateClaimedAdminJob(id, executionId, {
+    ...adminJobProgressPatch(progress),
   });
 }
 
@@ -2023,7 +3495,8 @@ export async function reapStaleAdminJobs(type = null) {
         runner_state = 'timed_out',
         error = COALESCE(error, 'Admin worker timed out or stopped heartbeating.'),
         finished_at = ?,
-        artifact_token_hash = NULL
+        artifact_token_hash = NULL,
+        execution_id = NULL
     WHERE status = 'running'
       AND (
         (timeout_at IS NOT NULL AND timeout_at <= ?)
@@ -2077,44 +3550,59 @@ export async function listAdminJobs(limit = 25) {
 
 // --- File metric functions ---
 
+// Retry-safe (#18 Layer A): pure read.
 export async function loadStoredFileMetric(docId) {
-  return get(`
+  return withDbRetry(() => get(`
     SELECT doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count,
            full_text_path, full_text_bytes, full_text_source_url, page_count,
            word_source, page_source, content_source, content_checksum,
            content_source_url, content_retrieved_at, parser_version,
            metadata_request_count, full_text_request_count,
-           original_pdf_request_count, retrieved_bytes, status, error, updated_at
+           original_pdf_request_count, retrieved_bytes, word_count_comparison_json,
+           status, error, updated_at
     FROM file_metrics
     WHERE doc_id = ?
-  `, [docId]);
+  `, [docId]), { label: 'loadStoredFileMetric' });
 }
 
 // Batched form of loadStoredFileMetric (H-05): one SELECT per page of sync
-// records instead of one per record. Returns a Map keyed by doc_id.
-export async function loadStoredFileMetrics(docIds = []) {
+// records instead of one per record. `includeRestrictedAccess` additionally
+// returns restricted document rows that have no file metric, in the same query;
+// sync uses that to honour a durable embargo hold when a source refresh omits
+// the original availability field.
+// Retry-safe (#18 Layer A): pure reads, chunk by chunk.
+export async function loadStoredFileMetrics(docIds = [], { includeRestrictedAccess = false } = {}) {
   const ids = normalizeDocIdList(docIds);
   const byDocId = new Map();
   if (!ids.length) return byDocId;
   for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
     const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
     const placeholders = chunk.map(() => '?').join(', ');
-    const rows = await all(`
-      SELECT doc_id, pdf_path, download_url, file_bytes, word_count, body_word_count,
+    const rows = await withDbRetry(() => all(`
+      SELECT ${includeRestrictedAccess ? 'd.doc_id' : 'fm.doc_id'} AS doc_id,
+             pdf_path, download_url, file_bytes, word_count, body_word_count,
              full_text_path, full_text_bytes, full_text_source_url, page_count,
              word_source, page_source, content_source, content_checksum,
              content_source_url, content_retrieved_at, parser_version,
              metadata_request_count, full_text_request_count,
-             original_pdf_request_count, retrieved_bytes, status, error, updated_at
-      FROM file_metrics
-      WHERE doc_id IN (${placeholders})
-    `, chunk);
+             original_pdf_request_count, retrieved_bytes, word_count_comparison_json,
+             status, error, fm.updated_at AS updated_at
+             ${includeRestrictedAccess ? ', d.access_status AS access_status, d.available_at AS available_at' : ''}
+      FROM ${includeRestrictedAccess ? 'documents d LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id' : 'file_metrics fm'}
+      WHERE ${includeRestrictedAccess ? 'd.doc_id' : 'fm.doc_id'} IN (${placeholders})
+        ${includeRestrictedAccess ? "AND (fm.doc_id IS NOT NULL OR d.access_status IN ('embargoed', 'verification_due'))" : ''}
+    `, chunk), { label: 'loadStoredFileMetrics' });
     for (const row of rows) byDocId.set(String(row.doc_id), row);
   }
   return byDocId;
 }
 
+// Retry-safe (#18 Layer A): `INSERT ... ON CONFLICT DO UPDATE` upsert.
 export async function saveFileMetric(docId, payload) {
+  return withDbRetry(() => saveFileMetricOnce(docId, payload), { label: 'saveFileMetric' });
+}
+
+async function saveFileMetricOnce(docId, payload) {
   const now = new Date().toISOString();
   await run(`
     INSERT INTO file_metrics (
@@ -2177,6 +3665,20 @@ export async function saveFileMetric(docId, payload) {
   ]);
 }
 
+export async function saveWordCountComparisonParadata(docId, comparison) {
+  const now = new Date().toISOString();
+  const payload = JSON.stringify({ ...comparison, comparedAt: comparison?.comparedAt || now });
+  return withDbRetry(async () => {
+    const result = await run(`
+      UPDATE file_metrics
+      SET word_count_comparison_json = ?, updated_at = ?
+      WHERE doc_id = ?
+    `, [payload, now, docId]);
+    if (!result.changes) throw new Error(`Cannot save word-count comparison for missing file metric ${docId}`);
+    return result;
+  }, { label: 'saveWordCountComparisonParadata' });
+}
+
 export async function deleteFileMetric(docId) {
   await run('DELETE FROM file_metrics WHERE doc_id = ?', [docId]);
 }
@@ -2191,7 +3693,12 @@ export async function deleteFileMetric(docId) {
 // whenever the stored word source is DSpace full text, exactly as the JS does.
 export function enrichmentPolicySatisfiedSql(contentMode, contentFallback = null, alias = 'fm') {
   const counted = `COALESCE(${alias}.word_count, 0) > 0 AND COALESCE(${alias}.page_count, 0) > 0`;
-  const fullText = `${alias}.word_source = 'dspace_full_text' AND ${counted}`;
+  const pdfAttempted = `COALESCE(${alias}.original_pdf_request_count, 0) > 0`;
+  const pdfPreferred = contentMode === 'pdf_cache' || contentMode === 'pdf_stream';
+  // Mirrors the JS: an explicit full_text_fallback row is terminal even when no
+  // original-PDF request was ever made (record has no PDF bitstream).
+  const fullText = `${alias}.word_source = 'dspace_full_text' AND ${counted}`
+    + (pdfPreferred ? ` AND (${alias}.status = 'full_text_fallback' OR ${pdfAttempted})` : '');
   let byMode = '0';
   if (contentMode === 'pdf_cache') {
     byMode = `${alias}.pdf_path IS NOT NULL AND ${alias}.pdf_path <> ''`;
@@ -2203,7 +3710,7 @@ export function enrichmentPolicySatisfiedSql(contentMode, contentFallback = null
     byMode = fullText;
   }
   const expression = contentFallback === 'full_text'
-    ? `CASE WHEN ${alias}.word_source = 'dspace_full_text' THEN (${counted}) ELSE (${byMode}) END`
+    ? `CASE WHEN ${alias}.word_source = 'dspace_full_text' THEN (${fullText}) ELSE (${byMode}) END`
     : `(${byMode})`;
   return `COALESCE(${expression}, 0)`;
 }
@@ -2237,6 +3744,7 @@ export async function listDocumentsPendingEnrichment({
     args.push(cursor);
   }
   where.push(`${enrichmentPolicySatisfiedSql(contentMode, contentFallback, 'fm')} = 0`);
+  where.push(CONTENT_RETRY_ACCESS_SQL);
   if (attemptedBefore) {
     where.push('(ea.attempted_at IS NULL OR ea.attempted_at < ?)');
     args.push(String(attemptedBefore));
@@ -2258,6 +3766,19 @@ export async function listDocumentsPendingEnrichment({
   });
 }
 
+export async function countDeferredEmbargoedDocuments({ syncKey = null } = {}) {
+  const clauses = ["d.access_status = 'embargoed'", "(d.available_at IS NULL OR datetime(d.available_at) > CURRENT_TIMESTAMP)"];
+  const args = [];
+  if (syncKey) {
+    clauses.push('d.sync_key = ?');
+    args.push(syncKey);
+  }
+  const row = await get(`SELECT COUNT(*) AS count FROM documents d WHERE ${clauses.join(' AND ')}`, args);
+  return Number(row?.count || 0);
+}
+
+// Retry-safe (#18 Layer A): each chunk is one client.batch() of upserts —
+// a retry re-applies the same `attempted_at` stamp to the same doc_ids.
 export async function markEnrichmentAttempts(docIds = [], attemptedAt = new Date().toISOString()) {
   const ids = normalizeDocIdList(docIds);
   if (!ids.length) return 0;
@@ -2265,18 +3786,20 @@ export async function markEnrichmentAttempts(docIds = [], attemptedAt = new Date
   const stamp = String(attemptedAt || new Date().toISOString());
   const chunkSize = 250;
   for (let i = 0; i < ids.length; i += chunkSize) {
-    await client.batch(ids.slice(i, i + chunkSize).map((docId) => ({
+    const chunk = ids.slice(i, i + chunkSize);
+    await withDbRetry(() => client.batch(chunk.map((docId) => ({
       sql: `
         INSERT INTO enrichment_attempts (doc_id, attempted_at)
         VALUES (?, ?)
         ON CONFLICT(doc_id) DO UPDATE SET attempted_at = excluded.attempted_at
       `,
       args: [docId, stamp],
-    })), 'write');
+    })), 'write'), { label: 'markEnrichmentAttempts' });
   }
   return ids.length;
 }
 
+// Retry-safe (#18 Layer A): pure reads, chunk by chunk.
 export async function loadEnrichmentAttempts(docIds = []) {
   const ids = normalizeDocIdList(docIds);
   const byDocId = new Map();
@@ -2284,10 +3807,10 @@ export async function loadEnrichmentAttempts(docIds = []) {
   for (let i = 0; i < ids.length; i += ID_CHUNK_SIZE) {
     const chunk = ids.slice(i, i + ID_CHUNK_SIZE);
     const placeholders = chunk.map(() => '?').join(', ');
-    const rows = await all(
+    const rows = await withDbRetry(() => all(
       `SELECT doc_id, attempted_at FROM enrichment_attempts WHERE doc_id IN (${placeholders})`,
       chunk
-    );
+    ), { label: 'loadEnrichmentAttempts' });
     for (const row of rows) byDocId.set(String(row.doc_id), row.attempted_at || null);
   }
   return byDocId;
@@ -2301,6 +3824,7 @@ export async function listFileMetrics() {
            fm.content_source_url, fm.content_retrieved_at, fm.parser_version,
            fm.metadata_request_count, fm.full_text_request_count,
            fm.original_pdf_request_count, fm.retrieved_bytes,
+           fm.word_count_comparison_json,
            fm.status, fm.error, fm.updated_at,
            d.title, d.author, d.metadata_json
     FROM file_metrics fm
@@ -2549,9 +4073,7 @@ export function importRuleRevision(input) {
     source: rule.source,
     contentMode: rule.contentMode,
     contentFallback: rule.contentFallback,
-    extractCitations: rule.extractCitations,
     extractCommittee: rule.extractCommittee,
-    runConcepts: rule.runConcepts,
     maxContentBytes: rule.maxContentBytes,
     contentConcurrency: rule.contentConcurrency,
     contentRateLimit: rule.contentRateLimit,
@@ -2654,6 +4176,8 @@ export async function deleteImportRule(id) {
   if (!existing) return false;
   const client = await getDb();
   await client.batch([
+    { sql: 'DELETE FROM rule_document_processing_eligibility WHERE rule_id = ?', args: [id] },
+    { sql: 'DELETE FROM import_rule_eligibility_projections WHERE rule_id = ?', args: [id] },
     { sql: 'DELETE FROM import_rule_request_limits WHERE rule_id = ?', args: [id] },
     { sql: 'DELETE FROM enrichment_rollout_evidence WHERE rule_id = ?', args: [id] },
     { sql: 'DELETE FROM enrichment_rollouts WHERE rule_id = ?', args: [id] },
@@ -2662,12 +4186,330 @@ export async function deleteImportRule(id) {
   return true;
 }
 
-export async function reserveImportRuleRequestSlot(ruleId, limit, {
-  nowMs = Date.now(), windowMs = 60_000,
+const ELIGIBILITY_PROCESSORS = new Set(['citation', 'patternrank']);
+const PROCESSING_STATUSES = new Set(['pending', 'running', 'completed', 'failed']);
+
+function eligibilityProcessor(value) {
+  const processor = String(value || '').trim().toLowerCase();
+  if (!ELIGIBILITY_PROCESSORS.has(processor)) {
+    throw new Error(`Unsupported eligibility processor: ${value}`);
+  }
+  return processor;
+}
+
+// A projection is generation-based so a page-by-page import never needs to
+// retain the complete rule corpus in memory. Rows written for current_token are
+// staging rows; readers continue to use completed_token until finalize succeeds.
+export async function beginImportRuleEligibilityProjection(ruleId, { token = crypto.randomUUID() } = {}) {
+  const rule = await getImportRule(ruleId);
+  if (!rule) throw new Error(`Import rule not found: ${ruleId}`);
+  const ruleRevision = importRuleRevision(rule);
+  const projectionToken = String(token || '').trim();
+  if (!projectionToken) throw new Error('Eligibility projection token is required.');
+  const now = new Date().toISOString();
+  const client = await getDb();
+  await client.batch([
+    { sql: `
+      INSERT INTO import_rule_eligibility_projections (
+        rule_id, current_token, completed_token, rule_revision, status,
+        started_at, completed_at, updated_at
+      ) VALUES (?, ?, NULL, ?, 'running', ?, NULL, ?)
+      ON CONFLICT(rule_id) DO UPDATE SET
+        current_token = excluded.current_token,
+        rule_revision = excluded.rule_revision,
+        status = 'running',
+        started_at = excluded.started_at,
+        completed_at = NULL,
+        updated_at = excluded.updated_at
+    `, args: [ruleId, projectionToken, ruleRevision, now, now] },
+    { sql: `
+      DELETE FROM rule_document_processing_eligibility
+      WHERE rule_id = ?
+        AND projection_token <> ?
+        AND projection_token <> COALESCE((
+          SELECT completed_token FROM import_rule_eligibility_projections WHERE rule_id = ?
+        ), '')
+    `, args: [ruleId, projectionToken, ruleId] },
+  ], 'write');
+  return projectionToken;
+}
+
+export async function projectImportRuleEligibilityBatch(ruleId, projectionToken, docIds) {
+  const ids = [...new Set((docIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+  if (!ids.length) return 0;
+  const projection = await get(`
+    SELECT current_token, status FROM import_rule_eligibility_projections WHERE rule_id = ?
+  `, [ruleId]);
+  if (projection?.status !== 'running' || projection.current_token !== projectionToken) {
+    throw new Error(`Eligibility projection is not current for rule ${ruleId}.`);
+  }
+  const now = new Date().toISOString();
+  const client = await getDb();
+  const results = await client.batch(ids.map((docId) => ({ sql: `
+    INSERT INTO rule_document_processing_eligibility (
+      rule_id, doc_id, projection_token, projected_at
+    ) VALUES (?, ?, ?, ?)
+    ON CONFLICT(rule_id, doc_id, projection_token) DO UPDATE SET
+      projected_at = excluded.projected_at
+  `, args: [
+    ruleId, docId, projectionToken, now,
+  ] })), 'write');
+  return results.reduce((total, result) => total + changes(result), 0);
+}
+
+export async function finalizeImportRuleEligibilityProjection(ruleId, projectionToken) {
+  const now = new Date().toISOString();
+  const client = await getDb();
+  const transaction = await client.transaction('write');
+  let staleRuleError = null;
+  try {
+    const stateResult = await transaction.execute({ sql: `
+      SELECT p.current_token, p.status, p.rule_revision,
+             r.id, r.name, r.degree, r.program, r.affiliation, r.requested_index,
+             r.query, r.source, r.content_mode, r.content_fallback,
+             r.extract_citations, r.extract_committee, r.run_concepts,
+             r.max_content_bytes, r.content_concurrency, r.content_rate_limit,
+             r.created_at, r.updated_at
+      FROM import_rule_eligibility_projections p
+      JOIN import_rules r ON r.id = p.rule_id
+      WHERE p.rule_id = ?
+    `, args: [ruleId] });
+    const state = stateResult.rows[0];
+    if (state?.status !== 'running' || state.current_token !== projectionToken) {
+      await transaction.rollback();
+      throw new Error(`Eligibility projection is not current for rule ${ruleId}.`);
+    }
+    const savedRuleRevision = importRuleRevision(importRuleFromRow(state));
+    if (!state.rule_revision || state.rule_revision !== savedRuleRevision) {
+      await transaction.execute({ sql: `
+        DELETE FROM rule_document_processing_eligibility
+        WHERE rule_id = ? AND projection_token = ?
+      `, args: [ruleId, projectionToken] });
+      await transaction.execute({ sql: `
+        UPDATE import_rule_eligibility_projections
+        SET current_token = NULL, status = 'aborted', updated_at = ?
+        WHERE rule_id = ? AND current_token = ? AND status = 'running'
+      `, args: [now, ruleId, projectionToken] });
+      staleRuleError = new Error(`Eligibility projection rule scope changed for rule ${ruleId}.`);
+    } else {
+      const finalized = await transaction.execute({ sql: `
+        UPDATE import_rule_eligibility_projections
+        SET completed_token = ?, current_token = NULL, status = 'completed',
+            completed_at = ?, updated_at = ?
+        WHERE rule_id = ? AND current_token = ? AND rule_revision = ? AND status = 'running'
+      `, args: [projectionToken, now, now, ruleId, projectionToken, savedRuleRevision] });
+      if (changes(finalized) !== 1) {
+        await transaction.rollback();
+        throw new Error(`Eligibility projection is not current for rule ${ruleId}.`);
+      }
+      await transaction.execute({ sql: `
+        INSERT INTO processing_eligibility_activation (id, activated_at)
+        SELECT 1, ?
+        WHERE NOT EXISTS (
+          SELECT 1
+          FROM import_rules r
+          LEFT JOIN import_rule_eligibility_projections p ON p.rule_id = r.id
+          WHERE p.completed_token IS NULL
+        )
+        ON CONFLICT(id) DO NOTHING
+      `, args: [now] });
+      await transaction.execute({ sql: `
+        DELETE FROM rule_document_processing_eligibility
+        WHERE rule_id = ? AND projection_token <> ?
+          AND EXISTS (
+            SELECT 1 FROM import_rule_eligibility_projections
+            WHERE rule_id = ? AND completed_token = ? AND status = 'completed'
+          )
+      `, args: [ruleId, projectionToken, ruleId, projectionToken] });
+    }
+    await transaction.commit();
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    throw error;
+  } finally {
+    transaction.close();
+  }
+  if (staleRuleError) throw staleRuleError;
+  return true;
+}
+
+export async function abortImportRuleEligibilityProjection(ruleId, projectionToken) {
+  const now = new Date().toISOString();
+  const client = await getDb();
+  const results = await client.batch([
+    { sql: `
+      DELETE FROM rule_document_processing_eligibility
+      WHERE rule_id = ? AND projection_token = ?
+        AND EXISTS (
+          SELECT 1 FROM import_rule_eligibility_projections
+          WHERE rule_id = ? AND current_token = ? AND status = 'running'
+        )
+    `, args: [ruleId, projectionToken, ruleId, projectionToken] },
+    { sql: `
+      UPDATE import_rule_eligibility_projections
+      SET current_token = NULL, status = 'aborted', updated_at = ?
+      WHERE rule_id = ? AND current_token = ? AND status = 'running'
+    `, args: [now, ruleId, projectionToken] },
+  ], 'write');
+  return changes(results[1]) === 1;
+}
+
+export async function listEffectiveDocumentEligibility({ docIds = [] } = {}) {
+  const ids = [...new Set((docIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+  const where = ids.length ? `WHERE e.doc_id IN (${ids.map(() => '?').join(', ')})` : '';
+  const rows = await all(`
+    SELECT e.doc_id,
+           MAX(r.extract_citations) AS citation_eligible,
+           MAX(r.run_concepts) AS patternrank_eligible,
+           COUNT(DISTINCT e.rule_id) AS matching_rule_count
+    FROM rule_document_processing_eligibility e
+    JOIN import_rule_eligibility_projections p
+      ON p.rule_id = e.rule_id AND p.completed_token = e.projection_token
+    JOIN import_rules r ON r.id = e.rule_id
+    ${where}
+    GROUP BY e.doc_id
+    ORDER BY e.doc_id
+  `, ids);
+  return rows.map((row) => ({
+    docId: row.doc_id,
+    citationEligible: Boolean(row.citation_eligible),
+    patternRankEligible: Boolean(row.patternrank_eligible),
+    matchingRuleCount: Number(row.matching_rule_count || 0),
+  }));
+}
+
+export async function saveDocumentProcessingState(docId, processorValue, {
+  status, contentChecksum = null, processorVersion = null, error = null,
+} = {}) {
+  const processor = eligibilityProcessor(processorValue);
+  if (!PROCESSING_STATUSES.has(status)) throw new Error(`Unsupported processing status: ${status}`);
+  const now = new Date().toISOString();
+  await run(`
+    INSERT INTO document_processing_state (
+      doc_id, processor, status, content_checksum, processor_version, error, attempted_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(doc_id, processor) DO UPDATE SET
+      status = excluded.status,
+      content_checksum = excluded.content_checksum,
+      processor_version = excluded.processor_version,
+      error = excluded.error,
+      attempted_at = excluded.attempted_at
+  `, [docId, processor, status, contentChecksum, processorVersion, error, now]);
+}
+
+export async function listEligibleDocumentsForProcessing({
+  processor: processorValue, status = 'actionable', processorVersion = null,
+  afterDocId = '', limit = 100,
+} = {}) {
+  const processor = eligibilityProcessor(processorValue);
+  const requestedStatus = String(status || 'actionable').toLowerCase();
+  const allowedStatuses = new Set(['all', 'actionable', 'pending', 'running', 'completed', 'stale', 'failed']);
+  if (!allowedStatuses.has(requestedStatus)) throw new Error(`Unsupported eligibility status: ${status}`);
+  const eligibilityColumn = processor === 'citation' ? 'extract_citations' : 'run_concepts';
+  const statusPredicate = requestedStatus === 'all' ? '1 = 1'
+    : requestedStatus === 'actionable' ? "queue_status IN ('pending', 'stale', 'failed')"
+      : 'queue_status = ?';
+  const statusArgs = ['all', 'actionable'].includes(requestedStatus) ? [] : [requestedStatus];
+  return all(`
+    WITH effective AS (
+      SELECT DISTINCT e.doc_id
+      FROM rule_document_processing_eligibility e
+      JOIN import_rule_eligibility_projections p
+        ON p.rule_id = e.rule_id AND p.completed_token = e.projection_token
+      JOIN import_rules r ON r.id = e.rule_id
+      WHERE r.${eligibilityColumn} = 1
+    ), queued AS (
+      SELECT d.doc_id, d.metadata_json, fm.pdf_path, fm.full_text_path,
+             fm.content_source,
+             COALESCE(fm.content_checksum, fm.updated_at, '') AS content_checksum,
+             ps.status AS processing_status, ps.error, ps.attempted_at,
+             CASE
+               WHEN ps.doc_id IS NULL THEN 'pending'
+               WHEN ps.status = 'failed' THEN 'failed'
+               WHEN ps.status = 'completed' AND (
+                 COALESCE(ps.content_checksum, '') <> COALESCE(fm.content_checksum, fm.updated_at, '')
+                 OR (? IS NOT NULL AND COALESCE(ps.processor_version, '') <> ?)
+               ) THEN 'stale'
+               ELSE ps.status
+             END AS queue_status
+      FROM effective e
+      JOIN documents d ON d.doc_id = e.doc_id
+      LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
+      LEFT JOIN document_processing_state ps
+        ON ps.doc_id = d.doc_id AND ps.processor = ?
+      WHERE d.doc_id > ?
+        AND ${ACTIVE_ANALYTICS_ACCESS_SQL}
+    )
+    SELECT * FROM queued
+    WHERE ${statusPredicate}
+    ORDER BY doc_id
+    LIMIT ?
+  `, [
+    processorVersion, processorVersion, processor, String(afterDocId || ''),
+    ...statusArgs, Math.max(1, Math.min(1000, Number(limit) || 100)),
+  ]);
+}
+
+// CAS backoff is intentionally smaller/faster-capped than Layer A's
+// withDbRetry default — this loop can run up to `maxAttempts` times per call
+// under real contention (many concurrent workers on one import rule), so a
+// large base/cap here would multiply into unacceptable worst-case latency.
+const CAS_BACKOFF_OPTIONS = { baseMs: 5, factor: 1.6, jitterRatio: 0.4, capMs: 200 };
+
+// #23: never throws for ordinary contention. Jittered backoff is inserted
+// between CAS attempts (spreading collisions in time instead of every
+// contending worker retrying in lockstep), and exhausting the attempt budget
+// returns a wait duration — reusing the same "next window boundary"
+// computation the "window is full" branch below already does, since 20
+// straight CAS collisions is operationally the same situation as a full
+// window from the caller's point of view (createRequestRateLimiter's
+// `reserveSlot` loop already knows how to wait on a returned waitMs and try
+// again). The one case this cannot paper over — the persisted state being
+// unparseable on every single attempt, never once recovering even after this
+// function's own CAS tried to replace it — is genuine data corruption, not
+// contention, and is the sole remaining throw path; it is tagged
+// `RATE_LIMIT_STATE_CORRUPT` so evaluateEnrichmentRun can exclude it from the
+// enrichment-quality success rate rather than counting infra noise as a bad
+// PDF (see src/services/enrichmentRollout.js).
+//
+// Retry-safe (#18 Layer A, corrected): a transient error out of the SELECT or
+// the CAS UPDATE/INSERT below (a dropped connection mid-round-trip, not
+// ordinary CAS contention — contention never throws, see above) is retried by
+// wrapping the WHOLE function body in `withDbRetry`, not just an individual
+// statement. This is deliberate and was verified safe, not assumed: retrying
+// the entire function re-reads `timestamps_json` from scratch and re-derives
+// its decision from that fresh read, so a retried call can only ever (a) see
+// its own prior attempt's write already applied (if the UPDATE actually
+// committed despite the client-side error) and skip re-adding a slot because
+// the window now looks fuller, or (b) at worst append `nowMs` a second time,
+// which makes the limiter *more* conservative, never less — it can never
+// double-grant a slot to two distinct real requests, because the calling
+// content-request path only invokes this once per real request regardless of
+// how many times it is retried internally. This function was previously
+// listed as one of the seven Layer-A-wrapped functions (see the design notes
+// above and docs/phase-b-completion-plan.md §2.1's audit table) but was not
+// actually wrapped — a transient SELECT/UPDATE failure threw on the first
+// attempt with zero retries. `reserveImportRuleRequestSlotOnce` below is the
+// un-retried body; this exported function is the retry-wrapped entry point.
+export async function reserveImportRuleRequestSlot(ruleId, limit, options = {}) {
+  return withDbRetry(
+    () => reserveImportRuleRequestSlotOnce(ruleId, limit, options),
+    { label: 'reserveImportRuleRequestSlot' }
+  );
+}
+
+async function reserveImportRuleRequestSlotOnce(ruleId, limit, {
+  nowMs = Date.now(), windowMs = 60_000, wait = defaultRetryWait, maxAttempts = 20,
+  backoff = computeBackoffDelayMs,
 } = {}) {
   if (!ruleId || !Number.isFinite(Number(limit)) || Number(limit) <= 0) return 0;
   const boundedLimit = Math.max(1, Math.min(600, Math.floor(Number(limit))));
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  let everParsed = false;
+  let lastTimestamps = [];
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    if (attempt > 0) {
+      await wait(backoff(attempt - 1, CAS_BACKOFF_OPTIONS));
+    }
     const row = await get(
       'SELECT timestamps_json FROM import_rule_request_limits WHERE rule_id = ?',
       [ruleId]
@@ -2675,12 +4517,13 @@ export async function reserveImportRuleRequestSlot(ruleId, limit, {
     let timestamps = [];
     try {
       const parsed = JSON.parse(row?.timestamps_json || '[]');
-      if (Array.isArray(parsed)) timestamps = parsed;
+      if (Array.isArray(parsed)) { timestamps = parsed; everParsed = true; }
     } catch { /* replace malformed limiter state */ }
     timestamps = timestamps
       .map(Number)
       .filter((value) => Number.isFinite(value) && value > nowMs - windowMs)
       .sort((left, right) => left - right);
+    lastTimestamps = timestamps;
     if (timestamps.length >= boundedLimit) {
       return Math.max(1, timestamps[0] + windowMs - nowMs);
     }
@@ -2700,7 +4543,16 @@ export async function reserveImportRuleRequestSlot(ruleId, limit, {
     }
     if (result.changes === 1) return 0;
   }
-  throw new Error(`Could not reserve content-request quota for import rule ${ruleId}.`);
+  if (!everParsed) {
+    const err = new Error(
+      `Rate-limit state for import rule ${ruleId} is corrupt: timestamps_json was not valid JSON after ${maxAttempts} attempts.`
+    );
+    err.code = 'RATE_LIMIT_STATE_CORRUPT';
+    throw err;
+  }
+  return lastTimestamps.length
+    ? Math.max(1, lastTimestamps[0] + windowMs - nowMs)
+    : backoff(maxAttempts, CAS_BACKOFF_OPTIONS);
 }
 
 function enrichmentRolloutFromRow(row) {
@@ -3398,7 +5250,9 @@ async function upsertCitation(fields, hash, now) {
   return Number(row.id);
 }
 
-export async function saveCitations(docId, citations, hashFn, { onProgress = null, matchObserver = null } = {}) {
+export async function saveCitations(docId, citations, hashFn, {
+  onProgress = null, matchObserver = null, linkDocument = true,
+} = {}) {
   const now = new Date().toISOString();
 
   const items = citations.map((item) => {
@@ -3451,22 +5305,26 @@ export async function saveCitations(docId, citations, hashFn, { onProgress = nul
     if (matchedId) {
       if (matchedBy === 'exact') counts.exactMatches += 1;
       if (matchedBy === 'fuzzy') counts.fuzzyMatches += 1;
-      await run(`
-        INSERT INTO document_citations (doc_id, citation_id, updated_at)
-        VALUES (?, ?, ?)
-        ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
-      `, [docId, matchedId, now]);
+      if (linkDocument) {
+        await run(`
+          INSERT INTO document_citations (doc_id, citation_id, updated_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
+        `, [docId, matchedId, now]);
+      }
       linkedIds.push(matchedId);
     } else {
       counts.newCitations += 1;
       const citationId = await upsertCitation(item, item.hash, now);
       if (citationId) {
         idByHash.set(item.hash, citationId);
-        await run(`
-          INSERT INTO document_citations (doc_id, citation_id, updated_at)
-          VALUES (?, ?, ?)
-          ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
-        `, [docId, citationId, now]);
+        if (linkDocument) {
+          await run(`
+            INSERT INTO document_citations (doc_id, citation_id, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
+          `, [docId, citationId, now]);
+        }
         linkedIds.push(citationId);
       }
     }
@@ -3530,32 +5388,92 @@ export async function loadDocsByCitation(citationId) {
   `, [citationId]);
 }
 
-// Re-extraction entry point: saves the new citation set, then prunes only the
-// links that no longer match, so catalogue lookups on surviving citations are
-// preserved. Replaces the old clearDocumentCitations + saveCitations pattern,
-// which destroyed catalogue lookups for citations that survived the reparse.
+// Re-extraction stages/deduplicates the complete citation set without publishing
+// document links, then swaps the link set in one transaction. If extraction or
+// matching fails, the previous known-good link set remains visible; a failed
+// attempt can never publish a partial bibliography.
 export async function reextractDocumentCitations(docId, citations, hashFn, options = {}) {
-  let linkedIds = [];
-  if (citations.length) {
-    linkedIds = await saveCitations(docId, citations, hashFn, options);
+  try {
+    let linkedIds = [];
+    if (citations.length) {
+      linkedIds = await saveCitations(docId, citations, hashFn, {
+        ...options,
+        linkDocument: false,
+      });
+    }
+    await replaceDocumentCitationLinks(docId, linkedIds);
+    return linkedIds;
+  } catch (error) {
+    // A failed extraction is retryable even if an older implementation left
+    // links behind. The scan gate explicitly admits failed rows when an
+    // operator chooses retryFailures, while ordinary runs keep the last known
+    // good bibliography untouched.
+    try {
+      const existing = await all('SELECT COUNT(*) AS total FROM document_citations WHERE doc_id = ?', [docId]);
+      await saveCitationExtractionState(docId, {
+        status: 'failed',
+        citationCount: Number(existing[0]?.total || 0),
+        error: error?.message || String(error),
+      });
+    } catch (stateError) {
+      logger.error('Could not record failed citation extraction state', {
+        docId,
+        error: stateError?.message || String(stateError),
+      });
+    }
+    throw error;
   }
-  await replaceDocumentCitationLinks(docId, linkedIds);
-  return linkedIds;
 }
 
 export async function replaceDocumentCitationLinks(docId, keepCitationIds = []) {
   const keep = new Set(
     (keepCitationIds || []).map((id) => Number(id)).filter((id) => Number.isFinite(id) && id > 0)
   );
-  const existing = await all('SELECT citation_id FROM document_citations WHERE doc_id = ?', [docId]);
-  const stale = existing
-    .map((row) => Number(row.citation_id))
-    .filter((id) => !keep.has(id));
-  const chunkSize = 900;
-  for (let i = 0; i < stale.length; i += chunkSize) {
-    const chunk = stale.slice(i, i + chunkSize);
-    const placeholders = chunk.map(() => '?').join(', ');
-    await run(`DELETE FROM document_citations WHERE doc_id = ? AND citation_id IN (${placeholders})`, [docId, ...chunk]);
+  const now = new Date().toISOString();
+  const client = await getDb();
+  // Both libSQL and the embedded file client implement `transaction('write')`.
+  // Keeping the read, inserts, and deletes in that one transaction is stronger
+  // than the former file-SQLite compensating loop: an interruption can now only
+  // expose the old complete set or the new complete set, never a partial swap.
+  const transaction = await client.transaction('write');
+  let stale = [];
+  try {
+    const existingResult = await transaction.execute({
+      sql: 'SELECT citation_id FROM document_citations WHERE doc_id = ?', args: [docId],
+    });
+    const existing = existingResult.rows;
+    stale = existing
+      .map((row) => Number(row.citation_id))
+      .filter((id) => !keep.has(id));
+    const statements = [];
+    for (const citationId of keep) {
+      statements.push({
+        sql: `
+          INSERT INTO document_citations (doc_id, citation_id, updated_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(doc_id, citation_id) DO UPDATE SET updated_at = excluded.updated_at
+        `,
+        args: [docId, citationId, now],
+      });
+    }
+    const chunkSize = 900;
+    for (let i = 0; i < stale.length; i += chunkSize) {
+      const chunk = stale.slice(i, i + chunkSize);
+      const placeholders = chunk.map(() => '?').join(', ');
+      statements.push({
+        sql: `DELETE FROM document_citations WHERE doc_id = ? AND citation_id IN (${placeholders})`,
+        args: [docId, ...chunk],
+      });
+    }
+    if (statements.length) {
+      await transaction.batch(statements);
+    }
+    await transaction.commit();
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    throw error;
+  } finally {
+    transaction.close();
   }
   await collectOrphanedCitations(stale);
 }
@@ -3633,10 +5551,11 @@ export async function getCitationStats() {
 
 export async function listPendingCitationExtractions({
   limit = 100, afterDocId = '', syncKey = null, filters: requestedFilters = {},
-  parserVersion = 'citation-v1',
+  parserVersion = 'citation-v1', eligibilityRuleIds = [],
 } = {}) {
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
+  const eligibility = citationEligibilityGate({ eligibilityRuleIds });
   return all(`
     SELECT d.doc_id, d.metadata_json,
            fm.pdf_path, fm.full_text_path,
@@ -3648,6 +5567,7 @@ export async function listPendingCitationExtractions({
     ${filters.where}
     ${qualifier} d.doc_id > ?
       AND (fm.pdf_path IS NOT NULL OR fm.full_text_path IS NOT NULL)
+      ${eligibility.sql}
       AND (
         ces.doc_id IS NULL
         OR ces.status <> 'completed'
@@ -3659,9 +5579,80 @@ export async function listPendingCitationExtractions({
   `, [
     ...filters.args,
     String(afterDocId || ''),
+    ...eligibility.args,
     String(parserVersion || 'citation-v1'),
     Math.max(1, Math.min(1000, Number(limit) || 100)),
   ]);
+}
+
+// Content retrieval for citation scans is governed by every currently enabled
+// rule whose published membership includes the document. This deliberately
+// uses the global effective union rather than only the rule ids that triggered
+// an immediate scan: an overlapping rule must never have its tighter download
+// or request-rate policy bypassed merely because another matching rule queued
+// the work.
+export async function listEffectiveCitationPoliciesForDocument(docId) {
+  const rows = await all(`
+    SELECT r.id AS rule_id,
+           r.max_content_bytes,
+           r.content_rate_limit
+    FROM rule_document_processing_eligibility e
+    JOIN import_rule_eligibility_projections p
+      ON p.rule_id = e.rule_id
+     AND p.completed_token = e.projection_token
+    JOIN import_rules r ON r.id = e.rule_id
+    WHERE e.doc_id = ?
+      AND r.extract_citations = 1
+    ORDER BY r.id
+  `, [String(docId || '')]);
+  return rows.map((row) => ({
+    ruleId: String(row.rule_id),
+    maxContentBytes: Number(row.max_content_bytes || 209715200),
+    contentRateLimit: Number(row.content_rate_limit || 0),
+  }));
+}
+
+// Once the first rule/document eligibility projection has been finalized,
+// citation work is opt-in through the union of all matching rules whose current
+// policy enables extraction. Before that migration boundary, the legacy corpus
+// selectors remain available. A rule-scoped immediate run narrows the document
+// set to memberships published by the requested rules, but the effective policy
+// is still the global union, so an overlapping rule can keep a document eligible.
+function citationEligibilityGate({ eligibilityRuleIds = [], documentAlias = 'd' } = {}) {
+  const ruleIds = [...new Set((eligibilityRuleIds || [])
+    .map((id) => String(id || '').trim()).filter(Boolean))];
+  const eligibilityActivated = 'SELECT 1 FROM processing_eligibility_activation WHERE id = 1';
+  const effectiveEligibility = `
+    SELECT 1
+    FROM rule_document_processing_eligibility effective_e
+    JOIN import_rule_eligibility_projections effective_p
+      ON effective_p.rule_id = effective_e.rule_id
+     AND effective_p.completed_token = effective_e.projection_token
+    JOIN import_rules effective_r ON effective_r.id = effective_e.rule_id
+    WHERE effective_e.doc_id = ${documentAlias}.doc_id
+      AND effective_r.extract_citations = 1
+  `;
+  if (!ruleIds.length) {
+    return {
+      sql: `AND (NOT EXISTS (${eligibilityActivated}) OR EXISTS (${effectiveEligibility}))`,
+      args: [],
+      legacyFallback: true,
+    };
+  }
+  const placeholders = ruleIds.map(() => '?').join(', ');
+  return {
+    sql: `AND EXISTS (
+      SELECT 1
+      FROM rule_document_processing_eligibility scoped_e
+      JOIN import_rule_eligibility_projections scoped_p
+        ON scoped_p.rule_id = scoped_e.rule_id
+       AND scoped_p.completed_token = scoped_e.projection_token
+      WHERE scoped_e.doc_id = ${documentAlias}.doc_id
+        AND scoped_e.rule_id IN (${placeholders})
+    ) AND EXISTS (${effectiveEligibility})`,
+    args: ruleIds,
+    legacyFallback: false,
+  };
 }
 
 // Selection gate shared by `listPendingCitationScans` and
@@ -3675,7 +5666,8 @@ export async function listPendingCitationExtractions({
 // state row, or a `failed` state row — is NOT reselected automatically, and a
 // citation-parser/GROBID version bump changes nothing about selection. The only
 // ways to reconsider a document are the explicit UI options: `retryFailures`
-// drops the failed exclusion (re-attempt known-bad documents), and `reprocess`
+// drops the failed exclusion and overrides legacy partial links for a document
+// explicitly recorded as failed, while `reprocess`
 // drops every gate so all streamable in-scope documents are reselected — its
 // re-extraction safely replaces existing citations (reextractDocumentCitations →
 // replaceDocumentCitationLinks), so no manual clearing is needed. `reprocess`
@@ -3684,32 +5676,40 @@ export async function listPendingCitationExtractions({
 // re-scans already-scanned documents.
 function citationScanGate({ retryFailures = false, reprocess = false }) {
   if (reprocess) return '';
-  const clauses = [
-    "AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = d.doc_id)",
-    "AND COALESCE(ces.status, '') <> 'completed'",
-  ];
-  if (!retryFailures) {
+  const clauses = ["AND COALESCE(ces.status, '') <> 'completed'"];
+  if (retryFailures) {
+    // A failed extraction may predate the atomic link-swap implementation and
+    // have left partial links. An explicit retry must be able to repair it while
+    // ordinary citation-bearing documents remain protected from re-scanning.
+    clauses.push(`AND (
+        COALESCE(ces.status, '') = 'failed'
+        OR NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = d.doc_id)
+      )`);
+  } else {
+    clauses.push("AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = d.doc_id)");
     clauses.push("AND COALESCE(ces.status, '') <> 'failed'");
   }
   return clauses.join('\n      ');
 }
 
-// Selection for the re-streaming citation scan job. Unlike
-// `listPendingCitationExtractions`, this deliberately requires NO cached bytes
-// (the scan re-streams the PDF). A document qualifies when it recorded a
-// successful streamed content download at import (`content_source =
-// 'streamed_pdf'` with a checksum) and passes the scan-once gates above (unless
-// `reprocess` forces every streamable in-scope document to be reselected).
+// Selection for the re-streaming citation scan job. The scan retrieves the PDF
+// itself, so a published, eligible metadata-only document does not need an
+// existing file_metrics row. Before eligibility projection is first activated,
+// the legacy selector remains limited to documents previously recorded as a
+// successful streamed PDF. Terminal scan-once gates apply in both cases unless
+// `reprocess` deliberately reselects every eligible in-scope document.
 export async function listPendingCitationScans({
   limit = 50, afterDocId = '', syncKey = null, filters: requestedFilters = {},
-  retryFailures = false, reprocess = false,
+  retryFailures = false, reprocess = false, eligibilityRuleIds = [],
 } = {}) {
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
   const gateSql = citationScanGate({ retryFailures, reprocess });
+  const eligibility = citationEligibilityGate({ eligibilityRuleIds });
   const args = [
     ...filters.args,
     String(afterDocId || ''),
+    ...eligibility.args,
     Math.max(1, Math.min(1000, Number(limit) || 50)),
   ];
   return all(`
@@ -3717,12 +5717,24 @@ export async function listPendingCitationScans({
            COALESCE(fm.content_checksum, fm.updated_at, '') AS content_checksum,
            fm.content_source
     FROM documents d
-    JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
     LEFT JOIN citation_extraction_state ces ON ces.doc_id = d.doc_id
     ${filters.where}
     ${qualifier} d.doc_id > ?
-      AND fm.content_source = 'streamed_pdf'
-      AND COALESCE(fm.content_checksum, '') <> ''
+      AND (
+        (NOT EXISTS (
+          SELECT 1 FROM processing_eligibility_activation WHERE id = 1
+        ) AND fm.content_source = 'streamed_pdf' AND COALESCE(fm.content_checksum, '') <> '')
+        OR EXISTS (
+          SELECT 1
+          FROM rule_document_processing_eligibility active_e
+          JOIN import_rule_eligibility_projections active_p
+            ON active_p.rule_id = active_e.rule_id
+           AND active_p.completed_token = active_e.projection_token
+          WHERE active_e.doc_id = d.doc_id
+        )
+      )
+      ${eligibility.sql}
       ${gateSql}
     ORDER BY d.doc_id
     LIMIT ?
@@ -3734,21 +5746,34 @@ export async function listPendingCitationScans({
 // without the cursor or limit.
 export async function countPendingCitationScans({
   syncKey = null, filters: requestedFilters = {},
-  retryFailures = false, reprocess = false,
+  retryFailures = false, reprocess = false, eligibilityRuleIds = [],
 } = {}) {
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
   const gateSql = citationScanGate({ retryFailures, reprocess });
+  const eligibility = citationEligibilityGate({ eligibilityRuleIds });
   const row = await get(`
     SELECT COUNT(*) AS total
     FROM documents d
-    JOIN file_metrics fm ON fm.doc_id = d.doc_id
+    LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
     LEFT JOIN citation_extraction_state ces ON ces.doc_id = d.doc_id
     ${filters.where}
-    ${qualifier} fm.content_source = 'streamed_pdf'
-      AND COALESCE(fm.content_checksum, '') <> ''
+    ${qualifier} (
+      (NOT EXISTS (
+        SELECT 1 FROM processing_eligibility_activation WHERE id = 1
+      ) AND fm.content_source = 'streamed_pdf' AND COALESCE(fm.content_checksum, '') <> '')
+      OR EXISTS (
+        SELECT 1
+        FROM rule_document_processing_eligibility active_e
+        JOIN import_rule_eligibility_projections active_p
+          ON active_p.rule_id = active_e.rule_id
+         AND active_p.completed_token = active_e.projection_token
+        WHERE active_e.doc_id = d.doc_id
+      )
+    )
+      ${eligibility.sql}
       ${gateSql}
-  `, filters.args);
+  `, [...filters.args, ...eligibility.args]);
   return Number(row?.total || 0);
 }
 
@@ -3808,31 +5833,28 @@ export async function getCitationForSummon(citationId) {
 }
 
 export async function getCatalogueLookupStats() {
-  const row = await get(`
-    SELECT
-      (SELECT COUNT(*) FROM catalogue_lookups) AS total,
-      (SELECT COUNT(*) FROM catalogue_lookups WHERE hits > 0) AS found,
-      (SELECT COUNT(*) FROM catalogue_lookups WHERE hits = 0) AS not_found,
-      (SELECT COUNT(*) FROM catalogue_lookups WHERE hits = -1) AS failed,
-      (SELECT COUNT(*) FROM catalogue_lookups WHERE hits IS NULL) AS skipped,
-      (
-        (SELECT COUNT(*) FROM citations)
-        - (SELECT COUNT(*) FROM catalogue_lookups)
-        + (
-          SELECT COUNT(*)
-          FROM catalogue_lookups
-          WHERE hits IS NULL
-            AND query_title IS NOT NULL
-        )
-      ) AS pending
-  `);
+  const [row, pending] = await Promise.all([
+    get(`
+      SELECT
+        (SELECT COUNT(*) FROM catalogue_lookups) AS total,
+        (SELECT COUNT(*) FROM catalogue_lookups WHERE hits > 0) AS found,
+        (SELECT COUNT(*) FROM catalogue_lookups WHERE hits = 0) AS not_found,
+        (SELECT COUNT(*) FROM catalogue_lookups WHERE hits = -1) AS failed,
+        (SELECT COUNT(*) FROM catalogue_lookups WHERE hits IS NULL) AS skipped
+    `),
+    // Reuse countPendingLookups()'s predicate (NOT a table-total subtraction) so the
+    // dashboard number can never disagree with the pager/resolution-job's own count.
+    // See #30 (M-09): the previous arithmetic here double-counted/under-counted once
+    // citations and catalogue_lookups rows could be deleted independently of each other.
+    countPendingLookups(),
+  ]);
   return {
     total: Number(row?.total || 0),
     found: Number(row?.found || 0),
     not_found: Number(row?.not_found || 0),
     failed: Number(row?.failed || 0),
     skipped: Number(row?.skipped || 0),
-    pending: Number(row?.pending || 0),
+    pending: Number(pending || 0),
   };
 }
 
@@ -3862,18 +5884,34 @@ function pendingLookupOptions(limitOrOptions = 100) {
 }
 
 function pendingLookupScope({ syncKey = null, filters: requestedFilters = {} } = {}) {
-  const filters = documentServingFilters({ syncKey, ...requestedFilters });
-  if (!filters.where) return { sql: '', args: [] };
-  return {
-    sql: `AND EXISTS (
+  const requested = documentServingFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
+  const linkedToActiveDocument = `EXISTS (
       SELECT 1
       FROM document_citations scoped_dc
       JOIN documents d ON d.doc_id = scoped_dc.doc_id
       WHERE scoped_dc.citation_id = c.id
         AND ${filters.where.replace(/^WHERE\s+/, '')}
+    )`;
+  // With no caller scope, the access rule (embargoed / verification-due documents
+  // are deferred) only excludes citations that are linked to documents and none
+  // of those are active. Citations with no catalogued document at all (no link,
+  // or a link to a document row that does not exist) are unlinked, not deferred,
+  // and stay pending so they are still looked up.
+  if (!requested.where) {
+    return {
+      sql: `AND (
+      NOT EXISTS (
+        SELECT 1 FROM document_citations unlinked_dc
+        JOIN documents d ON d.doc_id = unlinked_dc.doc_id
+        WHERE unlinked_dc.citation_id = c.id
+      )
+      OR ${linkedToActiveDocument}
     )`,
-    args: filters.args,
-  };
+      args: filters.args,
+    };
+  }
+  return { sql: `AND ${linkedToActiveDocument}`, args: filters.args };
 }
 
 export async function listPendingLookups(limitOrOptions = 100) {
@@ -3919,11 +5957,35 @@ export async function countPendingLookups(options = {}) {
   return Number(row?.total || 0);
 }
 
-export async function getCitationCooccurrence(limit = 100) {
+// #25: dc1/dc2's self-join has no bound on its own — both arms already use
+// covering indexes (dc1: idx_document_citations_citation_doc; dc2: the
+// implicit index behind PRIMARY KEY(doc_id, citation_id)), verified by
+// EXPLAIN QUERY PLAN, so this was never an indexing gap. The bottleneck is
+// the *cardinality* the join is asked to process: with no document-set bound
+// it processes every document that contains any of the top-50 citations
+// corpus-wide, which grows with total corpus size regardless of how bounded
+// the caller's own document sample already is. `docIds`, when supplied,
+// scopes both top_citations and the self-join to that bounded set via a
+// single JSON-array parameter (`WHERE doc_id IN (SELECT value FROM
+// json_each(?))`) rather than a giant literal IN list, which risks
+// exceeding libsql's parameter-count ceiling above a few hundred ids. Do not
+// add a new index here — the existing ones already cover this query; the fix
+// is bounding the input, not the lookup path.
+export async function getCitationCooccurrence(limit = 100, docIds = null) {
+  const hasBound = Array.isArray(docIds) && docIds.length > 0;
+  const boundJson = hasBound ? JSON.stringify(docIds) : null;
+  const topCitationsFilter = hasBound ? 'WHERE doc_id IN (SELECT value FROM json_each(?))' : '';
+  const selfJoinFilter = hasBound ? 'AND dc1.doc_id IN (SELECT value FROM json_each(?))' : '';
+  const args = [];
+  if (hasBound) args.push(boundJson);
+  if (hasBound) args.push(boundJson);
+  args.push(limit);
+
   return all(`
     WITH top_citations AS (
       SELECT citation_id, COUNT(DISTINCT doc_id) AS cnt
       FROM document_citations
+      ${topCitationsFilter}
       GROUP BY citation_id
       HAVING cnt >= 2
       ORDER BY cnt DESC
@@ -3940,11 +6002,12 @@ export async function getCitationCooccurrence(limit = 100) {
     JOIN citations c2 ON c2.id = dc2.citation_id
     JOIN top_citations tc1 ON tc1.citation_id = c1.id
     JOIN top_citations tc2 ON tc2.citation_id = c2.id
+    WHERE 1 = 1 ${selfJoinFilter}
     GROUP BY dc1.citation_id, dc2.citation_id
     HAVING shared >= 2
     ORDER BY shared DESC
     LIMIT ?
-  `, [limit]);
+  `, args);
 }
 
 export async function getTopCitedWorks(limit = 50) {

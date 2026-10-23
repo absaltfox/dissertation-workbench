@@ -1,0 +1,868 @@
+[
+  {
+    "docId": "1.0058350",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0058355",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0066233",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0066247",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0068084",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0071537",
+    "members": [
+      {
+        "name": "Coll Thrush",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0072722",
+    "members": [
+      {
+        "name": "Richard Menkis",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0073083",
+    "members": [
+      {
+        "name": "Neil Safier",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0073713",
+    "members": [
+      {
+        "name": "Coll Thrush",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0073764",
+    "members": [
+      {
+        "name": "Eagle Glasshiem",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0086158",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0087501",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0087506",
+    "members": [
+      {
+        "name": "Robert A.J. McDonald",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0087510",
+    "members": [
+      {
+        "name": "Colin Gordon",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0089112",
+    "members": [
+      {
+        "name": "Peter Boothroyd",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "Mark Allison",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "Tom Hutton",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0089118",
+    "members": [
+      {
+        "name": "Tony Dorcey",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0089711",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0090266",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0090378",
+    "members": [
+      {
+        "name": "Joy Dixon",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0090389",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0090396",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0091408",
+    "members": [
+      {
+        "name": "William Wray",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0091475",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0093411",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0094072",
+    "members": [
+      {
+        "name": "Dr. Burton",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0094711",
+    "members": [
+      {
+        "name": "John Conway",
+        "role": "Co-Supervisor"
+      },
+      {
+        "name": "Leonidas Hill",
+        "role": "Co-Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0094714",
+    "members": [
+      {
+        "name": "William French",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0096272",
+    "members": [
+      {
+        "name": "Brahm Wiesman",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0096311",
+    "members": [
+      {
+        "name": "Fritz Lehmann",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0096315",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0096317",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0096361",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0096372",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0096373",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0096374",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0096377",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0096985",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0097150",
+    "members": [
+      {
+        "name": "Harvey Mitchell",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0097749",
+    "members": [
+      {
+        "name": "Brahm Wiesman",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0097780",
+    "members": [
+      {
+        "name": "R. A. J. McDonald",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0099259",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0099281",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0099420",
+    "members": [
+      {
+        "name": "Peter Boothroyd",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0100150",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0100469",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0100786",
+    "members": [
+      {
+        "name": "Joy Dixon",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0101336",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0101346",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0101385",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0102242",
+    "members": [
+      {
+        "name": "Dr. C. Davis",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0102303",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0102320",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0104765",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0104775",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0104776",
+    "members": [
+      {
+        "name": "Dr. K. J. Cross",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0105620",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0105683",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0105686",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0105724",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0107032",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0107055",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0107082",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0167705",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0300255",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0302162",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0302164",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0305104",
+    "members": [
+      {
+        "name": "Bill French",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0340537",
+    "members": [
+      {
+        "name": "Leslie Paris",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0340563",
+    "members": [],
+    "negatives": []
+  },
+  {
+    "docId": "1.0355219",
+    "members": [
+      {
+        "name": "Coll Thrush",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0366300",
+    "members": [
+      {
+        "name": "GLEN PETERSON",
+        "role": "Supervisor"
+      },
+      {
+        "name": "LEO K. SHIN",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "DONALD L. BAKER",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0371856",
+    "members": [
+      {
+        "name": "Prof. Robert Brain",
+        "role": "Co-Supervisor"
+      },
+      {
+        "name": "Prof. Joy Dixon",
+        "role": "Co-Supervisor"
+      },
+      {
+        "name": "Prof. Suzy Anger",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0371926",
+    "members": [
+      {
+        "name": "Tina Loo",
+        "role": "Co-Supervisor"
+      },
+      {
+        "name": "John Roosa",
+        "role": "Co-Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0379610",
+    "members": [
+      {
+        "name": "Prof. Leo Shin",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Prof. Timothy Brook",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "Prof. Bruce Rusk",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0380534",
+    "members": [
+      {
+        "name": "Coll Thrush",
+        "role": "Supervisor"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0380552",
+    "members": [
+      {
+        "name": "Doctor Laura Ishiguro",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0380621",
+    "members": [
+      {
+        "name": "Dr. Laura Ishiguro",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Dr. Paige Raibmon",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "Dr. Coll Thrush",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0380698",
+    "members": [
+      {
+        "name": "Leslie Paris",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Joy Dixon",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0380839",
+    "members": [
+      {
+        "name": "John Roosa",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Glen Peterson",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0390962",
+    "members": [
+      {
+        "name": "William French",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Alejandra Bronfman",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0392575",
+    "members": [
+      {
+        "name": "Dr. Michel Ducharme",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Dr. Bradley Miller",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0394126",
+    "members": [
+      {
+        "name": "The University of British Columbia History",
+        "role": "Co-Supervisor"
+      },
+      {
+        "name": "Simon Fraser University History",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0395103",
+    "members": [
+      {
+        "name": "Alexei Kojevnikov",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Carr University of Art + Design",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "Pheroze Unwalla",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0402145",
+    "members": [
+      {
+        "name": "Dr. Jeffrey James Byrne",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Dr. Jessica Wang",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "Dr. Steven Lee",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0412931",
+    "members": [
+      {
+        "name": "Dr Laura Ishiguro",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Dr Tamara Myers",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0422983",
+    "members": [
+      {
+        "name": "Henry Yu",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Bradley Miller",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "Leslie Paris",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0433758",
+    "members": [
+      {
+        "name": "Dr. Leo K. Shin",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Dr. Shoufu Yin",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "Dr. Glen Peterson",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0445084",
+    "members": [
+      {
+        "name": "Timothy Cheek",
+        "role": "Co-Supervisor"
+      },
+      {
+        "name": "Jeremy Brown",
+        "role": "Co-Supervisor"
+      },
+      {
+        "name": "Leo Shin",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "Francis L. F. Lee",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0445116",
+    "members": [
+      {
+        "name": "Benjamin Bryce",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Joy Dixon",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "Coll Thrush",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0445133",
+    "members": [
+      {
+        "name": "Timothy Cheek",
+        "role": "Co-Supervisor"
+      },
+      {
+        "name": "Jeremy Brown",
+        "role": "Co-Supervisor"
+      },
+      {
+        "name": "Heidi Tworek",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0448418",
+    "members": [
+      {
+        "name": "Paige Raibmon",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Laura Ishiguro",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "Madeline Knickerbocker",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0451090",
+    "members": [
+      {
+        "name": "Alexei Kojevnikov",
+        "role": "Supervisor"
+      },
+      {
+        "name": "Robert M. Brain",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "Alexia Bloch",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  },
+  {
+    "docId": "1.0451684",
+    "members": [
+      {
+        "name": "Leo K. Shin",
+        "role": "Supervisor"
+      },
+      {
+        "name": "David Morton",
+        "role": "Supervisory Committee Member"
+      },
+      {
+        "name": "Timothy Cheek",
+        "role": "Supervisory Committee Member"
+      }
+    ],
+    "negatives": []
+  }
+]

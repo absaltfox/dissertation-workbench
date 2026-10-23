@@ -2,17 +2,30 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import {
   ADMIN_WORKER_GRACE_MS, ADMIN_WORKER_MODE, ADMIN_WORKER_TIMEOUT_MS,
+  BERTOPIC_WORKER_IMAGE,
   FLY_API_HOSTNAME, FLY_API_TOKEN, FLY_APP_NAME, FLY_MACHINE_ID,
   FLY_WORKER_CPUS, FLY_WORKER_CPU_KIND, FLY_WORKER_MEMORY_MB, LABELER_WORKER_IMAGE,
   LOCAL_LABEL_BACKEND, LOCAL_LABEL_MODEL_PATH,
   FLY_WORKER_REGION, IS_PRODUCTION, WORKER_IMAGE
 } from '../config.js';
 import {
-  appendAdminJobLog, createAdminJob, finishAdminJob, getAdminJob, hashAdminJobToken,
-  updateAdminJob
+  appendAdminJobLog, completeAdminJobFollowup, createAdminJob, createAdminJobIfNotRunning,
+  finishAdminJob, finishRunningAdminJob, getAdminJob, hashAdminJobToken,
+  listAdminJobFollowups, updateRunningAdminJob
 } from '../db.js';
+import { terminateChild } from './workerLifecycle.js';
 
 const localChildren = new Map();
+
+async function terminateLocalChild(jobId, entry, reason) {
+  if (!entry?.child) return;
+  clearTimeout(entry.timer);
+  try {
+    await terminateChild(entry.child, { graceMs: ADMIN_WORKER_GRACE_MS });
+  } catch (error) {
+    await appendAdminJobLog(jobId, `Could not terminate local worker after ${reason}: ${error?.message || String(error)}\n`).catch(() => {});
+  }
+}
 
 function isoAfter(ms) {
   return new Date(Date.now() + ms).toISOString();
@@ -80,15 +93,27 @@ async function resolveWorkerImage() {
   return image;
 }
 
-export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = ADMIN_WORKER_TIMEOUT_MS, jobType = null }) {
+export function buildFlyWorkerMachinePayload({
+  image, jobId, token, executionId = '', timeoutMs = ADMIN_WORKER_TIMEOUT_MS, jobType = null
+}) {
   const isBertopic = jobType === 'bertopic';
   const isTopicLabels = jobType === 'topic_labels';
   const isConceptRebuild = jobType === 'concept_rebuild';
+  const bertopicWorkerImage = process.env.BERTOPIC_WORKER_IMAGE || BERTOPIC_WORKER_IMAGE;
+  const labelerWorkerImage = process.env.LABELER_WORKER_IMAGE || LABELER_WORKER_IMAGE || bertopicWorkerImage;
   const workerImage = isTopicLabels
-    ? (process.env.LABELER_WORKER_IMAGE || LABELER_WORKER_IMAGE || process.env.BERTOPIC_WORKER_IMAGE || image)
+    ? labelerWorkerImage
     : isBertopic || isConceptRebuild
-    ? (process.env.BERTOPIC_WORKER_IMAGE || image)
+    ? bertopicWorkerImage
     : image;
+  if (!workerImage) {
+    const variable = isTopicLabels
+      ? 'LABELER_WORKER_IMAGE or BERTOPIC_WORKER_IMAGE'
+      : isBertopic || isConceptRebuild
+      ? 'BERTOPIC_WORKER_IMAGE'
+      : 'WORKER_IMAGE';
+    throw new Error(`${variable} is required for Fly ${jobType} workers.`);
+  }
   const execCmd = isTopicLabels
     ? ['python3', 'scripts/build-topics.py', '--labels-only']
     : isConceptRebuild
@@ -103,6 +128,7 @@ export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = 
   const env = {
     ADMIN_JOB_ID: String(jobId),
     ADMIN_JOB_ARTIFACT_TOKEN: token,
+    ADMIN_JOB_EXECUTION_ID: executionId,
     ADMIN_WORKER_TIMEOUT_MS: String(timeoutMs),
     DOCUMENT_SYNC_ENABLED: '0',
     DOCUMENT_SYNC_ON_START: '0',
@@ -121,6 +147,10 @@ export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = 
     GROBID_APP_NAME: process.env.GROBID_APP_NAME || '',
     GROBID_FLY_API_TOKEN: process.env.GROBID_FLY_API_TOKEN || process.env.FLY_API_TOKEN || '',
     ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+    // Import workers can launch downstream Python jobs. Preserve the dedicated
+    // image selectors so those nested launches never fall back to the Node image.
+    BERTOPIC_WORKER_IMAGE: bertopicWorkerImage,
+    LABELER_WORKER_IMAGE: labelerWorkerImage,
     LOCAL_LABEL_BACKEND,
     LOCAL_LABEL_MODEL_PATH,
     HF_HUB_OFFLINE: '1',
@@ -156,15 +186,15 @@ export function buildFlyWorkerMachinePayload({ image, jobId, token, timeoutMs = 
   };
 }
 
-async function startFlyWorker(jobId, token) {
+async function startFlyWorker(jobId, token, executionId) {
   const job = await getAdminJob(jobId);
   const image = await resolveWorkerImage();
-  const payload = buildFlyWorkerMachinePayload({ image, jobId, token, jobType: job?.type });
+  const payload = buildFlyWorkerMachinePayload({ image, jobId, token, executionId, jobType: job?.type });
   const machine = await flyRequest(`/v1/apps/${encodeURIComponent(FLY_APP_NAME)}/machines`, {
     method: 'POST',
     body: JSON.stringify(payload),
   });
-  await updateAdminJob(jobId, {
+  await updateRunningAdminJob(jobId, {
     runnerType: 'fly',
     runnerId: machine?.id || null,
     runnerState: machine?.state || 'created',
@@ -173,28 +203,42 @@ async function startFlyWorker(jobId, token) {
   return machine;
 }
 
-function startLocalWorker(jobId, token) {
+function startLocalWorker(jobId, token, executionId) {
   const child = spawn(process.execPath, ['src/jobWorker.js'], {
     cwd: process.cwd(),
     env: {
       ...process.env,
       ADMIN_JOB_ID: String(jobId),
       ADMIN_JOB_ARTIFACT_TOKEN: token,
+      ADMIN_JOB_EXECUTION_ID: executionId,
       ADMIN_WORKER_TIMEOUT_MS: String(ADMIN_WORKER_TIMEOUT_MS),
       DOCUMENT_SYNC_ENABLED: '0',
       DOCUMENT_SYNC_ON_START: '0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const timer = setTimeout(async () => {
-    await appendAdminJobLog(jobId, 'Local worker timed out; terminating process.\n');
-    child.kill('SIGTERM');
-    setTimeout(() => child.kill('SIGKILL'), ADMIN_WORKER_GRACE_MS).unref();
+  const timer = setTimeout(() => {
+    void (async () => {
+      try {
+        const timedOut = await finishRunningAdminJob(jobId, {
+          status: 'timed_out',
+          runnerState: 'timed_out',
+          error: 'Local admin worker timed out.',
+          finishedAt: new Date().toISOString(),
+        });
+        if (!timedOut) return;
+      } catch (error) {
+        await appendAdminJobLog(jobId, `Could not publish local worker timeout: ${error?.message || String(error)}\n`).catch(() => {});
+        return;
+      }
+      await appendAdminJobLog(jobId, 'Local worker timed out; terminating process.\n').catch(() => {});
+      await terminateLocalChild(jobId, { child, timer }, 'timeout');
+    })();
   }, ADMIN_WORKER_TIMEOUT_MS);
   timer.unref();
 
   localChildren.set(jobId, { child, timer });
-  updateAdminJob(jobId, {
+  updateRunningAdminJob(jobId, {
     runnerType: 'local',
     runnerId: String(child.pid || ''),
     runnerState: 'running',
@@ -204,32 +248,47 @@ function startLocalWorker(jobId, token) {
   child.on('close', async (code, signal) => {
     clearTimeout(timer);
     localChildren.delete(jobId);
-    await updateAdminJob(jobId, { runnerState: signal ? `exited:${signal}` : `exited:${code}` });
+    await updateRunningAdminJob(jobId, { runnerState: signal ? `exited:${signal}` : `exited:${code}` });
   });
   return child;
 }
 
-export async function createAndStartAdminWorkerJob({ type, label, params = null }) {
+export async function createAndStartAdminWorkerJob({
+  type, label, params = null, singleInstance = false, replaceRunningJobId = null,
+}) {
   const token = crypto.randomBytes(32).toString('hex');
+  const executionId = crypto.randomUUID();
   let runnerType;
   try {
     runnerType = shouldUseFly() ? 'fly' : 'local';
   } catch (error) {
     throw adminWorkerStartError(error);
   }
-  const jobId = await createAdminJob({
-    type,
-    label,
-    params,
-    artifactTokenHash: hashAdminJobToken(token),
-    timeoutAt: isoAfter(ADMIN_WORKER_TIMEOUT_MS),
-    runnerType,
-  });
+  const job = singleInstance
+    ? await createAdminJobIfNotRunning({
+      type,
+      label,
+      params,
+      artifactTokenHash: hashAdminJobToken(token),
+      timeoutAt: isoAfter(ADMIN_WORKER_TIMEOUT_MS),
+      runnerType,
+      replaceRunningJobId,
+    })
+    : { jobId: await createAdminJob({
+      type,
+      label,
+      params,
+      artifactTokenHash: hashAdminJobToken(token),
+      timeoutAt: isoAfter(ADMIN_WORKER_TIMEOUT_MS),
+      runnerType,
+    }), created: true };
+  if (!job.created) return { jobId: job.jobId, alreadyRunning: true };
+  const jobId = job.jobId;
   try {
     if (runnerType === 'fly') {
-      await startFlyWorker(jobId, token);
+      await startFlyWorker(jobId, token, executionId);
     } else {
-      startLocalWorker(jobId, token);
+      startLocalWorker(jobId, token, executionId);
     }
   } catch (error) {
     await finishAdminJob(jobId, {
@@ -241,6 +300,30 @@ export async function createAndStartAdminWorkerJob({ type, label, params = null 
     throw adminWorkerStartError(error);
   }
   return { jobId, runnerType };
+}
+
+// Called periodically by the long-lived web process. Requests remain in the
+// outbox while their singleton is busy or a worker fails to start. Deletion is
+// generation-fenced so an import arriving during dispatch cannot be lost.
+export async function dispatchAdminJobFollowups({ createJob = createAndStartAdminWorkerJob } = {}) {
+  const followups = await listAdminJobFollowups();
+  const dispatched = [];
+  for (const followup of followups) {
+    try {
+      const job = await createJob({
+        type: followup.type,
+        label: followup.label,
+        params: followup.params,
+        singleInstance: true,
+      });
+      if (job.alreadyRunning) continue;
+      const completed = await completeAdminJobFollowup(followup.type, followup.requestToken);
+      dispatched.push({ type: followup.type, jobId: job.jobId, superseded: !completed });
+    } catch {
+      // A transient launch error leaves the durable row for the next pass.
+    }
+  }
+  return dispatched;
 }
 
 export async function cancelAdminWorkerJob(jobId) {
@@ -255,28 +338,41 @@ export async function cancelAdminWorkerJob(jobId) {
       });
     } catch (error) {
       await appendAdminJobLog(jobId, `Fly worker destroy failed: ${error?.message || String(error)}\n`);
-      await updateAdminJob(jobId, { runnerState: 'kill_failed' });
+      await updateRunningAdminJob(jobId, { runnerState: 'kill_failed' });
       return { ok: false, error: `Fly worker destroy failed: ${error?.message || String(error)}` };
     }
   }
 
   if (job.runnerType === 'local') {
     const entry = localChildren.get(Number(jobId));
-    if (entry?.child) {
-      entry.child.kill('SIGTERM');
-      setTimeout(() => entry.child.kill('SIGKILL'), ADMIN_WORKER_GRACE_MS).unref();
-      clearTimeout(entry.timer);
-      localChildren.delete(Number(jobId));
+    const now = new Date().toISOString();
+    const cancelled = await finishRunningAdminJob(jobId, {
+      status: 'cancelled',
+      runnerState: 'cancelled',
+      cancelledAt: now,
+      finishedAt: now,
+    });
+    if (!cancelled) {
+      const current = await getAdminJob(jobId);
+      return { ok: false, error: `Job reached ${current?.status || 'an unknown state'} before cancellation was published` };
     }
+    await terminateLocalChild(jobId, entry, 'cancellation');
+    localChildren.delete(Number(jobId));
+    await appendAdminJobLog(jobId, 'Job cancelled by administrator.\n');
+    return { ok: true };
   }
 
   const now = new Date().toISOString();
-  await finishAdminJob(jobId, {
+  const cancelled = await finishRunningAdminJob(jobId, {
     status: 'cancelled',
     runnerState: 'cancelled',
     cancelledAt: now,
     finishedAt: now,
   });
+  if (!cancelled) {
+    const current = await getAdminJob(jobId);
+    return { ok: false, error: `Job reached ${current?.status || 'an unknown state'} before cancellation was published` };
+  }
   await appendAdminJobLog(jobId, 'Job cancelled by administrator.\n');
   return { ok: true };
 }

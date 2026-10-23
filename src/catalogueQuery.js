@@ -3,6 +3,8 @@
 // values into PQF commands.
 export function sanitizePqfValue(value) {
   const cleaned = String(value || '')
+    // Control characters would break the PQF query string; stripping them is the point.
+    // eslint-disable-next-line no-control-regex -- intentional control-character match
     .replace(/[\u0000-\u001F\u007F]/g, ' ')
     .replace(/["\\]/g, '')
     .replace(/\s+/g, ' ')

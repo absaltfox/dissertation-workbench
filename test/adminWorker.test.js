@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { EventEmitter } from 'node:events';
 
 const execFileAsync = promisify(execFile);
 let testDataDir;
@@ -17,7 +18,9 @@ let runImportPdfAdminJob;
 let startCitationScanContinuation;
 let runThemeRecomputeAdminJob;
 let runCatalogueLookupJob;
+let runBertopicJob;
 let runPendingCatalogueLookups;
+let runYazClient;
 let analyzeDocumentFile;
 let extractAndSaveParsedData;
 let _setDownloadSafetyOptionsForTests;
@@ -26,6 +29,7 @@ let claimAdminJob;
 let clearAllCitations;
 let closeDb;
 let createAdminJob;
+let createAdminJobIfNotRunning;
 let ensureStorage;
 let getAdminJob;
 let hashAdminJobToken;
@@ -33,9 +37,11 @@ let heartbeatAdminJob;
 let hasRunningAdminJob;
 let updateAdminJob;
 let finishAdminJob;
+let finishClaimedAdminJob;
 let getDb;
 let loadDocumentCitations;
 let loadDocumentMetadata;
+let loadCommitteeMembers;
 let listTopicLabelReviews;
 let loadCatalogueLookup;
 let loadStoredFileMetric;
@@ -47,12 +53,14 @@ let countPendingLookups;
 let publishPassingTopicLabels;
 let saveDocumentMetadata;
 let saveCitations;
+let reextractDocumentCitations;
 let saveCitationExtractionState;
 let saveFileMetric;
 let selectTopicLabelCandidate;
 let updateTopicManualLabel;
 let deleteTopicLabelOverride;
 let validateAdminJobArtifactToken;
+let updateClaimedAdminJobProgress;
 
 async function writeTextPdf(filePath, lines) {
   const escapedLines = lines.map((line) => String(line).replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)'));
@@ -128,6 +136,14 @@ async function waitFor(predicate, timeoutMs = 1000) {
   assert.equal(await predicate(), true);
 }
 
+// Lifecycle tests drive fake child processes, so while terminateChild waits
+// the only pending work is its deliberately unref'd grace timer. Node 22's
+// test runner (production runtime) treats an otherwise-empty event loop as
+// "promise still pending" and cancels that test and every one after it; Node
+// 24+ keeps the loop alive itself. A real ChildProcess handle keeps the loop
+// alive in production, so hold a ref'd handle for the file's duration here.
+const eventLoopKeepAlive = setInterval(() => {}, 1 << 30);
+
 test.before(async () => {
   testDataDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-worker-tests-'));
   process.env.SKIP_LOCAL_ENV = '1';
@@ -138,8 +154,8 @@ test.before(async () => {
   process.env.NODE_ENV = 'test';
 
   ({ buildFlyWorkerMachinePayload, cancelAdminWorkerJob } = await import('../src/services/adminWorker.js'));
-  ({ cancelInProcessAdminJob, runCatalogueLookupJob } = await import('../src/services/adminJobs.js'));
-  ({ CatalogueLookupCancelledError, runPendingCatalogueLookups } = await import('../src/catalogue.js'));
+  ({ cancelInProcessAdminJob, runBertopicJob, runCatalogueLookupJob } = await import('../src/services/adminJobs.js'));
+  ({ CatalogueLookupCancelledError, runPendingCatalogueLookups, runYazClient } = await import('../src/catalogue.js'));
   ({ WorkerArtifactClient } = await import('../src/workerArtifacts.js'));
   ({ runImportPdfAdminJob, startCitationScanContinuation } = await import('../src/services/importPdfJobRunner.js'));
   ({ runThemeRecomputeAdminJob } = await import('../src/services/themeJobRunner.js'));
@@ -151,15 +167,18 @@ test.before(async () => {
     clearAllCitations,
     closeDb,
     createAdminJob,
+    createAdminJobIfNotRunning,
     ensureStorage,
     getAdminJob,
     hashAdminJobToken,
     heartbeatAdminJob,
     hasRunningAdminJob,
     finishAdminJob,
+    finishClaimedAdminJob,
     getDb,
     loadDocumentCitations,
     loadDocumentMetadata,
+    loadCommitteeMembers,
     listTopicLabelReviews,
     loadCatalogueLookup,
     loadStoredFileMetric,
@@ -171,17 +190,20 @@ test.before(async () => {
     publishPassingTopicLabels,
     saveDocumentMetadata,
     saveCitations,
+    reextractDocumentCitations,
     saveCitationExtractionState,
     saveFileMetric,
     selectTopicLabelCandidate,
     updateTopicManualLabel,
     deleteTopicLabelOverride,
     updateAdminJob,
+    updateClaimedAdminJobProgress,
     validateAdminJobArtifactToken,
   } = await import('../src/db.js'));
 });
 
 test.after(async () => {
+  clearInterval(eventLoopKeepAlive);
   await closeDb?.();
   if (testDataDir) await fs.rm(testDataDir, { recursive: true, force: true });
 });
@@ -191,6 +213,7 @@ test('Fly worker machine payload is private, one-shot, and job-scoped', () => {
     image: 'registry.fly.io/dissertation-workbench:deployment-123',
     jobId: 42,
     token: 'secret-token',
+    executionId: 'worker-execution-42',
     timeoutMs: 12345,
   });
 
@@ -201,8 +224,11 @@ test('Fly worker machine payload is private, one-shot, and job-scoped', () => {
   assert.deepEqual(payload.config.init.exec, ['node', 'src/jobWorker.js']);
   assert.equal(payload.config.env.ADMIN_JOB_ID, '42');
   assert.equal(payload.config.env.ADMIN_JOB_ARTIFACT_TOKEN, 'secret-token');
+  assert.equal(payload.config.env.ADMIN_JOB_EXECUTION_ID, 'worker-execution-42');
   assert.equal(payload.config.env.ADMIN_WORKER_TIMEOUT_MS, '12345');
   assert.equal(payload.config.env.DOCUMENT_SYNC_ENABLED, '0');
+  assert.equal(payload.config.env.BERTOPIC_WORKER_IMAGE, process.env.BERTOPIC_WORKER_IMAGE || '');
+  assert.equal(payload.config.env.LABELER_WORKER_IMAGE, process.env.LABELER_WORKER_IMAGE || process.env.BERTOPIC_WORKER_IMAGE || '');
   assert.equal(payload.config.metadata.role, 'admin-worker');
   assert.equal(payload.config.metadata.admin_job_id, '42');
   assert.equal(payload.config.services, undefined);
@@ -278,9 +304,64 @@ test('PatternRank concept rebuild Fly worker payload uses Python NLP worker', ()
     assert.deepEqual(payload.config.init.exec, ['python3', 'scripts/build-concepts.py']);
     assert.equal(payload.config.env.ADMIN_JOB_ID, '45');
     assert.equal(payload.config.env.ADMIN_JOB_ARTIFACT_TOKEN, 'secret-token');
+    assert.equal(payload.config.env.BERTOPIC_WORKER_IMAGE, 'registry.fly.io/dissertation-workbench:worker-latest');
     assert.equal(payload.config.env.HF_HUB_OFFLINE, '1');
     assert.equal(payload.config.env.TRANSFORMERS_OFFLINE, '1');
     assert.equal(payload.config.guest.memory_mb >= 2048, true);
+  } finally {
+    if (previousBertopicImage === undefined) delete process.env.BERTOPIC_WORKER_IMAGE;
+    else process.env.BERTOPIC_WORKER_IMAGE = previousBertopicImage;
+  }
+});
+
+test('Fly workers propagate Python image selectors to nested downstream jobs', () => {
+  const previousBertopicImage = process.env.BERTOPIC_WORKER_IMAGE;
+  const previousLabelerImage = process.env.LABELER_WORKER_IMAGE;
+  process.env.BERTOPIC_WORKER_IMAGE = 'registry.fly.io/dissertation-workbench:worker-latest';
+  process.env.LABELER_WORKER_IMAGE = 'registry.fly.io/dissertation-workbench:labeler-latest';
+
+  try {
+    const payload = buildFlyWorkerMachinePayload({
+      image: 'registry.fly.io/dissertation-workbench:deployment-123',
+      jobId: 46,
+      token: 'secret-token',
+      jobType: 'import_rules_sync',
+    });
+
+    assert.equal(payload.config.image, 'registry.fly.io/dissertation-workbench:deployment-123');
+    assert.equal(payload.config.env.BERTOPIC_WORKER_IMAGE, 'registry.fly.io/dissertation-workbench:worker-latest');
+    assert.equal(payload.config.env.LABELER_WORKER_IMAGE, 'registry.fly.io/dissertation-workbench:labeler-latest');
+
+    // Model the downstream launch from inside the temporary import machine.
+    process.env.BERTOPIC_WORKER_IMAGE = payload.config.env.BERTOPIC_WORKER_IMAGE;
+    process.env.LABELER_WORKER_IMAGE = payload.config.env.LABELER_WORKER_IMAGE;
+    const downstream = buildFlyWorkerMachinePayload({
+      image: payload.config.image,
+      jobId: 47,
+      token: 'downstream-token',
+      jobType: 'concept_rebuild',
+    });
+    assert.equal(downstream.config.image, 'registry.fly.io/dissertation-workbench:worker-latest');
+    assert.deepEqual(downstream.config.init.exec, ['python3', 'scripts/build-concepts.py']);
+  } finally {
+    if (previousBertopicImage === undefined) delete process.env.BERTOPIC_WORKER_IMAGE;
+    else process.env.BERTOPIC_WORKER_IMAGE = previousBertopicImage;
+    if (previousLabelerImage === undefined) delete process.env.LABELER_WORKER_IMAGE;
+    else process.env.LABELER_WORKER_IMAGE = previousLabelerImage;
+  }
+});
+
+test('PatternRank Fly worker fails closed without a Python worker image', () => {
+  const previousBertopicImage = process.env.BERTOPIC_WORKER_IMAGE;
+  delete process.env.BERTOPIC_WORKER_IMAGE;
+
+  try {
+    assert.throws(() => buildFlyWorkerMachinePayload({
+      image: 'registry.fly.io/dissertation-workbench:deployment-123',
+      jobId: 47,
+      token: 'secret-token',
+      jobType: 'concept_rebuild',
+    }), /BERTOPIC_WORKER_IMAGE is required/);
   } finally {
     if (previousBertopicImage === undefined) delete process.env.BERTOPIC_WORKER_IMAGE;
     else process.env.BERTOPIC_WORKER_IMAGE = previousBertopicImage;
@@ -333,6 +414,78 @@ test('topic label candidates can be reviewed, selected, edited, unlocked, and bu
   assert.equal(topic.label, `Teacher Identity Practice ${suffix}`);
 });
 
+test('atomic citation job creation admits exactly one concurrent starter', async () => {
+  await ensureStorage();
+  const type = 'citation_scan';
+  const results = await Promise.all(Array.from({ length: 8 }, () => createAdminJobIfNotRunning({
+    type,
+    label: 'Concurrent citation scan',
+    params: { trigger: 'test' },
+    runnerType: 'local',
+  })));
+  const created = results.filter((result) => result.created);
+  assert.equal(created.length, 1);
+  assert.ok(results.every((result) => result.jobId === created[0].jobId));
+  await finishAdminJob(created[0].jobId, { status: 'completed', runnerState: 'completed' });
+});
+
+test('singleton lease admits one citation starter across independent SQLite clients', async () => {
+  // The in-process test above shares one module-level libSQL client. Exercise
+  // the production topology too: independent Node processes, each with its
+  // own client, contend for the same local SQLite lease row.
+  await ensureStorage();
+  // WAL for this file's temporary database only. In the default rollback
+  // journal a reader blocks another process's COMMIT, and libsql 0.5.29 never
+  // resets a statement that failed with SQLITE_BUSY: the failed COMMIT keeps
+  // its read lock until garbage collection, so each loser blocks the others'
+  // retries and the claimants livelock for seconds (about 1 round in 7 on
+  // macOS). In WAL readers never block a commit. The lease logic under test is
+  // unchanged; production uses remote Turso, which has no local locks.
+  await (await getDb()).execute('PRAGMA journal_mode = WAL');
+  const type = `citation_scan_cross_client_${Date.now()}`;
+  const dbModuleUrl = new URL('../src/db.js', import.meta.url).href;
+  const childSource = `
+    const db = await import(${JSON.stringify(dbModuleUrl)});
+    const result = await db.createAdminJobIfNotRunning({
+      type: ${JSON.stringify(type)},
+      label: 'Cross-client citation scan',
+      params: { trigger: 'cross-client-test' },
+      runnerType: 'local',
+    });
+    process.stdout.write(JSON.stringify(result));
+    await db.closeDb();
+  `;
+  const childOptions = {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      APP_DATA_DIR: testDataDir,
+      SQLITE_PATH: path.join(testDataDir, 'metrics.sqlite'),
+      TURSO_DATABASE_URL: '',
+      SKIP_LOCAL_ENV: '1',
+    },
+  };
+  // allSettled, not all: a failed child must not end the test while its
+  // siblings are still writing to the shared database, or their lock traffic
+  // fails unrelated later tests in this file.
+  const settled = await Promise.allSettled(Array.from({ length: 4 }, () => execFileAsync(
+    process.execPath,
+    ['--input-type=module', '-e', childSource],
+    { ...childOptions, timeout: 60_000 }
+  )));
+  const failures = settled.filter((outcome) => outcome.status === 'rejected');
+  assert.deepEqual(
+    failures.map((outcome) => outcome.reason?.stderr?.split('\n').filter(Boolean).at(-1) || String(outcome.reason)),
+    [],
+    'every claimant process should exit cleanly'
+  );
+  const results = settled.map(({ value }) => JSON.parse(value.stdout.trim().split('\n').at(-1)));
+  const created = results.filter((result) => result.created);
+  assert.equal(created.length, 1);
+  assert.ok(results.every((result) => result.jobId === created[0].jobId));
+  await finishAdminJob(created[0].jobId, { status: 'completed', runnerState: 'completed' });
+});
+
 test('admin worker job lifecycle helpers claim once, heartbeat, log, and validate artifact token', async () => {
   await ensureStorage();
   const token = `token-${Date.now()}`;
@@ -366,6 +519,313 @@ test('admin worker job lifecycle helpers claim once, heartbeat, log, and validat
 
   await finishAdminJob(jobId, { status: 'completed', runnerState: 'completed' });
   assert.equal(await validateAdminJobArtifactToken(jobId, token, { docId: 'lifecycle-doc' }), false);
+});
+
+test('claimed job updates require the current execution lease and a running status', async () => {
+  const jobId = await createAdminJob({
+    type: 'lease_fence_test',
+    label: 'Lease fence test',
+    timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const claimed = await claimAdminJob(jobId, 'runner-a', 'execution-a');
+  assert.equal(claimed.executionId, 'execution-a');
+
+  assert.equal(await updateClaimedAdminJobProgress(jobId, 'execution-stale', {
+    phase: 'stale', currentTask: 'Stale worker',
+  }), false);
+  assert.equal((await getAdminJob(jobId)).progress, null);
+
+  assert.equal(await updateClaimedAdminJobProgress(jobId, 'execution-a', {
+    phase: 'owned', currentTask: 'Current worker',
+  }), true);
+  assert.equal((await getAdminJob(jobId)).progress.phase, 'owned');
+
+  const cancelledAt = new Date().toISOString();
+  await finishAdminJob(jobId, {
+    status: 'cancelled', runnerState: 'cancelled', cancelledAt, finishedAt: cancelledAt,
+  });
+  assert.equal(await finishClaimedAdminJob(jobId, 'execution-a', {
+    status: 'completed', runnerState: 'completed', result: { late: true },
+  }), false);
+  assert.equal(await updateClaimedAdminJobProgress(jobId, 'execution-a', {
+    phase: 'late_success', currentTask: 'Late success',
+  }), false);
+  const terminal = await getAdminJob(jobId);
+  assert.equal(terminal.status, 'cancelled');
+  assert.equal(terminal.result, null);
+  assert.equal(terminal.progress.phase, 'owned');
+  assert.equal(terminal.executionId, null);
+});
+
+test('stale-job reaper wins its CAS against a late worker completion', async () => {
+  const jobId = await createAdminJob({
+    type: 'reaper_lease_race_test',
+    label: 'Reaper lease race',
+    timeoutAt: new Date(Date.now() - 1_000).toISOString(),
+  });
+  await claimAdminJob(jobId, 'late-runner', 'late-execution');
+
+  assert.equal(await hasRunningAdminJob('reaper_lease_race_test'), null);
+  assert.equal(await finishClaimedAdminJob(jobId, 'late-execution', {
+    status: 'completed', result: { shouldNotPublish: true }, runnerState: 'completed',
+  }), false);
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'timed_out');
+  assert.equal(job.result, null);
+  assert.equal(job.executionId, null);
+});
+
+test('terminal failure publication survives cleanup failures and reports them separately', async () => {
+  const { publishTerminalFailure } = await import('../src/services/workerLifecycle.js');
+  const events = [];
+  const result = await publishTerminalFailure({
+    finish: async (patch) => {
+      events.push(['finish', patch.status]);
+      return true;
+    },
+    failRollout: async () => { throw new Error('rollout cleanup exploded'); },
+    appendLog: async () => { throw new Error('terminal log exploded'); },
+    onCleanupError: async (context, error) => events.push(['cleanup', context, error.message]),
+  }, { error: new Error('worker exploded'), status: 'failed' });
+
+  assert.deepEqual(events[0], ['finish', 'failed']);
+  assert.equal(result.published, true);
+  assert.equal(result.cleanupErrors.length, 2);
+  assert.match(events[1][2], /rollout cleanup exploded/);
+  assert.match(events[2][2], /terminal log exploded/);
+});
+
+test('worker child termination escalates from SIGTERM to SIGKILL after the grace bound', async () => {
+  const { terminateChild } = await import('../src/services/workerLifecycle.js');
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    signals = [];
+    kill(signal) {
+      this.signals.push(signal);
+      if (signal === 'SIGKILL') {
+        this.signalCode = signal;
+        queueMicrotask(() => this.emit('close', null, signal));
+      }
+      return true;
+    }
+  }
+  const child = new FakeChild();
+  await terminateChild(child, { graceMs: 5, forceWaitMs: 20 });
+  assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
+});
+
+test('worker child termination does not signal a child that already exited', async () => {
+  const { terminateChild } = await import('../src/services/workerLifecycle.js');
+  const child = {
+    exitCode: 0,
+    signalCode: null,
+    kill() {
+      throw new Error('kill must not be called for an exited child');
+    },
+  };
+  await terminateChild(child, { graceMs: 5, forceWaitMs: 5 });
+});
+
+test('legacy BERTopic runner completes and fails through its claimed execution lease', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    stdout = new EventEmitter();
+    stderr = new EventEmitter();
+    kill() { return true; }
+  }
+
+  const successfulJobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic success', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const successfulChild = new FakeChild();
+  let childEnv;
+  assert.equal(await runBertopicJob(successfulJobId, {
+    spawnProcess: (_command, _args, options) => {
+      childEnv = options.env;
+      return successfulChild;
+    },
+    getStatus: async () => ({ topics: 12 }),
+  }), successfulChild);
+  const claimed = await getAdminJob(successfulJobId);
+  assert.equal(childEnv.ADMIN_JOB_ID, String(successfulJobId));
+  assert.equal(childEnv.ADMIN_JOB_EXECUTION_ID, claimed.executionId);
+  successfulChild.emit('close', 0, null);
+  await waitFor(async () => (await getAdminJob(successfulJobId)).status === 'completed');
+  assert.deepEqual((await getAdminJob(successfulJobId)).result, { topics: 12 });
+
+  const failedJobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic failure', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const failedChild = new FakeChild();
+  await runBertopicJob(failedJobId, { spawnProcess: () => failedChild });
+  failedChild.emit('close', 2, null);
+  await waitFor(async () => (await getAdminJob(failedJobId)).status === 'failed');
+  assert.match((await getAdminJob(failedJobId)).error, /code 2/);
+
+  const preclaimedJobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic preclaimed', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  await claimAdminJob(preclaimedJobId, 'calling-runner', 'caller-execution');
+  const preclaimedChild = new FakeChild();
+  await runBertopicJob(preclaimedJobId, {
+    spawnProcess: () => preclaimedChild,
+    executionId: 'caller-execution',
+    getStatus: async () => ({ reusedLease: true }),
+  });
+  assert.equal((await getAdminJob(preclaimedJobId)).executionId, 'caller-execution');
+  preclaimedChild.emit('close', 0, null);
+  await waitFor(async () => (await getAdminJob(preclaimedJobId)).status === 'completed');
+});
+
+test('legacy BERTopic cancellation wins over a late successful child close', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    stdout = new EventEmitter();
+    stderr = new EventEmitter();
+    kill() { return true; }
+  }
+
+  const jobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic cancellation race', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const child = new FakeChild();
+  let cacheClears = 0;
+  await runBertopicJob(jobId, {
+    spawnProcess: () => child,
+    clearMetricsCache: () => { cacheClears += 1; },
+    getStatus: async () => ({ shouldNotPublish: true }),
+  });
+
+  assert.equal((await cancelAdminWorkerJob(jobId)).ok, true);
+  child.emit('close', 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'cancelled');
+  assert.equal(job.result, null);
+  assert.equal(job.executionId, null);
+  assert.equal(cacheClears, 0);
+});
+
+test('legacy BERTopic timeout terminates the child through the guarded escalation lifecycle', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    signals = [];
+    stdout = new EventEmitter();
+    stderr = new EventEmitter();
+    kill(signal) {
+      this.signals.push(signal);
+      if (signal === 'SIGKILL') {
+        this.signalCode = signal;
+        queueMicrotask(() => this.emit('close', null, signal));
+      }
+      return true;
+    }
+  }
+  const child = new FakeChild();
+  const jobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic timeout race', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  await runBertopicJob(jobId, {
+    spawnProcess: () => child,
+    timeoutMs: 5,
+    terminationGraceMs: 5,
+    terminationForceWaitMs: 20,
+  });
+
+  await waitFor(async () => (await getAdminJob(jobId)).status === 'timed_out', 250);
+  assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
+  const job = await getAdminJob(jobId);
+  assert.equal(job.executionId, null);
+  assert.match(job.error, /timed out/i);
+});
+
+test('legacy BERTopic timeout wins over a late successful child close', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    stdout = new EventEmitter();
+    stderr = new EventEmitter();
+    kill() { return true; }
+  }
+
+  const jobId = await createAdminJob({
+    type: 'bertopic', label: 'Legacy BERTopic timeout close race', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const child = new FakeChild();
+  await runBertopicJob(jobId, {
+    spawnProcess: () => child,
+    timeoutMs: 5,
+    // Keep the process alive until after the terminal timeout is committed.
+    terminate: async () => {},
+    getStatus: async () => ({ shouldNotPublish: true }),
+  });
+
+  await waitFor(async () => (await getAdminJob(jobId)).status === 'timed_out');
+  child.emit('close', 0, null);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'timed_out');
+  assert.equal(job.result, null);
+  assert.equal(job.executionId, null);
+});
+
+test('cancelled YAZ lookup does not signal a child that has already exited', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = 0;
+    signalCode = null;
+    signals = [];
+    stdout = new EventEmitter();
+    stdin = { write() {}, end() {} };
+    kill(signal) {
+      this.signals.push(signal);
+      return true;
+    }
+  }
+  const child = new FakeChild();
+  const controller = new AbortController();
+  const result = runYazClient('quit\n', {
+    signal: controller.signal,
+    spawnProcess: () => child,
+    terminationGraceMs: 5,
+  });
+  controller.abort();
+
+  await assert.rejects(result, CatalogueLookupCancelledError);
+  assert.deepEqual(child.signals, []);
+});
+
+test('timed-out YAZ lookup escalates when SIGTERM does not produce exit evidence', async () => {
+  class FakeChild extends EventEmitter {
+    exitCode = null;
+    signalCode = null;
+    signals = [];
+    stdout = new EventEmitter();
+    stdin = { write() {}, end() {} };
+    kill(signal) {
+      this.signals.push(signal);
+      if (signal === 'SIGKILL') {
+        this.signalCode = signal;
+        queueMicrotask(() => this.emit('close', null, signal));
+      }
+      return true;
+    }
+  }
+  const child = new FakeChild();
+  await assert.rejects(
+    runYazClient('quit\n', {
+      timeoutMs: 5,
+      spawnProcess: () => child,
+      terminationGraceMs: 5,
+      terminationForceWaitMs: 20,
+    }),
+    (error) => error?.code === 'YAZ_TIMEOUT',
+  );
+  await waitFor(() => child.signals.length === 2, 250);
+  assert.deepEqual(child.signals, ['SIGTERM', 'SIGKILL']);
 });
 
 test('expired running admin jobs are timed out before they block new jobs', async () => {
@@ -422,6 +882,54 @@ test('in-process catalogue lookup jobs can be cancelled cooperatively', async ()
   assert.ok(job.cancelledAt);
   assert.ok(job.finishedAt);
   assert.match(job.log, /cancelled by administrator/i);
+});
+
+test('in-process cancellation cannot overwrite a completion that wins its terminal CAS race', async () => {
+  await ensureStorage();
+  const jobId = await createAdminJob({
+    type: 'catalogue_lookup',
+    label: 'Catalogue Completion Race Test',
+    params: { limit: 5, pendingOnly: true },
+  });
+  let startedResolve;
+  const started = new Promise((resolve) => { startedResolve = resolve; });
+  let releaseLookup;
+  const lookupReleased = new Promise((resolve) => { releaseLookup = resolve; });
+
+  runCatalogueLookupJob(jobId, 5, {
+    runLookup: async () => {
+      startedResolve();
+      await lookupReleased;
+      return { processed: 0, found: 0, notFound: 0, skipped: 0, failed: 0 };
+    },
+  });
+
+  await started;
+  let reads = 0;
+  const result = await cancelInProcessAdminJob(jobId, {
+    getJob: async (id) => {
+      reads += 1;
+      if (reads === 1) {
+        const current = await getAdminJob(id);
+        await finishClaimedAdminJob(id, current.executionId, {
+          status: 'completed',
+          runnerState: 'completed',
+          result: { raced: true },
+        });
+        return { ...current, status: 'running', finishedAt: null };
+      }
+      return getAdminJob(id);
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /reached completed/i);
+  const job = await getAdminJob(jobId);
+  assert.equal(job.status, 'completed');
+  assert.equal(job.runnerState, 'completed');
+  assert.equal(job.cancelledAt, null);
+  releaseLookup();
+  const { isAdminJobRunning } = await import('../src/services/adminJobs.js');
+  await waitFor(() => !isAdminJobRunning('catalogue_lookup'));
 });
 
 test('in-process catalogue lookup jobs publish heartbeat and progress', async () => {
@@ -597,6 +1105,144 @@ test('strict citation extraction propagates failures instead of creating a compl
   );
 });
 
+test('committee extraction fills a missing supervisor from acknowledgements without replacing certification roles', async () => {
+  await ensureStorage();
+  const docId = `ack-supervisor-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const doc = { id: docId, title: 'Attendance at Indian residential schools', supervisors: [], supervisorsSource: null };
+  await saveDocumentMetadata(doc);
+  const text = `The following individuals certify that they have read and recommend this thesis
+University Examiner
+Elaine Scholar, Professor, UBC
+
+ACKNOWLEDGEMENTS
+I am grateful to my a d v i s o r, M i c h a e l Ignatieff, for his patient guidance.
+Friends, family, archivists, and community members also sustained this research over many years.`;
+
+  await extractAndSaveParsedData(doc, text, null, { extractCommittee: true, extractCitations: false });
+  await extractAndSaveParsedData(doc, text, null, { extractCommittee: true, extractCitations: false });
+
+  const committee = await loadCommitteeMembers(docId);
+  assert.ok(committee.some((member) => member.name === 'Elaine Scholar' && member.role === 'University Examiner' && member.source === 'pdf'));
+  assert.ok(committee.some((member) => member.name === 'Michael Ignatieff' && member.role === 'Supervisor' && member.source === 'pdf_acknowledgements'));
+  assert.equal(doc.supervisorsSource, 'pdf_acknowledgements');
+  assert.equal(committee.filter((member) => member.name === 'Michael Ignatieff').length, 1);
+  const people = await (await getDb()).execute({
+    sql: 'SELECT name, role, source FROM document_people WHERE doc_id = ? ORDER BY name',
+    args: [docId],
+  });
+  assert.ok(people.rows.some((row) => row.name === 'Michael Ignatieff' && row.source === 'pdf_acknowledgements'));
+  assert.equal(people.rows.some((row) => row.name === 'Michael Ignatieff' && row.source === 'metadata'), false);
+});
+
+test('API supervisors remain authoritative over acknowledgement inferences', async () => {
+  await ensureStorage();
+  const docId = `api-supervisor-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const doc = {
+    id: docId,
+    title: 'API supervisor precedence',
+    supervisors: ['Authoritative Person'],
+    supervisorsSource: 'api',
+  };
+  await saveDocumentMetadata(doc);
+  const { saveCommitteeMembers } = await import('../src/db.js');
+  await saveCommitteeMembers(docId, [
+    { name: 'Superseded API Person', role: 'Supervisor', affiliation: null },
+    { name: 'Old Acknowledgement Person', role: 'Supervisor', affiliation: null },
+  ], 'api');
+  await saveCommitteeMembers(docId, [
+    { name: 'Old Acknowledgement Person', role: 'Supervisor', affiliation: null },
+  ], 'pdf_acknowledgements');
+  const text = `ACKNOWLEDGEMENTS
+I thank my advisor, Inferred Person, for thoughtful guidance throughout this thesis.
+Friends, colleagues, and family also supported this research over many years.`;
+
+  await extractAndSaveParsedData(doc, text, null, { extractCommittee: true, extractCitations: false });
+
+  const committee = await loadCommitteeMembers(docId);
+  assert.deepEqual(committee.filter((member) => member.role === 'Supervisor').map((member) => [member.name, member.source]), [
+    ['Authoritative Person', 'api'],
+  ]);
+  assert.deepEqual(doc.supervisors, ['Authoritative Person']);
+  assert.equal(doc.supervisorsSource, 'api');
+});
+
+test('a degraded reparse does not erase an existing PDF-derived supervisor', async () => {
+  await ensureStorage();
+  const docId = `preserve-pdf-supervisor-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const doc = {
+    id: docId,
+    title: 'Preserve prior extraction',
+    supervisors: ['Previously Parsed'],
+    supervisorsSource: 'pdf_acknowledgements',
+  };
+  await saveDocumentMetadata(doc);
+  const { saveCommitteeMembers } = await import('../src/db.js');
+  await saveCommitteeMembers(docId, [
+    { name: 'Previously Parsed', role: 'Supervisor', affiliation: null },
+  ], 'pdf_acknowledgements');
+
+  await extractAndSaveParsedData(doc, 'A short degraded extraction with no acknowledgements section.', null, {
+    extractCommittee: true,
+    extractCitations: false,
+  });
+
+  const committee = await loadCommitteeMembers(docId);
+  assert.ok(committee.some((member) =>
+    member.name === 'Previously Parsed'
+      && member.role === 'Supervisor'
+      && member.source === 'pdf_acknowledgements'
+  ));
+  assert.deepEqual(doc.supervisors, ['Previously Parsed']);
+  assert.equal(doc.supervisorsSource, 'pdf_acknowledgements');
+});
+
+test('committee reparse targets missing supervisor roles and dry-run does not persist its diff', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const targetId = `reparse-target-${suffix}`;
+  const alreadySupervisedId = `reparse-complete-${suffix}`;
+  const pdfPath = path.join(testDataDir, `${targetId}.pdf`);
+  await writeTextPdf(pdfPath, [
+    'ACKNOWLEDGEMENTS',
+    'I thank my a d v i s o r, M i c h a e l Ignatieff, for patient guidance.',
+    'Friends colleagues archivists and family supported this project over many years.',
+  ]);
+  await saveDocumentMetadata({ id: targetId, title: 'Missing supervisor', supervisors: [], supervisorsSource: null });
+  await saveDocumentMetadata({ id: alreadySupervisedId, title: 'Existing supervisor', supervisors: [], supervisorsSource: null });
+  await saveFileMetric(targetId, { status: 'downloaded', pdfPath, contentSource: 'streamed_pdf' });
+  await saveFileMetric(alreadySupervisedId, { status: 'downloaded', pdfPath, contentSource: 'streamed_pdf' });
+  const { saveCommitteeMembers } = await import('../src/db.js');
+  await saveCommitteeMembers(targetId, [{ name: 'Existing Examiner', role: 'University Examiner' }], 'pdf');
+  await saveCommitteeMembers(alreadySupervisedId, [{ name: 'Existing Supervisor', role: 'Supervisor' }], 'pdf');
+
+  const dryJobId = await createAdminJob({
+    type: 'reparse_committee',
+    label: 'Dry-run missing supervisors',
+    params: { docIds: [targetId, alreadySupervisedId], dryRun: true, maxDocuments: 10 },
+  });
+  const dryResult = await runImportPdfAdminJob(await getAdminJob(dryJobId));
+  assert.equal(dryResult.processed, 1);
+  assert.equal(dryResult.supervisorsFound, 1);
+  assert.equal(dryResult.ocrRecovered, 1);
+  assert.deepEqual(dryResult.proposedAdditions, [{
+    docId: targetId,
+    supervisors: [{ name: 'Michael Ignatieff', role: 'Supervisor', source: 'pdf_acknowledgements' }],
+  }]);
+  assert.equal((await loadCommitteeMembers(targetId)).some((member) => member.name === 'Michael Ignatieff'), false);
+
+  const applyJobId = await createAdminJob({
+    type: 'reparse_committee',
+    label: 'Apply missing supervisors',
+    params: { docIds: [targetId], dryRun: false, maxDocuments: 10 },
+  });
+  const applyResult = await runImportPdfAdminJob(await getAdminJob(applyJobId));
+  assert.equal(applyResult.processed, 1);
+  assert.equal(applyResult.supervisorsFound, 1);
+  assert.ok((await loadCommitteeMembers(targetId)).some((member) =>
+    member.name === 'Michael Ignatieff' && member.source === 'pdf_acknowledgements'
+  ));
+});
+
 test('incremental PatternRank reuses checkpoints and rebuilds changed documents only', async () => {
   await ensureStorage();
   const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -665,16 +1311,117 @@ test('incremental PatternRank reuses checkpoints and rebuilds changed documents 
   assert.equal(third.result.partitionVersion, 3);
 });
 
+test('PatternRank corpus consistently follows the published union of live rule eligibility', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-eligibility-'));
+  const dbPath = path.join(dir, 'eligibility.sqlite');
+  const harnessPath = path.join(dir, 'eligibility_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sqlite3, sys
+spec = importlib.util.spec_from_file_location("build_concepts", sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+db_path = sys.argv[2]
+
+db = sqlite3.connect(db_path)
+db.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, degree TEXT, year INTEGER, updated_at TEXT NOT NULL)")
+for doc_id in ("enabled-only", "disabled-only", "overlap", "unprojected"):
+    meta = {"id": doc_id, "title": doc_id, "abstract": f"{doc_id} community learning leadership", "subjects": [doc_id]}
+    db.execute("INSERT INTO documents VALUES (?, ?, ?, ?, ?)", (doc_id, json.dumps(meta), "Eligibility Degree", 2025, "2026-01-01T00:00:00Z"))
+db.commit()
+db.close()
+
+# No published eligibility membership means a pre-migration corpus remains whole.
+legacy = bc.SqliteClientWrapper(db_path)
+bc.ensure_incremental_schema(legacy)
+legacy_docs, _ = bc.load_partition_documents(legacy, {"degree": "Eligibility Degree"})
+legacy.close()
+
+db = sqlite3.connect(db_path)
+db.executescript("""
+CREATE TABLE import_rules (id TEXT PRIMARY KEY, run_concepts INTEGER NOT NULL);
+CREATE TABLE import_rule_eligibility_projections (
+  rule_id TEXT PRIMARY KEY, current_token TEXT, completed_token TEXT, status TEXT
+);
+CREATE TABLE rule_document_processing_eligibility (
+  rule_id TEXT NOT NULL, doc_id TEXT NOT NULL, projection_token TEXT NOT NULL
+);
+CREATE TABLE processing_eligibility_activation (
+  id INTEGER PRIMARY KEY CHECK (id = 1), activated_at TEXT NOT NULL
+);
+INSERT INTO processing_eligibility_activation VALUES (1, '2026-01-01T00:00:00Z');
+INSERT INTO import_rules VALUES ('rule-on', 1), ('rule-off', 0);
+INSERT INTO import_rule_eligibility_projections VALUES
+  ('rule-on', NULL, 'generation-on', 'completed'),
+  ('rule-off', NULL, 'generation-off', 'completed');
+INSERT INTO rule_document_processing_eligibility VALUES
+  ('rule-on', 'enabled-only', 'generation-on'),
+  ('rule-on', 'overlap', 'generation-on'),
+  ('rule-off', 'disabled-only', 'generation-off'),
+  ('rule-off', 'overlap', 'generation-off'),
+  -- Staging rows must not become visible before their generation is finalized.
+  ('rule-off', 'unprojected', 'staging-generation');
+""")
+db.commit()
+db.close()
+
+client = bc.SqliteClientWrapper(db_path)
+selected = bc.discover_partition(client, requested_scope={"degree": "Eligibility Degree"})
+eligible_docs, _ = bc.load_partition_documents(client, {"degree": "Eligibility Degree"})
+cohort_fingerprints = bc.fetch_cohort_content_fingerprints(client)
+scope_fingerprint = bc.fetch_scope_content_fingerprint(client, {"degree": "Eligibility Degree"})
+
+# Policy is evaluated live and overlapping rules use union semantics.
+client.execute("UPDATE import_rules SET run_concepts = 0 WHERE id = 'rule-on'")
+none_docs, _ = bc.load_partition_documents(client, {"degree": "Eligibility Degree"})
+client.execute("UPDATE import_rules SET run_concepts = 1 WHERE id = 'rule-off'")
+flipped_docs, _ = bc.load_partition_documents(client, {"degree": "Eligibility Degree"})
+# Activation is permanent: removing the final rule/membership yields an empty
+# eligible corpus and must never restore the pre-migration all-document fallback.
+client.execute("DELETE FROM rule_document_processing_eligibility")
+client.execute("DELETE FROM import_rule_eligibility_projections")
+client.execute("DELETE FROM import_rules")
+after_last_rule_deleted, _ = bc.load_partition_documents(client, {"degree": "Eligibility Degree"})
+client.close()
+
+print(json.dumps({
+  "legacy": sorted(doc["id"] for doc in legacy_docs),
+  "selectedCount": selected["documentCount"],
+  "eligible": sorted(doc["id"] for doc in eligible_docs),
+  "fingerprintsAgree": cohort_fingerprints[("Eligibility Degree", 2020)] == scope_fingerprint,
+  "none": sorted(doc["id"] for doc in none_docs),
+  "flipped": sorted(doc["id"] for doc in flipped_docs),
+  "afterLastRuleDeleted": sorted(doc["id"] for doc in after_last_rule_deleted),
+}))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync('python3', [
+    harnessPath, path.resolve('scripts/build-concepts.py'), dbPath,
+  ], { cwd: path.resolve('.') });
+  const result = JSON.parse(stdout);
+  assert.deepEqual(result.legacy, ['disabled-only', 'enabled-only', 'overlap', 'unprojected']);
+  assert.equal(result.selectedCount, 2);
+  assert.deepEqual(result.eligible, ['enabled-only', 'overlap']);
+  assert.equal(result.fingerprintsAgree, true);
+  assert.deepEqual(result.none, []);
+  assert.deepEqual(result.flipped, ['disabled-only', 'overlap']);
+  assert.deepEqual(result.afterLastRuleDeleted, []);
+});
+
 test('automatic PatternRank publishes only a complete generation and reconciles retired shards', async () => {
   const autoDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-auto-'));
   const sqlitePath = path.join(autoDir, 'metrics.sqlite');
   const latestPath = path.join(autoDir, 'concepts', 'latest.json');
+  // Two different *degrees* (not two years of the same degree): the automatic
+  // partition family groups by (degree, decade) by default (#21), so two years
+  // of one degree now collapse into a single cohort and would publish after just
+  // one run, defeating this test's whole point (multi-cohort gating/retirement).
+  // Two degrees in the same decade keep two distinct cohorts under either grouping.
   const setup = `
 import json, sqlite3, sys
 db = sqlite3.connect(sys.argv[1])
 db.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, degree TEXT, year INTEGER, updated_at TEXT NOT NULL)")
-for year in (2024, 2025):
-    doc = {"id": f"auto-{year}", "title": "Community Learning Leadership", "abstract": "Community learning leadership supports schools.", "subjects": ["community learning leadership"], "degree": "Auto Degree", "year": year}
+for degree, year in (("Auto Degree Alpha", 2024), ("Auto Degree Beta", 2025)):
+    doc = {"id": f"auto-{degree.split()[-1].lower()}", "title": "Community Learning Leadership", "abstract": "Community learning leadership supports schools.", "subjects": ["community learning leadership"], "degree": degree, "year": year}
     db.execute("INSERT INTO documents VALUES (?, ?, ?, ?, ?)", (doc["id"], json.dumps(doc), doc["degree"], year, "2026-01-01T00:00:00+00:00"))
 db.commit()
 `;
@@ -718,7 +1465,7 @@ db.commit()
   artifact = JSON.parse(await fs.readFile(latestPath, 'utf8'));
   assert.equal(artifact.source.documents, 2);
 
-  await execFileAsync('python3', ['-c', 'import sqlite3, sys; db=sqlite3.connect(sys.argv[1]); db.execute("DELETE FROM documents WHERE year = 2024"); db.commit()', sqlitePath]);
+  await execFileAsync('python3', ['-c', 'import sqlite3, sys; db=sqlite3.connect(sys.argv[1]); db.execute("DELETE FROM documents WHERE degree = ?", ("Auto Degree Alpha",)); db.commit()', sqlitePath]);
   await run();
   artifact = JSON.parse(await fs.readFile(latestPath, 'utf8'));
   assert.equal(artifact.source.documents, 1);
@@ -1746,6 +2493,821 @@ print(json.dumps({"few": run(few), "many": run(many)}, sort_keys=True))
   assert.equal(many.telemetry.extensionFanInLimit, 2);
 });
 
+// #35 half: a hub with two co-stemming surface forms ("student outcome" /
+// "student outcomes") must not have its fan-in decision counted twice just
+// because cluster_phrases's `extensions` dict is keyed by literal surface phrase.
+// Regression cover: before the fix, this fixture reports Hubs=2/Edges=8 (each
+// surface form independently decides "skip" and increments the shared counters);
+// grouping by component root and merging each root's absorbed set as a set (not a
+// concatenated list, which silently reintroduces the same double-count) gives the
+// truthful Hubs=1/Edges=4.
+test('variant clustering counts one fan-in decision per hub even with a co-stemming surface pair', async () => {
+  const clusterDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-fanin-costem-'));
+  const harnessPath = path.join(clusterDir, 'costem_fanin_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+hub1 = "student outcome"
+hub2 = "student outcomes"
+extensions = [hub1 + " " + w for w in ("policy", "funding", "tracking", "equity")]
+phrases = {hub1, hub2, *extensions}
+clusters, telemetry = bc.cluster_phrases(phrases, {p: 5 for p in phrases})
+print(json.dumps({
+    "telemetry": telemetry,
+    "hubCluster": sorted(next(c for c in clusters if hub1 in c)),
+    "clusters": len(clusters),
+}, sort_keys=True))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync(
+    'python3',
+    [harnessPath, path.resolve('scripts/build-concepts.py')],
+    { cwd: path.resolve('.'), env: { ...process.env, CONCEPT_VARIANT_EXTENSION_MAX_FAN_IN: '2' } },
+  );
+  const { telemetry, hubCluster, clusters } = JSON.parse(stdout);
+
+  // The truthful count: one hub (however many surface forms it has), 4 withheld
+  // extensions -- not the doubled Hubs=2/Edges=8 the surface-form keying produced.
+  assert.equal(telemetry.extensionHubsSkipped, 1);
+  assert.equal(telemetry.extensionEdgesSkipped, 4);
+  // Both co-stemming surface forms stay together (R1 already merged them); none of
+  // the 4 extensions folds in, since together they exceed the fan-in limit of 2.
+  assert.deepEqual(hubCluster, ['student outcome', 'student outcomes']);
+  assert.equal(clusters, 5);
+});
+
+// #31 half: fan-in must hold through merge_partition_artifacts, not just within one
+// shard's own cluster_phrases pass. Three shards each independently keep 2
+// extensions of the *same* hub -- each shard is legal on its own (2 <= the cap of
+// 2), but the union across shards is 6, well past it. Regression cover: before the
+// fix, merge unions every shard's variants unconditionally, so the merged hub ends
+// up with all 6 extensions attached (7-member component) and reports zero
+// withheld edges even though the fan-in limit was blown at merge time.
+test('merge re-enforces extension fan-in across shards and reports it truthfully', async () => {
+  const mergeDir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-merge-fanin-'));
+  const harnessPath = path.join(mergeDir, 'merge_fanin_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+client = bc.SqliteClientWrapper(sys.argv[2])
+bc.ensure_incremental_schema(client)
+for shard in json.loads(sys.argv[3]):
+    documents = shard["artifact"]["stats"]["documents"]
+    client.execute(
+        "INSERT OR REPLACE INTO concept_partitions (partition_key, scope_json, priority, enabled,"
+        " status, source_document_count, artifact_version, updated_at)"
+        " VALUES (?, '{}', 0, 1, 'complete', ?, 1, '2026-01-01T00:00:00+00:00')",
+        [shard["key"], documents],
+    )
+    client.execute(
+        "INSERT OR REPLACE INTO concept_partition_artifacts (partition_key, version, artifact_json,"
+        " document_count, created_at) VALUES (?, 1, ?, ?, '2026-01-01T00:00:00+00:00')",
+        [shard["key"], json.dumps(shard["artifact"]), documents],
+    )
+merged = bc.merge_partition_artifacts(client)
+hub = "student outcome"
+hub_concept = next(
+    c for c in merged["concepts"] if c["canonical"] == hub or hub in c.get("variants", [])
+)
+print(json.dumps({
+    "hubMembers": sorted([hub_concept["canonical"], *hub_concept["variants"]]),
+    "totalConcepts": len(merged["concepts"]),
+    "stats": merged["stats"],
+    "canonicals": sorted(c["canonical"] for c in merged["concepts"]),
+}, sort_keys=True))
+`, 'utf8');
+
+  const hub = 'student outcome';
+  const shard = (key, extensions) => ({
+    key,
+    artifact: {
+      stats: { documents: 5, clusterTruncatedBuckets: 0, clusterTruncatedHeads: 0, clusterExtensionHubsSkipped: 0, clusterExtensionEdgesSkipped: 0 },
+      partition: { key },
+      concepts: [{
+        canonical: hub,
+        variants: extensions,
+        variantRules: Object.fromEntries(extensions.map((e) => [e, 'R3'])),
+        variantDocFreq: Object.fromEntries(extensions.map((e) => [e, 3])),
+        docFreq: 5,
+        docIndexes: [0, 1, 2, 3, 4],
+        patternRankScore: 0.6,
+      }],
+    },
+  });
+  const shards = [
+    shard('p-outcome-1', [`${hub} policy`, `${hub} funding`]),
+    shard('p-outcome-2', [`${hub} tracking`, `${hub} equity`]),
+    shard('p-outcome-3', [`${hub} access`, `${hub} quality`]),
+  ];
+  const dbPath = path.join(mergeDir, 'merge-fanin.sqlite');
+  const { stdout } = await execFileAsync(
+    'python3',
+    [harnessPath, path.resolve('scripts/build-concepts.py'), dbPath, JSON.stringify(shards)],
+    { cwd: path.resolve('.'), env: { ...process.env, CONCEPT_VARIANT_EXTENSION_MAX_FAN_IN: '2' } },
+  );
+  const result = JSON.parse(stdout);
+
+  // The hub's merged component must not exceed the fan-in limit + 1 (itself),
+  // regardless of how many shards independently, legally, contributed to it.
+  assert.ok(result.hubMembers.length <= 3, `hub component grew to ${result.hubMembers.length} members: ${result.hubMembers}`);
+  assert.deepEqual(result.hubMembers, [hub]);
+  // Every withheld extension survives as its own concept rather than vanishing.
+  assert.equal(result.totalConcepts, 7);
+  assert.deepEqual(result.canonicals, [
+    hub, `${hub} access`, `${hub} equity`, `${hub} funding`, `${hub} policy`, `${hub} quality`, `${hub} tracking`,
+  ]);
+  // Truthful telemetry: zero shard withheld anything on its own (each stayed
+  // within its own 2-extension cap), so every withheld edge counted here was
+  // caught by merge's own cross-shard re-check, and the totals must say so.
+  assert.equal(result.stats.mergeExtensionHubsSkipped, 1);
+  assert.equal(result.stats.mergeExtensionEdgesSkipped, 6);
+  assert.equal(result.stats.clusterExtensionHubsSkipped, 1);
+  assert.equal(result.stats.clusterExtensionEdgesSkipped, 6);
+});
+
+// ---------------------------------------------------------------------------
+// Phase C gates (#10 completion gate): countable cold start (#21, supported by
+// #20), no-op rerun (#22, supported by #20), fan-in holds through merge
+// (#31/#35, covered by the two tests immediately above this section).
+// ---------------------------------------------------------------------------
+
+// Gate A, statement-count half (#20): discover_partition's own statement count
+// must not scale with cohort count once nothing is changing -- this is the
+// mechanical fix Gate A's run-count bound depends on (fewer statements per
+// cohort is what makes a much larger K tractable at all).
+test('Gate A / #20: discover_partition statement count does not scale with cohort count on a steady-state pass', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'gate-a-statement-count-'));
+  const harnessPath = path.join(dir, 'statement_count_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sqlite3, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+db_path = sys.argv[2]
+k = int(sys.argv[3])
+
+db = sqlite3.connect(db_path)
+db.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, degree TEXT, year INTEGER, updated_at TEXT NOT NULL)")
+for i in range(k):
+    doc = {
+        "id": f"doc-{i}", "title": f"Distinct Topic {i}",
+        "abstract": f"Distinct topic {i} discussion of unrelated subject matter.",
+        "subjects": [f"topic-{i}"],
+    }
+    db.execute(
+        "INSERT INTO documents VALUES (?, ?, ?, ?, ?)",
+        (doc["id"], json.dumps(doc), f"Degree {i}", 2020, "2026-01-01T00:00:00+00:00"),
+    )
+db.commit()
+db.close()
+
+client = bc.SqliteClientWrapper(db_path)
+bc.ensure_incremental_schema(client)
+
+counts = {"calls": 0}
+def counting_execute(sql, params=None):
+    counts["calls"] += 1
+    cursor = client.conn.cursor()
+    cursor.execute(sql, tuple(params or ()))
+    client.conn.commit()
+    class ResultSet:
+        def __init__(self, cursor):
+            self.rows = cursor.fetchall()
+    return ResultSet(cursor)
+client.execute = counting_execute
+
+# Pass 1: nothing in concept_partitions yet (a from-scratch cold start).
+counts["calls"] = 0
+bc.discover_partition(client)
+fresh_pass_statements = counts["calls"]
+
+# Simulate every cohort's worker run having finished successfully, so pass 2
+# starts from "last completed pass had no changes" -- the scenario #20's fix
+# targets, and the one this test's assertions are about.
+client.execute(
+    "UPDATE concept_partitions SET status = 'complete', last_completed_at = updated_at, artifact_version = 1 WHERE enabled = 1"
+)
+bc.mark_global_published(client)
+
+counts["calls"] = 0
+selected = bc.discover_partition(client)
+unchanged_pass_statements = counts["calls"]
+
+print(json.dumps({
+    "freshPassStatements": fresh_pass_statements,
+    "unchangedPassStatements": unchanged_pass_statements,
+    "selectedIsNone": selected is None,
+}))
+`, 'utf8');
+
+  const measure = async (k) => {
+    const dbPath = path.join(dir, `statements-${k}.sqlite`);
+    const { stdout } = await execFileAsync(
+      'python3',
+      [harnessPath, path.resolve('scripts/build-concepts.py'), dbPath, String(k)],
+      { cwd: path.resolve('.') },
+    );
+    return JSON.parse(stdout);
+  };
+
+  const small = await measure(5);
+  const large = await measure(50);
+
+  assert.equal(small.selectedIsNone, true);
+  assert.equal(large.selectedIsNone, true);
+  // The steady-state statement count must not grow with cohort count.
+  assert.equal(small.unchangedPassStatements, large.unchangedPassStatements);
+  assert.ok(
+    small.unchangedPassStatements <= 6,
+    `expected a small constant, got ${small.unchangedPassStatements}`,
+  );
+  // Both K=5 and K=50 fit inside one write batch (PARTITION_WRITE_BATCH_SIZE),
+  // so even the from-scratch pass stays flat here -- a world apart from the
+  // pre-fix 3-statements-per-cohort growth (15 vs 150 for these two K values).
+  assert.equal(small.freshPassStatements, large.freshPassStatements);
+});
+
+// Gate A, run-count half (#21): phrase-disjoint cohorts publish in exactly K
+// runs, and decade coarsening needs strictly fewer runs than exact-year
+// grouping over the same corpus.
+test('Gate A / #21: phrase-disjoint cohorts publish in exactly K runs, fewer under decade coarsening', async () => {
+  const gateDir = await fs.mkdtemp(path.join(testDataDir, 'gate-a-disjoint-'));
+  const buildDb = async (sqlitePath) => {
+    const setup = `
+import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, degree TEXT, year INTEGER, updated_at TEXT NOT NULL)")
+degrees = {
+    "Disjoint Physics": ("Quantum Entanglement Research", "Quantum entanglement research explores nonlocal correlation phenomena.", ["quantum entanglement research"]),
+    "Disjoint History": ("Colonial Trade Networks", "Colonial trade networks reshaped regional maritime commerce routes.", ["colonial trade networks"]),
+}
+for degree, (title, abstract, subjects) in degrees.items():
+    for year in (2021, 2022, 2023):
+        doc_id = f"{degree.split()[-1].lower()}-{year}"
+        doc = {"id": doc_id, "title": title, "abstract": abstract, "subjects": subjects, "degree": degree, "year": year}
+        db.execute("INSERT INTO documents VALUES (?, ?, ?, ?, ?)", (doc_id, json.dumps(doc), degree, year, "2026-01-01T00:00:00+00:00"))
+db.commit()
+`;
+    await execFileAsync('python3', ['-c', setup, sqlitePath]);
+  };
+
+  const countRunsUntilPublished = async (granularity) => {
+    const dir = await fs.mkdtemp(path.join(gateDir, `${granularity}-`));
+    const sqlitePath = path.join(dir, 'metrics.sqlite');
+    const latestPath = path.join(dir, 'concepts', 'latest.json');
+    await buildDb(sqlitePath);
+    const env = {
+      ...process.env,
+      SQLITE_PATH: sqlitePath,
+      APP_DATA_DIR: dir,
+      TURSO_DATABASE_URL: '',
+      ADMIN_JOB_ID: '',
+      NODE_ENV: 'test',
+      CONCEPT_EMBEDDING_BACKEND: 'deterministic_test',
+      CONCEPT_PATTERNRANK_MIN_SCORE: '-1',
+      CONCEPT_PARTITION_GRANULARITY: granularity,
+    };
+    let runs = 0;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      await execFileAsync('python3', ['scripts/build-concepts.py'], { cwd: path.resolve('.'), env });
+      runs += 1;
+      try { await fs.access(latestPath); break; } catch { /* first generation still incomplete */ }
+    }
+    await fs.access(latestPath); // fail loudly (not silently time out) if it never published
+    return runs;
+  };
+
+  const decadeRuns = await countRunsUntilPublished('decade');
+  const yearRuns = await countRunsUntilPublished('year');
+
+  // Two phrase-disjoint degrees, each spanning one decade -> exactly 2 decade
+  // cohorts with no shared vocabulary to ripple: the clean K == runs bound.
+  assert.equal(decadeRuns, 2);
+  // The same corpus under exact-year grouping splits into up to 6 cohorts (2
+  // degrees x 3 years) -- strictly more runs to reach the same first generation.
+  assert.ok(
+    yearRuns > decadeRuns,
+    `expected year-granularity runs (${yearRuns}) > decade-granularity runs (${decadeRuns})`,
+  );
+});
+
+// Gate A, vocabulary-sharing half (#21): cohorts that share borderline
+// vocabulary may need a bounded number of extra runs past K (the
+// save_partition_candidates DF-crossing ripple), but that ripple must converge
+// -- a subsequent, completely unchanged run must re-pend nothing.
+test('Gate A / #21: vocabulary-sharing cohorts publish within K + a small ripple bound, and the ripple converges', async () => {
+  const gateDir = await fs.mkdtemp(path.join(testDataDir, 'gate-a-vocab-share-'));
+  const sqlitePath = path.join(gateDir, 'metrics.sqlite');
+  const latestPath = path.join(gateDir, 'concepts', 'latest.json');
+  const setup = `
+import json, sqlite3, sys
+db = sqlite3.connect(sys.argv[1])
+db.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT NOT NULL, degree TEXT, year INTEGER, updated_at TEXT NOT NULL)")
+for degree in ("Vocab Share Alpha", "Vocab Share Beta"):
+    doc_id = degree.split()[-1].lower()
+    doc = {"id": doc_id, "title": "Community Learning Leadership", "abstract": "Community learning leadership supports schools.", "subjects": ["community learning leadership"], "degree": degree, "year": 2021}
+    db.execute("INSERT INTO documents VALUES (?, ?, ?, ?, ?)", (doc_id, json.dumps(doc), degree, 2021, "2026-01-01T00:00:00+00:00"))
+db.commit()
+`;
+  await execFileAsync('python3', ['-c', setup, sqlitePath]);
+  const env = {
+    ...process.env,
+    SQLITE_PATH: sqlitePath,
+    APP_DATA_DIR: gateDir,
+    TURSO_DATABASE_URL: '',
+    ADMIN_JOB_ID: '',
+    NODE_ENV: 'test',
+    CONCEPT_EMBEDDING_BACKEND: 'deterministic_test',
+    CONCEPT_PATTERNRANK_MIN_SCORE: '-1',
+  };
+  const run = () => execFileAsync('python3', ['scripts/build-concepts.py'], { cwd: path.resolve('.'), env });
+  const fetchPartitionStates = async () => {
+    const { stdout } = await execFileAsync('python3', ['-c',
+      'import sqlite3, json, sys\n' +
+      'db = sqlite3.connect(sys.argv[1])\n' +
+      'db.row_factory = sqlite3.Row\n' +
+      'rows = [dict(r) for r in db.execute("SELECT partition_key, status, content_fingerprint, updated_at FROM concept_partitions ORDER BY partition_key")]\n' +
+      'print(json.dumps(rows, sort_keys=True))\n',
+      sqlitePath]);
+    return JSON.parse(stdout);
+  };
+
+  const K = 2;
+  const RIPPLE_BOUND = 3; // documented small ripple allowance -- see #21 in docs/phase-c-completion-plan.md
+  let runs = 0;
+  for (let attempt = 0; attempt < K + RIPPLE_BOUND; attempt += 1) {
+    await run();
+    runs += 1;
+    try { await fs.access(latestPath); break; } catch { /* first generation still incomplete */ }
+  }
+  await fs.access(latestPath);
+  assert.ok(runs <= K + RIPPLE_BOUND, `expected <= ${K + RIPPLE_BOUND} runs, took ${runs}`);
+  assert.ok(
+    runs > K,
+    'expected this shared-vocabulary fixture to need at least one extra run past K -- a fixture with zero ripple would not exercise the bound this gate checks',
+  );
+
+  // Ripple convergence: one further, completely unchanged run must not re-pend
+  // anything. Comparing status, content_fingerprint AND updated_at makes this a
+  // genuine no-op check (Gate B's own property), not just "still converged".
+  const beforeExtra = await fetchPartitionStates();
+  await run();
+  const afterExtra = await fetchPartitionStates();
+  assert.deepEqual(afterExtra, beforeExtra);
+});
+
+// Gate B (#22, supported by #20): a real enrichment pass (sync.js's
+// runEnrichmentBatch double-calls saveDocumentMetadata per document) that
+// changes no concept-relevant field must be a genuine no-op on the next concept
+// rebuild -- not merely "no re-embedding", but no re-pend of the partition at
+// all. A true-positive companion guards against a fix that is simply "never
+// mark dirty".
+test('Gate B / #22: an enrichment pass with no concept-relevant change is a genuine no-op rerun', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const degree = `Gate B Fixture ${suffix}`;
+  const baseDoc = {
+    author: 'Gate B Tester',
+    degree,
+    year: 2025,
+    abstract: 'Indigenous language revitalization sustains community knowledge systems.',
+    subjects: ['indigenous language revitalization'],
+    supervisors: [],
+  };
+  const docA = { ...baseDoc, id: `gateb-a-${suffix}`, title: 'Indigenous Language Revitalization A' };
+  const docB = { ...baseDoc, id: `gateb-b-${suffix}`, title: 'Indigenous Language Revitalization B' };
+  await saveDocumentMetadata(docA);
+  await saveDocumentMetadata(docB);
+
+  const runPatternRank = async () => {
+    const jobId = await createAdminJob({
+      type: 'concept_rebuild',
+      label: 'Gate B Test',
+      params: { scope: { degree }, method: 'patternrank_incremental' },
+      runnerType: 'local',
+    });
+    await execFileAsync('python3', ['scripts/build-concepts.py'], {
+      cwd: path.resolve('.'),
+      env: {
+        ...process.env,
+        ADMIN_JOB_ID: String(jobId),
+        NODE_ENV: 'test',
+        CONCEPT_EMBEDDING_BACKEND: 'deterministic_test',
+        CONCEPT_PATTERNRANK_MIN_SCORE: '-1',
+      },
+    });
+    return getAdminJob(jobId);
+  };
+
+  const first = await runPatternRank();
+  assert.equal(first.status, 'completed');
+  assert.equal(first.result.partitionVersion, 1);
+  const partitionKey = first.result.partition;
+
+  const db = await getDb();
+  const fetchPartitionRow = async () => (await db.execute({
+    sql: 'SELECT status, content_fingerprint, updated_at FROM concept_partitions WHERE partition_key = ?',
+    args: [partitionKey],
+  })).rows[0];
+  const before = await fetchPartitionRow();
+  assert.equal(before.status, 'complete');
+
+  // Reproduce sync.js's runEnrichmentBatch double-call shape (src/sync.js:317,340):
+  // saveDocumentMetadata called twice per document per enrichment pass, with
+  // byte-identical title/abstract/subjects both times -- only updated_at moves.
+  await saveDocumentMetadata(docA);
+  await saveDocumentMetadata(docA);
+  await saveDocumentMetadata(docB);
+  await saveDocumentMetadata(docB);
+
+  const second = await runPatternRank();
+  assert.equal(second.status, 'completed');
+  assert.equal(second.result.noChanges, true);
+
+  const after = await fetchPartitionRow();
+  assert.equal(after.status, 'complete');
+  assert.equal(after.content_fingerprint, before.content_fingerprint);
+  // Never re-pended, never re-written: #20's "no write for an unchanged cohort"
+  // and #22's "no false-dirty from a timestamp-only change" holding together.
+  assert.equal(after.updated_at, before.updated_at);
+
+  // True-positive companion: a genuinely different title/abstract must still be
+  // detected and reprocessed.
+  await saveDocumentMetadata({
+    ...docA,
+    title: 'Indigenous Language Revitalization A Revised',
+    abstract: 'Revised: elders document oral history archives and land-based curricula.',
+  });
+  const third = await runPatternRank();
+  assert.equal(third.status, 'completed');
+  assert.equal(third.result.documentsChanged, 1);
+  assert.equal(third.result.partitionVersion, 2);
+  const afterRevision = await fetchPartitionRow();
+  assert.notEqual(afterRevision.content_fingerprint, before.content_fingerprint);
+});
+
+// Gate B support: the new concept_partitions.content_fingerprint column is
+// added by a fresh ALTER-TABLE primitive (ensure_incremental_schema previously
+// only ever did CREATE TABLE IF NOT EXISTS) -- must be idempotent against an
+// already-migrated database.
+test('#22: content_fingerprint column migration is idempotent', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'gate-b-migration-'));
+  const dbPath = path.join(dir, 'metrics.sqlite');
+  const harnessPath = path.join(dir, 'migration_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sys
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+client = bc.SqliteClientWrapper(sys.argv[2])
+bc.ensure_incremental_schema(client)
+bc.ensure_incremental_schema(client)
+cols = [row[1] for row in client.conn.execute("PRAGMA table_info(concept_partitions)").fetchall()]
+print(json.dumps({"columnCount": cols.count("content_fingerprint"), "hasColumn": "content_fingerprint" in cols}))
+`, 'utf8');
+  const { stdout } = await execFileAsync(
+    'python3',
+    [harnessPath, path.resolve('scripts/build-concepts.py'), dbPath],
+    { cwd: path.resolve('.') },
+  );
+  const result = JSON.parse(stdout);
+  assert.equal(result.hasColumn, true);
+  assert.equal(result.columnCount, 1);
+});
+
+test('PatternRank schema migration avoids opaque Turso duplicate-column errors', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'patternrank-opaque-migration-'));
+  const harnessPath = path.join(dir, 'opaque_migration_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, sqlite3, sys
+
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+class Result:
+    def __init__(self, rows):
+        self.rows = rows
+
+class OpaqueTursoClient:
+    def __init__(self):
+        self.conn = sqlite3.connect(':memory:')
+        self.conn.row_factory = sqlite3.Row
+        self.alter_attempts = []
+
+    def execute(self, sql, params=None):
+        if sql.lstrip().upper().startswith('ALTER TABLE'):
+            self.alter_attempts.append(sql)
+        try:
+            cursor = self.conn.execute(sql, tuple(params or ()))
+            self.conn.commit()
+            return Result(cursor.fetchall())
+        except sqlite3.OperationalError as exc:
+            if 'duplicate column' in str(exc).lower():
+                raise KeyError('result') from exc
+            raise
+
+client = OpaqueTursoClient()
+bc.ensure_incremental_schema(client)
+bc.ensure_incremental_schema(client)
+partition_cols = [row['name'] for row in client.execute('PRAGMA table_info(concept_partitions)').rows]
+artifact_cols = [row['name'] for row in client.execute('PRAGMA table_info(concept_partition_artifacts)').rows]
+print(json.dumps({
+    'alterAttempts': client.alter_attempts,
+    'partitionColumnCount': partition_cols.count('content_fingerprint'),
+    'artifactColumnCount': artifact_cols.count('artifact_checksum'),
+}))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync(
+    'python3', [harnessPath, path.resolve('scripts/build-concepts.py')], { cwd: path.resolve('.') },
+  );
+  const result = JSON.parse(stdout);
+  assert.equal(result.partitionColumnCount, 1);
+  assert.equal(result.artifactColumnCount, 1);
+  assert.deepEqual(result.alterAttempts, [
+    'ALTER TABLE concept_partitions ADD COLUMN content_fingerprint TEXT',
+  ]);
+});
+
+test('concept partition publication is atomic, idempotent, and safe for concurrent builders', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'concept-publication-'));
+  const dbPath = path.join(dir, 'metrics.sqlite');
+  const harnessPath = path.join(dir, 'publication_harness.py');
+  await fs.writeFile(harnessPath, `
+import copy, importlib.util, json, sqlite3, sys, threading
+
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+db_path = sys.argv[2]
+key = 'publication-test'
+scope = {'degree': 'Publication Test'}
+
+def artifact(label, generated_at):
+    return {
+        'version': 4,
+        'generatedAt': generated_at,
+        'source': {'scope': scope},
+        'stats': {'documents': 1, 'concepts': 1, 'aliases': 0},
+        'concepts': [{'canonical': label, 'variants': [], 'docFreq': 1}],
+        'variantToCanonical': {},
+    }
+
+client = bc.SqliteClientWrapper(db_path)
+bc.ensure_incremental_schema(client)
+client.execute(
+    "INSERT INTO concept_partitions (partition_key, scope_json, status, source_document_count, updated_at) "
+    "VALUES (?, ?, 'pending', 1, '2026-01-01T00:00:00+00:00')",
+    [key, json.dumps(scope)],
+)
+
+base = artifact('previous active', '2026-01-01T00:00:00+00:00')
+assert bc.save_partition_artifact(client, key, scope, base) == 1
+
+# The retry has a fresh attempt timestamp but identical content. It must reuse v1.
+assert bc.save_partition_artifact(client, key, scope, artifact('previous active', '2026-01-02T00:00:00+00:00')) == 1
+
+reader_versions = []
+def inspect_reader():
+    reader = sqlite3.connect(db_path)
+    try:
+        row = reader.execute(
+            "SELECT cp.artifact_version, cpa.artifact_json FROM concept_partitions cp "
+            "JOIN concept_partition_artifacts cpa ON cpa.partition_key = cp.partition_key "
+            "AND cpa.version = cp.artifact_version WHERE cp.partition_key = ?",
+            [key],
+        ).fetchone()
+        reader_versions.append([row[0], json.loads(row[1])['concepts'][0]['canonical']])
+    finally:
+        reader.close()
+
+try:
+    bc.save_partition_artifact(
+        client, key, scope, artifact('must roll back', '2026-01-03T00:00:00+00:00'),
+        before_activate=lambda: (inspect_reader(), (_ for _ in ()).throw(RuntimeError('inject pointer failure'))),
+    )
+    raise AssertionError('expected injected publication failure')
+except RuntimeError as exc:
+    assert str(exc) == 'inject pointer failure'
+
+pointer_after_failure = client.execute(
+    "SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", [key]
+).rows[0]['artifact_version']
+artifact_rows_after_failure = client.execute(
+    "SELECT COUNT(*) AS count FROM concept_partition_artifacts WHERE partition_key = ?", [key]
+).rows[0]['count']
+
+# Simulate a pre-existing unactivated v2 (for example, from an older worker). A
+# different payload cannot silently take over that version.
+conflicting = artifact('other builder content', '2026-01-04T00:00:00+00:00')
+conflicting['partition'] = {'key': key, 'scope': scope, 'version': 2}
+client.execute(
+    "INSERT INTO concept_partition_artifacts (partition_key, version, artifact_json, document_count, created_at, artifact_checksum) "
+    "VALUES (?, 2, ?, 1, '2026-01-04T00:00:00+00:00', ?)",
+    [key, json.dumps(conflicting), bc.artifact_content_checksum(conflicting)],
+)
+try:
+    bc.save_partition_artifact(client, key, scope, artifact('different proposed content', '2026-01-05T00:00:00+00:00'))
+    raise AssertionError('expected same-version conflict')
+except ValueError as exc:
+    conflict_message = str(exc)
+    assert 'Conflicting concept artifact' in conflict_message
+
+# Remove the intentionally invalid old-worker row, then race two identical
+# builders. The immediate transaction makes one publish v2 and the other reuse it.
+client.execute("DELETE FROM concept_partition_artifacts WHERE partition_key = ? AND version = 2", [key])
+barrier = threading.Barrier(2)
+results = []
+errors = []
+def publish_concurrently():
+    worker = bc.SqliteClientWrapper(db_path)
+    try:
+        barrier.wait()
+        results.append(bc.save_partition_artifact(
+            worker, key, scope, artifact('concurrent content', '2026-01-06T00:00:00+00:00')
+        ))
+    except Exception as exc:
+        errors.append(str(exc))
+    finally:
+        worker.close()
+
+threads = [threading.Thread(target=publish_concurrently) for _ in range(2)]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+
+final_pointer = client.execute(
+    "SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", [key]
+).rows[0]['artifact_version']
+final_artifacts = client.execute(
+    "SELECT version, artifact_checksum FROM concept_partition_artifacts WHERE partition_key = ? ORDER BY version", [key]
+).rows
+print(json.dumps({
+    'readerVersions': reader_versions,
+    'pointerAfterFailure': pointer_after_failure,
+    'artifactRowsAfterFailure': artifact_rows_after_failure,
+    'conflictMessage': conflict_message,
+    'concurrentResults': sorted(results),
+    'concurrentErrors': errors,
+    'finalPointer': final_pointer,
+    'finalArtifacts': [[row['version'], bool(row['artifact_checksum'])] for row in final_artifacts],
+}))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync(
+    'python3', [harnessPath, path.resolve('scripts/build-concepts.py'), dbPath], { cwd: path.resolve('.') },
+  );
+  const result = JSON.parse(stdout);
+  assert.deepEqual(result.readerVersions, [[1, 'previous active']]);
+  assert.equal(result.pointerAfterFailure, 1);
+  assert.equal(result.artifactRowsAfterFailure, 1);
+  assert.match(result.conflictMessage, /Conflicting concept artifact/);
+  assert.deepEqual(result.concurrentResults, [2, 2]);
+  assert.deepEqual(result.concurrentErrors, []);
+  assert.equal(result.finalPointer, 2);
+  assert.deepEqual(result.finalArtifacts, [[1, true], [2, true]]);
+});
+
+test('concept publication uses transactional batches for HTTPS Turso clients', async () => {
+  const dir = await fs.mkdtemp(path.join(testDataDir, 'concept-publication-remote-'));
+  const harnessPath = path.join(dir, 'remote_publication_harness.py');
+  await fs.writeFile(harnessPath, `
+import importlib.util, json, os, sqlite3, sys, types
+
+spec = importlib.util.spec_from_file_location('build_concepts', sys.argv[1])
+bc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bc)
+
+class Result:
+    def __init__(self, rows):
+        self.rows = rows
+
+class RemoteClient:
+    def __init__(self):
+        self.executed = []
+        self.batches = []
+        self.transaction_called = False
+        self.conn = sqlite3.connect(':memory:')
+        self.conn.row_factory = sqlite3.Row
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        cursor = self.conn.execute(sql, tuple(params or ()))
+        self.conn.commit()
+        return Result(cursor.fetchall())
+    def transaction(self):
+        self.transaction_called = True
+        raise AssertionError('HTTPS publication must not use interactive transactions')
+    def batch(self, statements):
+        self.batches.append(statements)
+        try:
+            self.conn.execute('BEGIN IMMEDIATE')
+            results = []
+            for sql, params in statements:
+                cursor = self.conn.execute(sql, tuple(params or ()))
+                results.append(Result(cursor.fetchall()))
+            self.conn.commit()
+            return results
+        except Exception:
+            self.conn.rollback()
+            raise
+    def close(self):
+        self.conn.close()
+
+remote = RemoteClient()
+created = []
+def create_client_sync(url, auth_token=None):
+    created.append((url, auth_token))
+    return remote
+
+sys.modules['libsql_client'] = types.SimpleNamespace(create_client_sync=create_client_sync)
+os.environ['TURSO_DATABASE_URL'] = 'libsql://example.turso.io'
+os.environ['TURSO_AUTH_TOKEN'] = 'test-token'
+client = bc.get_db_client(':memory:')
+assert isinstance(client, bc.HttpLibsqlClientWrapper)
+assert created == [('https://example.turso.io', 'test-token')]
+
+scope = {'degree': 'Remote Test'}
+bc.ensure_incremental_schema(client)
+client.execute(
+    "INSERT INTO concept_partitions (partition_key, scope_json, status, source_document_count, updated_at) "
+    "VALUES (?, ?, 'pending', 1, '2026-01-01T00:00:00+00:00')",
+    ['remote-test', json.dumps(scope)],
+)
+artifact = {
+    'version': 4, 'generatedAt': '2026-01-01T00:00:00+00:00',
+    'source': {'scope': scope}, 'stats': {'documents': 1, 'concepts': 1, 'aliases': 0},
+    'concepts': [], 'variantToCanonical': {},
+}
+assert bc.save_partition_artifact(client, 'remote-test', scope, artifact) == 1
+assert artifact['partition'] == {'key': 'remote-test', 'scope': scope, 'version': 1}
+# A repeat takes the active-match branch of the same batch and does not create v2.
+assert bc.save_partition_artifact(client, 'remote-test', scope, dict(artifact)) == 1
+assert not remote.transaction_called
+assert len(remote.batches) == 2
+statements = remote.batches[0]
+assert len(statements) == 3
+assert 'INSERT INTO concept_partition_artifacts' in statements[0][0]
+assert 'UPDATE concept_partitions' in statements[1][0]
+assert 'SELECT artifact_version' in statements[2][0]
+
+# A stale unactivated v2 forces the server-side INSERT to conflict. The batch
+# rolls back, so the pointer remains at v1 and the caller's artifact is not
+# marked published.
+stale = dict(artifact)
+stale['partition'] = {'key': 'remote-test', 'scope': scope, 'version': 2}
+client.execute(
+    "INSERT INTO concept_partition_artifacts "
+    "(partition_key, version, artifact_json, document_count, created_at, artifact_checksum) "
+    "VALUES (?, 2, ?, 1, '2026-01-02T00:00:00+00:00', ?)",
+    ['remote-test', json.dumps(stale), bc.artifact_content_checksum(stale)],
+)
+failed = dict(artifact)
+failed.pop('partition')
+failed['different'] = True
+try:
+    bc.save_partition_artifact(client, 'remote-test', scope, failed)
+    raise AssertionError('expected stale-version conflict')
+except sqlite3.IntegrityError:
+    pass
+assert 'partition' not in failed
+assert client.execute(
+    "SELECT artifact_version FROM concept_partitions WHERE partition_key = ?", ['remote-test']
+).rows[0]['artifact_version'] == 1
+
+class NoBatchClient:
+    def execute(self, sql, params=None):
+        return Result([])
+    def close(self):
+        pass
+
+sys.modules['libsql_client'] = types.SimpleNamespace(
+    create_client_sync=lambda url, auth_token=None: NoBatchClient()
+)
+try:
+    bc.get_db_client(':memory:')
+    raise AssertionError('expected missing-batch configuration error')
+except RuntimeError as exc:
+    assert 'transactional batch support' in str(exc)
+
+print(json.dumps({'batchStatements': len(statements)}))
+`, 'utf8');
+
+  const { stdout } = await execFileAsync(
+    'python3', [harnessPath, path.resolve('scripts/build-concepts.py')], { cwd: path.resolve('.') },
+  );
+  const result = JSON.parse(stdout.trim().split('\n').at(-1));
+  assert.deepEqual(result, { batchStatements: 3 });
+});
+
 // --- Citation scan (re-streaming) job ---
 
 async function seedStreamableDoc(id, { degree = null, syncKey = null, checksum = 'scan-checksum-v1' } = {}) {
@@ -1803,6 +3365,9 @@ test('citation scan selection includes streamable un-scanned docs and excludes c
   await saveCitationExtractionState(failedDoc, {
     contentChecksum: 'scan-checksum-v1', parserVersion: 'citation-v1', status: 'failed', citationCount: 0, error: 'boom',
   });
+  // Simulate a legacy failed extraction that published some links before it
+  // failed. The explicit retry control must still be able to repair it.
+  await saveCitations(failedDoc, [{ text: `Partial, P. (2018). Failed scan. ${suffix}` }], (t) => `partial-${suffix}-${t}`);
   await saveCitations(hasCitations, [{ text: `Already, C. (2020). Extracted. ${suffix}` }], (t) => `hascites-${suffix}-${t}`);
 
   const ids = async (opts) => (await listPendingCitationScans({
@@ -1825,6 +3390,82 @@ test('citation scan selection includes streamable un-scanned docs and excludes c
     await ids({ reprocess: true }),
     [completed, zeroCiteCompleted, failedDoc, hasCitations, pending].sort()
   );
+});
+
+test('citation re-extraction publishes links atomically and preserves the last good set on failure', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const docId = `scan-atomic-${suffix}`;
+  await saveDocumentMetadata({ id: docId, title: 'Atomic citation fixture', supervisors: [] });
+  await saveCitations(docId, [{ text: `Known, G. (2017). Last good citation. ${suffix}` }], (text) => `old-${text}`);
+
+  await assert.rejects(
+    reextractDocumentCitations(docId, [
+      { text: `New, A. (2024). First staged citation. ${suffix}` },
+      { text: `New, B. (2024). Second staged citation. ${suffix}` },
+    ], (text) => `new-${text}`, {
+      onProgress: async (event) => {
+        if (event.phase === 'citation_matching' && event.counts?.processed === 2) {
+          throw new Error('simulated staged-citation failure');
+        }
+      },
+    }),
+    /simulated staged-citation failure/
+  );
+
+  const linked = await loadDocumentCitations(docId);
+  assert.deepEqual(linked.map((row) => row.citation_text), [`Known, G. (2017). Last good citation. ${suffix}`]);
+  const state = await (await getDb()).execute({
+    sql: 'SELECT status, citation_count FROM citation_extraction_state WHERE doc_id = ?', args: [docId],
+  });
+  assert.equal(state.rows[0].status, 'failed');
+  assert.equal(Number(state.rows[0].citation_count), 1,
+    'a failed re-extraction remains explicitly retryable even with prior links');
+});
+
+test('strict citation failure preserves successful stream status and the attempted checksum', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const docId = `scan-strict-${suffix}`;
+  await seedStreamableDoc(docId, { checksum: 'pre-stream-checksum' });
+  const pdfBytes = await buildTextPdfBytes([
+    'Body text',
+    'REFERENCES',
+    'Doe, J. (2022). A strict citation fixture. Press.',
+  ]);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = makeCircleStreamFetch([
+    { handlePart: `/handle/2429/${docId}`, recordId: 91, bitstreamId: 9091, body: pdfBytes, contentType: 'application/pdf' },
+  ]);
+  _setDownloadSafetyOptionsForTests({ allowOriginalPdfRetrieval: true, resolveHost: async () => [{ address: '142.103.96.1' }] });
+
+  try {
+    const doc = await loadDocumentMetadata(docId);
+    await assert.rejects(
+      analyzeDocumentFile(doc, {
+        contentMode: 'pdf_stream',
+        downloadFiles: true,
+        forceDownload: true,
+        recomputeFromCache: false,
+        extractCommittee: false,
+        extractCitations: true,
+        strictCitationErrors: true,
+        onProgress: async (event) => {
+          if (event.phase === 'citation_extraction' && event.status === 'completed') {
+            throw new Error('simulated strict extraction failure');
+          }
+        },
+      }),
+      /simulated strict extraction failure/
+    );
+    const metric = await loadStoredFileMetric(docId);
+    assert.equal(metric.status, 'streamed');
+    assert.equal(metric.content_source, 'streamed_pdf');
+    assert.notEqual(metric.content_checksum, 'pre-stream-checksum');
+  } finally {
+    globalThis.fetch = originalFetch;
+    _setDownloadSafetyOptionsForTests({ resolveHost: async () => [{ address: '142.103.96.1' }] });
+  }
 });
 
 test('citation scan streams per document: success writes citations + completed state and no catalogue lookup; a failure is counted without failing the batch', async () => {
@@ -1879,9 +3520,15 @@ test('citation scan streams per document: success writes citations + completed s
     // Failure doc: failed state recorded, no citations.
     assert.equal((await loadDocumentCitations(failId)).length, 0);
     const failState = await db.execute({
-      sql: 'SELECT status FROM citation_extraction_state WHERE doc_id = ?', args: [failId],
+      sql: 'SELECT status, content_checksum FROM citation_extraction_state WHERE doc_id = ?', args: [failId],
     });
     assert.equal(failState.rows[0].status, 'failed');
+
+    const okState = await db.execute({
+      sql: 'SELECT status, content_checksum FROM citation_extraction_state WHERE doc_id = ?', args: [okId],
+    });
+    assert.equal(okState.rows[0].status, 'completed');
+    assert.equal(okState.rows[0].content_checksum, okMetric.content_checksum);
 
     const job = await getAdminJob(jobId);
     assert.equal(job.status, 'failed');
@@ -1929,7 +3576,6 @@ test('citation scan continuation drains a multi-batch backlog with O(1) params_j
     for (;;) {
       if (guard++ > 20) throw new Error('drain did not terminate');
       const jobId = await createAdminJob({ type: 'citation_scan', label: 'Drain', params, runnerType: 'local' });
-      // eslint-disable-next-line no-await-in-loop
       const result = await runImportPdfAdminJob(await getAdminJob(jobId));
       batches += 1;
       scanned += result.processed;
@@ -1940,7 +3586,6 @@ test('citation scan continuation drains a multi-batch backlog with O(1) params_j
       // seam. autoContinue is added only so the gate fires for this offline check;
       // the returned params carry only a fixed-width cursor forward (O(1)).
       let nextParams = null;
-      // eslint-disable-next-line no-await-in-loop
       await startCitationScanContinuation({ id: jobId, params: { ...params, autoContinue: true } }, result, null, {
         createContinuationJob: async (payload) => { nextParams = payload.params; return { jobId: jobId + 1 }; },
       });
@@ -1955,7 +3600,6 @@ test('citation scan continuation drains a multi-batch backlog with O(1) params_j
     assert.equal(scanned, total, 'every backlog document was scanned across batches');
     assert.ok(batches >= 3, 'expected the capped backlog to span multiple batches');
     for (const id of docIds) {
-      // eslint-disable-next-line no-await-in-loop
       assert.equal((await loadDocumentCitations(id)).length > 0, true);
     }
     // Every continuation carries the same bounded set of params keys -- nothing accumulates.

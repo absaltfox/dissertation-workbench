@@ -45,14 +45,13 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
 
   router.get('/jobs', asyncHandler(async (_req, res) => {
     const { getDocumentSyncStatus } = await loadSyncModule();
-    const [jobs, syncRuns, catalogueStats, topicStatus, documentSyncStatus, conceptStatus, citationScanPending] = await Promise.all([
+    const [jobs, syncRuns, catalogueStats, topicStatus, documentSyncStatus, conceptStatus] = await Promise.all([
       listAdminJobs(25),
       listRecentSyncRuns(25),
       getCatalogueLookupStats(),
       getTopicBuildStatus(),
       getDocumentSyncStatus(),
       getConceptPipelineStatus(),
-      countPendingCitationScans({}),
     ]);
     // Read-only schedule state for the Citation Scan status card, mirroring how
     // conceptStatus feeds the concept card. lastRun comes from the most recent
@@ -65,7 +64,10 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
         ? { status: lastCitationScan.status, startedAt: lastCitationScan.startedAt, finishedAt: lastCitationScan.finishedAt }
         : null,
       nextRun: CITATION_SCAN_NIGHTLY_ENABLED ? nextDailyRunIso(CITATION_SCAN_NIGHTLY_HOUR_LOCAL) : null,
-      pendingCount: citationScanPending,
+      // Counting requires checking the full eligible stream set. Keep the
+      // five-second job-status poll bounded; the explicit Preview action runs
+      // the exact count only when an operator asks for it.
+      pendingCount: null,
     };
     res.status(200).json({
       jobs,
@@ -142,11 +144,6 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
       return;
     }
 
-    const runningId = await hasRunningAdminJob('citation_scan');
-    if (runningId) {
-      res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
-      return;
-    }
     const result = await createAndStartAdminWorkerJob({
       type: 'citation_scan',
       label: 'Citation Scan',
@@ -159,7 +156,12 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
         autoContinue,
         scope,
       },
+      singleInstance: true,
     });
+    if (result.alreadyRunning) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: result.jobId });
+      return;
+    }
     clearMetricsCache();
     res.status(202).json({ ok: true, started: true, ...result });
   }));

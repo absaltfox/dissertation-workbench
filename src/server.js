@@ -7,13 +7,20 @@ import {
   CITATION_SCAN_NIGHTLY_ENABLED, CITATION_SCAN_NIGHTLY_HOUR_LOCAL, validateRuntimeSecrets
 } from './config.js';
 import {
-  checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb, hasRunningAdminJob
+  checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb,
+  initDocumentTermsReadiness, isDocumentTermsReady, runDocumentTermsBackfillOnce
 } from './db.js';
 import { ensureDefaultAdmin } from './auth.js';
 import { createBoundedCache } from './boundedCache.js';
 import { getConceptPipelineStatus } from './conceptsPipeline.js';
-import { createAndStartAdminWorkerJob } from './services/adminWorker.js';
+import {
+  createAndStartAdminWorkerJob, dispatchAdminJobFollowups
+} from './services/adminWorker.js';
 import { logger } from './logger.js';
+import {
+  msUntilNextDailyHour,
+  scheduleDaily as scheduleDailyTimer,
+} from './dailyScheduler.js';
 import { getConfiguredApiKey } from './secrets.js';
 import { getTrustedClientIp } from './requestSecurity.js';
 import { applyCompression, applySecurityHeaders } from './middleware/http.js';
@@ -41,7 +48,9 @@ const metricsInflight = new Map();
 let stopDailyConceptScheduler = null;
 let stopDailyCitationScanScheduler = null;
 let stopWorkbenchCacheWarmup = null;
+let stopAdminJobFollowupDispatcher = null;
 const DAILY_CONCEPT_REBUILD_HOUR_LOCAL = 2;
+const ADMIN_JOB_FOLLOWUP_INTERVAL_MS = 5_000;
 
 // Sync pulls in the metrics/PDF pipeline and is only needed for admin import
 // workflows. Loading it lazily keeps normal API startup cheaper and avoids
@@ -50,45 +59,28 @@ async function loadSyncModule() {
   return import('./sync.js');
 }
 
-// Milliseconds until the next local occurrence of `hourLocal`:00. Shared by both
-// daily schedulers so the timer/boundary math lives in one place.
-export function msUntilNextDailyHour(hourLocal, from = new Date()) {
-  const now = new Date(from);
-  const next = new Date(now);
-  next.setHours(hourLocal, 0, 0, 0);
-  if (next <= now) next.setDate(next.getDate() + 1);
-  return next.getTime() - now.getTime();
-}
+export { msUntilNextDailyHour };
 
-// Self-rescheduling daily timer. Returns a stop function that clears the pending
-// timer. `fn` failures are logged and never break the reschedule.
-function scheduleDaily(hourLocal, fn, { label = 'daily job' } = {}) {
-  let timer = null;
-  const scheduleNext = () => {
-    timer = setTimeout(() => {
-      Promise.resolve()
-        .then(fn)
-        .catch((error) => logger.error(`Scheduled ${label} failed to start`, { error: error?.message || String(error) }))
-        .finally(scheduleNext);
-    }, msUntilNextDailyHour(hourLocal));
-  };
-  scheduleNext();
-  return () => {
-    if (timer) clearTimeout(timer);
-  };
+export function scheduleDaily(hourLocal, fn, options = {}) {
+  return scheduleDailyTimer(hourLocal, fn, {
+    ...options,
+    onError: options.onError || ((error, label) => {
+      logger.error(`Scheduled ${label} failed to start`, { error: error?.message || String(error) });
+    }),
+  });
 }
 
 async function startConceptRebuildJob(trigger) {
-  const runningId = await hasRunningAdminJob('concept_rebuild');
-  if (runningId) {
-    logger.info('Concept rebuild job already running', { trigger, jobId: runningId });
-    return { alreadyRunning: true, jobId: runningId };
-  }
   const result = await createAndStartAdminWorkerJob({
     type: 'concept_rebuild',
     label: trigger === 'scheduled' ? 'Scheduled PatternRank Partition' : 'Startup PatternRank Partition',
     params: { method: 'patternrank_incremental', trigger },
+    singleInstance: true,
   });
+  if (result.alreadyRunning) {
+    logger.info('Concept rebuild job already running', { trigger, jobId: result.jobId });
+    return result;
+  }
   logger.info('Concept rebuild job started', { trigger, jobId: result.jobId, runnerType: result.runnerType });
   return result;
 }
@@ -100,16 +92,16 @@ function scheduleDailyConceptRebuildJob() {
 }
 
 export async function startCitationScanJob(trigger) {
-  const runningId = await hasRunningAdminJob('citation_scan');
-  if (runningId) {
-    logger.info('Citation scan job already running', { trigger, jobId: runningId });
-    return { alreadyRunning: true, jobId: runningId };
-  }
   const result = await createAndStartAdminWorkerJob({
     type: 'citation_scan',
     label: trigger === 'scheduled' ? 'Scheduled Citation Scan' : 'Citation Scan',
     params: { trigger, retryFailures: false },
+    singleInstance: true,
   });
+  if (result.alreadyRunning) {
+    logger.info('Citation scan job already running', { trigger, jobId: result.jobId });
+    return result;
+  }
   logger.info('Citation scan job started', { trigger, jobId: result.jobId, runnerType: result.runnerType });
   return result;
 }
@@ -244,17 +236,38 @@ export async function start() {
       trigger,
       documents: payload?.bootstrap?.summary?.documents || 0,
       firstPage: payload?.documentPage?.documents?.length || 0,
+      analyticsDocuments: payload?.analytics?.documents?.length || 0,
+      visualizationsDocuments: payload?.visualizations?.documents?.length || 0,
     });
   };
   warmWorkbenchCache('startup').catch((e) => {
     logger.warn('Workbench landing cache warmup failed', { trigger: 'startup', error: e.message });
   });
+
+  initDocumentTermsReadiness()
+    .then(() => (isDocumentTermsReady() ? null : runDocumentTermsBackfillOnce()))
+    .then(() => logger.info('document_terms projection ready'))
+    .then(() => warmWorkbenchCache('post-projection').catch((e) => {
+      logger.warn('Workbench landing cache warmup failed', { trigger: 'post-projection', error: e.message });
+    }))
+    .catch((e) => logger.warn('document_terms backfill failed; using json_each fallback', { error: e.message }));
+
   const workbenchCacheWarmupTimer = setInterval(() => {
     warmWorkbenchCache('scheduled').catch((e) => {
       logger.warn('Workbench landing cache warmup failed', { trigger: 'scheduled', error: e.message });
     });
   }, WORKBENCH_CACHE_REFRESH_MS);
   stopWorkbenchCacheWarmup = () => clearInterval(workbenchCacheWarmupTimer);
+
+  // Singleton collisions write a durable reconciliation request. Polling from
+  // the long-lived web process guarantees a fresh pass starts after the active
+  // worker releases its lease, including when that worker runs on Fly.
+  const dispatchFollowups = () => dispatchAdminJobFollowups().catch((error) => {
+    logger.error('Admin job follow-up dispatch failed', { error: error?.message || String(error) });
+  });
+  dispatchFollowups();
+  const followupTimer = setInterval(dispatchFollowups, ADMIN_JOB_FOLLOWUP_INTERVAL_MS);
+  stopAdminJobFollowupDispatcher = () => clearInterval(followupTimer);
 
   stopDailyConceptScheduler = scheduleDailyConceptRebuildJob();
   logger.info('Scheduled daily concept rebuild job', { hourLocal: DAILY_CONCEPT_REBUILD_HOUR_LOCAL });
@@ -287,6 +300,10 @@ export async function start() {
     if (stopWorkbenchCacheWarmup) {
       stopWorkbenchCacheWarmup();
       stopWorkbenchCacheWarmup = null;
+    }
+    if (stopAdminJobFollowupDispatcher) {
+      stopAdminJobFollowupDispatcher();
+      stopAdminJobFollowupDispatcher = null;
     }
     
     server.close(() => {

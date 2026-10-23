@@ -1,4 +1,4 @@
-import { getDb, saveFileMetric, saveDocumentMetadata, listFileMetrics } from '../src/db.js';
+import { saveFileMetric, saveDocumentMetadata, listFileMetrics } from '../src/db.js';
 import { analyzePdfAtPath, fileExists } from '../src/pdf.js';
 
 async function main() {

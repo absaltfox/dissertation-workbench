@@ -1,13 +1,16 @@
 import {
-  appendAdminJobLog, finishAdminJob, getDb, listFileMetrics, listImportRules,
+  appendAdminJobLog, finishAdminJob, finishClaimedAdminJob, getDb, listFileMetrics, listImportRules,
   listPendingCitationExtractions, listPendingCitationScans, loadCommitteeMembers,
-  loadDocumentMetadata, finishEnrichmentRolloutPhase, getEnrichmentRollout,
-  listEnrichmentRolloutEvidence, saveCitationExtractionState, saveEnrichmentRolloutEvidence,
-  startEnrichmentRolloutPhase, updateAdminJobProgress
+  loadDocumentMetadata, loadStoredFileMetric, finishEnrichmentRolloutPhase, getEnrichmentRollout,
+  listEffectiveCitationPoliciesForDocument, listEnrichmentRolloutEvidence,
+  reserveImportRuleRequestSlot, saveCitationExtractionState, saveEnrichmentRolloutEvidence,
+  requestAdminJobFollowup, saveWordCountComparisonParadata,
+  startEnrichmentRolloutPhase, updateAdminJobProgress, updateClaimedAdminJobProgress
 } from '../db.js';
 import fs from 'node:fs/promises';
 import {
-  analyzeDocumentFile, analyzePdfAtPath, deleteCachedPdf, extractAndSaveParsedData
+  analyzeDocumentFile, analyzePdfAtPath, deleteCachedPdf, extractAndSaveParsedData,
+  parseAcknowledgementsDetailed, parseCommittee
 } from '../pdf.js';
 import { getConfiguredApiKey } from '../secrets.js';
 import {
@@ -24,7 +27,8 @@ async function log(jobId, message) {
   await appendAdminJobLog(jobId, `[${new Date().toISOString()}] ${message}\n`);
 }
 
-function createProgressReporter(jobId) {
+function createProgressReporter(job) {
+  const jobId = job.id;
   const tasks = [];
   const taskIndex = new Map();
 
@@ -46,13 +50,24 @@ function createProgressReporter(jobId) {
       taskIndex.set(key, tasks.length);
       tasks.push(task);
     }
-    await updateAdminJobProgress(jobId, {
+    const progress = {
       phase: key,
       currentTask: status === 'completed' ? event.nextTask || label : label,
       tasks,
       counts: event.counts || null,
-    });
+    };
+    if (job.executionId) {
+      await updateClaimedAdminJobProgress(jobId, job.executionId, progress);
+    } else {
+      await updateAdminJobProgress(jobId, progress);
+    }
   };
+}
+
+function finishWorkerAdminJob(job, patch) {
+  return job.executionId
+    ? finishClaimedAdminJob(job.id, job.executionId, patch)
+    : finishAdminJob(job.id, patch);
 }
 
 function readPdfBatchSize(params = {}) {
@@ -64,6 +79,55 @@ function readDocIdList(value) {
   return Array.isArray(value)
     ? value.map((id) => String(id || '').trim()).filter(Boolean)
     : [];
+}
+
+const DEFAULT_CITATION_MAX_CONTENT_BYTES = 200 * 1024 * 1024;
+
+// Overlapping eligible rules compose conservatively: the smallest byte ceiling
+// wins, and every positive per-rule request limit is reserved. A zero rate is
+// the documented "no rule-specific limit" value and therefore adds no gate.
+export function citationContentPolicy(policies = []) {
+  const normalized = (Array.isArray(policies) ? policies : [])
+    .map((policy) => ({
+      ruleId: String(policy?.ruleId || '').trim(),
+      maxContentBytes: Number(policy?.maxContentBytes),
+      contentRateLimit: Number(policy?.contentRateLimit),
+    }))
+    .filter((policy) => policy.ruleId);
+  const byteLimits = normalized
+    .map((policy) => policy.maxContentBytes)
+    .filter((value) => Number.isFinite(value) && value > 0);
+  return {
+    maxContentBytes: byteLimits.length
+      ? Math.min(...byteLimits)
+      : DEFAULT_CITATION_MAX_CONTENT_BYTES,
+    rateLimits: normalized
+      .filter((policy) => Number.isFinite(policy.contentRateLimit) && policy.contentRateLimit > 0)
+      .map((policy) => ({
+        ruleId: policy.ruleId,
+        contentRateLimit: Math.floor(policy.contentRateLimit),
+      }))
+      .sort((left, right) => (
+        left.contentRateLimit - right.contentRateLimit || left.ruleId.localeCompare(right.ruleId)
+      )),
+  };
+}
+
+export async function reserveCitationPolicyRequest(rateLimits, {
+  reserveSlot = reserveImportRuleRequestSlot,
+  now = () => Date.now(),
+  wait = (delayMs) => new Promise((resolve) => setTimeout(resolve, delayMs)),
+  windowMs = 60_000,
+} = {}) {
+  for (const policy of Array.isArray(rateLimits) ? rateLimits : []) {
+    for (;;) {
+      const waitMs = await reserveSlot(policy.ruleId, policy.contentRateLimit, {
+        nowMs: now(), windowMs,
+      });
+      if (!waitMs) break;
+      await wait(waitMs);
+    }
+  }
 }
 
 // `createContinuationJob` is a test seam only: production always takes the
@@ -167,6 +231,11 @@ export async function startCitationScanContinuation(job, result, progress, { cre
       type: 'citation_scan',
       label: 'Citation Scan (continuation)',
       params: nextParams,
+      // Atomically transfer the citation-scan singleton lease from this
+      // still-running worker to its child. Manual/scheduled starts therefore
+      // see the child as already running throughout the hand-off.
+      singleInstance: true,
+      replaceRunningJobId: job.id,
     });
     await log(job.id, `Scheduled next citation scan batch as job ${next.jobId}.`);
     await progress?.({
@@ -187,6 +256,113 @@ export async function startCitationScanContinuation(job, result, progress, { cre
     });
     return { error: message };
   }
+}
+
+// Import and enrichment remain the source-of-truth job. Downstream processors
+// are queued only after the final automatic content batch, and a failure to
+// start either processor is reported without rewriting an otherwise successful
+// metadata/content result as failed.
+export async function queueEligibleImportProcessing(
+  job,
+  result,
+  progress,
+  { createProcessingJob = null, requestProcessingFollowup = requestAdminJobFollowup } = {}
+) {
+  const params = job.params || {};
+  if (params.mode !== 'sync_missing_pdfs' || params.queueEligibleProcessing !== true) return null;
+  if (!result.ok) return null;
+  if (result.nextJobId) return null;
+  if (params.autoContinuePdfBatches && result.pdfBatchLimitReached) return null;
+
+  // `params.rules` is deliberately narrowed as content continuations finish.
+  // The immutable policy snapshot remains complete so a rule whose content
+  // finished in an earlier batch does not lose its downstream work.
+  const rules = Array.isArray(params.downstreamPolicyRules)
+    ? params.downstreamPolicyRules
+    : Array.isArray(params.rules) ? params.rules : [];
+  const citationRuleIds = rules
+    .filter((rule) => rule?.extractCitations)
+    .map((rule) => String(rule.id || '').trim())
+    .filter(Boolean);
+  const patternRankRuleIds = rules
+    .filter((rule) => rule?.runConcepts !== false)
+    .map((rule) => String(rule.id || '').trim())
+    .filter(Boolean);
+  if (!citationRuleIds.length && !patternRankRuleIds.length) return { jobs: [], errors: [] };
+
+  const createJob = createProcessingJob || (async (payload) => {
+    const { createAndStartAdminWorkerJob } = await import('./adminWorker.js');
+    return createAndStartAdminWorkerJob(payload);
+  });
+  const jobs = [];
+  const deferred = [];
+  const errors = [];
+  const queueOne = async (processor, payload) => {
+    try {
+      const queued = await createJob(payload);
+      if (queued.alreadyRunning) {
+        // Reconcile the complete effective eligibility set, rather than the
+        // triggering rule subset: several imports may collide with one active
+        // singleton, and pending-state selectors make the broad pass cheap.
+        const { scope: _ignoredScope, ...citationParams } = payload.params || {};
+        const followupParams = processor === 'citation'
+          ? { ...citationParams, trigger: 'import_enrichment_reconciliation' }
+          : { ...payload.params, trigger: 'import_enrichment_reconciliation' };
+        await requestProcessingFollowup({
+          type: payload.type,
+          label: `${payload.label} (reconciliation)`,
+          params: followupParams,
+        });
+        deferred.push({ processor, activeJobId: queued.jobId, reason: 'processor_already_running' });
+        await log(job.id, `${processor} eligibility is durable; processing is deferred behind active job ${queued.jobId}.`).catch(() => {});
+      } else {
+        jobs.push({ processor, jobId: queued.jobId });
+        await log(job.id, `${processor} processing queued as job ${queued.jobId}.`).catch(() => {});
+      }
+    } catch (error) {
+      const message = error?.message || String(error);
+      errors.push({ processor, error: message });
+      await log(job.id, `Could not queue ${processor} processing: ${message}`).catch(() => {});
+    }
+  };
+
+  if (progress) {
+    await progress({
+      phase: 'downstream_processing',
+      label: 'Queueing eligible processing',
+      status: 'running',
+    }).catch(() => {});
+  }
+  if (citationRuleIds.length) {
+    await queueOne('citation', {
+      type: 'citation_scan',
+      label: 'Citation Scan (import policy)',
+      params: {
+        trigger: 'import_enrichment',
+        retryFailures: false,
+        autoContinue: true,
+        scope: { eligibilityRuleIds: citationRuleIds },
+      },
+      singleInstance: true,
+    });
+  }
+  if (patternRankRuleIds.length) {
+    await queueOne('PatternRank', {
+      type: 'concept_rebuild',
+      label: 'Incremental PatternRank (import policy)',
+      params: { method: 'patternrank_incremental', trigger: 'import_enrichment' },
+      singleInstance: true,
+    });
+  }
+  if (progress) {
+    await progress({
+      phase: 'downstream_processing',
+      label: 'Eligible processing queued',
+      status: errors.length ? 'failed' : 'completed',
+      counts: { queued: jobs.length, deferred: deferred.length, failed: errors.length },
+    }).catch(() => {});
+  }
+  return { jobs, deferred, errors };
 }
 
 export function rulesForContinuation(rules, completedRuleResults) {
@@ -330,7 +506,7 @@ async function loadCitationSource(entry, artifactClient, progress, counts = null
 
 export async function runImportPdfAdminJob(job, { artifactClient = null, clearMetricsCache = null } = {}) {
   const params = job.params || {};
-  const progress = createProgressReporter(job.id);
+  const progress = createProgressReporter(job);
 
   if (job.type === 'document_sync') {
     const { runDocumentSync } = await import('../sync.js');
@@ -342,7 +518,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       artifactClient,
     });
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: result.ok ? 'completed' : 'failed',
       result,
       error: result.ok ? null : result.error || 'Document sync failed',
@@ -412,6 +588,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       totalEnrichmentAttempted: 0,
       totalEnriched: 0,
       totalEnrichmentFailed: 0,
+      totalEmbargoedDeferred: 0,
     };
     const enrichmentOutcomes = [];
     let heapGrowthBytes = 0;
@@ -438,6 +615,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         ...importRuleToSyncOptions(rule, {
           mode: params.mode,
           apiKey,
+          ...(params.syncOptions && typeof params.syncOptions === 'object' ? params.syncOptions : {}),
         }),
         artifactClient,
         onProgress: async (event = {}) => progress({
@@ -461,6 +639,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       totals.totalEnrichmentAttempted += Number(result.totalEnrichmentAttempted || 0);
       totals.totalEnriched += Number(result.totalEnriched || 0);
       totals.totalEnrichmentFailed += Number(result.totalEnrichmentFailed || 0);
+      totals.totalEmbargoedDeferred += Number(result.totalEmbargoedDeferred || 0);
       enrichmentOutcomes.push(...(Array.isArray(result.enrichmentOutcomes) ? result.enrichmentOutcomes : []));
       heapGrowthBytes = Math.max(heapGrowthBytes, Number(result.heapGrowthBytes || 0));
       for (const docId of readDocIdList(result.pdfAttemptedIds)) attemptedPdfIds.add(docId);
@@ -480,11 +659,13 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         totalEnrichmentAttempted: Number(result.totalEnrichmentAttempted || 0),
         totalEnriched: Number(result.totalEnriched || 0),
         totalEnrichmentFailed: Number(result.totalEnrichmentFailed || 0),
+        totalEmbargoedDeferred: Number(result.totalEmbargoedDeferred || 0),
         requestCounts: result.requestCounts || {
           metadata: 0, fullText: 0, originalPdf: 0, retrievedBytes: 0,
         },
         heapGrowthBytes: Number(result.heapGrowthBytes || 0),
         enrichmentExhausted: Boolean(result.enrichmentExhausted),
+        eligibilityProjectionPublished: Boolean(result.eligibilityProjectionPublished),
         error: result.error || null,
       });
       await log(job.id, `Rule result: ${result.ok ? 'success' : 'failed'}; ${result.totalSaved || 0} saved.`);
@@ -535,6 +716,18 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         heapGrowthBytes,
         exhausted: perRule.length === 1 && Boolean(perRule[0].enrichmentExhausted),
       });
+      if (rollout.phase === 'control') {
+        for (const comparison of evaluation.comparison?.documents || []) {
+          await saveWordCountComparisonParadata(comparison.docId, {
+            ...comparison,
+            status: comparison.flagged ? 'flagged' : 'within_threshold',
+            ruleId: rule.id,
+            ruleRevision: rollout.ruleRevision,
+            jobId: job.id,
+            phase: rollout.phase,
+          });
+        }
+      }
       if (rollout.phase === 'sample' && Number(requestCounts.originalPdf || 0) > 0) {
         await log(job.id, `ALERT: protected full-text sample made ${requestCounts.originalPdf} original PDF request(s); rollout blocked.`);
       }
@@ -545,8 +738,10 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     const continuation = await startContinuationJob(job, result, progress);
     if (continuation?.jobId) result.nextJobId = continuation.jobId;
     if (continuation?.error) result.continuationError = continuation.error;
+    const downstreamProcessing = await queueEligibleImportProcessing(job, result, progress);
+    if (downstreamProcessing) result.downstreamProcessing = downstreamProcessing;
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: result.ok ? 'completed' : 'failed',
       result,
       error: result.ok ? null : 'One or more import rules failed.',
@@ -591,7 +786,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       downloadError: doc.downloadError || null,
     };
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: 'completed',
       result,
       finishedAt: new Date().toISOString(),
@@ -635,7 +830,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       downloadError: doc.downloadError || null,
     };
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: result.ok ? 'completed' : 'failed',
       result,
       error: result.ok ? null : result.downloadError || 'Cached PDF/full-text reanalysis failed.',
@@ -682,7 +877,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
           error,
         };
         clearMetricsCache?.();
-        await finishAdminJob(job.id, {
+        await finishWorkerAdminJob(job, {
           status: 'failed',
           result,
           error,
@@ -728,7 +923,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       citations: doc.citationCount || 0,
     };
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: 'completed',
       result,
       finishedAt: new Date().toISOString(),
@@ -778,7 +973,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     }
     const result = { ok: true, processed, committees: withCommittee, citations: 0 };
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: 'completed',
       result,
       finishedAt: new Date().toISOString(),
@@ -810,6 +1005,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         afterDocId: cursor,
         syncKey: scope.syncKey || null,
         filters: scope.filters || scope,
+        eligibilityRuleIds: scope.eligibilityRuleIds || [],
         parserVersion: CITATION_PARSER_VERSION,
       });
       if (!entries.length) break;
@@ -871,6 +1067,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         afterDocId: cursor,
         syncKey: scope.syncKey || null,
         filters: scope.filters || scope,
+        eligibilityRuleIds: scope.eligibilityRuleIds || [],
         parserVersion: CITATION_PARSER_VERSION,
       });
       reachedLimit = remaining.length > 0;
@@ -886,7 +1083,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
       resolutionQueued: false,
     };
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: failed ? 'failed' : 'completed',
       result,
       error: failed ? `${failed} document(s) failed citation extraction.` : null,
@@ -925,12 +1122,14 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         afterDocId: cursor,
         syncKey: scope.syncKey || null,
         filters: scope.filters || scope,
+        eligibilityRuleIds: scope.eligibilityRuleIds || [],
         retryFailures,
         reprocess,
       });
       if (!entries.length) break;
       for (const entry of entries) {
         cursor = entry.doc_id;
+        let scannedContentChecksum = entry.content_checksum;
         try {
           await progress({
             phase: 'citation_scan',
@@ -941,6 +1140,9 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
           });
           const doc = await loadDocumentMetadata(entry.doc_id);
           if (!doc) throw new Error('Document metadata not found for citation scan.');
+          const contentPolicy = citationContentPolicy(
+            await listEffectiveCitationPoliciesForDocument(entry.doc_id)
+          );
           // Re-stream the original PDF (rate-limited, temp file deleted after
           // parse, nothing cached), extract and dedup citations. No committee,
           // no catalogue resolution.
@@ -953,23 +1155,36 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
             extractCitations: true,
             strictCitationErrors: true,
             artifactClient,
+            maxContentBytes: contentPolicy.maxContentBytes,
+            onContentRequest: async (event = {}) => {
+              if (event.request) {
+                await reserveCitationPolicyRequest(contentPolicy.rateLimits);
+              }
+            },
             onProgress: progress,
           });
           if (doc.downloadStatus !== 'streamed') {
             throw new Error(doc.downloadError || `Streaming failed (${doc.downloadStatus || 'unknown'}).`);
           }
+          const streamedMetric = await loadStoredFileMetric(entry.doc_id);
+          scannedContentChecksum = streamedMetric?.content_checksum || scannedContentChecksum;
           processed += 1;
           if (doc.citationCount) totalCitations += Number(doc.citationCount);
           await saveCitationExtractionState(entry.doc_id, {
-            contentChecksum: entry.content_checksum,
+            contentChecksum: scannedContentChecksum,
             parserVersion: CITATION_PARSER_VERSION,
             status: 'completed',
             citationCount: doc.citationCount || 0,
           });
         } catch (error) {
           failed += 1;
+          // The stream may have succeeded before strict citation extraction
+          // failed. Record the checksum of the bytes actually attempted rather
+          // than the stale checksum selected before the re-download.
+          const streamedMetric = await loadStoredFileMetric(entry.doc_id).catch(() => null);
+          scannedContentChecksum = streamedMetric?.content_checksum || scannedContentChecksum;
           await saveCitationExtractionState(entry.doc_id, {
-            contentChecksum: entry.content_checksum,
+            contentChecksum: scannedContentChecksum,
             parserVersion: CITATION_PARSER_VERSION,
             status: 'failed',
             citationCount: 0,
@@ -992,6 +1207,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
         afterDocId: cursor,
         syncKey: scope.syncKey || null,
         filters: scope.filters || scope,
+        eligibilityRuleIds: scope.eligibilityRuleIds || [],
         retryFailures,
         reprocess,
       });
@@ -1013,7 +1229,7 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
     if (continuation?.jobId) result.nextJobId = continuation.jobId;
     if (continuation?.error) result.continuationError = continuation.error;
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
+    await finishWorkerAdminJob(job, {
       status: failed ? 'failed' : 'completed',
       result,
       error: failed ? `${failed} document(s) failed citation scan.` : null,
@@ -1032,18 +1248,50 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
   if (job.type === 'reparse_committee') {
     await log(job.id, 'Starting committee reparse.');
     await progress({ phase: 'reparse_committee', label: 'Reparsing missing committees', status: 'running' });
+    const requestedDocIds = readDocIdList(params.docIds).slice(0, 5000);
+    const ruleId = String(params.ruleId || '').trim();
+    const dryRun = Boolean(params.dryRun);
+    const maxDocuments = Math.max(1, Math.min(5000, Number(params.maxDocuments) || 1000));
+    const predicates = [
+      'fm.pdf_path IS NOT NULL',
+      `NOT EXISTS (
+        SELECT 1 FROM committee_members cm
+        WHERE cm.doc_id = fm.doc_id
+          AND cm.role IN ('Supervisor', 'Co-Supervisor')
+      )`,
+    ];
+    const queryArgs = [];
+    if (requestedDocIds.length) {
+      predicates.push(`fm.doc_id IN (${requestedDocIds.map(() => '?').join(', ')})`);
+      queryArgs.push(...requestedDocIds);
+    }
+    if (ruleId) {
+      predicates.push(`EXISTS (
+        SELECT 1
+        FROM rule_document_processing_eligibility e
+        JOIN import_rule_eligibility_projections p
+          ON p.rule_id = e.rule_id AND p.completed_token = e.projection_token
+        WHERE e.doc_id = fm.doc_id AND e.rule_id = ?
+      )`);
+      queryArgs.push(ruleId);
+    }
+    queryArgs.push(maxDocuments);
     const targetResult = await (await getDb()).execute({
       sql: `
       SELECT fm.doc_id, fm.pdf_path
       FROM file_metrics fm
-      WHERE fm.pdf_path IS NOT NULL
-      AND NOT EXISTS (
-        SELECT 1 FROM committee_members cm WHERE cm.doc_id = fm.doc_id
-      )
-    `});
+      WHERE ${predicates.join('\n AND ')}
+      ORDER BY fm.doc_id
+      LIMIT ?
+    `, args: queryArgs });
     const targets = targetResult.rows;
     let processed = 0;
     let withCommittee = 0;
+    let supervisorsFound = 0;
+    let ocrRecovered = 0;
+    let stillMissingSupervisors = 0;
+    let failed = 0;
+    const proposedAdditions = [];
     for (const row of targets) {
       const doc = await loadDocumentMetadata(row.doc_id);
       if (!doc) continue;
@@ -1053,41 +1301,93 @@ export async function runImportPdfAdminJob(job, { artifactClient = null, clearMe
           label: 'Reparsing missing committees',
           detail: row.doc_id,
           status: 'running',
-          counts: { processed, total: targets.length, withCommittee },
+          counts: { processed, total: targets.length, withCommittee, supervisorsFound, failed },
         });
         const analysis = await analyzePdfEntry(row, artifactClient, {
           progress,
-          counts: { processed, total: targets.length, withCommittee },
+          counts: { processed, total: targets.length, withCommittee, supervisorsFound, failed },
           label: 'Parsing cached PDF text for committee data',
         });
         if (analysis?.fullText) {
           const before = (await loadCommitteeMembers(row.doc_id)).length;
-          await extractAndSaveParsedData(doc, analysis.fullText, null, {
-            onProgress: progress,
-            extractCommittee: true,
-            extractCitations: false,
-          });
-          const after = (await loadCommitteeMembers(row.doc_id)).length;
-          if (after > before) withCommittee += 1;
+          const certification = parseCommittee(analysis.fullText);
+          const hasCertificationSupervisor = certification.some((member) =>
+            member.role === 'Supervisor' || member.role === 'Co-Supervisor'
+          );
+          const acknowledgement = hasCertificationSupervisor
+            ? { members: [], ocrSpacingNormalized: false }
+            : parseAcknowledgementsDetailed(analysis.fullText);
+          const candidates = [
+            ...certification,
+            ...acknowledgement.members.filter((member) =>
+              member.role === 'Supervisor' || member.role === 'Co-Supervisor'
+            ),
+          ];
+          const supervisors = candidates.filter((member) =>
+            member.role === 'Supervisor' || member.role === 'Co-Supervisor'
+          );
+          if (!dryRun) {
+            await extractAndSaveParsedData(doc, analysis.fullText, null, {
+              onProgress: progress,
+              extractCommittee: true,
+              extractCitations: false,
+            });
+            const afterMembers = await loadCommitteeMembers(row.doc_id);
+            if (afterMembers.length > before) withCommittee += 1;
+            if (supervisors.length && !afterMembers.some((member) =>
+              member.role === 'Supervisor' || member.role === 'Co-Supervisor'
+            )) {
+              throw new Error('Supervisor candidates were parsed but not persisted.');
+            }
+          }
+          if (supervisors.length) {
+            supervisorsFound += 1;
+            if (acknowledgement.ocrSpacingNormalized) ocrRecovered += 1;
+            proposedAdditions.push({
+              docId: row.doc_id,
+              supervisors: supervisors.map((member) => ({
+                name: member.name,
+                role: member.role,
+                source: hasCertificationSupervisor ? 'pdf' : 'pdf_acknowledgements',
+              })),
+            });
+          } else {
+            stillMissingSupervisors += 1;
+          }
+        } else {
+          stillMissingSupervisors += 1;
         }
       } catch (error) {
+        failed += 1;
         await log(job.id, `Committee reparse failed for ${row.doc_id}: ${error?.message || String(error)}`);
       }
       processed += 1;
     }
-    const result = { ok: true, processed, withCommittee };
+    const result = {
+      ok: failed === 0,
+      dryRun,
+      processed,
+      withCommittee,
+      supervisorsFound,
+      ocrRecovered,
+      stillMissingSupervisors,
+      failed,
+      proposedAdditions,
+      scope: { docIds: requestedDocIds, ruleId: ruleId || null, maxDocuments },
+    };
     clearMetricsCache?.();
-    await finishAdminJob(job.id, {
-      status: 'completed',
+    await finishWorkerAdminJob(job, {
+      status: failed ? 'failed' : 'completed',
       result,
+      error: failed ? `${failed} document(s) failed committee reparse.` : null,
       finishedAt: new Date().toISOString(),
     });
-    await log(job.id, `Committee reparse finished: ${processed} processed.`);
+    await log(job.id, `Committee reparse finished: ${processed} processed, ${supervisorsFound} supervisors found, ${stillMissingSupervisors} still missing, ${failed} failed${dryRun ? ' (dry run)' : ''}.`);
     await progress({
       phase: 'reparse_committee',
       label: 'Committee reparse',
-      status: 'completed',
-      counts: { processed, total: targets.length, withCommittee },
+      status: failed ? 'failed' : 'completed',
+      counts: { processed, total: targets.length, withCommittee, supervisorsFound, ocrRecovered, stillMissingSupervisors, failed },
     });
     return result;
   }

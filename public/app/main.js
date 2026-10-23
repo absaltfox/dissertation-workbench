@@ -12,7 +12,6 @@ import {
   getFilteredDocs,
   getFilteredSortedDocs,
   openRecord,
-  renderDocuments,
   syncSelectAllDocs,
 } from './documents.js';
 import {
@@ -24,7 +23,6 @@ import {
   loadDocumentPage,
   loadPeopleData,
   loadPersonDetail,
-  populateFacetFilters,
   prefetchDocumentDetails,
   renderAll,
   resetCitationDocPager,

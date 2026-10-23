@@ -46,3 +46,4 @@ The per-rule limiter covers cIRcle record/bitstream resolution and derivative/or
 - Use `pdf_stream` when exact PDF measurements are required without retention. Streaming still counts as a repository download.
 - Do not use production-scale `pdf_cache` until the object-storage phase replaces Fly-volume retention.
 - Treat changes to fallback, extraction intent, bytes, concurrency, or rate as a new rollout revision requiring fresh evidence.
+- Policy-blocked `full_text_fallback` rows (recorded while `ALLOW_ORIGINAL_PDF_RETRIEVAL` was off) carry no real page count and are treated as terminal. If PDF retrieval is enabled later, run a reprocess for existing `full_text_fallback` rows to obtain real page counts.

@@ -1,13 +1,15 @@
 import { Router } from 'express';
-import { buildMetricsPayloadFromRecords, collectMetricRecords, collectMetrics, enrichDocumentSignals } from '../metrics.js';
+import {
+  buildMetricsPayloadFromRecords, collectMetricRecords, collectMetrics, enrichDocumentSignals, buildTermCooccurrence
+} from '../metrics.js';
 import {
   ALLOW_PUBLIC_REFRESH, CACHE_TTL_MS, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT
 } from '../config.js';
 import {
   applyCitationCountsToDocuments, applyCommitteeMembersToDocuments,
   applyStoredFileMetricsToDocuments, getDocumentCacheStats, getDocumentServingAnalytics, getDocumentServingSummary,
-  hasTopics, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics,
-  queryCachedDocumentPage, queryCitationDocumentPage, queryPeoplePage, queryPersonDetailPage,
+  hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics,
+  queryCachedDocumentPage, queryCitationDocumentPage, queryConceptTermsByDoc, queryPeoplePage, queryPersonDetailPage,
   queryRelatedDocuments, queryTopicDocumentPage
 } from '../db.js';
 import { authenticate } from '../auth.js';
@@ -20,6 +22,15 @@ const WORKBENCH_SLICE_TTL_MS = CACHE_TTL_MS;
 const ANALYTICS_DOCUMENT_SAMPLE_LIMIT = 100;
 const DETAILED_ANALYTICS_RECORD_LIMIT = 5000;
 const VISUALIZATION_DOCUMENT_LIMIT = 5000;
+// Hard server-side ceiling on /api/metrics regardless of role (#24). This route
+// runs every JS aggregator in buildMetricsPayloadFromRecords over whatever
+// record count it is handed and synchronously serializes the whole `documents`
+// array; without a ceiling an admin request (e.g. maxRecords=56000) can stall
+// the event loop and risk exceeding V8's max string length. Matches
+// VISUALIZATION_DOCUMENT_LIMIT for consistency with every other route in this
+// phase. Admins who need the full corpus should page through
+// /api/workbench/* instead (already scale-tested, cursor-paged).
+const ADMIN_MAX_RECORDS_CEILING = 5000;
 
 function readRawMetricsParams(req) {
   return {
@@ -420,8 +431,119 @@ async function cachedSlice(cache, inflight, key, refresh, compute) {
   return promise;
 }
 
+export async function buildWorkbenchAnalyticsPayload(params, filters, loadSyncModule) {
+  const documentCache = await documentCacheForParams(params, loadSyncModule);
+  if (documentCache.recordsAvailable <= DETAILED_ANALYTICS_RECORD_LIMIT) {
+    const { records, sourceMeta, subjectLimit } = await metricRecordsForParams(params, loadSyncModule);
+    const filtered = filterDocuments(records, filters);
+    const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit, {
+      persistRun: params.isAdminRequest && params.refresh,
+    });
+    return analyticsSlice(full);
+  }
+  const aggregate = await getDocumentServingAnalytics({
+    syncKey: documentCache.syncKey,
+    filters,
+    subjectLimit: params.subjectLimit,
+  });
+  const documentSample = await queryCachedDocumentPage({
+    syncKey: documentCache.syncKey,
+    filters,
+    limit: ANALYTICS_DOCUMENT_SAMPLE_LIMIT,
+    offset: 0,
+  });
+  // #15 termCooccurrence: the one panel of the six that isn't a
+  // straight SQL port (pairwise term combinatorics — the same
+  // unbounded-self-join shape #25/#26 already had to bound). Once the
+  // document_terms projection is ready, it's a full-corpus real answer
+  // built directly from the kind='concept' rows (no metadata_json
+  // transfer at all — see queryConceptTermsByDoc). Until then, it falls
+  // back to the bounded-sample pattern already proven for
+  // /workbench/visualizations' supervisorNetwork/citationCooccurrence.
+  // The sampling (or lack thereof) is disclosed via
+  // source.termCooccurrenceSampled/SampleSize/SampleOf — distinct from
+  // the other five panels' "not computed above N" language, since this
+  // one *is* computed, just on a sample when the projection isn't ready.
+  let termCooccurrence, termMeta;
+  if (isDocumentTermsReady()) {
+    const records = await queryConceptTermsByDoc({ syncKey: documentCache.syncKey, filters });
+    termCooccurrence = buildTermCooccurrence(records);
+    termMeta = {
+      termCooccurrenceSampled: false,
+      termCooccurrenceSampleSize: records.length,
+      termCooccurrenceSampleOf: records.length,
+    };
+  } else {
+    const termSample = await queryCachedDocumentPage({
+      syncKey: documentCache.syncKey,
+      filters,
+      limit: VISUALIZATION_DOCUMENT_LIMIT,
+      offset: 0,
+    });
+    termCooccurrence = buildTermCooccurrence(enrichDocumentSignals(termSample.documents));
+    termMeta = {
+      termCooccurrenceSampled: true,
+      termCooccurrenceSampleSize: termSample.documents.length,
+      termCooccurrenceSampleOf: termSample.total,
+    };
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    source: {
+      documentCache,
+      filters,
+      aggregateSource: 'database',
+      documentsAvailable: documentSample.total,
+      documentsReturned: documentSample.documents.length,
+      documentsTruncated: documentSample.total > documentSample.documents.length,
+      detailedAnalyticsRecordLimit: DETAILED_ANALYTICS_RECORD_LIMIT,
+      ...termMeta,
+      readOnlyFileEnrichment: true,
+    },
+    ...aggregate,
+    termCooccurrence,
+    documents: documentSample.documents.map(analyticsDoc),
+  };
+}
+
+export async function buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule) {
+  if (!await hasTopics()) {
+    return {
+      generatedAt: new Date().toISOString(),
+      topicData: null,
+      supervisorNetwork: { nodes: [], edges: [] },
+      citationCooccurrence: { nodes: [], edges: [] },
+      methodologyTopicMatrix: { methodologies: [], topics: [], matrix: [] },
+      documents: [],
+    };
+  }
+  const documentCache = await documentCacheForParams(params, loadSyncModule);
+  const page = await queryTopicDocumentPage({
+    syncKey: documentCache.syncKey,
+    filters,
+    limit: VISUALIZATION_DOCUMENT_LIMIT,
+    offset: 0,
+  });
+  const sourceMeta = {
+    documentCache,
+    filters,
+    aggregateSource: 'bounded-topic-document-page',
+    documentsAvailable: page.total,
+    documentsReturned: page.documents.length,
+    documentsTruncated: page.total > page.documents.length,
+    visualizationDocumentLimit: VISUALIZATION_DOCUMENT_LIMIT,
+    readOnlyFileEnrichment: true,
+  };
+  const full = await buildMetricsPayloadFromRecords(page.documents, sourceMeta, params.subjectLimit, {
+    persistRun: params.isAdminRequest && params.refresh,
+  });
+  return visualizationSlice(full);
+}
+
 export async function warmWorkbenchLandingCache({ metricsCache, metricsInflight, loadSyncModule, params }) {
-  const filters = {};
+  // Match activeFilters(req)'s shape for an unfiltered request so the cache
+  // key here lines up exactly with what the routes compute for real traffic.
+  const filters = { degree: '', program: '', affiliation: '' };
   const pageRequest = { offset: 0, limit: 50, q: '', sortKey: '', sortDir: 'asc' };
   const slices = [
     {
@@ -431,6 +553,14 @@ export async function warmWorkbenchLandingCache({ metricsCache, metricsInflight,
     {
       key: `workbench:document-page:${sourceCacheKey(params)}:${JSON.stringify(filters)}:${JSON.stringify(pageRequest)}`,
       compute: () => documentPageForParams(params, loadSyncModule, pageRequest, filters),
+    },
+    {
+      key: `workbench:analytics:${sourceCacheKey(params)}:${JSON.stringify(filters)}`,
+      compute: () => buildWorkbenchAnalyticsPayload(params, filters, loadSyncModule),
+    },
+    {
+      key: `workbench:visualizations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`,
+      compute: () => buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule),
     },
   ];
 
@@ -447,6 +577,8 @@ export async function warmWorkbenchLandingCache({ metricsCache, metricsInflight,
   return {
     bootstrap: results[0],
     documentPage: results[1],
+    analytics: results[2],
+    visualizations: results[3],
   };
 }
 
@@ -522,43 +654,9 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     if (!params) return;
     const filters = activeFilters(req);
     const key = `workbench:analytics:${sourceCacheKey(params)}:${JSON.stringify(filters)}`;
-    const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
-      const documentCache = await documentCacheForParams(params, loadSyncModule);
-      if (documentCache.recordsAvailable <= DETAILED_ANALYTICS_RECORD_LIMIT) {
-        const { records, sourceMeta, subjectLimit } = await metricRecordsForParams(params, loadSyncModule);
-        const filtered = filterDocuments(records, filters);
-        const full = await buildMetricsPayloadFromRecords(filtered, { ...sourceMeta, filters }, subjectLimit, {
-          persistRun: params.isAdminRequest && params.refresh,
-        });
-        return analyticsSlice(full);
-      }
-      const aggregate = await getDocumentServingAnalytics({
-        syncKey: documentCache.syncKey,
-        filters,
-        subjectLimit: params.subjectLimit,
-      });
-      const documentSample = await queryCachedDocumentPage({
-        syncKey: documentCache.syncKey,
-        filters,
-        limit: ANALYTICS_DOCUMENT_SAMPLE_LIMIT,
-        offset: 0,
-      });
-      return {
-        generatedAt: new Date().toISOString(),
-        source: {
-          documentCache,
-          filters,
-          aggregateSource: 'database',
-          documentsAvailable: documentSample.total,
-          documentsReturned: documentSample.documents.length,
-          documentsTruncated: documentSample.total > documentSample.documents.length,
-          detailedAnalyticsRecordLimit: DETAILED_ANALYTICS_RECORD_LIMIT,
-          readOnlyFileEnrichment: true,
-        },
-        ...aggregate,
-        documents: documentSample.documents.map(analyticsDoc),
-      };
-    });
+    const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => (
+      buildWorkbenchAnalyticsPayload(params, filters, loadSyncModule)
+    ));
     res.status(200).json(payload);
   }));
 
@@ -567,39 +665,9 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     if (!params) return;
     const filters = activeFilters(req);
     const key = `workbench:visualizations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`;
-    const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
-      if (!await hasTopics()) {
-        return {
-          generatedAt: new Date().toISOString(),
-          topicData: null,
-          supervisorNetwork: { nodes: [], edges: [] },
-          citationCooccurrence: { nodes: [], edges: [] },
-          methodologyTopicMatrix: { methodologies: [], topics: [], matrix: [] },
-          documents: [],
-        };
-      }
-      const documentCache = await documentCacheForParams(params, loadSyncModule);
-      const page = await queryTopicDocumentPage({
-        syncKey: documentCache.syncKey,
-        filters,
-        limit: VISUALIZATION_DOCUMENT_LIMIT,
-        offset: 0,
-      });
-      const sourceMeta = {
-        documentCache,
-        filters,
-        aggregateSource: 'bounded-topic-document-page',
-        documentsAvailable: page.total,
-        documentsReturned: page.documents.length,
-        documentsTruncated: page.total > page.documents.length,
-        visualizationDocumentLimit: VISUALIZATION_DOCUMENT_LIMIT,
-        readOnlyFileEnrichment: true,
-      };
-      const full = await buildMetricsPayloadFromRecords(page.documents, sourceMeta, params.subjectLimit, {
-        persistRun: params.isAdminRequest && params.refresh,
-      });
-      return visualizationSlice(full);
-    });
+    const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => (
+      buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule)
+    ));
     res.status(200).json(payload);
   }));
 
@@ -751,7 +819,9 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
       res.status(403).json({ error: 'refresh is restricted to authenticated admin sessions.' });
       return;
     }
-    const effectiveMaxRecords = isAdminRequest ? maxRecords : Math.min(maxRecords, PUBLIC_MAX_RECORDS);
+    const effectiveMaxRecords = isAdminRequest
+      ? Math.min(maxRecords, ADMIN_MAX_RECORDS_CEILING)
+      : Math.min(maxRecords, PUBLIC_MAX_RECORDS);
     const effectiveScanLimit = isAdminRequest ? scanLimit : Math.min(scanLimit, PUBLIC_SCAN_LIMIT);
 
     const cacheKey = JSON.stringify({

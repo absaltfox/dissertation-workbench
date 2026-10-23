@@ -3,6 +3,8 @@ node_modules/
 # Local runtime/cache artifacts
 data/
 output/
+playwright-report/
+test-results/
 docs/dissertation-workbench-architecture.md
 
 # Secrets
@@ -26,3 +28,6 @@ __pycache__/
 *.pyc
 .venv/
 .superpowers/
+.codex/plans/
+
+.worktrees/

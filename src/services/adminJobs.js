@@ -5,12 +5,17 @@ import { BERTOPIC_PYTHON_COMMAND, BERTOPIC_TIMEOUT_MS, SQLITE_PATH } from '../co
 import {
   appendAdminJobLog,
   claimAdminJob,
+  finishClaimedAdminJob,
+  finishRunningAdminJob,
   getAdminJob,
   getTopicBuildStatus,
+  updateClaimedAdminJob,
+  updateClaimedAdminJobProgress,
   updateAdminJob,
   updateAdminJobProgress,
 } from '../db.js';
 import { isCatalogueLookupCancelledError, runPendingCatalogueLookups } from '../catalogue.js';
+import { terminateChild } from './workerLifecycle.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,6 +40,7 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
     type: 'catalogue_lookup',
     controller,
   });
+  let executionId = null;
 
   let lastProgressWriteAt = 0;
   const writeProgress = async ({
@@ -51,7 +57,7 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
     if (!isMilestone && now - lastProgressWriteAt < 5_000) return;
     lastProgressWriteAt = now;
     const status = phase === 'complete' ? 'completed' : 'running';
-    await updateAdminJobProgress(id, {
+    const progress = {
       phase,
       currentTask: 'Z39.50 catalogue lookup',
       tasks: [{
@@ -78,12 +84,16 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
         skipped: stats.skipped || 0,
         failed: stats.failed || 0,
       },
-    });
+    };
+    if (executionId) await updateClaimedAdminJobProgress(id, executionId, progress);
+    else await updateAdminJobProgress(id, progress);
   };
 
   (async () => {
-    await claimAdminJob(id, runnerId);
-    await updateAdminJob(id, {
+    const claimed = await claimAdminJob(id, runnerId);
+    if (!claimed) throw new Error(`Catalogue lookup job ${id} could not be claimed`);
+    executionId = claimed.executionId;
+    await updateClaimedAdminJob(id, executionId, {
       runnerType: 'in_process',
       runnerId,
       runnerState: 'starting',
@@ -108,7 +118,7 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
         stats,
       });
       await appendAdminJobLog(jobId, `Catalogue lookup completed: ${stats.processed || 0} processed, ${stats.found || 0} found, ${stats.notFound || 0} not found, ${stats.skipped || 0} skipped, ${stats.failed || 0} failed.\n`);
-      await updateAdminJob(jobId, {
+      await finishClaimedAdminJob(jobId, executionId, {
         status: 'completed',
         result: stats,
         runnerState: 'completed',
@@ -118,7 +128,7 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
     .catch(async (error) => {
       if (isCatalogueLookupCancelledError(error)) {
         const now = new Date().toISOString();
-        await updateAdminJob(jobId, {
+        await finishClaimedAdminJob(jobId, executionId, {
           status: 'cancelled',
           error: null,
           runnerState: 'cancelled',
@@ -127,7 +137,7 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
         });
         return;
       }
-      await updateAdminJob(jobId, {
+      await finishClaimedAdminJob(jobId, executionId, {
         status: 'failed',
         error: error?.message || String(error),
         result: error?.stats || null,
@@ -141,87 +151,174 @@ export function runCatalogueLookupJob(jobId, limit, { runLookup = runPendingCata
     });
 }
 
-export async function cancelInProcessAdminJob(jobId) {
+export async function cancelInProcessAdminJob(jobId, {
+  getJob = getAdminJob,
+  finishRunning = finishRunningAdminJob,
+} = {}) {
   const id = Number(jobId || 0);
   const running = runningInProcessAdminJobs.get(id);
   if (!running) return { ok: false, error: 'Job is not running in this process' };
 
-  const job = await getAdminJob(id);
+  const job = await getJob(id);
   if (!job) return { ok: false, error: 'Job not found' };
   if (job.status !== 'running') return { ok: false, error: 'Job is not running' };
 
-  running.controller.abort();
   const now = new Date().toISOString();
-  await updateAdminJob(id, {
+  const cancelled = await finishRunning(id, {
     status: 'cancelled',
     error: null,
+    runnerState: 'cancelled',
     cancelledAt: now,
     finishedAt: now,
   });
+  if (!cancelled) {
+    const current = await getJob(id);
+    return {
+      ok: false,
+      error: `Job reached ${current?.status || 'an unknown state'} before cancellation was published`,
+    };
+  }
+
+  // Publish cancellation (and revoke the worker's lease) before signalling the
+  // cooperative worker. A completion that wins the race must not be replaced.
+  running.controller.abort();
   await appendAdminJobLog(id, 'Job cancelled by administrator.\n');
   return { ok: true, jobId: id, cancelled: true };
 }
 
-export function runBertopicJob(jobId, { clearMetricsCache } = {}) {
-  runningAdminJobs.add('bertopic');
-  const scriptPath = path.join(__dirname, '..', '..', 'scripts', 'build-topics.py');
-  let timedOut = false;
-  const child = spawn(BERTOPIC_PYTHON_COMMAND, [scriptPath], {
-    cwd: path.join(__dirname, '..', '..'),
-    env: {
-      PATH: process.env.PATH || '',
-      HOME: process.env.HOME || '',
-      NODE_ENV: process.env.NODE_ENV || '',
-      SQLITE_PATH,
-      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
-      HF_HOME: process.env.HF_HOME || '',
-      TRANSFORMERS_CACHE: process.env.TRANSFORMERS_CACHE || '',
-      SENTENCE_TRANSFORMERS_HOME: process.env.SENTENCE_TRANSFORMERS_HOME || '',
-    },
-  });
-  const timer = setTimeout(() => {
-    timedOut = true;
-    child.kill('SIGTERM');
-    setTimeout(() => {
-      if (!child.killed) child.kill('SIGKILL');
-    }, 5_000).unref();
-  }, BERTOPIC_TIMEOUT_MS);
-  timer.unref();
-  let output = '';
-  child.stdout.on('data', (chunk) => {
-    output = tailLog(output + chunk.toString());
-  });
-  child.stderr.on('data', (chunk) => {
-    output = tailLog(output + chunk.toString());
-  });
+export function runBertopicJob(jobId, {
+  clearMetricsCache,
+  spawnProcess = spawn,
+  timeoutMs = BERTOPIC_TIMEOUT_MS,
+  terminationGraceMs = 5_000,
+  terminationForceWaitMs,
+  terminate = terminateChild,
+  getStatus = getTopicBuildStatus,
+  claimJob = claimAdminJob,
+  getJob = getAdminJob,
+  updateClaimedJob = updateClaimedAdminJob,
+  finishJob = finishClaimedAdminJob,
+  executionId: suppliedExecutionId = null,
+  runnerId = `web:${process.pid}`,
+} = {}) {
+  const id = Number(jobId || 0);
+  if (!id) return Promise.resolve(null);
 
-  let jobFinished = false;
-  const finishJob = async (status, err, result = null) => {
-    if (jobFinished) return;
-    jobFinished = true;
-    clearTimeout(timer);
-    await updateAdminJob(jobId, {
-      status,
-      log: output,
-      error: err,
-      result,
-      finishedAt: new Date().toISOString(),
-    });
-    if (status === 'completed') {
-      clearMetricsCache?.();
+  // This runner predates the dedicated worker supervisor.  It may be handed an
+  // already-claimed lease by a caller, but otherwise must claim its own lease
+  // before it starts Python.  In either case every terminal write is fenced by
+  // that lease, so cancellation and the stale-job reaper win over a late child.
+  return (async () => {
+    let executionId = suppliedExecutionId;
+    let claimed = null;
+    if (executionId) {
+      const current = await getJob(id);
+      if (current?.status === 'running' && !current.finishedAt && current.executionId === executionId) {
+        claimed = current;
+      } else if (current?.status === 'running' && !current?.claimedAt) {
+        claimed = await claimJob(id, runnerId, executionId);
+      }
+    } else {
+      claimed = await claimJob(id, runnerId);
+      executionId = claimed?.executionId || null;
     }
-    runningAdminJobs.delete('bertopic');
-  };
+    if (!claimed || !executionId) return null;
 
-  child.on('error', async (error) => {
-    await finishJob('failed', error?.message || String(error));
-  });
-  child.on('close', async (code) => {
-    const status = code === 0 && !timedOut ? 'completed' : 'failed';
-    const err = status === 'completed' ? null : timedOut ? 'BERTopic process timed out' : `BERTopic process exited with code ${code}`;
-    const result = status === 'completed' ? await getTopicBuildStatus() : null;
-    await finishJob(status, err, result);
-  });
+    const markedRunning = await updateClaimedJob(id, executionId, {
+      runnerType: 'in_process',
+      runnerId,
+      runnerState: 'running',
+    });
+    if (!markedRunning) return null;
+
+    runningAdminJobs.add('bertopic');
+    const scriptPath = path.join(__dirname, '..', '..', 'scripts', 'build-topics.py');
+    let timedOut = false;
+    const child = spawnProcess(BERTOPIC_PYTHON_COMMAND, [scriptPath], {
+      cwd: path.join(__dirname, '..', '..'),
+      env: {
+        PATH: process.env.PATH || '',
+        HOME: process.env.HOME || '',
+        NODE_ENV: process.env.NODE_ENV || '',
+        SQLITE_PATH,
+        ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+        HF_HOME: process.env.HF_HOME || '',
+        TRANSFORMERS_CACHE: process.env.TRANSFORMERS_CACHE || '',
+        SENTENCE_TRANSFORMERS_HOME: process.env.SENTENCE_TRANSFORMERS_HOME || '',
+        TURSO_DATABASE_URL: process.env.TURSO_DATABASE_URL || '',
+        TURSO_AUTH_TOKEN: process.env.TURSO_AUTH_TOKEN || '',
+        ADMIN_JOB_ID: String(id),
+        ADMIN_JOB_EXECUTION_ID: executionId,
+      },
+    });
+    let termination = null;
+    const stopChild = () => {
+      if (!termination) {
+        termination = Promise.resolve(terminate(child, {
+          graceMs: terminationGraceMs,
+          ...(terminationForceWaitMs == null ? {} : { forceWaitMs: terminationForceWaitMs }),
+        })).catch((error) => {
+          output = tailLog(`${output}\nCould not terminate BERTopic process: ${error?.message || String(error)}\n`);
+        });
+      }
+      return termination;
+    };
+    let output = '';
+    let terminalPublication = null;
+    const publishTerminal = async (status, err, result = null) => {
+      if (terminalPublication) return terminalPublication;
+      terminalPublication = (async () => {
+        const published = await finishJob(id, executionId, {
+          status,
+          log: output,
+          error: err,
+          result,
+          runnerState: status,
+          finishedAt: new Date().toISOString(),
+        });
+        if (published && status === 'completed') {
+          clearMetricsCache?.();
+        }
+        return published;
+      })().finally(() => {
+        runningAdminJobs.delete('bertopic');
+      });
+      return terminalPublication;
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      // Revoke the lease before asking the child to stop.  Its eventual close
+      // event can then only lose the fenced terminal update.
+      void publishTerminal('timed_out', 'BERTopic process timed out')
+        .catch(() => {})
+        .finally(() => { void stopChild(); });
+    }, timeoutMs);
+    timer.unref();
+    child.stdout.on('data', (chunk) => {
+      output = tailLog(output + chunk.toString());
+    });
+    child.stderr.on('data', (chunk) => {
+      output = tailLog(output + chunk.toString());
+    });
+
+    const finishChild = async (status, err, result = null) => {
+      clearTimeout(timer);
+      return publishTerminal(status, err, result);
+    };
+
+    child.on('error', async (error) => {
+      await termination;
+      await finishChild('failed', error?.message || String(error));
+    });
+    child.on('close', async (code) => {
+      await termination;
+      const status = code === 0 && !timedOut ? 'completed' : 'failed';
+      const err = status === 'completed' ? null : timedOut ? 'BERTopic process timed out' : `BERTopic process exited with code ${code}`;
+      const result = status === 'completed' ? await getStatus() : null;
+      await finishChild(status, err, result);
+    });
+    return child;
+  })();
 }
 
 export function runImportRulesJob(jobId, { mode, scope, ruleIds, downloadFiles = true, clearMetricsCache }) {

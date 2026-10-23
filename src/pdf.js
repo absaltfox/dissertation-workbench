@@ -17,6 +17,7 @@ import { logger } from './logger.js';
 import { dedupeSupervisorNames } from './supervisors.js';
 import { safeFetchDownloadUrl } from './urlSafety.js';
 import { isImportContentMode } from './importRules.js';
+import { isEmbargoDeferred } from './accessStatus.js';
 
 // Recorded as file_metrics.word_source when pdftotext could not produce text
 // and we fell back to scraping raw PDF bytes. Treated as unreliable everywhere
@@ -1463,6 +1464,13 @@ const ROLE_PATTERNS = [
 ];
 const SUPERVISOR_ROLES = new Set(['Supervisor', 'Co-Supervisor']);
 
+// Leading academic honorific that precedes a real name on certificate pages,
+// e.g. "Professor Shigenori Matsui" or "Dr. Jane Roe". Stripped before name
+// validation so the honorific is not mistaken for a bare title/header line.
+// Requires trailing whitespace + a name, so a bare "Professor" line does not
+// match and is still rejected as a non-name.
+const LEADING_HONORIFIC = /^(?:(?:Associate|Assistant|Assoc\.?|Asst\.?)\s+)?(?:Professor|Prof\.?|Dr\.?)\s+/i;
+
 // Known lowercase name particles (Dutch, French, Spanish, German, etc.)
 const NAME_PARTICLES = new Set(['de', 'du', 'da', 'di', 'van', 'von', 'le', 'la', 'el', 'al', 'den', 'der', 'dos', 'das', 'ter', 'ten']);
 
@@ -1477,7 +1485,7 @@ function extractNameFromCapture(raw) {
   const parts = [];
   for (const word of raw.trim().split(/\s+/)) {
     // Strip trailing punctuation but keep periods for middle initials (e.g. "J.")
-    const stripped = word.replace(/[,;:()\[\]!?]+$/, '');
+    const stripped = word.replace(/[,;:()[\]!?]+$/, '');
     if (!stripped) break;
     // Must start with an uppercase letter (including accented uppercase)
     if (!/^[A-Z\u00C0-\u024F]/.test(stripped)) {
@@ -1491,7 +1499,9 @@ function extractNameFromCapture(raw) {
     // Reject common pronouns/articles that appear after a sentence boundary
     if (/^(He|She|They|We|I|It|His|Her|Their|This|That|The|A|An)$/.test(stripped)) break;
     // Sentence-ending period (word length > 2 means NOT a middle initial like "J.")
-    const endsWithSentencePeriod = /\.$/.test(stripped) && stripped.length > 2;
+    // Compact multi-initial tokens like "R.A.J." are also not sentence-ending.
+    const isMultiInitial = /^(?:[A-Z]\.){2,}$/.test(stripped);
+    const endsWithSentencePeriod = /\.$/.test(stripped) && stripped.length > 2 && !isMultiInitial;
     // Push with period stripped from non-initial words
     parts.push(endsWithSentencePeriod ? stripped.slice(0, -1) : stripped);
     if (parts.length >= 4) break;
@@ -1508,18 +1518,76 @@ function extractNameFromCapture(raw) {
 // The fuzzy fallback ACKNOW[A-Z]{4,12} captures OCR/transcription typos such as
 // "ACKNOWDLEGMENTS" (D/L transposition) and American vs British spelling variants
 // that the exact spellings miss. "ACKNOW" is the safe common prefix for all variants.
-const ACK_HEADING_RE = /(?:^|\n|\f)(ACKNOWLEDGEMENTS?|Acknowledgements?|ACKNOWLEDG[A-Z]{2,10}|ACKNOW[A-Z]{4,12})\s*\n/g;
+// Tolerates two scanned-thesis variants the original missed:
+//   - OCR letter-spacing in the heading itself ("A C K N O W L E D G E M E N T S"),
+//     via optional single spaces/tabs between letters;
+//   - a suffix on the heading line ("ACKNOWLEDGEMENTS AND DEDICATION").
+// Still anchored at line start and still requires the heading to end its line
+// (\n|$), which is what distinguishes a real heading from a run-in TOC row
+// ("Acknowledgements (^0 …"). The optional "E" before "MENT" covers the American
+// spelling ("ACKNOWLEDGMENTS"); the fuzzy fallbacks catch run-together OCR typos.
+const ACK_HEADING_RE = /(?:^|\n|\f)[^\S\n]*(A[ \t]?C[ \t]?K[ \t]?N[ \t]?O[ \t]?W[ \t]?L[ \t]?E[ \t]?D[ \t]?G[ \t]?E?[ \t]?M[ \t]?E[ \t]?N[ \t]?T[ \t]?S?|ACKNOWLEDG[A-Z]{2,10}|ACKNOW[A-Z]{4,12})(?:\s+AND\s+DEDICATION)?[^\S\n]*(?:\n|$)/gi;
 // Capture group: 1–4 tokens each starting with uppercase, including \S* tail and optional trailing space
 const DR_CAP = '((?:[A-Z\\u00C0-\\u024F]\\S*\\s*){1,4})';
 // Title prefix: Dr. or Prof/Professor (period optional for Prof/Professor)
 const TITLE_RE = '(?:Dr\\.|Prof(?:essor)?\\.?)';
 const BARE_NAME = '[A-Z\\u00C0-\\u024F][a-zA-Z\\u00C0-\\u024F]+(?:\\s+[A-Z\\u00C0-\\u024F][a-zA-Z\\u00C0-\\u024F]+){1,2}';
 
+// pdftotext/OCR sometimes emits words one glyph at a time ("a d v i s o r",
+// "M i c h a e l").  Repair only runs against the bounded acknowledgements
+// slice and only joins runs of four or more letters, preserving initials such
+// as "J R R" and avoiding any mutation of citations or the thesis body.
+function normalizeAcknowledgementOcrSpacing(value) {
+  let changed = false;
+  const text = String(value || '').replace(
+    /(?<![\p{L}\p{M}])(?:[\p{L}\p{M}]\s+){3,}[\p{L}\p{M}](?![\p{L}\p{M}])/gu,
+    (match) => {
+      changed = true;
+      return match.replace(/\s+/g, '');
+    }
+  );
+  return { text, changed };
+}
+
+const ADVISOR_NAME_STOP_WORDS = new Set([
+  'university', 'department', 'faculty', 'school', 'college', 'committee',
+  'advisor', 'adviser', 'supervisor', 'professor', 'doctor', 'research',
+  'thesis', 'support', 'guidance', 'encouragement', 'assistance',
+]);
+
+// Strong organization / geography signals.  A candidate whose tokens include any
+// of these is an institution or place ("National Science Foundation",
+// "Statistics Canada", "Vancouver General Hospital"), not a person, so reject it.
+// Kept to unambiguous org/place words so ordinary human names are never rejected.
+const ADVISOR_NAME_ORG_PLACE_WORDS = new Set([
+  'university', 'college', 'institute', 'foundation', 'hospital', 'association',
+  'council', 'ministry', 'department', 'society', 'commission', 'bureau',
+  'agency', 'corporation', 'company', 'museum', 'library', 'laboratory',
+  'centre', 'center', 'nations', 'statistics', 'canada', 'america', 'national',
+  'international', 'federal', 'science',
+]);
+
+function isPlausibleBareAdvisorName(raw) {
+  const name = extractNameFromCapture(raw);
+  const tokens = name.split(/\s+/).filter(Boolean);
+  if (tokens.length < 2 || tokens.length > 4 || name.length > 60 || /\d/.test(name)) return '';
+  let substantive = 0;
+  for (const token of tokens) {
+    const bare = token.replace(/[.'’-]/g, '');
+    if (NAME_PARTICLES.has(bare.toLowerCase())) continue;
+    if (ADVISOR_NAME_STOP_WORDS.has(bare.toLowerCase())) return '';
+    if (ADVISOR_NAME_ORG_PLACE_WORDS.has(bare.toLowerCase())) return '';
+    if (!/^\p{Lu}[\p{L}\p{M}'’.-]*$/u.test(token)) return '';
+    substantive += 1;
+  }
+  return substantive >= 2 ? name : '';
+}
+
 // --- Acknowledgement extraction patterns (constructed once at module scope) ---
 const PAT_PLURAL_SUPERVISORS = new RegExp(
   `my\\s+supervisors?,?\\s+${TITLE_RE}\\s+${DR_CAP}\\s+and\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
 const PAT_MY_SUPERVISOR = new RegExp(
-  `(?:my|research)\\s+(co-?)?supervisor,?\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
+  `(?:my|the|research)\\s+(?:(?:thesis|doctoral|dissertation)\\s+)?(co-?)?(?:supervisor|advis(?:or|er))s?,?\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
 const PAT_COMMITTEE_CHAIR = new RegExp(
   `Committee\\s+Chair\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
 const PAT_TITLE_ROLE_PARENS = new RegExp(
@@ -1530,6 +1598,18 @@ const PAT_CO_ADVISOR_SUFFIX = new RegExp(
   `${TITLE_RE}\\s+${DR_CAP},\\s*as\\s+(?:my\\s+)?co-?advisor\\b`, 'gi');
 const PAT_CO_ADVISOR_PREFIX = new RegExp(
   `co-?advisor,?\\s+${TITLE_RE}\\s+${DR_CAP}`, 'gi');
+// Untitled names are intentionally accepted only after first-person ownership
+// plus punctuation.  This avoids interpreting ordinary prose such as
+// "the advisor Michael suggested" as an asserted supervisory relationship.
+const PAT_BARE_ADVISOR_PREFIX = /\bmy\s+(?:(?:research|thesis|academic)\s+)?(co[- ]?)?advis(?:or|er)\s*[,;:–—-]\s*([^\n!?;:]{3,100})/giu;
+// Untitled advisor with NO trailing punctuation: "my thesis advisor Joy Dixon",
+// "my advisor Leslie Paris".  The role word is followed directly by a capitalized
+// name.  Infix is restricted to thesis|doctoral|dissertation (or none) — matching
+// Lever A — so administrative "my academic advisor …" / "my graduate advisor …"
+// cannot match this path.  The capitalized-start requirement rejects "my advisor
+// was …" / "my advisor and …", and isPlausibleBareAdvisorName (2+ substantive
+// capitalized tokens) rejects single-token / stop-word captures.
+const PAT_BARE_ADVISOR_UNTITLED = /\bmy\s+(?:(?:thesis|doctoral|dissertation)\s+)?(co[- ]?)?advis(?:or|er)\s+([A-ZÀ-ɏ][^\n!?;:]{2,100})/giu;
 const PAT_AS_SUPERVISOR = new RegExp(
   `${TITLE_RE}\\s+${DR_CAP}[^.]{0,150}as\\s+(?:my\\s+)?(?:(co-?))?supervisor`, 'gi');
 const PAT_TITLED_NAME = new RegExp(`${TITLE_RE}\\s+${DR_CAP}`, 'g');
@@ -1539,11 +1619,39 @@ const PAT_BARE_COMMITTEE_MEMBER_SUFFIX = new RegExp(
   `(${BARE_NAME})\\s+was\\s+the\\s+(?:third|final|other|remaining)\\s+member\\s+of\\s+my\\s+thesis\\s+committee\\b`, 'g');
 const PAT_DRS_ADVISORY_COMMITTEE = new RegExp(
   `(?:Advisory|Supervisory|Thesis)\\s+Committee\\s*[-:–—]\\s*Drs?\\.\\s+(${BARE_NAME}(?:,\\s*${BARE_NAME})*(?:,?\\s+and\\s+${BARE_NAME})?)`, 'g');
+// Comma-free name capture: stops before the comma / role clause that follows the
+// name. Used for phrasings where the supervisory role trails the name rather than a
+// title preceding it (§5b R2/R3), so the capture never swallows ", who …" or ", Q.C.".
+const NAME_NC = "([A-Z\\u00C0-\\u024F][A-Za-z.'\\u00C0-\\u024F-]*(?:\\s+[A-Z\\u00C0-\\u024F][A-Za-z.'\\u00C0-\\u024F-]*){0,3})";
+// R1 — untitled supervisor named after "my [thesis] supervisor". Mirrors the two
+// PAT_BARE_ADVISOR_* patterns (punctuation-delimited and untitled), but for
+// "supervisor". The (?!Dr|Prof) lookahead defers titled names to PAT_MY_SUPERVISOR
+// so a "Dr."/"Prof." never leaks into the captured name.
+const PAT_BARE_SUPERVISOR_PREFIX = /\bmy\s+(?:(?:research|thesis|academic)\s+)?(co[- ]?)?supervisors?\s*[,;:–—-]\s*(?!(?:Dr\b|Dr\.|Prof))([^\n!?;:]{3,100})/giu;
+const PAT_BARE_SUPERVISOR_UNTITLED = /\bmy\s+(?:(?:thesis|doctoral|dissertation)\s+)?(co[- ]?)?supervisors?\s+(?!(?:Dr\b|Dr\.|Prof))([A-ZÀ-ɏ][^\n!?;:]{2,100})/giu;
+// R2 — "Professor X … supervision of (this|the) thesis" (title precedes the name).
+const PAT_TITLED_SUPERVISION_OF_THESIS = new RegExp(
+  `${TITLE_RE}\\s+${NAME_NC}[^.]{0,60}?\\bsupervision of (?:this|the) thesis`, 'gi');
+// R3 — "Professor X[, Q.C.], who [both] supervised … thesis" (relative clause).
+const PAT_TITLED_WHO_SUPERVISED = new RegExp(
+  `${TITLE_RE}\\s+${NAME_NC}(?:\\s*,\\s*Q\\.?C\\.?)?\\s*,?\\s*who\\s+(?:both\\s+)?supervised\\b[^.]{0,40}thesis`, 'gi');
+// R4 (committee) — "my Advisory/Supervisory/Thesis Committee, Prof. X and Prof. Y".
+// Bounded to the titled names immediately adjacent to the phrase (not a wide forward
+// scan) so a later "such as Prof. Z" mention is not swept in as a committee member.
+// Case-sensitive ('g', not 'gi'): BARE_NAME relies on real uppercase to stop at
+// lowercase connectors like "and"; the i-flag would let [A-Z] match "and" and
+// truncate the list. Committee keywords appear title-cased inline ("my Advisory
+// Committee, …") so case-sensitivity does not lose real matches.
+const PAT_ADVISORY_COMMITTEE_TITLED = new RegExp(
+  `(?:[Mm]y|[Tt]he)\\s+(?:Advisory|Supervisory|Thesis)\\s+Committee\\s*[,:]\\s+(${TITLE_RE}\\s+${BARE_NAME}(?:\\s+and\\s+${TITLE_RE}\\s+${BARE_NAME})*)`, 'g');
 
-export function parseAcknowledgements(fullText) {
-  if (!fullText) return [];
+export function parseAcknowledgementsDetailed(fullText) {
+  if (!fullText) return { members: [], ocrSpacingNormalized: false };
 
-  // Normalize form feeds so they appear as newlines to the heading regex
+  // Normalize form feeds so they appear as newlines to the heading regex. OCR
+  // letter-spacing inside the heading itself is tolerated by ACK_HEADING_RE; the
+  // section body is de-spaced separately below. (De-spacing the whole document here
+  // would deflate the substantive-section word count and hide short real sections.)
   const text = fullText.replace(/\f/g, '\n');
 
   // Use the first *substantive* occurrence — TOC entries have dotted leaders and few words
@@ -1563,9 +1671,17 @@ export function parseAcknowledgements(fullText) {
       break;
     }
   }
-  if (!ackMatch) return [];
+  if (!ackMatch) return { members: [], ocrSpacingNormalized: false };
 
-  const section = text.slice(ackMatch.index + ackMatch[0].length, ackMatch.index + ackMatch[0].length + 3000);
+  const rawSection = text.slice(ackMatch.index + ackMatch[0].length, ackMatch.index + ackMatch[0].length + 3000);
+  const normalizedSection = normalizeAcknowledgementOcrSpacing(rawSection);
+  // Lever C1: within the bounded section only, collapse intra-section line-wrap
+  // newlines (and resulting whitespace runs) into single spaces so names/phrases
+  // that pdftotext wrapped across a line break — e.g. "my advisor, Joy \nDixon" —
+  // become contiguous for the PAT_* matchers instead of truncating at the newline.
+  // No text is deleted. Sentence terminators (. ! ? ; :) are preserved, so a match
+  // still cannot run across a sentence boundary (patterns use those, not \n).
+  const section = normalizedSection.text.replace(/\s+/g, ' ');
 
   const members = [];
   const seen = new Set();
@@ -1628,9 +1744,44 @@ export function parseAcknowledgements(fullText) {
     addMember(pm[1], 'Co-Supervisor');
   }
 
+  // "my advisor, Michael Ignatieff" / "my thesis adviser: Jane Doe".
+  // Unlike the titled patterns, this path uses strict two-to-four-token name
+  // validation and requires punctuation before the candidate.
+  for (const pm of section.matchAll(PAT_BARE_ADVISOR_PREFIX)) {
+    const name = isPlausibleBareAdvisorName(pm[2]);
+    if (name) addMember(name, pm[1] ? 'Co-Supervisor' : 'Supervisor');
+  }
+
+  // "my thesis advisor Joy Dixon" / "my advisor Leslie Paris" — untitled, no
+  // trailing punctuation.  Infix restricted to thesis|doctoral|dissertation.
+  for (const pm of section.matchAll(PAT_BARE_ADVISOR_UNTITLED)) {
+    const name = isPlausibleBareAdvisorName(pm[2]);
+    if (name) addMember(name, pm[1] ? 'Co-Supervisor' : 'Supervisor');
+  }
+
   // "Dr. X ... as my supervisor" (name comes before the role keyword, within 150 chars)
   for (const pm of section.matchAll(PAT_AS_SUPERVISOR)) {
     addMember(pm[1], pm[2] ? 'Co-Supervisor' : 'Supervisor');
+  }
+
+  // R1: untitled supervisor — "my supervisor, Steve Wexler" / "my thesis supervisor Karin Mickelson"
+  for (const pm of section.matchAll(PAT_BARE_SUPERVISOR_PREFIX)) {
+    const name = isPlausibleBareAdvisorName(pm[2]);
+    if (name) addMember(name, pm[1] ? 'Co-Supervisor' : 'Supervisor');
+  }
+  for (const pm of section.matchAll(PAT_BARE_SUPERVISOR_UNTITLED)) {
+    const name = isPlausibleBareAdvisorName(pm[2]);
+    if (name) addMember(name, pm[1] ? 'Co-Supervisor' : 'Supervisor');
+  }
+
+  // R2: "Professor X ... supervision of this thesis"
+  for (const pm of section.matchAll(PAT_TITLED_SUPERVISION_OF_THESIS)) {
+    addMember(pm[1], 'Supervisor');
+  }
+
+  // R3: "Professor X, who [both] supervised ... this thesis"
+  for (const pm of section.matchAll(PAT_TITLED_WHO_SUPERVISED)) {
+    addMember(pm[1], 'Supervisor');
   }
 
   // "Don Fisher and Kjell Rubenson, my research cosupervisors"
@@ -1662,6 +1813,13 @@ export function parseAcknowledgements(fullText) {
     addBareNamesFromList(cm[1], 'Supervisory Committee Member');
   }
 
+  // "my Advisory Committee, Prof. X and Prof. Y" — committee members, not a supervisor.
+  for (const cm of section.matchAll(PAT_ADVISORY_COMMITTEE_TITLED)) {
+    for (const dm of cm[1].matchAll(PAT_TITLED_NAME)) {
+      addMember(dm[1], 'Supervisory Committee Member');
+    }
+  }
+
   // Bare committee list: "committee consisting of Name1, Name2 and Name3"
   // Used when no title prefix (Dr./Prof.) is present, e.g. "my research committee
   // consisting of Tom Sork, Pierre Walter and Robert VanWynsberghe".
@@ -1672,7 +1830,11 @@ export function parseAcknowledgements(fullText) {
     addBareNamesFromList(cm[1], 'Supervisory Committee Member');
   }
 
-  return members;
+  return { members, ocrSpacingNormalized: normalizedSection.changed };
+}
+
+export function parseAcknowledgements(fullText) {
+  return parseAcknowledgementsDetailed(fullText).members;
 }
 
 export function parseCommittee(fullText) {
@@ -1803,6 +1965,9 @@ export function parseCommittee(fullText) {
         name = name.replace(/\s*[–—-]\s*(Professor|Assistant|Associate|Instructor).*$/i, '').trim();
         name = name.replace(/\s+(Thank|You|Sessional\s+Le[ct].*|Senior\s+Inst.*)$/i, '').trim();
         name = name.replace(/-$/, '').trim();
+        // Strip a leading honorific ("Professor X", "Dr. X") so the real name
+        // survives the bare-title reject below.
+        name = name.replace(LEADING_HONORIFIC, '').trim();
         // Skip label lines captured as names
         if (/^(additional|examining)\s+/i.test(name) || /committee\s+member/i.test(name)) continue;
         // Reject institution/department fragments, bare role words, and page artifacts
@@ -1859,7 +2024,7 @@ function isLikelyCitationStart(line) {
 
   // Person-author starts: "Lastname, Firstname ..."
   // Exclude publisher-location patterns and common non-name words that appear on wrapped lines
-  if (/^[A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F'\u2019.\-]+,\s+[A-Z\u00C0-\u024F]/.test(text)) {
+  if (/^[A-Z\u00C0-\u024F][A-Za-z\u00C0-\u024F'\u2019.-]+,\s+[A-Z\u00C0-\u024F]/.test(text)) {
     if (/^[A-Z][A-Za-z\s]+,\s+[A-Z]{2}\s*:/.test(text)) return false;
     if (/^(Dissertation|Thesis|Theses|Journal|Computers?|University|Department|Faculty|Ministry|Province|Government|Report|Paper|Conference|School|Press|Association|Institute|Committee|Society|Museum|Archive|Archives|Magazine|Newsletter|Vol|Chapter|Retrieved|Available|Accessed|Edited|Translated|Published|Information|Education|Teacher|Teachers|Inc|York|Studies|Study|Distribution|Exceptional|December|January|February|March|April|May|June|July|August|September|October|November)\.?,/i.test(text)) return false;
     return true;
@@ -2024,7 +2189,18 @@ function supervisorsFromCommittee(committee) {
 }
 
 function hasApiSupervisors(doc) {
-  return dedupeSupervisorNames(doc?.supervisors || []).length > 0;
+  // Missing source is retained as a legacy-metadata compatibility case. Modern
+  // PDF extraction always writes an explicit pdf_* source, so a previously
+  // inferred supervisor is no longer mistaken for API authority.
+  return (doc?.supervisorsSource === 'api' || doc?.supervisorsSource == null)
+    && dedupeSupervisorNames(doc?.supervisors || []).length > 0;
+}
+
+function inferredSupervisorSource(committee = []) {
+  const supervisors = (committee || []).filter((member) => SUPERVISOR_ROLES.has(member.role));
+  if (supervisors.some((member) => member.source === 'api')) return 'api';
+  if (supervisors.some((member) => member.source === 'pdf_acknowledgements')) return 'pdf_acknowledgements';
+  return supervisors.length ? 'pdf_fallback' : null;
 }
 
 export function detectDownloadBlockPage(html) {
@@ -2048,16 +2224,30 @@ export async function extractAndSaveParsedData(doc, fullText, pdfPath, {
     await onProgress?.({ phase: 'committee', label: 'Extracting committee information', status: 'running' });
     try {
       const committee = parseCommittee(fullText);
-      // Fall back to acknowledgements-based parsing when the certify-page parser finds nothing
-      const effectiveCommittee = committee.length > 0 ? committee : parseAcknowledgements(fullText);
+      const committeeHasSupervisor = supervisorsFromCommittee(committee).length > 0;
+      // A certification page may contain only examiners. In that case, retain
+      // those authoritative page-derived roles while consulting the bounded
+      // acknowledgement section for the still-missing supervisor role.
+      const acknowledgement = committeeHasSupervisor
+        ? { members: [], ocrSpacingNormalized: false }
+        : parseAcknowledgementsDetailed(fullText);
+      const acknowledgementSupervisors = acknowledgement.members.filter((member) => SUPERVISOR_ROLES.has(member.role));
+      const acknowledgementOtherMembers = committee.length ? [] : acknowledgement.members.filter((member) => !SUPERVISOR_ROLES.has(member.role));
 
       if (hasApiSupervisors(doc)) {
         const apiSupervisors = dedupeSupervisorNames(doc.supervisors || []);
-        const nonSupervisorCommittee = effectiveCommittee.filter((member) => !SUPERVISOR_ROLES.has(member.role));
+        const nonSupervisorCommittee = [
+          ...committee.filter((member) => !SUPERVISOR_ROLES.has(member.role)),
+          ...acknowledgementOtherMembers,
+        ];
         if (nonSupervisorCommittee.length) {
           await saveCommitteeMembers(doc.id, nonSupervisorCommittee, 'pdf');
         }
         await deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'pdf');
+        await deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'pdf_acknowledgements');
+        // The upstream list is an authoritative snapshot, not an append-only
+        // feed. Remove superseded API committee rows before projecting it.
+        await deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'api');
         await saveCommitteeMembers(
           doc.id,
           apiSupervisors.map((name) => ({ name, role: 'Supervisor', affiliation: null })),
@@ -2066,13 +2256,36 @@ export async function extractAndSaveParsedData(doc, fullText, pdfPath, {
         doc.supervisors = apiSupervisors;
         doc.supervisorsSource = 'api';
       } else {
-        if (effectiveCommittee.length) {
-          await saveCommitteeMembers(doc.id, effectiveCommittee, 'pdf');
+        const parsedSupervisors = supervisorsFromCommittee([
+          ...committee,
+          ...acknowledgementSupervisors,
+        ]);
+        // Replace lower-authority supervisor roles only when this parse found a
+        // replacement. A transiently degraded/short extraction must not erase a
+        // previously valid PDF-derived supervisor.
+        if (parsedSupervisors.length) {
+          await deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'pdf');
+          await deleteCommitteeMembersByRoles(doc.id, ['Supervisor', 'Co-Supervisor'], 'pdf_acknowledgements');
         }
-        const parsedSupervisors = supervisorsFromCommittee(effectiveCommittee);
+        if (committee.length) {
+          await saveCommitteeMembers(doc.id, committee, 'pdf');
+        }
+        if (acknowledgementSupervisors.length || acknowledgementOtherMembers.length) {
+          await saveCommitteeMembers(
+            doc.id,
+            [...acknowledgementSupervisors, ...acknowledgementOtherMembers],
+            'pdf_acknowledgements'
+          );
+        }
         if (parsedSupervisors.length) {
           doc.supervisors = parsedSupervisors;
-          doc.supervisorsSource = committee.length > 0 ? 'pdf_fallback' : 'pdf_acknowledgements';
+          doc.supervisorsSource = committeeHasSupervisor ? 'pdf_fallback' : 'pdf_acknowledgements';
+        } else {
+          // Durable committee state is loaded below and remains authoritative.
+          // Clear only the in-memory inference so stale metadata is not treated
+          // as a fresh parse result.
+          doc.supervisors = [];
+          doc.supervisorsSource = null;
         }
       }
       doc.committee = await loadCommitteeMembers(doc.id);
@@ -2081,11 +2294,7 @@ export async function extractAndSaveParsedData(doc, fullText, pdfPath, {
         const storedSupervisors = supervisorsFromCommittee(doc.committee);
         if (storedSupervisors.length) {
           doc.supervisors = storedSupervisors;
-          doc.supervisorsSource = doc.committee.some((member) =>
-            SUPERVISOR_ROLES.has(member.role) && member.source === 'api'
-          )
-            ? 'api'
-            : 'pdf_fallback';
+          doc.supervisorsSource = inferredSupervisorSource(doc.committee);
         }
       }
     } catch (err) {
@@ -2154,11 +2363,7 @@ async function loadStoredParsedData(doc) {
       const storedSupervisors = supervisorsFromCommittee(doc.committee);
       if (storedSupervisors.length) {
         doc.supervisors = storedSupervisors;
-        doc.supervisorsSource = doc.committee.some((member) =>
-          SUPERVISOR_ROLES.has(member.role) && member.source === 'api'
-        )
-          ? 'api'
-          : 'pdf_fallback';
+        doc.supervisorsSource = inferredSupervisorSource(doc.committee);
       }
     }
   } catch {
@@ -2180,6 +2385,11 @@ export async function analyzeDocumentFile(doc, options) {
   const fallback = contentFallback || (contentMode === 'pdf_cache' ? 'full_text' : 'legacy');
   if (!isImportContentMode(contentMode)) {
     throw new Error(`Unsupported content mode: ${contentMode}`);
+  }
+  if (isEmbargoDeferred(doc)) {
+    doc.downloadStatus = 'deferred_embargo';
+    doc.downloadError = null;
+    return;
   }
   if (contentMode !== 'metadata_only' && !CONTENT_RETRIEVAL_ENABLED) {
     throw new Error('Content retrieval is disabled for this deployment.');
@@ -2319,13 +2529,11 @@ export async function analyzeDocumentFile(doc, options) {
         });
         return;
       } catch (error) {
-        // Known cosmetic side-effect: when the stream itself succeeded but strict
-        // citation extraction threw (citation_scan), this drops through to the
-        // fallback below and persists status 'stream_failed' even though the
-        // download was fine. It does not affect citation-scan selection —
-        // `content_source` is preserved, so `retryFailures`/parser-version still
-        // work — and the scan runner's own `downloadStatus !== 'streamed'` check
-        // correctly counts it as a per-document failure.
+        // Strict post-stream extraction failures belong to the citation job, not
+        // the download. Preserve the successfully persisted stream status and
+        // provenance, clean up the temp file in `finally`, and let the runner
+        // record a failed citation attempt.
+        if (strictCitationErrors && doc.downloadStatus === 'streamed') throw error;
         doc.downloadError = error instanceof Error ? error.message : String(error);
       } finally {
         await streamed.cleanup();

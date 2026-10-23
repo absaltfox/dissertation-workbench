@@ -5,6 +5,7 @@ import {
   formatBytes,
   formatNum,
   getActiveAdminTab,
+  getCurrentParams,
   jsonHeaders,
   setActiveAdminTab as setActiveAdminTabShell,
   setStatus,
@@ -36,6 +37,7 @@ const {
   documentSyncStatusEl,
   importAffiliationEl,
   importAllRuleBtn,
+  importEnrichRuleBtn,
   importDegreeEl,
   importGeneratedTermEl,
   importIndexEl,
@@ -89,7 +91,6 @@ const {
   recomputeThemesBtn,
   refreshCacheBtn,
   refreshJobsBtn,
-  refreshMetadataRuleBtn,
   refreshTopicLabelsBtn,
   regenerateTopicLabelsBtn,
   reparseAllBtn,
@@ -99,9 +100,7 @@ const {
   saveSettingsBtn,
   settingsForm,
   setupOwnMfaBtn,
-  syncDifferencesRuleBtn,
   syncDocumentsBtn,
-  syncMissingPdfsRuleBtn,
   syncRunsTableEl,
   topicLabelCountEl,
   topicLabelDetailPanelEl,
@@ -138,9 +137,7 @@ function initAdmin() {
   newImportRuleBtn?.addEventListener('click', () => setImportRuleForm({}));
   previewImportRuleBtn?.addEventListener('click', handlePreviewImportRule);
   importAllRuleBtn?.addEventListener('click', () => handleRunImportRules('import_all', importAllRuleBtn));
-  syncDifferencesRuleBtn?.addEventListener('click', () => handleRunImportRules('sync_differences', syncDifferencesRuleBtn));
-  refreshMetadataRuleBtn?.addEventListener('click', () => handleRunImportRules('refresh_metadata', refreshMetadataRuleBtn));
-  syncMissingPdfsRuleBtn?.addEventListener('click', () => handleRunImportRules('sync_missing_pdfs', syncMissingPdfsRuleBtn));
+  importEnrichRuleBtn?.addEventListener('click', () => handleRunImportRules('sync_missing_pdfs', importEnrichRuleBtn));
   deleteImportRuleBtn?.addEventListener('click', handleDeleteImportRule);
 
   for (const input of [importRuleNameEl, importDegreeEl, importProgramEl, importAffiliationEl, importIndexEl, importQueryEl, importSourceEl]) {
@@ -707,7 +704,6 @@ function summarizeImportRule(rule) {
   parts.push(`Content: ${importContentModeLabel(rule.contentMode)}`);
   parts.push(`Fallback: ${(rule.contentFallback || 'fail_document').replaceAll('_', ' ')}`);
   parts.push(`Concurrency: ${rule.contentConcurrency || 1}`);
-  if (rule.rollout?.status) parts.push(`Rollout: ${rule.rollout.status.replaceAll('_', ' ')}`);
   return parts.join(' · ');
 }
 
@@ -898,28 +894,9 @@ async function handleRunImportRules(mode, button) {
   }
   const labels = {
     import_all: 'Import metadata',
-    sync_differences: 'Import new metadata',
-    refresh_metadata: 'Refresh existing metadata',
-    sync_missing_pdfs: 'Import and enrich using rule policy'
+    sync_missing_pdfs: 'Import and enrich metadata'
   };
   const selectedRules = state.importRules.filter((rule) => ruleIds.includes(rule.id));
-  const enrichingRules = selectedRules.filter((rule) => rule.contentMode !== 'metadata_only');
-  let rolloutPhase = null;
-  if (mode === 'sync_missing_pdfs' && enrichingRules.length) {
-    if (selectedRules.length !== 1) {
-      alert('Progressive enrichment runs one rule at a time so each cohort has an independent quality gate.');
-      return;
-    }
-    const rolloutState = selectedRules[0].rollout;
-    if (!rolloutState || rolloutState.status === 'invalidated') rolloutPhase = 'sample';
-    else if (rolloutState.status === 'awaiting_control') rolloutPhase = 'control';
-    else if (rolloutState.status === 'ready_for_cohort') rolloutPhase = 'cohort';
-    else if (rolloutState.status === 'blocked') rolloutPhase = rolloutState.evaluation?.phase;
-    if (!rolloutPhase) {
-      alert(`This rollout cannot start while it is ${rolloutState?.status || 'in an unknown state'}.`);
-      return;
-    }
-  }
   const policyCounts = selectedRules.reduce((counts, rule) => {
     const label = importContentModeLabel(rule.contentMode);
     counts[label] = (counts[label] || 0) + 1;
@@ -928,14 +905,13 @@ async function handleRunImportRules(mode, button) {
   const policySummary = mode === 'sync_missing_pdfs'
     ? `\n\nContent policies:\n${Object.entries(policyCounts).map(([label, count]) => `- ${label}: ${count}`).join('\n')}`
     : '';
-  const rolloutSummary = rolloutPhase
-    ? `\n\nProgressive enrichment phase: ${rolloutPhase}`
-    : '';
+  const retrievesOriginalPdfs = mode === 'sync_missing_pdfs'
+    && selectedRules.some((rule) => ['pdf_stream', 'pdf_cache'].includes(rule.contentMode));
   const originalPdfWarning = mode === 'sync_missing_pdfs'
-    && (rolloutPhase === 'control' || selectedRules.some((rule) => ['pdf_stream', 'pdf_cache'].includes(rule.contentMode)))
-    ? '\n\nWarning: this phase requests original PDFs. Confirming explicitly approves retrieval for this bounded run.'
+    && retrievesOriginalPdfs
+    ? '\n\nWarning: this run retrieves original PDFs for every in-scope document that still needs enrichment. It continues automatically in bounded worker batches.'
     : '';
-  if (!confirm(`${labels[mode]} for ${importScopeLabel()}?${policySummary}${rolloutSummary}${originalPdfWarning}`)) return;
+  if (!confirm(`${labels[mode]} for ${importScopeLabel()}?${policySummary}${originalPdfWarning}`)) return;
 
   button.disabled = true;
   const originalHtml = button.innerHTML;
@@ -948,8 +924,7 @@ async function handleRunImportRules(mode, button) {
         mode,
         scope,
         ruleIds,
-        rolloutPhase,
-        approveOriginalPdfControl: rolloutPhase === 'control',
+        approveOriginalPdfRetrieval: retrievesOriginalPdfs,
         maxRecords: document.getElementById('s-maxRecords')?.value || '9999',
         pageSize: document.getElementById('s-pageSize')?.value || '20',
         scanLimit: document.getElementById('s-scanLimit')?.value || '50000'
@@ -1212,7 +1187,9 @@ function summarizeJobResult(job) {
     return `${formatNum(result.updated || 0)} updated, ${formatNum(result.failed || 0)} failed`;
   }
   if (job.type === 'document_sync' || job.type === 'import_rules_sync') {
-    return `${formatNum(result.totalSaved || 0)} saved, ${formatNum(result.totalSkipped || 0)} skipped`;
+    const deferred = Number(result.totalEmbargoedDeferred || 0);
+    return `${formatNum(result.totalSaved || 0)} saved, ${formatNum(result.totalSkipped || 0)} skipped`
+      + (deferred ? `, ${formatNum(deferred)} embargoed/deferred` : '');
   }
   if (job.type === 'cache_refresh_doc' || job.type === 'cache_reanalyze_doc') {
     return result.docId ? `${escapeHtml(result.docId)}: ${escapeHtml(result.status || job.status || '-')}` : '-';
@@ -1230,7 +1207,7 @@ function summarizeJobResult(job) {
     return `${formatNum(result.processed || 0)} scanned, ${formatNum(result.citations || 0)} citations, ${formatNum(result.failed || 0)} failed`;
   }
   if (job.type === 'reparse_committee') {
-    return `${formatNum(result.processed || 0)} processed, ${formatNum(result.withCommittee || 0)} with committee`;
+    return `${result.dryRun ? 'dry run, ' : ''}${formatNum(result.processed || 0)} processed, ${formatNum(result.supervisorsFound || 0)} supervisors found, ${formatNum(result.stillMissingSupervisors || 0)} still missing, ${formatNum(result.failed || 0)} failed`;
   }
   return Object.keys(result).length ? JSON.stringify(result) : '-';
 }
@@ -1272,6 +1249,9 @@ function formatJobCounts(counts = {}) {
   if (counts.truncatedBuckets) parts.push(`${formatNum(counts.truncatedBuckets)} truncated buckets`);
   if (counts.truncationBlockedMerges) parts.push(`${formatNum(counts.truncationBlockedMerges)} merges blocked by truncation`);
   if (counts.withCommittee != null) parts.push(`${formatNum(counts.withCommittee)} with committee`);
+  if (counts.supervisorsFound != null) parts.push(`${formatNum(counts.supervisorsFound)} supervisors found`);
+  if (counts.ocrRecovered != null) parts.push(`${formatNum(counts.ocrRecovered)} OCR-recovered`);
+  if (counts.stillMissingSupervisors != null) parts.push(`${formatNum(counts.stillMissingSupervisors)} still missing supervisors`);
   if (counts.pages != null) parts.push(`${formatNum(counts.pages)} pages`);
   if (counts.words != null) parts.push(`${formatNum(counts.words)} words`);
   if (counts.saved != null) parts.push(`${formatNum(counts.saved)} saved`);
@@ -1316,9 +1296,12 @@ function renderCitationScanStatus(status) {
   const lastRun = status.lastRun
     ? `Last run ${escapeHtml(status.lastRun.status || 'unknown')} ${escapeHtml(formatJobDate(status.lastRun.finishedAt || status.lastRun.startedAt))}`
     : 'No citation scan has run yet';
+  const pendingLine = status.pendingCount != null && Number.isFinite(Number(status.pendingCount))
+    ? `${formatNum(Number(status.pendingCount))} pending`
+    : 'Preview pending to calculate';
   citationScanStatusEl.innerHTML = `
     <p class="settings-status-title">Citation Scan</p>
-    <p class="settings-status-main">${formatNum(status.pendingCount || 0)} pending</p>
+    <p class="settings-status-main">${pendingLine}</p>
     <p class="settings-status-detail">${escapeHtml(scheduleLine)}</p>
     <p class="settings-status-detail">${lastRun}</p>
   `;

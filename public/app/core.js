@@ -108,9 +108,7 @@ const newImportRuleBtn = document.getElementById('newImportRuleBtn');
 const previewImportRuleBtn = document.getElementById('previewImportRuleBtn');
 const importRunScopeEl = document.getElementById('importRunScope');
 const importAllRuleBtn = document.getElementById('importAllRuleBtn');
-const syncDifferencesRuleBtn = document.getElementById('syncDifferencesRuleBtn');
-const refreshMetadataRuleBtn = document.getElementById('refreshMetadataRuleBtn');
-const syncMissingPdfsRuleBtn = document.getElementById('syncMissingPdfsRuleBtn');
+const importEnrichRuleBtn = document.getElementById('importEnrichRuleBtn');
 const deleteImportRuleBtn = document.getElementById('deleteImportRuleBtn');
 const tabButtons = Array.from(document.querySelectorAll('.tab-btn'));
 const tabPanels = Array.from(document.querySelectorAll('.tab-panel'));
@@ -853,9 +851,7 @@ const dom = {
   previewImportRuleBtn,
   importRunScopeEl,
   importAllRuleBtn,
-  syncDifferencesRuleBtn,
-  refreshMetadataRuleBtn,
-  syncMissingPdfsRuleBtn,
+  importEnrichRuleBtn,
   deleteImportRuleBtn,
   tabButtons,
   tabPanels,

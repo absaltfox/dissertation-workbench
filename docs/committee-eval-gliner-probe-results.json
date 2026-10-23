@@ -1,0 +1,245 @@
+{
+  "model": "urchade/gliner_small-v2.1",
+  "results": [
+    {
+      "id": "1.0097749",
+      "label": "untitled plural supervisors (regex missed)",
+      "gold": [
+        "Brahm Wiesman",
+        "Michael Seelig"
+      ],
+      "person": [
+        {
+          "t": "Stanley Schibler",
+          "s": 0.95
+        },
+        {
+          "t": "Brahm Wiesman",
+          "s": 0.75
+        },
+        {
+          "t": "Michael Seelig",
+          "s": 0.88
+        }
+      ],
+      "role": [
+        {
+          "t": "Stanley Schibler",
+          "l": "thesis supervisor",
+          "s": 0.44
+        },
+        {
+          "t": "Brahm Wiesman",
+          "l": "thesis supervisor",
+          "s": 0.43
+        },
+        {
+          "t": "Michael Seelig",
+          "l": "thesis supervisor",
+          "s": 0.5
+        }
+      ]
+    },
+    {
+      "id": "1.0089112",
+      "label": "untitled committee list (regex missed)",
+      "gold": [
+        "Peter Boothroyd",
+        "Mark Allison",
+        "Tom Hutton"
+      ],
+      "person": [
+        {
+          "t": "Peter Boothroyd",
+          "s": 0.97
+        },
+        {
+          "t": "Mark Al l ison",
+          "s": 0.89
+        },
+        {
+          "t": "Tom Hutton",
+          "s": 0.75
+        },
+        {
+          "t": "Scott Nelson",
+          "s": 0.74
+        },
+        {
+          "t": "Cheryl Mackniak",
+          "s": 0.93
+        }
+      ],
+      "role": [
+        {
+          "t": "Peter Boothroyd",
+          "l": "committee member",
+          "s": 0.44
+        },
+        {
+          "t": "Mark Al l ison",
+          "l": "academic advisor",
+          "s": 0.41
+        },
+        {
+          "t": "Tom Hutton",
+          "l": "committee member",
+          "s": 0.39
+        },
+        {
+          "t": "Scott Nelson",
+          "l": "committee member",
+          "s": 0.37
+        },
+        {
+          "t": "Cheryl Mackniak",
+          "l": "committee member",
+          "s": 0.44
+        }
+      ]
+    },
+    {
+      "id": "1.0090378",
+      "label": "C2 no-heading, clean phrasing",
+      "gold": [
+        "Joy Dixon"
+      ],
+      "person": [
+        {
+          "t": "Ingrid",
+          "s": 0.34
+        },
+        {
+          "t": "Joy Dixon",
+          "s": 0.94
+        }
+      ],
+      "role": [
+        {
+          "t": "Joy Dixon",
+          "l": "thesis supervisor",
+          "s": 0.78
+        }
+      ]
+    },
+    {
+      "id": "1.0091408",
+      "label": "C3 OCR glyph-split name",
+      "gold": [
+        "William Wray"
+      ],
+      "person": [
+        {
+          "t": "Professor Wi l l iam Wray",
+          "s": 0.83
+        }
+      ],
+      "role": [
+        {
+          "t": "Professor Wi l l iam Wray",
+          "l": "thesis supervisor",
+          "s": 0.65
+        }
+      ]
+    },
+    {
+      "id": "1.0104776",
+      "label": "weak role signal",
+      "gold": [
+        "K.J. Cross (role ambiguous)"
+      ],
+      "person": [
+        {
+          "t": "Dr. K.J. Cross",
+          "s": 0.93
+        }
+      ],
+      "role": [
+        {
+          "t": "Dr. K.J. Cross",
+          "l": "academic advisor",
+          "s": 0.61
+        }
+      ]
+    },
+    {
+      "id": "1.0102242",
+      "label": "who supervised (regex missed)",
+      "gold": [
+        "C. Davis"
+      ],
+      "person": [
+        {
+          "t": "Dr. C. Davis",
+          "s": 0.96
+        },
+        {
+          "t": "Dr. R.W. Collier",
+          "s": 0.94
+        }
+      ],
+      "role": [
+        {
+          "t": "Dr. C. Davis",
+          "l": "academic advisor",
+          "s": 0.54
+        },
+        {
+          "t": "Dr. R.W. Collier",
+          "l": "academic advisor",
+          "s": 0.61
+        }
+      ]
+    },
+    {
+      "id": "CONTROL",
+      "label": "clean case regex ALREADY gets",
+      "gold": [
+        "Peter Boothroyd"
+      ],
+      "person": [
+        {
+          "t": "Professor Peter Boothroyd",
+          "s": 0.91
+        }
+      ],
+      "role": [
+        {
+          "t": "Professor Peter Boothroyd",
+          "l": "thesis supervisor",
+          "s": 0.71
+        }
+      ]
+    },
+    {
+      "id": "F-2d-synthetic",
+      "label": "name-boundary merge (regex merges these)",
+      "gold": [
+        "Joy Dixon",
+        "(Peter Parker is NOT the advisor)"
+      ],
+      "person": [
+        {
+          "t": "Joy Dixon",
+          "s": 0.74
+        },
+        {
+          "t": "Peter Parker",
+          "s": 0.74
+        }
+      ],
+      "role": [
+        {
+          "t": "Joy Dixon",
+          "l": "academic advisor",
+          "s": 0.58
+        },
+        {
+          "t": "Peter Parker",
+          "l": "academic advisor",
+          "s": 0.47
+        }
+      ]
+    }
+  ]
+}

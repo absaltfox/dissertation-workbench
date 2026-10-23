@@ -7,7 +7,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 import { createClient } from '@libsql/client';
-import { addColumnIfMissing } from '../src/db.js';
+import { addColumnIfMissing, ensureSchemaWithRetry, tryExec } from '../src/db.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -60,7 +60,25 @@ test('schema migration adds content policy and provenance fields conservatively'
         'legacy-serving-doc',
         '{"id":"legacy-serving-doc","title":"Legacy serving document","supervisors":["Deirdre M. Kelly"]}',
         '2026-01-01T00:00:00.000Z'
+      ), (
+        'legacy-bibliographic-date',
+        '{"id":"legacy-bibliographic-date","title":"Ordinary current thesis","date":"2026-12-31","abstract":"This is a normal scholarly abstract, not a repository access notice."}',
+        '2026-01-01T00:00:00.000Z'
       );
+      CREATE TABLE sync_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sync_key TEXT NOT NULL,
+        source_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        total_seen INTEGER NOT NULL DEFAULT 0,
+        total_saved INTEGER NOT NULL DEFAULT 0,
+        api_total INTEGER,
+        error TEXT,
+        started_at TEXT NOT NULL,
+        finished_at TEXT
+      );
+      INSERT INTO sync_runs (sync_key, source_json, status, total_seen, total_saved, started_at)
+      VALUES ('legacy-sync-run', '{}', 'completed', 7, 6, '2026-01-01T00:00:00.000Z');
       CREATE TABLE committee_members (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         doc_id TEXT NOT NULL,
@@ -95,20 +113,25 @@ test('schema migration adds content policy and provenance fields conservatively'
     const db = await import(${JSON.stringify(dbModuleUrl)});
     const rule = await db.getImportRule('legacy-rule');
     const metric = await db.loadStoredFileMetric('legacy-doc');
+    const syncRun = await db.getLatestSyncRun('legacy-sync-run');
     const people = await db.queryPeoplePage({ limit: 10 });
     const client = await db.getDb();
     const projection = await client.execute("SELECT serving_projection_version FROM documents WHERE doc_id = 'legacy-serving-doc'");
+    const bibliographicDate = await client.execute("SELECT access_status, metadata_json FROM documents WHERE doc_id = 'legacy-bibliographic-date'");
     const committeeProjection = await client.execute("SELECT doc_id, person_key, affiliation, source FROM document_people WHERE source <> 'metadata' ORDER BY doc_id");
     const committeeState = await client.execute("SELECT projection_value FROM serving_projection_state WHERE projection_key = 'committee_people'");
     const rolloutTables = await client.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('enrichment_rollouts', 'enrichment_rollout_evidence') ORDER BY name");
     const limiterTable = await client.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'import_rule_request_limits'");
+    const eligibilityTables = await client.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('import_rule_eligibility_projections', 'rule_document_processing_eligibility', 'document_processing_state', 'processing_eligibility_activation') ORDER BY name");
     process.stdout.write(JSON.stringify({
-      rule, metric, people,
+      rule, metric, syncRun, people,
       projectionVersion: projection.rows[0]?.serving_projection_version,
+      bibliographicDate: bibliographicDate.rows[0],
       committeeProjection: committeeProjection.rows,
       committeeState: committeeState.rows[0]?.projection_value,
       rolloutTables: rolloutTables.rows.map((row) => row.name),
       limiterTable: limiterTable.rows.map((row) => row.name),
+      eligibilityTables: eligibilityTables.rows.map((row) => row.name),
     }));
     await db.closeDb();
   `;
@@ -141,7 +164,14 @@ test('schema migration adds content policy and provenance fields conservatively'
     assert.equal(migrated.metric.content_source, null);
     assert.equal(Number(migrated.metric.metadata_request_count), 0);
     assert.equal(Number(migrated.metric.original_pdf_request_count), 0);
+    assert.equal(migrated.metric.word_count_comparison_json, null);
+    assert.equal(migrated.syncRun.totalSeen, 7);
+    assert.equal(migrated.syncRun.totalSaved, 6);
+    assert.equal(migrated.syncRun.localQueueSeen, 0);
+    assert.equal(migrated.syncRun.upstreamUniqueSeen, 0);
     assert.equal(Number(migrated.projectionVersion), 1);
+    assert.equal(migrated.bibliographicDate.access_status, 'unknown');
+    assert.match(JSON.parse(migrated.bibliographicDate.metadata_json).abstract, /normal scholarly abstract/);
     assert.equal(migrated.people.total, 1);
     assert.equal(migrated.people.people[0].key, 'deirdre kelly');
     assert.deepEqual(migrated.committeeProjection, [
@@ -161,6 +191,12 @@ test('schema migration adds content policy and provenance fields conservatively'
     assert.equal(migrated.committeeState, 'complete');
     assert.deepEqual(migrated.rolloutTables, ['enrichment_rollout_evidence', 'enrichment_rollouts']);
     assert.deepEqual(migrated.limiterTable, ['import_rule_request_limits']);
+    assert.deepEqual(migrated.eligibilityTables, [
+      'document_processing_state',
+      'import_rule_eligibility_projections',
+      'processing_eligibility_activation',
+      'rule_document_processing_eligibility',
+    ]);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }
@@ -190,6 +226,188 @@ test('concurrent column migration accepts only a verified winner', async () => {
   } finally {
     await clientOne.close();
     await clientTwo.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('schema startup retries SQLITE_BUSY and verifies citation match columns', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-schema-busy-retry-'));
+  const sqlitePath = path.join(tempDir, 'schema.sqlite');
+  const client = createClient({ url: `file:${sqlitePath}` });
+  let schemaPasses = 0;
+  let busyAttempts = 0;
+  const retryingClient = {
+    executeMultiple: async (sql) => {
+      if (String(sql).includes('CREATE TABLE IF NOT EXISTS documents')) {
+        schemaPasses += 1;
+      }
+      // This is a tryExec call. If it swallows SQLITE_BUSY, the outer schema
+      // retry is never reached and the assertion below fails.
+      if (String(sql).includes('CREATE INDEX IF NOT EXISTS idx_documents_sync_key') && busyAttempts === 0) {
+        busyAttempts += 1;
+        const error = new Error('database is locked');
+        error.code = 'SQLITE_BUSY';
+        throw error;
+      }
+      return client.executeMultiple(sql);
+    },
+    execute: (...args) => client.execute(...args),
+    batch: (...args) => client.batch(...args),
+    transaction: (...args) => client.transaction(...args),
+  };
+  const waits = [];
+  try {
+    await ensureSchemaWithRetry(retryingClient, {
+      maxAttempts: 2,
+      wait: async (delay) => { waits.push(delay); },
+      backoff: () => 1,
+    });
+    assert.equal(busyAttempts, 1);
+    assert.equal(schemaPasses, 2, 'the complete schema pass should restart after SQLITE_BUSY');
+    assert.deepEqual(waits, [1], 'retry remains bounded and waits once before the second attempt');
+    const columns = await client.execute('PRAGMA table_info(citations)');
+    const names = new Set(columns.rows.map((row) => String(row.name)));
+    assert.equal(names.has('match_year'), true);
+    assert.equal(names.has('match_prefix'), true);
+    assert.equal(names.has('match_key_version'), true);
+  } finally {
+    await client.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('a non-lock failure in a critical citation migration surfaces immediately', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-schema-critical-error-'));
+  const sqlitePath = path.join(tempDir, 'schema.sqlite');
+  const client = createClient({ url: `file:${sqlitePath}` });
+  let criticalAttempts = 0;
+  const failingClient = {
+    executeMultiple: (...args) => client.executeMultiple(...args),
+    execute: async (statement) => {
+      const sql = typeof statement === 'string' ? statement : statement.sql;
+      if (String(sql).includes('ALTER TABLE citations ADD COLUMN match_year')) {
+        criticalAttempts += 1;
+        const error = new Error('citation match migration is invalid');
+        error.code = 'SQLITE_ERROR';
+        throw error;
+      }
+      return client.execute(statement);
+    },
+    batch: (...args) => client.batch(...args),
+    transaction: (...args) => client.transaction(...args),
+  };
+  try {
+    await assert.rejects(
+      ensureSchemaWithRetry(failingClient, {
+        maxAttempts: 2,
+        wait: async () => { throw new Error('permanent failures must not be retried'); },
+      }),
+      /citation match migration is invalid/
+    );
+    assert.equal(criticalAttempts, 1);
+  } finally {
+    await client.close();
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('tryExec retains explicit tolerance for an already-applied legacy DDL migration', async () => {
+  const error = new Error('duplicate column name: legacy_field');
+  error.code = 'SQLITE_ERROR';
+  const client = {
+    executeMultiple: async () => { throw error; },
+  };
+  assert.equal(await tryExec(client, 'ALTER TABLE legacy ADD COLUMN legacy_field TEXT'), false);
+});
+
+test('tryExec rethrows a non-tolerated migration error', async () => {
+  const error = new Error('invalid migration SQL');
+  error.code = 'SQLITE_ERROR';
+  const client = {
+    executeMultiple: async () => { throw error; },
+  };
+  await assert.rejects(
+    tryExec(client, 'CREATE INDEX broken ON missing_table(missing_column)'),
+    /invalid migration SQL/
+  );
+});
+
+test('document_terms table and indexes are created', async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-document-terms-'));
+  const sqlitePath = path.join(tempDir, 'test.sqlite');
+
+  const dbModuleUrl = pathToFileURL(path.resolve('src/db.js')).href;
+  const childSource = `
+    const db = await import(${JSON.stringify(dbModuleUrl)});
+    await db.ensureStorage();
+    const client = await db.getDb();
+    const tbl = await client.execute(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='document_terms'"
+    );
+    const idx = await client.execute(
+      "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='document_terms' ORDER BY name"
+    );
+    const names = idx.rows.map((r) => r.name);
+    process.stdout.write(JSON.stringify({
+      tableExists: tbl.rows.length === 1,
+      hasKindTerm: names.includes('idx_document_terms_kind_term'),
+      hasKindTermlower: names.includes('idx_document_terms_kind_termlower'),
+      hasDoc: names.includes('idx_document_terms_doc'),
+    }));
+    await db.closeDb();
+  `;
+  try {
+    const childOptions = {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        APP_DATA_DIR: path.join(tempDir, 'data'),
+        SQLITE_PATH: sqlitePath,
+        TURSO_DATABASE_URL: '',
+        SKIP_LOCAL_ENV: '1',
+      },
+    };
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      ['--input-type=module', '-e', childSource],
+      childOptions
+    );
+    const result = JSON.parse(stdout.trim().split('\n').at(-1));
+    assert.equal(result.tableExists, true, 'document_terms table should exist');
+    assert.equal(result.hasKindTerm, true, 'idx_document_terms_kind_term should exist');
+    assert.equal(result.hasKindTermlower, true, 'idx_document_terms_kind_termlower should exist');
+    assert.equal(result.hasDoc, true, 'idx_document_terms_doc should exist');
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('the schema pass on an up-to-date database takes no write lock', async () => {
+  // Every process (web server, worker, CLI) runs this pass at startup. If it
+  // writes even when there is nothing to migrate, concurrent cold starts
+  // contend for SQLite's single write lock, and libsql's 0 ms busy timeout
+  // turns that into SQLITE_BUSY churn that can starve a real writer.
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-schema-readonly-'));
+  const sqlitePath = path.join(tempDir, 'schema.sqlite');
+  const setup = createClient({ url: `file:${sqlitePath}` });
+  const writer = createClient({ url: `file:${sqlitePath}` });
+  const starter = createClient({ url: `file:${sqlitePath}` });
+  let held;
+  try {
+    await ensureSchemaWithRetry(setup, { maxAttempts: 1 });
+    // Another process mid-write: holds the RESERVED lock, readers still allowed.
+    held = await writer.transaction('write');
+    await held.execute("UPDATE documents SET title = title WHERE doc_id = 'none'");
+    await ensureSchemaWithRetry(starter, {
+      maxAttempts: 1,
+      wait: async () => { throw new Error('an up-to-date schema pass must not need a retry'); },
+    });
+  } finally {
+    await held?.rollback().catch(() => {});
+    held?.close();
+    setup.close();
+    writer.close();
+    starter.close();
     await fs.rm(tempDir, { recursive: true, force: true });
   }
 });

@@ -526,15 +526,45 @@ function renderMethodologies() {
   }
 }
 
+// #15: distinguishes three states the six panels below can be in, so a
+// corpus this large never renders a silent empty shape that reads the same
+// as "no signal found": (1) real data — render it, possibly with a sampling
+// caveat; (2) explicitly not computed above the detailed-analytics
+// threshold — state why, using the source metadata the backend already
+// sends; (3) genuinely empty (computed, found nothing) — the original,
+// unqualified "no data" message. aggregateSource/detailedAnalyticsRecordLimit
+// were already present in every /workbench/analytics response above the
+// threshold but were never read here before this change.
+function notComputedReason(source) {
+  if (!source || source.aggregateSource !== 'database' || source.detailedAnalyticsRecordLimit == null) return null;
+  const limit = formatNum(source.detailedAnalyticsRecordLimit);
+  const available = source.documentCache?.recordsAvailable;
+  const corpus = available == null ? '' : ` (corpus has ${formatNum(available)})`;
+  return `Not computed above ${limit} documents${corpus}.`;
+}
+
+function sampledCaveat(source) {
+  if (!source?.termCooccurrenceSampled) return null;
+  const size = source.termCooccurrenceSampleSize;
+  const of = source.termCooccurrenceSampleOf;
+  if (size == null || of == null || size >= of) return null;
+  return `Based on a sample of ${formatNum(size)} of ${formatNum(of)} documents — rare cross-corpus pairs outside the sample may not appear.`;
+}
+
 function renderCooccurrence() {
-  const pairs = getAnalytics()?.termCooccurrence || [];
+  const analytics = getAnalytics();
+  const pairs = analytics?.termCooccurrence || [];
+  const caveat = sampledCaveat(analytics?.source);
+  const caveatHtml = caveat ? `<p class="meta" style="margin-bottom:0.5rem">${escapeHtml(caveat)}</p>` : '';
   if (!pairs.length) {
-    cooccurrenceBarsEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No co-occurring term pairs found.</p>';
+    const reason = notComputedReason(analytics?.source);
+    const message = reason || 'No co-occurring term pairs found.';
+    cooccurrenceBarsEl.innerHTML = `${caveatHtml}<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">${escapeHtml(message)}</p>`;
     return;
   }
 
   const maxCount = Math.max(...pairs.map((p) => p.count), 1);
-  cooccurrenceBarsEl.innerHTML = pairs
+  cooccurrenceBarsEl.innerHTML = caveatHtml + pairs
     .map((entry) => {
       const widthPct = (entry.count / maxCount) * 100;
       const label = `${entry.termA} + ${entry.termB}`;
@@ -559,9 +589,12 @@ function renderCooccurrence() {
 }
 
 function renderSupervisorHeatmap() {
-  const data = getAnalytics()?.supervisorNgramMatrix;
+  const analytics = getAnalytics();
+  const data = analytics?.supervisorNgramMatrix;
   if (!data || !data.supervisors.length || !data.ngrams.length) {
-    supervisorHeatmapEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No supervisor-term data available.</p>';
+    const reason = data === null ? notComputedReason(analytics?.source) : null;
+    const message = reason || 'No supervisor-term data available.';
+    supervisorHeatmapEl.innerHTML = `<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">${escapeHtml(message)}</p>`;
     return;
   }
 
@@ -614,9 +647,15 @@ function renderSupervisorHeatmap() {
 let conceptTimelineChartInstance = null;
 
 function renderConceptTimeline() {
-  const data = getAnalytics()?.conceptTimeline || [];
+  const analytics = getAnalytics();
+  const raw = analytics?.conceptTimeline;
+  const data = raw || [];
   if (!data.length || !conceptTimelineChartEl) {
-    if (conceptTimelineChartEl) conceptTimelineChartEl.innerHTML = '<p class="meta">No concept timeline data available.</p>';
+    if (conceptTimelineChartEl) {
+      const reason = raw === null ? notComputedReason(analytics?.source) : null;
+      const message = reason || 'No concept timeline data available.';
+      conceptTimelineChartEl.innerHTML = `<p class="meta">${escapeHtml(message)}</p>`;
+    }
     if (conceptTimelineLegendEl) conceptTimelineLegendEl.innerHTML = '';
     return;
   }
@@ -929,9 +968,14 @@ function docsForMethodologyConcept(methodology, concept) {
 }
 
 function renderMethodologyConceptMatrix() {
-  const data = getAnalytics()?.methodologyConceptMatrix;
+  const analytics = getAnalytics();
+  const data = analytics?.methodologyConceptMatrix;
   if (!data || !data.methodologies.length || !data.concepts.length) {
-    if (methodologyConceptHeatmapEl) methodologyConceptHeatmapEl.innerHTML = '<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">No methodology-concept data available.</p>';
+    if (methodologyConceptHeatmapEl) {
+      const reason = data === null ? notComputedReason(analytics?.source) : null;
+      const message = reason || 'No methodology-concept data available.';
+      methodologyConceptHeatmapEl.innerHTML = `<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">${escapeHtml(message)}</p>`;
+    }
     return;
   }
 

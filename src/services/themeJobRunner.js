@@ -1,7 +1,9 @@
 import {
   appendAdminJobLog,
+  finishClaimedAdminJob,
   finishAdminJob,
   recomputeStoredDocumentThemes,
+  updateClaimedAdminJobProgress,
   updateAdminJobProgress,
 } from '../db.js';
 
@@ -32,8 +34,14 @@ function buildThemeProgress(event = {}, status = 'running') {
 }
 
 export async function runThemeRecomputeAdminJob(job) {
+  const updateProgress = (progress) => job.executionId
+    ? updateClaimedAdminJobProgress(job.id, job.executionId, progress)
+    : updateAdminJobProgress(job.id, progress);
+  const finishJob = (patch) => job.executionId
+    ? finishClaimedAdminJob(job.id, job.executionId, patch)
+    : finishAdminJob(job.id, patch);
   await appendAdminJobLog(job.id, 'Starting stored theme recompute.\n');
-  await updateAdminJobProgress(job.id, {
+  await updateProgress({
     phase: 'load_documents',
     currentTask: 'Loading stored dissertation metadata',
     tasks: [
@@ -48,13 +56,13 @@ export async function runThemeRecomputeAdminJob(job) {
 
   const result = await recomputeStoredDocumentThemes({
     onProgress: async (event) => {
-      await updateAdminJobProgress(job.id, buildThemeProgress(event));
+      await updateProgress(buildThemeProgress(event));
     },
   });
 
   const finalProgress = buildThemeProgress(result, 'completed');
-  await updateAdminJobProgress(job.id, finalProgress);
-  await finishAdminJob(job.id, {
+  await updateProgress(finalProgress);
+  await finishJob({
     status: 'completed',
     runnerState: 'completed',
     result: {

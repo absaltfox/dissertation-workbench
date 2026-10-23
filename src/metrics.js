@@ -12,13 +12,17 @@ import {
 } from './db.js';
 import {
   toArray, flattenText, extractYear, parsePageCount, buildWordCloud,
-  buildMethodologyStats, extractNgrams, detectMethodologies, isLowSignalConceptPhrase,
-  isLowSignalConceptTerm, documentThemeTerms
+  buildMethodologyStats, extractNgrams, detectMethodologies,
+  isLowSignalConceptTerm, documentThemeTerms, COOCCURRENCE_BLOCKLIST
 } from './nlp.js';
 import { fetchPage, extractHits, resolveIndexName, collectCandidateUrls } from './api.js';
 import { enrichDocumentsWithFileAnalysis } from './pdf.js';
 import { dedupeSupervisorNames } from './supervisors.js';
 import { canonicalizeDomainText } from './domainDictionary.js';
+import { buildParentClusters, buildTopicsByYear } from './topicHierarchy.js';
+import {
+  deriveAccessState, isAccessRestricted, isAnalyticallyEligible, isEmbargoPlaceholder,
+} from './accessStatus.js';
 
 function average(values) {
   if (!values.length) return null;
@@ -48,10 +52,6 @@ function firstPresent(obj, keys) {
     if (val !== undefined && val !== null && val !== '') return val;
   }
   return null;
-}
-
-function unique(values) {
-  return Array.from(new Set(values.filter(Boolean)));
 }
 
 const MIN_RELIABLE_WORD_COUNT = 1000;
@@ -98,7 +98,6 @@ export function normalizeRecord(doc, dict = null) {
   const supervisors = dedupeSupervisorNames(toArray(firstPresent(doc, ['supervisor', 'Supervisor'])));
   const affiliation = toArray(firstPresent(doc, ['affiliation', 'Affiliation']));
   const dateRaw = firstPresent(doc, [
-    'date_available', 'DateAvailable', 'dateAvailable',
     'dateIssued', 'DateIssued',
     'graduationDate', 'GraduationDate',
     'ubc_date_sort',
@@ -108,6 +107,9 @@ export function normalizeRecord(doc, dict = null) {
   ]);
 
   const description = flattenText(firstPresent(doc, ['description', 'Description', 'abstract', 'Abstract']));
+  const access = deriveAccessState(doc);
+  const accessRestricted = isAccessRestricted(access);
+  const analyticalDescription = isEmbargoPlaceholder(description) ? '' : description;
   const fullText = flattenText(firstPresent(doc, ['full_text', 'FullText', 'transcript', 'text', 'ocr', 'body']));
   const subjects = toArray(firstPresent(doc, ['subject', 'Subject', 'subjects', 'keywords', 'keyword']));
   const program = toArray(firstPresent(doc, ['program_theses', 'program', 'Program']));
@@ -127,14 +129,20 @@ export function normalizeRecord(doc, dict = null) {
   const derivedId = extractOcId(rawId) || extractOcId(uri) || downloadCandidates.map(extractOcId).find(Boolean);
   const stableId = derivedId || `${title}:${creators[0] || ''}`;
 
-  const textForLength = fullText || description;
+  const textForLength = accessRestricted ? '' : (fullText || analyticalDescription);
   const cleaned = String(textForLength).replace(/\s+/g, ' ').trim();
   const metadataWords = cleaned ? cleaned.split(' ').length : 0;
   const extentPages = parsePageCount(extentValues);
-  const metadataPages = extentPages || Math.max(1, Math.round((metadataWords || 1) / 300));
+  const metadataPages = accessRestricted
+    ? null
+    : (extentPages || Math.max(1, Math.round((metadataWords || 1) / 300)));
 
-  const methodologies = detectMethodologies([title, description, subjects.join(' ')].join(' '));
-  const conceptTerms = docConceptTerms({ title, abstract: description, subjects }, 12, dict);
+  const methodologies = accessRestricted
+    ? []
+    : detectMethodologies([title, analyticalDescription, subjects.join(' ')].join(' '));
+  const conceptTerms = accessRestricted
+    ? []
+    : docConceptTerms({ title, abstract: analyticalDescription, subjects }, 12, dict);
 
   return {
     id: stableId,
@@ -155,12 +163,15 @@ export function normalizeRecord(doc, dict = null) {
     scholarlyLevel,
     extent: extentValues.join('; '),
     pages: metadataPages,
-    pagesSource: extentPages ? 'metadata_extent' : 'estimated_from_metadata_words',
-    abstract: description,
+    pagesSource: accessRestricted
+      ? null
+      : (extentPages ? 'metadata_extent' : 'estimated_from_metadata_words'),
+    abstract: analyticalDescription,
+    rawAbstract: access.isEmbargoPlaceholder ? description : undefined,
     subjects: subjects.length ? subjects : ['(Unspecified)'],
-    wordCount: metadataWords,
-    wordCountSource: 'metadata_text',
-    charCount: cleaned.length,
+    wordCount: accessRestricted ? null : metadataWords,
+    wordCountSource: accessRestricted ? null : 'metadata_text',
+    charCount: accessRestricted ? null : cleaned.length,
     themes: [],
     methodologies,
     conceptTerms,
@@ -171,7 +182,12 @@ export function normalizeRecord(doc, dict = null) {
     downloadStatus: 'not_attempted',
     downloadError: null,
     fileBytes: null,
-    bodyWordCount: null
+    bodyWordCount: null,
+    accessStatus: access.accessStatus,
+    availableAt: access.availableAt,
+    accessStatusSource: access.accessStatusSource,
+    accessStatusReason: access.accessStatusReason,
+    accessEvidence: access.accessEvidence,
   };
 }
 
@@ -269,46 +285,6 @@ function buildMetrics(records, subjectLimit) {
     avgPagesByYear,
     pageTrend
   };
-}
-
-function docNgrams(rec, limit = 8) {
-  const text = [rec.title, rec.abstract, rec.subjects.join(' ')].join(' ');
-  const counts = new Map();
-  for (const n of [2, 3, 4]) {
-    for (const ng of extractNgrams(text, n)) {
-      const normalized = canonicalizeDomainText(ng);
-      if (!normalized || isLowSignalConceptPhrase(normalized)) continue;
-      counts.set(normalized, (counts.get(normalized) || 0) + 1);
-    }
-  }
-  const entries = Array.from(counts.entries())
-    .map(([term, count]) => ({ term, count, tokens: term.split(' ') }))
-    .sort((a, b) => b.tokens.length - a.tokens.length || b.count - a.count);
-  const kept = [];
-  for (const entry of entries) {
-    const isSubphrase = kept.some((longer) => {
-      if (longer.tokens.length <= entry.tokens.length) return false;
-      const maxStart = longer.tokens.length - entry.tokens.length;
-      for (let start = 0; start <= maxStart; start++) {
-        let ok = true;
-        for (let i = 0; i < entry.tokens.length; i++) {
-          if (longer.tokens[start + i] !== entry.tokens[i]) {
-            ok = false;
-            break;
-          }
-        }
-        if (ok) return true;
-      }
-      return false;
-    });
-    if (!isSubphrase) kept.push(entry);
-  }
-
-  return kept
-    .filter((entry) => entry.tokens.length <= 3)
-    .sort((a, b) => b.count - a.count)
-    .slice(0, limit)
-    .map((entry) => entry.term);
 }
 
 const EMPTY_CONCEPT_DICT = {
@@ -521,48 +497,43 @@ function buildSupervisorNgramMatrix(records, topN = 12, topM = 10) {
   };
 }
 
-// Non-topical phrases excluded from the concept cloud and co-occurrence panel.
-// Covers three categories:
-//   • Statistical / experimental-design vocabulary (quantitative boilerplate)
-//   • Results-reporting boilerplate (findings indicate, results showed, …)
-//   • Generic academic-writing filler (based upon, further investigation, …)
-// Keep in sync with COOCCURRENCE_BLOCKLIST in public/app.js.
-const COOCCURRENCE_BLOCKLIST = new Set([
-  // Statistical and experimental design
-  'significant differences', 'statistically significant', 'significant difference',
-  'significant relationships', 'significant relationship', 'significantly related',
-  'control group', 'treatment groups', 'treatment group',
-  'experimental groups', 'experimental group', 'experimental design',
-  'randomly assigned', 'randomly selected', 'random sample',
-  'dependent variables', 'independent variables', 'dependent variable', 'independent variable',
-  'predictor variables', 'criterion variables',
-  'regression analysis', 'regression analyses', 'multiple regression', 'stepwise regression',
-  'factor analysis', 'path analysis', 'discriminant analysis', 'canonical analysis',
-  'analysis variance', 'multivariate analysis', 'repeated measures',
-  'three groups', 'two groups',
-  // Results / findings boilerplate
-  'results indicated', 'results showed', 'results suggest', 'results revealed',
-  'analysis revealed', 'analysis indicated', 'analyses indicated',
-  'findings indicate', 'findings indicated', 'findings suggest',
-  // Generic academic-writing filler
-  'data analysis', 'data collected', 'data collection', 'data gathering', 'data sources',
-  'analyzed using', 'semi structured', 'interview data',
-  'attitudes toward', 'determine whether', 'based upon', 'directed towards',
-  'further investigation', 'important factor', 'wide range',
-  'higher levels', 'high levels', 'second part', 'first part',
-  // Older psychometric / measurement instruments
-  'main effects', 'significant main', 'interaction effects', 'post test',
-  'discriminant function', 'tennessee self', 'concept scale',
-  'native indian', // archaic, from older dissertations — not a useful discovery concept
-]);
+// #26: the floor below was a bare `2`, tuned by inspection for the corpus
+// size at the time (~400 documents) and never revisited as the corpus grew.
+// A fixed floor stops trimming low-signal pairs as N grows, so the
+// (post-filter) ranked list balloons toward the concept vocabulary's full
+// pair space. Co-occurrence significance conventionally scales sub-linearly
+// with corpus size — this mirrors why `lift`, not raw `count`, already
+// carries the ranking signal below. Named and exported so its concrete
+// behavior (minCount stays 2 up to N≈1600; ≈12 at N=56,000) is a pinned,
+// testable contract, not inline math.
+export function termCooccurrenceMinCount(n) {
+  return Math.max(2, Math.round(Math.sqrt(n / 400)));
+}
 
-function buildTermCooccurrence(records, topN = 20) {
+// #26: hard, corpus-size-independent cap on how many distinct concept terms
+// ever enter the pairwise loop below. Each document only ever contributes a
+// bounded number of terms (docConceptTerms' own limit), so per-document work
+// is already bounded — but pairCounts' *key space* is bounded by the number
+// of distinct multi-doc concept terms seen across the whole record set, which
+// is not bounded by anything else here and could otherwise grow with the
+// corpus (a larger, more varied corpus surfaces a larger concept
+// vocabulary). This caps that independently of both N and the minCount
+// threshold, which only shrinks the output after the Map is already built.
+const TERM_COOCCURRENCE_MAX_TERMS = 400;
+
+export function buildTermCooccurrence(records, topN = 20) {
   const dict = loadConceptDictionary();
-  const pairCounts = new Map();
-  const termCounts = new Map(); // per-document frequency within this corpus view
   const N = records.length;
+  const minCount = termCooccurrenceMinCount(N);
 
-  for (const rec of records) {
+  // Pass 1: per-document term lists (already deduped/filtered) plus each
+  // term's document frequency, without building any pairs yet — so the
+  // allowlist below can cap the term vocabulary before the quadratic pairing
+  // step runs, rather than after an unbounded Map has already been built.
+  const docFreq = new Map();
+  const perDocTerms = new Array(records.length);
+  for (let i = 0; i < records.length; i++) {
+    const rec = records[i];
     // Use a generous budget (20) so multi-doc concepts aren't crowded out by
     // high-IDF single-doc concepts occupying all the top slots.  Then keep only
     // multi-doc concepts: single-doc concepts (docFreq=1) can never co-occur
@@ -575,8 +546,26 @@ function buildTermCooccurrence(records, topN = 20) {
       // trivially in quantitative studies regardless of topic. These belong in
       // the Methodology panel; including them here hides meaningful topic pairs.
       .filter((c) => !COOCCURRENCE_BLOCKLIST.has(c));
-    for (const c of unique) termCounts.set(c, (termCounts.get(c) || 0) + 1);
-    const sorted = [...unique].sort();
+    if (unique.length < 2) continue;
+    perDocTerms[i] = unique;
+    for (const c of unique) docFreq.set(c, (docFreq.get(c) || 0) + 1);
+  }
+
+  const allowedTerms = new Set(
+    Array.from(docFreq.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, TERM_COOCCURRENCE_MAX_TERMS)
+      .map(([term]) => term)
+  );
+
+  const pairCounts = new Map();
+  const termCounts = new Map(); // per-document frequency within this corpus view
+  for (const unique of perDocTerms) {
+    if (!unique) continue;
+    const filtered = unique.filter((c) => allowedTerms.has(c));
+    if (filtered.length < 2) continue;
+    for (const c of filtered) termCounts.set(c, (termCounts.get(c) || 0) + 1);
+    const sorted = [...filtered].sort();
     for (let i = 0; i < sorted.length; i++) {
       for (let j = i + 1; j < sorted.length; j++) {
         const key = `${sorted[i]}|||${sorted[j]}`;
@@ -586,7 +575,7 @@ function buildTermCooccurrence(records, topN = 20) {
   }
 
   return Array.from(pairCounts.entries())
-    .filter(([, count]) => count >= 2) // minimum co-occurrence (corpus is ~400 docs)
+    .filter(([, count]) => count >= minCount)
     .map(([key, count]) => {
       const [termA, termB] = key.split('|||');
       const freqA = termCounts.get(termA) || 1;
@@ -720,117 +709,61 @@ function buildMethodologyConceptMatrix(records, topM = 10, topC = 10) {
   };
 }
 
-function buildParentClusters(hierarchy, topics, targetK = 10) {
-  const { leafTopicIds, linkage } = hierarchy;
-  const N = leafTopicIds.length;
-  if (N <= targetK) {
-    // Fewer leaves than target — each leaf is its own parent
-    const parentClusters = topics.filter((t) => t.topicId !== -1).map((t, i) => ({
-      parentId: i, topicId: i, label: t.label, docCount: t.docCount, children: [t.topicId],
-    }));
-    const leafToParent = new Map(parentClusters.map((p) => [p.children[0], p.parentId]));
-    return { parentClusters, leafToParent };
-  }
-
-  // Union-find over N leaves + up to N-1 merge nodes
-  const parent = new Array(N + linkage.length).fill(-1);
-  const find = (x) => { while (parent[x] !== -1) x = parent[x]; return x; };
-  const union = (a, b, into) => { parent[find(a)] = into; parent[find(b)] = into; };
-
-  // Apply first N - targetK merges (linkage is sorted by distance)
-  const mergesToApply = N - targetK;
-  for (let m = 0; m < mergesToApply; m++) {
-    const [i, j] = linkage[m];
-    union(i, j, N + m);
-  }
-
-  // Collect connected components — each root is a parent cluster
-  const rootToChildren = new Map();
-  const leafIdxToTopicId = new Map();
-  const topicDocCount = new Map(topics.map((t) => [t.topicId, t.docCount || 0]));
-  for (let i = 0; i < N; i++) {
-    leafIdxToTopicId.set(i, leafTopicIds[i]);
-    const root = find(i);
-    if (!rootToChildren.has(root)) rootToChildren.set(root, []);
-    rootToChildren.get(root).push(leafTopicIds[i]);
-  }
-
-  const topicLabelMap = new Map(topics.map((t) => [t.topicId, t.label]));
-  const parentClusters = [];
-  const leafToParent = new Map();
-  let parentIdx = 0;
-
-  for (const [, children] of rootToChildren) {
-    // Label = label of the child topic with the most docs
-    const bestChild = children.reduce((best, tid) =>
-      (topicDocCount.get(tid) || 0) > (topicDocCount.get(best) || 0) ? tid : best
-    , children[0]);
-    const totalDocs = children.reduce((sum, tid) => sum + (topicDocCount.get(tid) || 0), 0);
-    parentClusters.push({
-      parentId: parentIdx, topicId: parentIdx,
-      label: topicLabelMap.get(bestChild) || `Cluster ${parentIdx}`,
-      docCount: totalDocs, children,
-    });
-    for (const tid of children) leafToParent.set(tid, parentIdx);
-    parentIdx++;
-  }
-
-  parentClusters.sort((a, b) => b.docCount - a.docCount);
-  // Re-index after sort
-  const oldToNew = new Map(parentClusters.map((p, i) => [p.parentId, i]));
-  for (const p of parentClusters) p.parentId = p.topicId = oldToNew.get(p.parentId);
-  for (const [tid, oldPid] of leafToParent) leafToParent.set(tid, oldToNew.get(oldPid));
-
-  return { parentClusters, leafToParent };
-}
-
-function buildTopicsByYear(topics, documents, leafToParent) {
-  const yearCounts = new Map(); // topicId -> Map<year, count>
-
-  for (const doc of documents) {
-    if (doc.topicId == null || !doc.year) continue;
-    const resolvedId = leafToParent ? (leafToParent.get(doc.topicId) ?? doc.topicId) : doc.topicId;
-    if (!yearCounts.has(resolvedId)) yearCounts.set(resolvedId, new Map());
-    const ym = yearCounts.get(resolvedId);
-    ym.set(doc.year, (ym.get(doc.year) || 0) + 1);
-  }
-
-  return topics
-    .filter((t) => t.topicId !== -1)
-    .slice(0, 10)
-    .map((topic) => {
-      const ym = yearCounts.get(topic.topicId) || new Map();
-      const data = Array.from(ym.entries())
-        .map(([year, count]) => ({ year: Number(year), count }))
-        .sort((a, b) => a.year - b.year);
-      return { topicId: topic.topicId, label: topic.label, data };
-    });
-}
-
-function buildSupervisorNetwork(records, minEdge = 1) {
-  const nodeMap = new Map(); // name -> docCount
-  const edgeMap = new Map(); // "A|||B" -> { weight, docs }
-
-  for (const rec of records) {
-    const people = [];
-    for (const s of (rec.supervisors || [])) people.push(s);
-    if (rec.committee) {
-      for (const m of rec.committee) {
-        if (m.role === 'Supervisor' || m.role === 'Co-Supervisor' || m.role === 'Committee Member') {
-          if (!people.includes(m.name)) people.push(m.name);
-        }
+// #27: two-pass by design. Pass 1 builds only nodeMap (docCount per person) —
+// no edges, no `docs` arrays — so the top-N cut can be computed before any
+// pairwise memory is allocated. Pass 2 re-scans records and builds edges
+// (with their `docs` arrays) only for pairs whose *both* endpoints already
+// survived the top-N cut. The single-pass predecessor built a full edgeMap
+// (docs arrays included) for every co-authorship pair in every record, then
+// discarded all but the top-30-node-qualifying edges afterward — so every
+// non-qualifying edge's `docs` array was fully populated for nothing. This
+// changes cost, not output: same top-N nodes, same qualifying edges, same
+// weights, same docs lists for the edges that survive.
+//
+// Neither pass keeps anything per record: each record's people list is
+// rebuilt into one reused scratch array (pass 2 recomputes it from the
+// record rather than caching every record's list from pass 1, which would
+// hold O(records) arrays alive until the function returns). The only state
+// that grows with input is nodeMap (distinct people) and the docs lists of
+// top-N-qualifying edges.
+function collectNetworkPeople(rec, people) {
+  people.length = 0;
+  for (const s of (rec.supervisors || [])) people.push(s);
+  if (rec.committee) {
+    for (const m of rec.committee) {
+      if (m.role === 'Supervisor' || m.role === 'Co-Supervisor' || m.role === 'Committee Member') {
+        if (!people.includes(m.name)) people.push(m.name);
       }
     }
-    if (people.length === 0) continue;
+  }
+  return people;
+}
 
-    for (const p of people) {
-      nodeMap.set(p, (nodeMap.get(p) || 0) + 1);
-    }
+export function buildSupervisorNetwork(records, minEdge = 1, topN = 30) {
+  const nodeMap = new Map(); // name -> docCount
+  const people = [];
 
-    const sorted = [...people].sort();
-    for (let i = 0; i < sorted.length; i++) {
-      for (let j = i + 1; j < sorted.length; j++) {
-        const key = `${sorted[i]}|||${sorted[j]}`;
+  for (const rec of records) {
+    collectNetworkPeople(rec, people);
+    for (const p of people) nodeMap.set(p, (nodeMap.get(p) || 0) + 1);
+  }
+
+  const topNodes = Array.from(nodeMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, topN);
+  const topSet = new Set(topNodes.map(([name]) => name));
+
+  const edgeMap = new Map(); // "A|||B" -> { weight, docs } — only for topSet pairs
+  const qualifying = [];
+  for (const rec of records) {
+    collectNetworkPeople(rec, people);
+    qualifying.length = 0;
+    for (const p of people) if (topSet.has(p)) qualifying.push(p);
+    if (qualifying.length < 2) continue;
+    qualifying.sort();
+    for (let a = 0; a < qualifying.length; a++) {
+      for (let b = a + 1; b < qualifying.length; b++) {
+        const key = `${qualifying[a]}|||${qualifying[b]}`;
         if (!edgeMap.has(key)) edgeMap.set(key, { weight: 0, docs: [] });
         const e = edgeMap.get(key);
         e.weight += 1;
@@ -839,18 +772,9 @@ function buildSupervisorNetwork(records, minEdge = 1) {
     }
   }
 
-  // Top 30 nodes by docCount
-  const topNodes = Array.from(nodeMap.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 30);
-  const topSet = new Set(topNodes.map(([name]) => name));
-
   const nodes = topNodes.map(([id, docCount]) => ({ id, docCount }));
   const edges = Array.from(edgeMap.entries())
-    .filter(([key, e]) => {
-      const [a, b] = key.split('|||');
-      return topSet.has(a) && topSet.has(b) && e.weight >= minEdge;
-    })
+    .filter(([, e]) => e.weight >= minEdge)
     .map(([key, e]) => {
       const [source, target] = key.split('|||');
       return { source, target, weight: e.weight, docs: e.docs };
@@ -859,8 +783,12 @@ function buildSupervisorNetwork(records, minEdge = 1) {
   return { nodes, edges };
 }
 
-async function buildCitationCooccurrenceNetwork() {
-  const rows = await getCitationCooccurrence(100);
+// #25: docIds bounds the self-join in getCitationCooccurrence to the same
+// document sample the rest of this payload is scoped to, instead of the
+// caller's bound silently being ignored while this one panel's cost tracks
+// the full corpus's citation-table size.
+async function buildCitationCooccurrenceNetwork(docIds = null) {
+  const rows = await getCitationCooccurrence(100, docIds);
   const nodeMap = new Map();
 
   for (const row of rows) {
@@ -880,7 +808,6 @@ async function buildCitationCooccurrenceNetwork() {
 
 function buildMethodologyTopicMatrix(records, topics) {
   const methCounts = new Map();
-  const topicMap = new Map(topics.map(t => [t.topicId, t.label]));
 
   for (const rec of records) {
     for (const m of (rec.methodologies || [])) {
@@ -936,6 +863,16 @@ export function enrichDocumentSignals(records = []) {
   const conceptDict = loadConceptDictionary();
   const normalizedRecords = records.map(normalizeStoredRecordShape);
   for (const rec of normalizedRecords) {
+    if (isAccessRestricted(rec)) {
+      rec.abstract = '';
+      rec.themes = [];
+      rec.methodologies = [];
+      rec.conceptTerms = [];
+      rec.wordCount = null;
+      rec.bodyWordCount = null;
+      rec.pages = null;
+      continue;
+    }
     if (!rec.conceptTerms.length) {
       rec.conceptTerms = docConceptTerms(rec, 12, conceptDict);
     }
@@ -992,21 +929,22 @@ export async function collectMetricRecords(options = {}) {
   // bounds live Open Collections paging above.
   const limitedRecords = usesCachedDocuments ? records : records.slice(0, maxRecords);
   const normalizedRecords = limitedRecords.map(normalizeStoredRecordShape);
+  const analyticalRecords = normalizedRecords.filter(isAnalyticallyEligible);
 
   if (!options.skipFileEnrichment) {
-    await enrichDocumentsWithFileAnalysis(normalizedRecords, {
+    await enrichDocumentsWithFileAnalysis(analyticalRecords, {
       downloadFiles,
       forceDownload,
       recomputeFromCache
     });
   } else if (options.applyStoredFileMetrics && !usesCachedDocuments) {
-    await applyStoredFileMetricsToDocuments(normalizedRecords);
+    await applyStoredFileMetricsToDocuments(analyticalRecords);
   }
   if (options.applyCitationCounts) {
-    await applyCitationCountsToDocuments(normalizedRecords);
+    await applyCitationCountsToDocuments(analyticalRecords);
   }
   if (options.applyCommitteeMembers) {
-    await applyCommitteeMembersToDocuments(normalizedRecords);
+    await applyCommitteeMembersToDocuments(analyticalRecords);
   }
 
   const sourceMeta = {
@@ -1029,20 +967,21 @@ export async function collectMetricRecords(options = {}) {
     sqlitePath: SQLITE_PATH
   };
 
-  return { records: normalizedRecords, sourceMeta, subjectLimit };
+  return { records: analyticalRecords, sourceMeta, subjectLimit };
 }
 
 export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjectLimit = 25, { persistRun = false } = {}) {
-  const normalizedRecords = enrichDocumentSignals(records);
+  const normalizedRecords = enrichDocumentSignals(records).filter(isAnalyticallyEligible);
 
   const metrics = buildMetrics(normalizedRecords, subjectLimit);
   if (persistRun) await saveRunMetrics(sourceMeta, metrics);
+
+  const docIds = normalizedRecords.map((doc) => doc.id).filter(Boolean);
 
   // Load BERTopic results if available
   let topicData = null;
   if (await hasTopics()) {
     const topics = await loadTopics();
-    const docIds = normalizedRecords.map((doc) => doc.id).filter(Boolean);
     const docTopics = await loadDocumentTopics(docIds);
     // Attach topic_id and UMAP coords to each document
     const topicCoords = await loadDocumentTopicCoords(docIds);
@@ -1092,7 +1031,7 @@ export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjec
     conceptTimeline: buildConceptTimeline(normalizedRecords),
     methodologyConceptMatrix: buildMethodologyConceptMatrix(normalizedRecords),
     supervisorNetwork: buildSupervisorNetwork(normalizedRecords),
-    citationCooccurrence: await buildCitationCooccurrenceNetwork(),
+    citationCooccurrence: await buildCitationCooccurrenceNetwork(docIds),
     methodologyTopicMatrix: topicData ? buildMethodologyTopicMatrix(normalizedRecords, topicData.topics) : null,
     topicData
   };

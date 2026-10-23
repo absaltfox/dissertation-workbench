@@ -148,8 +148,9 @@ Two controls, each following an existing admin-panel precedent.
   (documented in `.env.*.example`). The UI surfaces the schedule **read-only** as
   a new status card in the settings status grid
   (`public/index.html:705`, beside `documentSyncStatus` /
-  `conceptPipelineStatus`), showing: enabled?, scheduled hour, last run, next run,
-  and pending-backlog count. There is no in-UI enable/hour switch; changing the
+  `conceptPipelineStatus`), showing: enabled?, scheduled hour, and last/next run.
+  The exact pending-backlog count is calculated only by the explicit Preview
+  action so the five-second job-status poll stays bounded. There is no in-UI enable/hour switch; changing the
   schedule is a config change, as with concept rebuild.
 
 ## Reconciliation (unchanged, still separate)
@@ -184,7 +185,7 @@ decoupled per `docs/admin-worker-job-standards.md`; this plan does not chain the
   beside `stopDailyConceptScheduler`.
 - `src/routes/adminJobsRoutes.js` (or `adminOperationsRoutes.js`) — on-demand
   endpoint with optional `retryFailures`; extend the jobs status payload with
-  citation-scan schedule state (enabled, hour, last/next run, pending count) so
+  citation-scan schedule state (enabled, hour, last/next run) so
   the status card has a data source, mirroring `conceptPipelineStatus`.
 - `public/index.html` — new "Citation Scan" run fieldset in the Operational Jobs
   grid, and a read-only schedule status card in the settings status grid.

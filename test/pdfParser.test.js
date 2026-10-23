@@ -473,6 +473,205 @@ and their ongoing efforts to challenge my thinking and strengthen this work.`;
   assert.ok(res6.some((m) => m.name === 'Jim Frankish' && m.role === 'Supervisory Committee Member'));
 });
 
+test('parseAcknowledgements recovers thesis 1.0094455 OCR spacing and bare advisor syntax', () => {
+  const text = `ACKNOWLEDGEMENTS
+I wish to thank my a d v i s o r, M i c h a e l Ignatieff, for his patient guidance
+throughout the research and writing of this thesis. I am also grateful to my family,
+friends, archivists, and the many communities who supported this project.`;
+
+  assert.deepEqual(parseAcknowledgements(text), [
+    { name: 'Michael Ignatieff', role: 'Supervisor', affiliation: null },
+  ]);
+});
+
+test('parseAcknowledgements accepts conservative advisor variants and complex names', () => {
+  const variants = [
+    ['my adviser, Anne-Marie O\'Neill', 'Supervisor', "Anne-Marie O'Neill"],
+    ['my thesis advisor: José de la Cruz', 'Supervisor', 'José de la Cruz'],
+    ['my academic co-adviser — J. R. Smith', 'Co-Supervisor', 'J. R. Smith'],
+  ];
+  for (const [phrase, role, name] of variants) {
+    const text = `ACKNOWLEDGEMENTS\nI am deeply grateful to ${phrase}, whose thoughtful guidance made this work possible.\nThe support of colleagues and friends sustained the project over many years.`;
+    assert.ok(parseAcknowledgements(text).some((member) => member.name === name && member.role === role), phrase);
+  }
+});
+
+test('parseAcknowledgements recognizes thesis/graduate adjective infix and titled advisor (Lever A)', () => {
+  const positives = [
+    ['my thesis supervisor, Professor Peter Boothroyd', 'Supervisor', 'Boothroyd'],
+    ['my thesis advisor, Prof. R.A.J. McDonald', 'Supervisor', 'McDonald'],
+    ['my research supervisor, Dr. Jane Smith', 'Supervisor', 'Smith'],
+    ['my supervisor, Dr. John Doe', 'Supervisor', 'Doe'],
+  ];
+  for (const [phrase, role, surname] of positives) {
+    const text = `ACKNOWLEDGEMENTS\n\nI am deeply grateful to ${phrase}, whose thoughtful guidance made this work possible.\nThe support of colleagues and friends sustained the project over many years and made a real difference.\n`;
+    const members = parseAcknowledgements(text);
+    assert.ok(
+      members.some((m) => m.role === role && m.name.split(/\s+/).pop() === surname),
+      `${phrase} -> expected surname ${surname}; got ${JSON.stringify(members)}`
+    );
+  }
+});
+
+test('parseAcknowledgements does not over-broaden the adjective-infix supervisor pattern', () => {
+  const negatives = [
+    'my supervisor was extremely generous with her time',
+    'the supervisor Michael suggested edits',
+  ];
+  for (const sentence of negatives) {
+    const text = `ACKNOWLEDGEMENTS\n${sentence}, and I am thankful for it.\nI remain grateful to friends and family whose generous support made this long project possible.`;
+    const members = parseAcknowledgements(text);
+    assert.equal(
+      members.some((m) => ['Supervisor', 'Co-Supervisor'].includes(m.role)),
+      false,
+      sentence
+    );
+  }
+});
+
+test('parseAcknowledgements does not mistake graduate/academic advisor (administrative staff) for the thesis supervisor', () => {
+  const negatives = [
+    'I am grateful to the graduate advisor, Dr. Jane Smith, for her assistance with administrative matters.',
+    'I would like to thank my academic advisor, Dr. John Lee, for help navigating course registration and paperwork.',
+  ];
+  for (const sentence of negatives) {
+    const text = `ACKNOWLEDGEMENTS\n${sentence}, and I am thankful for it.\nI remain grateful to friends and family whose generous support made this long project possible.`;
+    const members = parseAcknowledgements(text);
+    assert.equal(
+      members.some((m) => ['Supervisor', 'Co-Supervisor'].includes(m.role)),
+      false,
+      sentence
+    );
+  }
+});
+
+test('parseAcknowledgements does not infer bare advisors from ambiguous prose or institutions', () => {
+  const negatives = [
+    'The advisor Michael suggested that I speak to the archive staff.',
+    'I thank my advisor at the University of British Columbia for guidance.',
+    'I thank my advisor, The Committee, for its institutional support.',
+    'My colleagues J R R and the project team offered encouragement.',
+  ];
+  for (const sentence of negatives) {
+    const text = `ACKNOWLEDGEMENTS\n${sentence}\nI remain grateful to friends and family whose generous support made this long project possible.`;
+    assert.equal(parseAcknowledgements(text).some((member) => ['Supervisor', 'Co-Supervisor'].includes(member.role)), false, sentence);
+  }
+});
+
+test('parseAcknowledgements recognizes untitled advisor without trailing punctuation (Lever B)', () => {
+  const PAD = 'I am deeply grateful to the many people who made this long and difficult project possible over the years. ';
+  const positives = [
+    // doc 1.0090378: infix + untitled + no punctuation
+    ['I am in gratitude to my thesis advisor Joy Dixon for reading countless drafts', 'Joy Dixon', 'Supervisor'],
+    // doc 1.0340537: untitled, sentence period after the name
+    ['Most of all, I thank my advisor Leslie Paris. She helped me develop', 'Leslie Paris', 'Supervisor'],
+    // doc 1.0100786: untitled WITH comma (existing punctuation path should handle)
+    ['I would like to thank my advisor, Joy Dixon, for her patience', 'Joy Dixon', 'Supervisor'],
+  ];
+  for (const [sentence, name, role] of positives) {
+    const text = `\nACKNOWLEDGEMENTS\n\n${PAD}${sentence} ${PAD}\n`;
+    const members = parseAcknowledgements(text);
+    assert.ok(
+      members.some((m) => m.name === name && m.role === role),
+      `${sentence} -> expected ${name}/${role}; got ${JSON.stringify(members)}`
+    );
+  }
+});
+
+test('parseAcknowledgements does not extract untitled advisors from ambiguous or administrative prose (Lever B)', () => {
+  const PAD = 'I am deeply grateful to the many people who made this long and difficult project possible over the years. ';
+  const negatives = [
+    'my advisor was extremely generous with her time',
+    'my advisor and I met every week to discuss progress',
+    'the advisor Michael suggested I revise the chapter',
+    'my advisor at the consulting firm, before graduate school, taught me',
+    'my academic advisor Jane Smith helped with course registration',
+    'my graduate advisor Bob Jones handled my paperwork',
+  ];
+  for (const sentence of negatives) {
+    const text = `\nACKNOWLEDGEMENTS\n\n${PAD}${sentence} ${PAD}\n`;
+    const members = parseAcknowledgements(text);
+    assert.equal(
+      members.some((m) => ['Supervisor', 'Co-Supervisor'].includes(m.role)),
+      false,
+      `${sentence} -> unexpectedly extracted ${JSON.stringify(members)}`
+    );
+  }
+});
+
+test('parseAcknowledgements does not misfile institutions or places following "my advisor" as a supervisor (Lever B precision)', () => {
+  const PAD = 'I am deeply grateful to the many people who made this long and difficult project possible over the years. ';
+  const negatives = [
+    'my thesis advisor National Science Foundation funded this work',
+    'my advisor Statistics Canada provided data',
+    'my thesis advisor United Nations staff assisted',
+    'my advisor Vancouver General Hospital staff helped',
+    'my thesis advisor North America helped me secure funding',
+  ];
+  for (const sentence of negatives) {
+    const text = `\nACKNOWLEDGEMENTS\n\n${PAD}${sentence} ${PAD}\n`;
+    const members = parseAcknowledgements(text);
+    assert.equal(
+      members.some((m) => ['Supervisor', 'Co-Supervisor'].includes(m.role)),
+      false,
+      `${sentence} -> unexpectedly extracted ${JSON.stringify(members)}`
+    );
+  }
+});
+
+test('parseAcknowledgements still extracts person names after the org/place guard (Lever B precision)', () => {
+  const PAD = 'I am deeply grateful to the many people who made this long and difficult project possible over the years. ';
+  const positives = [
+    ['my thesis advisor Joy Dixon for reading', 'Joy Dixon', 'Supervisor'],
+    ['my advisor Leslie Paris. She helped', 'Leslie Paris', 'Supervisor'],
+    ['my advisor, Jane Smith, for her patience', 'Jane Smith', 'Supervisor'],
+  ];
+  for (const [sentence, name, role] of positives) {
+    const text = `\nACKNOWLEDGEMENTS\n\n${PAD}${sentence} ${PAD}\n`;
+    const members = parseAcknowledgements(text);
+    assert.ok(
+      members.some((m) => m.name === name && m.role === role),
+      `${sentence} -> expected ${name}/${role}; got ${JSON.stringify(members)}`
+    );
+  }
+});
+
+test('parseAcknowledgements collapses intra-section line-wraps so wrapped names are not truncated (Lever C1)', () => {
+  const PAD = 'I am deeply grateful to the many people who made this long and difficult project possible over the years. ';
+  const positives = [
+    // doc 1.0100786: pdftotext wraps "Joy \nDixon" across a line break
+    ['I would like to thank my advisor, Joy \nDixon, for her patience and encouragement.', 'Joy Dixon', 'Supervisor'],
+    // titled + wrapped across the line break
+    ['I thank my thesis supervisor, Professor Peter \nBoothroyd, who guided this work.', 'Peter Boothroyd', 'Supervisor'],
+  ];
+  for (const [sentence, name, role] of positives) {
+    const text = `\nACKNOWLEDGEMENTS\n\n${PAD}${sentence} ${PAD}\n`;
+    const members = parseAcknowledgements(text);
+    assert.ok(
+      members.some((m) => m.name === name && m.role === role),
+      `${sentence} -> expected ${name}/${role}; got ${JSON.stringify(members)}`
+    );
+  }
+});
+
+test('parseAcknowledgements newline-collapse does not create cross-sentence matches (Lever C1 precision)', () => {
+  const PAD = 'I am deeply grateful to the many people who made this long and difficult project possible over the years. ';
+  const negatives = [
+    // Period boundary must still block; Smith is not the supervisor.
+    'I thank my supervisor.\nDr. Smith gave a guest lecture that year.',
+    'I thank the members of my committee.\nJohn Doe attended the defense as an observer.',
+  ];
+  for (const sentence of negatives) {
+    const text = `\nACKNOWLEDGEMENTS\n\n${PAD}${sentence} ${PAD}\n`;
+    const members = parseAcknowledgements(text);
+    assert.equal(
+      members.length,
+      0,
+      `${sentence} -> unexpectedly extracted ${JSON.stringify(members)}`
+    );
+  }
+});
+
 test('parseCommittee parses different layout structures from exam cert pages', () => {
   // Test case 1: Pre-2016 format (name above role label)
   const committeeText1 = `The following individuals certify that they have read, and recommend to the Faculty of Graduate and Postdoctoral Studies...
@@ -504,6 +703,103 @@ Bob Dylan (Supervisor)`;
   const res3 = parseCommittee(committeeText3);
   assert.ok(res3.some((m) => m.name === 'Tracy Friedel' && m.role === 'Co-Supervisor'));
   assert.ok(res3.some((m) => m.name === 'Bob Dylan' && m.role === 'Supervisor'));
+});
+
+test('parseCommittee extracts a supervisor whose name carries a "Professor" honorific', () => {
+  // Regression (doc 1.0396863): UBC certificate pages often list the supervisor
+  // as "Professor <Name>". The leading honorific must be stripped, not treated
+  // as a bare-title reject — otherwise the whole Supervisor entry is dropped and
+  // the thesis ends up with a committee member but no supervisor.
+  const committeeText = `The following individuals certify that they have read, and recommend to the Faculty of Graduate and Postdoctoral Studies for acceptance, the thesis entitled:
+Is Global Convergence of Competition Law the Answer?
+submitted by Thomas Martin
+Examining Committee:
+Professor Shigenori Matsui, Peter A. Allard School of Law, UBC
+Supervisor
+John Kim, Peter A. Allard School of Law, UBC
+Supervisory Committee Member`;
+
+  const res = parseCommittee(committeeText);
+  assert.ok(
+    res.some((m) => m.name === 'Shigenori Matsui' && m.role === 'Supervisor'),
+    `expected Shigenori Matsui as Supervisor, got ${JSON.stringify(res)}`
+  );
+  assert.ok(res.some((m) => m.name === 'John Kim' && m.role === 'Supervisory Committee Member'));
+});
+
+test('parseAcknowledgements extracts an untitled supervisor named after "my supervisor,"', () => {
+  // Regression (doc 1.0077471): "my supervisor, Steve Wexler" — no Dr./Prof. title.
+  const text = `ACKNOWLEDGEMENTS
+I would like to thank my supervisor, Steve Wexler, and second reader, Richard Paisley. Their patience, guidance and invaluable advice have made my graduate study possible and enjoyable this year.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'Steve Wexler' && m.role === 'Supervisor'),
+    `expected Steve Wexler as Supervisor, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements extracts an untitled name after "my thesis supervisor"', () => {
+  // Regression (doc 1.0077517): "my thesis supervisor Karin Mickelson" — untitled, no comma.
+  const text = `ACKNOWLEDGEMENTS
+I would like to acknowledge the suggestions, commentaries and guidance of my thesis supervisor Karin Mickelson and my external reader Richard Paisley. Both of them were extremely patient reviewing the draft versions of this thesis.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'Karin Mickelson' && m.role === 'Supervisor'),
+    `expected Karin Mickelson as Supervisor, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements extracts a supervisor from "for the supervision of this thesis"', () => {
+  // Regression (doc 1.0077661): "Professor A.R. Thompson, not only for the supervision of this thesis".
+  const text = `ACKNOWLEDGEMENTS
+I wish to express my thanks to Professor A.R. Thompson, not only for the supervision of this thesis, but also for his guidance and assistance generally throughout my time in the graduate program.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'A.R. Thompson' && m.role === 'Supervisor'),
+    `expected A.R. Thompson as Supervisor, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements extracts a supervisor from "Professor X, who supervised ... this thesis"', () => {
+  // Regression (docs 1.0077436, 1.0077618): relative-clause attribution.
+  const text = `ACKNOWLEDGEMENTS
+Special thanks are due to Professor Peter Burns, who both supervised and facilitated this thesis with great patience, and to the second reader for his insightful comments throughout the process.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'Peter Burns' && m.role === 'Supervisor'),
+    `expected Peter Burns as Supervisor, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements finds the section when the heading is OCR letter-spaced', () => {
+  // Regression (doc 1.0077650): "A C K N O W L E D G E M E N T S" defeats heading detection.
+  const text = `A C K N O W L E D G E M E N T S
+This project would never have even begun without the insight and clear thinking of my advisor Susan B. Boyd, who waded through my multiple proposals to find one that was workable.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'Susan B. Boyd' && m.role === 'Supervisor'),
+    `expected Susan B. Boyd as Supervisor, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements finds the section when the heading has a suffix', () => {
+  // Regression (doc 1.0077618): "ACKNOWLEDGEMENTS AND DEDICATION" defeats heading detection.
+  const text = `ACKNOWLEDGEMENTS AND DEDICATION
+The author would like to thank Professor Peter Burns, Q.C., who supervised and facilitated this thesis, and Mr. Daniel Prefontaine, second reader, for his thoughtful comments on the material.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'Peter Burns' && m.role === 'Supervisor'),
+    `expected Peter Burns as Supervisor, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements extracts committee members from "my Advisory Committee, Prof. X and Prof. Y"', () => {
+  // Regression (doc 1.0077585): committee members present, no supervisor stated.
+  const text = `A C K N O W L E D G E M E N T S
+It is my wish to express my gratitude to all of those who have supported this work. The members of my Advisory Committee, Prof. Bruce MacDougall and Prof. William Black, have devoted time and energy to this work.`;
+  const res = parseAcknowledgements(text);
+  assert.ok(res.some((m) => m.name === 'Bruce MacDougall' && m.role === 'Supervisory Committee Member'),
+    `expected Bruce MacDougall as committee member, got ${JSON.stringify(res)}`);
+  assert.ok(res.some((m) => m.name === 'William Black' && m.role === 'Supervisory Committee Member'));
+  assert.ok(!res.some((m) => m.role === 'Supervisor' || m.role === 'Co-Supervisor'),
+    `no supervisor should be inferred, got ${JSON.stringify(res)}`);
+});
+
+test('parseAcknowledgements does NOT infer a supervisor from gratitude/guidance alone', () => {
+  // Guardrail (docs 1.0077655, 1.0077608): "guidance of Professor X" with no role word
+  // must not be promoted to a supervisor.
+  const text = `ACKNOWLEDGEMENTS
+The thesis itself could not have been written without the encouragement and expert guidance of Professor M. J. O'Keefe. I also wish to gratefully acknowledge the invaluable guidance and support of Professor Pitman B. Potter throughout this work.`;
+  const res = parseAcknowledgements(text);
+  assert.deepEqual(res, [], `expected no supervisor from guidance alone, got ${JSON.stringify(res)}`);
 });
 
 test('parseBibliography extracts lists of references and cleans OCR spacing artifacts', () => {

@@ -21,7 +21,11 @@ test('content policy satisfaction is mode-specific', () => {
   };
   assert.equal(hasCachedEnrichmentMetric(fullTextMetric, 'full_text_only'), true);
   assert.equal(hasCachedEnrichmentMetric(fullTextMetric, 'pdf_cache'), false);
-  assert.equal(hasCachedEnrichmentMetric(fullTextMetric, 'pdf_cache', 'full_text'), true);
+  assert.equal(hasCachedEnrichmentMetric(fullTextMetric, 'pdf_cache', 'full_text'), false);
+  assert.equal(hasCachedEnrichmentMetric({
+    ...fullTextMetric,
+    original_pdf_request_count: 1,
+  }, 'pdf_cache', 'full_text'), true);
   assert.equal(hasCachedEnrichmentMetric({ pdf_path: '/cache/doc.pdf' }, 'pdf_cache'), true);
   assert.equal(hasCachedEnrichmentMetric({
     content_source: 'streamed_pdf',

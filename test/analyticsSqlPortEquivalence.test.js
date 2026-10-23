@@ -1,0 +1,389 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
+// #15: JS-vs-SQL cross-check for the two corrected ports (topicData.byYear,
+// supervisorNgramMatrix) on an identical fixture, proving behavioral
+// equivalence rather than assuming it. Both ports are exercised through
+// their real production entry points: the JS side via
+// buildMetricsPayloadFromRecords (the same function the below-threshold
+// route calls), the SQL side via getDocumentServingAnalytics (the
+// above-threshold route's DB-aggregate path).
+
+let closeDb;
+let ensureStorage;
+let getDb;
+let saveDocumentMetadataBatch;
+let saveCommitteeMembers;
+let listCachedDocuments;
+let applyCommitteeMembersToDocuments;
+let getDocumentServingAnalytics;
+let buildMetricsPayloadFromRecords;
+let tempDir;
+
+const SYNC_KEY = 'sql-port-equivalence';
+const TOTAL_DOCUMENTS = 220;
+
+function fixtureDoc(index) {
+  // Docs 0-109: metadata-sourced supervisors only, drawn from a pool of 8 so
+  // several supervisors clear a meaningful doc-count threshold.
+  // Docs 110-219: NO metadata supervisor at all — their only supervisor
+  // comes from a committee-sourced document_people row added below,
+  // specifically exercising the corrected filter (role IN (...) regardless
+  // of source) against the superseded (source='metadata'-only) design.
+  const hasMetadataSupervisor = index < 110;
+  return {
+    id: `sqlport-${String(index).padStart(4, '0')}`,
+    title: `SQL port fixture ${index}`,
+    author: `Author ${index}`,
+    year: 2000 + (index % 20),
+    degree: 'PhD',
+    program: 'Education',
+    affiliation: ['UBC'],
+    supervisors: hasMetadataSupervisor ? [`Metadata Supervisor ${index % 8}`] : [],
+    abstract: `abstract ${index}`,
+    subjects: ['education'],
+    conceptTerms: ['concept alpha', 'concept beta', `concept gamma ${index % 6}`],
+    methodologies: [index % 2 === 0 ? 'Qualitative' : 'Quantitative'],
+    charCount: 500 + index,
+  };
+}
+
+test.before(async () => {
+  tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-sql-port-equiv-'));
+  process.env.SKIP_LOCAL_ENV = '1';
+  process.env.NODE_ENV = 'test';
+  process.env.APP_DATA_DIR = tempDir;
+  process.env.SQLITE_PATH = path.join(tempDir, 'metrics.sqlite');
+  process.env.PDF_CACHE_DIR = path.join(tempDir, 'pdf-cache');
+  process.env.FULL_TEXT_CACHE_DIR = path.join(tempDir, 'full-text-cache');
+
+  const db = await import('../src/db.js');
+  ({
+    closeDb, ensureStorage, getDb, saveDocumentMetadataBatch, saveCommitteeMembers,
+    listCachedDocuments, applyCommitteeMembersToDocuments, getDocumentServingAnalytics,
+  } = db);
+  ({ buildMetricsPayloadFromRecords } = await import('../src/metrics.js'));
+  await ensureStorage();
+
+  const items = Array.from({ length: TOTAL_DOCUMENTS }, (_, i) => ({ doc: fixtureDoc(i), syncKey: SYNC_KEY }));
+  for (let start = 0; start < items.length; start += 50) {
+    await saveDocumentMetadataBatch(items.slice(start, start + 50));
+  }
+
+  // Committee-only supervisors for docs 110-219 (no metadata supervisor at
+  // all) — a source='committee' document_people row, distinct from
+  // 'metadata'. Each committee-only doc gets exactly one supervisor from a
+  // small pool of 4 names, so this pool clears the "top 12 supervisors" cut
+  // alongside the metadata-sourced pool above.
+  for (let i = 110; i < TOTAL_DOCUMENTS; i++) {
+    const docId = `sqlport-${String(i).padStart(4, '0')}`;
+    await saveCommitteeMembers(docId, [
+      { name: `Committee Supervisor ${i % 4}`, role: 'Supervisor' },
+    ], 'committee');
+  }
+
+  // Task 6a: one extra doc with 12 conceptTerms (docConceptTerms can emit up
+  // to 12 in production — see src/metrics.js), exercising the
+  // `term.key < 10` ordinal cutoff that computeSupervisorNgramMatrixSql's
+  // legacy json_each form applies. document_terms has no stored array
+  // position, so the projected branch reconstructs it via ROW_NUMBER()
+  // OVER (PARTITION BY doc_id ORDER BY rowid).
+  //
+  // Positions 0-9 reuse the fixture's 8 existing high-count concept names
+  // plus exactly 2 brand-new names ('filler a'/'filler b') — exactly
+  // filling the two open slots left in the topM=10 ranking (8 existing +
+  // 2 new = 10, no surplus, so no tie-break ambiguity is introduced for
+  // the unrelated #15 JS-vs-SQL cross-check below).
+  // Positions 10-11 ('boundary x'/'boundary y') are two more brand-new
+  // names placed *past* the cutoff. If the projected branch's ROW_NUMBER
+  // ordinal were off by even one position, these would leak into the
+  // topM=10 ranking (now 12 count=1 candidates for 2 slots) while the
+  // legacy branch correctly excludes them (exactly 10, no surplus) —
+  // producing a content-level mismatch between readiness modes that the
+  // Task 6a deep-equal test below would catch.
+  await saveDocumentMetadataBatch([{
+    doc: {
+      id: 'sqlport-0220',
+      title: 'SQL port fixture 220 (ordinal boundary)',
+      author: 'Author 220',
+      year: 2015,
+      degree: 'PhD',
+      program: 'Education',
+      affiliation: ['UBC'],
+      supervisors: ['Metadata Supervisor 0'],
+      abstract: 'abstract 220',
+      subjects: ['education'],
+      conceptTerms: [
+        'filler a', 'filler b',
+        'concept alpha', 'concept beta', 'concept gamma 0', 'concept gamma 1',
+        'concept gamma 2', 'concept gamma 3', 'concept gamma 4', 'concept gamma 5',
+        'boundary x', 'boundary y',
+      ],
+      methodologies: ['Qualitative'],
+      charCount: 999,
+    },
+    syncKey: SYNC_KEY,
+  }]);
+
+  // A real topic hierarchy: 14 leaf topics merged down to 10 parent
+  // clusters (4 merges), so topicData.byYear's parent-cluster resolution is
+  // genuinely exercised (not the "N <= targetK, no merges" trivial case).
+  const client = await getDb();
+  const now = new Date().toISOString();
+  const topicRows = Array.from({ length: 14 }, (_, i) => ({
+    topicId: i, label: `Topic ${i}`, docCount: TOTAL_DOCUMENTS - i, // distinct doc counts: no ranking ties
+  }));
+  await client.batch(topicRows.map((t) => ({
+    sql: `INSERT INTO topics (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (?, ?, '[]', ?, 'test', ?)`,
+    args: [t.topicId, t.label, t.docCount, now],
+  })), 'write');
+  // Assign each document to a leaf topic (round-robin over the 14 leaves).
+  await client.batch(Array.from({ length: TOTAL_DOCUMENTS }, (_, i) => ({
+    sql: 'INSERT INTO document_topics (doc_id, topic_id, probability) VALUES (?, ?, 0.9)',
+    args: [`sqlport-${String(i).padStart(4, '0')}`, i % 14],
+  })), 'write');
+  // Merge leaves [0,1]->14, [2,3]->15, [4,5]->16, [6,7]->17 (4 merges,
+  // 14 leaves - 4 merges = 10 components = targetK exactly).
+  const leafTopicIds = topicRows.map((t) => t.topicId);
+  const linkage = [[0, 1], [2, 3], [4, 5], [6, 7]];
+  await client.execute({
+    sql: `INSERT INTO topic_hierarchy_meta (id, leaf_topic_ids, linkage_json, created_at) VALUES (1, ?, ?, ?)`,
+    args: [JSON.stringify(leafTopicIds), JSON.stringify(linkage), now],
+  });
+});
+
+test.after(async () => {
+  await closeDb?.();
+  if (tempDir) await fs.rm(tempDir, { recursive: true, force: true });
+});
+
+async function computeJsPath() {
+  const records = await listCachedDocuments({ syncKey: SYNC_KEY });
+  await applyCommitteeMembersToDocuments(records);
+  const payload = await buildMetricsPayloadFromRecords(records, { generatedAt: 'test' }, 25);
+  return payload;
+}
+
+test('#15 cross-check: supervisorNgramMatrix — SQL port matches the JS path on an identical fixture, including committee-only (non-metadata-source) supervisors', async () => {
+  const jsPayload = await computeJsPath();
+  const sqlPayload = await getDocumentServingAnalytics({ syncKey: SYNC_KEY });
+
+  const jsMatrix = jsPayload.supervisorNgramMatrix;
+  const sqlMatrix = sqlPayload.supervisorNgramMatrix;
+
+  assert.deepEqual([...jsMatrix.supervisors].sort(), [...sqlMatrix.supervisors].sort());
+  // The committee-only supervisor pool must actually be present in both —
+  // proving the fix isn't accidentally passing by omission (e.g. a
+  // source='metadata'-only filter would silently drop this entire pool).
+  const committeeSupervisorsInSql = sqlMatrix.supervisors.filter((name) => name.startsWith('Committee Supervisor'));
+  assert.ok(committeeSupervisorsInSql.length > 0, 'committee-sourced supervisors must appear in the SQL port');
+  assert.deepEqual([...jsMatrix.ngrams].sort(), [...sqlMatrix.ngrams].sort());
+
+  // Compare the matrix cell-by-cell after aligning both sides' row/column
+  // order (ranking ties are avoided by fixture design, so alignment via
+  // sorted labels is sufficient — no ordering ambiguity to paper over).
+  const jsSupIndex = new Map(jsMatrix.supervisors.map((name, i) => [name, i]));
+  const sqlSupIndex = new Map(sqlMatrix.supervisors.map((name, i) => [name, i]));
+  const jsNgIndex = new Map(jsMatrix.ngrams.map((name, i) => [name, i]));
+  const sqlNgIndex = new Map(sqlMatrix.ngrams.map((name, i) => [name, i]));
+  for (const name of jsMatrix.supervisors) {
+    for (const ngram of jsMatrix.ngrams) {
+      const jsValue = jsMatrix.matrix[jsSupIndex.get(name)][jsNgIndex.get(ngram)];
+      const sqlValue = sqlMatrix.matrix[sqlSupIndex.get(name)][sqlNgIndex.get(ngram)];
+      assert.equal(sqlValue, jsValue, `mismatch at supervisor="${name}" ngram="${ngram}": js=${jsValue} sql=${sqlValue}`);
+    }
+  }
+});
+
+test('#15 cross-check: topicData.byYear — SQL port resolves to parent-cluster id via the same buildParentClusters algorithm as the JS path', async () => {
+  const jsPayload = await computeJsPath();
+  const sqlPayload = await getDocumentServingAnalytics({ syncKey: SYNC_KEY });
+
+  const jsByYear = jsPayload.topicData.byYear;
+  const sqlByYear = sqlPayload.topicData.byYear;
+
+  assert.equal(jsByYear.length, sqlByYear.length);
+  assert.ok(jsByYear.length > 0, 'fixture must actually produce byYear rows');
+
+  const sortByTopicId = (rows) => [...rows].sort((a, b) => a.topicId - b.topicId);
+  const jsSorted = sortByTopicId(jsByYear);
+  const sqlSorted = sortByTopicId(sqlByYear);
+  for (let i = 0; i < jsSorted.length; i++) {
+    assert.equal(sqlSorted[i].topicId, jsSorted[i].topicId);
+    assert.equal(sqlSorted[i].label, jsSorted[i].label);
+    const sortData = (data) => [...data].sort((a, b) => a.year - b.year);
+    assert.deepEqual(sortData(sqlSorted[i].data), sortData(jsSorted[i].data));
+  }
+
+  // Sanity: this must be a genuine parent-cluster resolution, not a
+  // pass-through of raw leaf topic ids — confirm at least one returned
+  // topicId is one of the merge-produced parent ids (>= 14, since leaves
+  // are 0-13 and merges start at index 14) OR, if parent ids were
+  // re-indexed to 0-9 after sorting by docCount (buildParentClusters does
+  // this), confirm the byYear rows total more documents per topic than any
+  // single leaf could contribute alone (14 leaves round-robin over 220 docs
+  // is ~15-16 docs/leaf; a merged cluster combining two leaves should show
+  // a noticeably higher total for at least one entry).
+  const totalsByTopic = sqlByYear.map((t) => t.data.reduce((sum, d) => sum + d.count, 0));
+  const maxTotal = Math.max(...totalsByTopic);
+  const singleLeafApprox = Math.ceil(TOTAL_DOCUMENTS / 14) + 2;
+  assert.ok(
+    maxTotal > singleLeafApprox,
+    `expected at least one parent cluster to combine multiple leaves' documents ` +
+    `(max total ${maxTotal}, single-leaf approx ${singleLeafApprox}) — otherwise this fixture ` +
+    `doesn't actually exercise the merge path`
+  );
+});
+
+test('Task 6a: conceptTimeline + supervisorNgramMatrix — document_terms projection equals legacy json_each', async () => {
+  const { __setDocumentTermsReadyForTesting } = await import('../src/db.js');
+  try {
+    __setDocumentTermsReadyForTesting(false);
+    const legacy = await getDocumentServingAnalytics({ syncKey: SYNC_KEY });
+
+    __setDocumentTermsReadyForTesting(true);
+    const projected = await getDocumentServingAnalytics({ syncKey: SYNC_KEY });
+
+    // Non-empty guard: deep-equaling two empty panels would be a vacuous pass.
+    assert.ok(legacy.conceptTimeline.length > 0, 'conceptTimeline must be non-empty for this fixture');
+    assert.ok(
+      legacy.conceptTimeline.some((row) => row.data.length > 0 && row.totalDocs > 0),
+      'conceptTimeline must have at least one concept with year data'
+    );
+    assert.ok(legacy.supervisorNgramMatrix.supervisors.length > 0, 'supervisorNgramMatrix.supervisors must be non-empty');
+    assert.ok(legacy.supervisorNgramMatrix.ngrams.length > 0, 'supervisorNgramMatrix.ngrams must be non-empty');
+    assert.ok(
+      legacy.supervisorNgramMatrix.matrix.some((row) => row.some((v) => v > 0)),
+      'supervisorNgramMatrix.matrix must contain at least one nonzero cell'
+    );
+
+    assert.deepEqual(projected.conceptTimeline, legacy.conceptTimeline);
+    assert.deepEqual(projected.supervisorNgramMatrix, legacy.supervisorNgramMatrix);
+  } finally {
+    __setDocumentTermsReadyForTesting(false);
+  }
+});
+
+test('Task 6b: methodologyConceptMatrix + methodologyTopicMatrix — document_terms projection equals legacy json_each', async () => {
+  const { __setDocumentTermsReadyForTesting } = await import('../src/db.js');
+  try {
+    __setDocumentTermsReadyForTesting(false);
+    const legacy = await getDocumentServingAnalytics({ syncKey: SYNC_KEY });
+
+    __setDocumentTermsReadyForTesting(true);
+    const projected = await getDocumentServingAnalytics({ syncKey: SYNC_KEY });
+
+    // Non-empty guards: deep-equaling two empty panels would be a vacuous pass.
+    assert.ok(legacy.methodologyConceptMatrix.methodologies.length > 0, 'methodologyConceptMatrix.methodologies must be non-empty');
+    assert.ok(legacy.methodologyConceptMatrix.concepts.length > 0, 'methodologyConceptMatrix.concepts must be non-empty');
+    assert.ok(
+      legacy.methodologyConceptMatrix.matrix.some((row) => row.some((v) => v > 0)),
+      'methodologyConceptMatrix.matrix must contain at least one nonzero cell'
+    );
+    assert.ok(legacy.methodologyTopicMatrix.methodologies.length > 0, 'methodologyTopicMatrix.methodologies must be non-empty');
+    assert.ok(legacy.methodologyTopicMatrix.topics.length > 0, 'methodologyTopicMatrix.topics must be non-empty');
+    assert.ok(
+      legacy.methodologyTopicMatrix.matrix.some((row) => row.some((v) => v > 0)),
+      'methodologyTopicMatrix.matrix must contain at least one nonzero cell'
+    );
+
+    assert.deepEqual(projected.methodologyConceptMatrix, legacy.methodologyConceptMatrix);
+    assert.deepEqual(projected.methodologyTopicMatrix, legacy.methodologyTopicMatrix);
+  } finally {
+    __setDocumentTermsReadyForTesting(false);
+  }
+});
+
+test('Task 6a/6b fix (round 1 review + Task 6b reuse): supervisorNgramMatrix + methodologyConceptMatrix — legacy distinct-first-10 selection matches the document_terms projection when a document has a duplicate conceptTerm inside its first 10 raw array positions', async () => {
+  // Isolated in its own syncKey/doc, deliberately NOT added to the shared
+  // 222-doc SYNC_KEY corpus: the JS reference path (buildSupervisorNgramMatrix
+  // -> docConceptTerms -> rec.conceptTerms.slice(0, 10)) truncates by RAW
+  // array position with no dedup, so on a document with a duplicate in its
+  // first 10 positions it would disagree with the (correct, post-fix)
+  // distinct-based SQL truncation used by both branches here. That's a
+  // separate, pre-existing JS-vs-SQL semantic gap outside this task's scope
+  // (computeSupervisorNgramMatrixSql's two *SQL* branches, not the JS port);
+  // keeping this fixture off SYNC_KEY avoids corrupting the unrelated #15
+  // JS-vs-SQL cross-check above with that unrelated gap.
+  const dupSyncKey = 'sql-port-dup-boundary';
+  await saveDocumentMetadataBatch([{
+    doc: {
+      id: 'sqlport-dup-0001',
+      title: 'Duplicate-in-first-10 boundary fixture',
+      author: 'Author Dup',
+      year: 2016,
+      degree: 'PhD',
+      program: 'Education',
+      affiliation: ['UBC'],
+      supervisors: ['Solo Supervisor'],
+      abstract: 'abstract dup',
+      subjects: ['education'],
+      // 'filler a' repeats at raw positions 0 and 1. A raw-position cutoff
+      // (the old `term.key < 10`) wastes a slot on the repeat, so 'filler b'
+      // (raw position 10) falls outside the first-10 *raw* window and is
+      // wrongly excluded. A distinct-by-earliest-position cutoff (the fix)
+      // does not waste that slot on the repeat, so 'filler b' — the 10th
+      // *distinct* value — is correctly pulled IN. 'boundary x' (raw
+      // position 11, the 11th distinct value either way) stays excluded
+      // under both schemes: it's the control proving the fix doesn't just
+      // admit everything past the old cutoff.
+      conceptTerms: [
+        'filler a', 'filler a',
+        'term02', 'term03', 'term04', 'term05', 'term06', 'term07', 'term08', 'term09',
+        'filler b', 'boundary x',
+      ],
+      methodologies: ['Qualitative'],
+      charCount: 777,
+    },
+    syncKey: dupSyncKey,
+  }]);
+
+  const { __setDocumentTermsReadyForTesting: setDupReady } = await import('../src/db.js');
+  try {
+    setDupReady(false);
+    const legacy = await getDocumentServingAnalytics({ syncKey: dupSyncKey });
+    setDupReady(true);
+    const projected = await getDocumentServingAnalytics({ syncKey: dupSyncKey });
+
+    assert.ok(legacy.supervisorNgramMatrix.supervisors.length > 0, 'supervisors must be non-empty');
+    assert.ok(legacy.supervisorNgramMatrix.ngrams.length > 0, 'ngrams must be non-empty');
+    assert.ok(
+      legacy.supervisorNgramMatrix.matrix.some((row) => row.some((v) => v > 0)),
+      'matrix must contain at least one nonzero cell'
+    );
+
+    // The fix's load-bearing assertions: this is the exact scenario the
+    // round-1 review flagged as a hole. Before the fix, legacy's raw
+    // term.key < 10 would have excluded 'filler b' here while the
+    // document_terms projection (deduped on write) included it —
+    // diverging. Confirm the (now-fixed) legacy branch agrees with
+    // production's distinct-term intent, and that the boundary control
+    // term stays excluded on both sides.
+    assert.ok(legacy.supervisorNgramMatrix.ngrams.includes('filler b'), "'filler b' (10th distinct term) must be selected under distinct-based first-10 counting");
+    assert.ok(!legacy.supervisorNgramMatrix.ngrams.includes('boundary x'), "'boundary x' (11th distinct term) must remain excluded");
+
+    assert.deepEqual(projected.supervisorNgramMatrix, legacy.supervisorNgramMatrix);
+
+    // Task 6b reuses this exact fixture (same doc, same duplicate-in-first-10
+    // boundary) to prove computeMethodologyConceptMatrixSql's topConcepts
+    // query — which applies the identical term.key < 10 / term.rnk <= 10
+    // dedup-sensitive cutoff — doesn't regress the same way. The doc's lone
+    // methodology ('Qualitative') makes topMethodologies trivially
+    // single-valued, isolating the assertion to the conceptTerms cutoff.
+    assert.ok(legacy.methodologyConceptMatrix.methodologies.length > 0, 'methodologyConceptMatrix.methodologies must be non-empty');
+    assert.ok(legacy.methodologyConceptMatrix.concepts.length > 0, 'methodologyConceptMatrix.concepts must be non-empty');
+    assert.ok(
+      legacy.methodologyConceptMatrix.matrix.some((row) => row.some((v) => v > 0)),
+      'methodologyConceptMatrix.matrix must contain at least one nonzero cell'
+    );
+    assert.ok(legacy.methodologyConceptMatrix.concepts.includes('filler b'), "'filler b' (10th distinct term) must be selected under distinct-based first-10 counting in methodologyConceptMatrix");
+    assert.ok(!legacy.methodologyConceptMatrix.concepts.includes('boundary x'), "'boundary x' (11th distinct term) must remain excluded from methodologyConceptMatrix");
+
+    assert.deepEqual(projected.methodologyConceptMatrix, legacy.methodologyConceptMatrix);
+  } finally {
+    setDupReady(false);
+  }
+});
