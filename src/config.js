@@ -120,6 +120,11 @@ export const CATALOGUE_LOOKUP_ENABLED = process.env.CATALOGUE_LOOKUP_ENABLED
   : true;
 export const CATALOGUE_LOOKUP_PAGE_SIZE = Number(process.env.CATALOGUE_LOOKUP_PAGE_SIZE || 200);
 export const CATALOGUE_LOOKUP_BATCH_SIZE = Number(process.env.CATALOGUE_LOOKUP_BATCH_SIZE || 1);
+// Daily 2:00 concept rebuild. On by default; set to 0 to turn the scheduler off
+// (the browser test server does, so a run spanning 2:00 starts no worker).
+export const CONCEPT_REBUILD_NIGHTLY_ENABLED = process.env.CONCEPT_REBUILD_NIGHTLY_ENABLED
+  ? /^(1|true|yes)$/i.test(process.env.CONCEPT_REBUILD_NIGHTLY_ENABLED)
+  : true;
 // Nightly re-streaming citation scan. Off by default; staggered an hour after the
 // 2:00 concept rebuild so the two never contend for the single worker.
 export const CITATION_SCAN_NIGHTLY_ENABLED = /^(1|true|yes)$/i.test(

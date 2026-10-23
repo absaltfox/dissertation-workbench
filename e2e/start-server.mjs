@@ -4,9 +4,12 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { isolatedServerEnv } from './server-env.mjs';
 
 const dataDir = mkdtempSync(path.join(tmpdir(), 'oc-e2e-'));
-Object.assign(process.env, {
+// Replace the inherited env wholesale: only allowlisted host variables plus
+// the settings below reach the app (see server-env.mjs).
+const serverEnv = isolatedServerEnv(process.env, {
   SKIP_LOCAL_ENV: '1',                     // never load the developer's .env
   NODE_ENV: 'development',                 // non-production: no MFA/encryption-key requirements
   APP_DATA_DIR: dataDir,
@@ -23,8 +26,11 @@ Object.assign(process.env, {
   DOCUMENT_SYNC_ENABLED: '0',
   DOCUMENT_SYNC_ON_START: '0',
   CITATION_SCAN_NIGHTLY_ENABLED: '0',
+  CONCEPT_REBUILD_NIGHTLY_ENABLED: '0',    // a run spanning 2:00 must not start a worker
   PORT: process.env.E2E_PORT || '4173',
 });
+for (const name of Object.keys(process.env)) delete process.env[name];
+Object.assign(process.env, serverEnv);
 
 const { seedFixtureCorpus } = await import('./seed.mjs');
 await seedFixtureCorpus();
