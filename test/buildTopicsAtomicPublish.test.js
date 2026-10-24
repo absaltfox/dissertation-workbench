@@ -38,7 +38,7 @@ test('live topic tables keep old rows until the swap, then hold staged rows and 
 stage()
 before = {"topics": count("topics"), "labels": [x["label"] for x in client.execute("SELECT label FROM topics").rows],
           "dt": count("document_topics"), "staged": count("topics_next")}
-bt.publish_staged_topics(client)
+bt.publish_staged_topics(client, 't2')
 print(json.dumps({"before": before,
   "labels": sorted(x["label"] for x in client.execute("SELECT label FROM topics").rows),
   "dt": sorted(x["doc_id"] for x in client.execute("SELECT doc_id FROM document_topics").rows),
@@ -59,7 +59,7 @@ test('a failed swap rolls back and leaves live rows intact', () => {
 stage()
 client.execute("DROP TABLE document_topic_coords_next")
 try:
-    bt.publish_staged_topics(client)
+    bt.publish_staged_topics(client, 't2')
     failed = False
 except Exception:
     failed = True
@@ -104,15 +104,67 @@ print(json.dumps({"n": count("topics_next") + count("document_topics_next") + co
 test('staging_swap_committed distinguishes a committed swap from a rolled-back one', () => {
   const r = runPython(`
 stage()
-rolled_back = bt.staging_swap_committed(client)
-bt.publish_staged_topics(client)
-committed = bt.staging_swap_committed(client)
+rolled_back = bt.staging_swap_committed(client, 't2')
+bt.publish_staged_topics(client, 't2')
+committed = bt.staging_swap_committed(client, 't2')
 class Broken:
     def execute(self, *a, **k):
         raise RuntimeError("down")
-print(json.dumps({"rolled_back": rolled_back, "committed": committed, "broken": bt.staging_swap_committed(Broken())}))
+print(json.dumps({"rolled_back": rolled_back, "committed": committed, "broken": bt.staging_swap_committed(Broken(), 't2')}))
 `);
   assert.equal(r.rolled_back, false);
   assert.equal(r.committed, true);
   assert.equal(r.broken, false);
+});
+
+test('staging_swap_committed requires the live topics to carry this run created_at', () => {
+  const r = runPython(`
+stage()
+bt.publish_staged_topics(client, 't2')
+print(json.dumps({"mine": bt.staging_swap_committed(client, 't2'), "other": bt.staging_swap_committed(client, 'other-run')}))
+`);
+  assert.equal(r.mine, true);
+  assert.equal(r.other, false);
+});
+
+test('publish refuses to swap when staged topics or assignments are empty', () => {
+  const r = runPython(`
+out = {}
+for table in ("topics_next", "document_topics_next"):
+    stage()
+    client.execute(f"DELETE FROM {table}")
+    try:
+        bt.publish_staged_topics(client, 't2')
+        out[table] = "swapped"
+    except RuntimeError as ex:
+        out[table] = str(ex)
+    out[table + "_live"] = [x["label"] for x in client.execute("SELECT label FROM topics").rows]
+    out[table + "_staging_kept"] = "topics_next" in tables()
+print(json.dumps(out))
+`);
+  for (const table of ['topics_next', 'document_topics_next']) {
+    assert.match(r[table], /empty/);
+    assert.deepEqual(r[`${table}_live`], ['old']);
+    assert.equal(r[`${table}_staging_kept`], true);
+  }
+});
+
+test('publish bumps topics_generation inside the swap and rolls it back on failure', () => {
+  const r = runPython(`
+def gen():
+    rows = client.execute("SELECT value FROM settings WHERE key = 'topics_generation'").rows if "settings" in tables() else []
+    return rows[0]["value"] if rows else None
+stage()
+client.execute("DROP TABLE document_topic_coords_next")
+try:
+    bt.publish_staged_topics(client, 'gen-1')
+except Exception:
+    pass
+after_fail = gen()
+stage()
+bt.publish_staged_topics(client, 'gen-2')
+print(json.dumps({"after_fail": after_fail, "after_ok": gen()}))
+`);
+  assert.equal(r.after_fail, null);
+  assert.equal(r.after_ok, 'gen-2');
 });

@@ -62,13 +62,20 @@ def resolve_min_topic_size(n_docs):
     """BERTOPIC_MIN_TOPIC_SIZE if valid, else max(MIN_TOPIC_SIZE, round(n_docs / 500))."""
     override = _positive_int_env("BERTOPIC_MIN_TOPIC_SIZE")
     if override is not None:
-        return override
+        if override >= 2:
+            return override
+        print(f"Warning: ignoring BERTOPIC_MIN_TOPIC_SIZE={override} (HDBSCAN needs at least 2); using the default",
+              file=sys.stderr)
     return max(MIN_TOPIC_SIZE, round(n_docs / MIN_TOPIC_SIZE_DOCS_PER_TOPIC))
 
 
 def resolve_max_topics():
     """BERTOPIC_MAX_TOPICS (positive int) or None for no cap."""
-    return _positive_int_env("BERTOPIC_MAX_TOPICS")
+    value = _positive_int_env("BERTOPIC_MAX_TOPICS")
+    if value is not None and value < 2:
+        print(f"Warning: ignoring BERTOPIC_MAX_TOPICS={value} (needs at least 2); no cap applied", file=sys.stderr)
+        return None
+    return value
 
 
 # DB connection and logging utilities
@@ -105,26 +112,43 @@ class SqliteClientWrapper:
         self.conn.close()
 
 
-def write_rows(client, sql, rows, chunk=500, retries=3):
-    """Write parameter lists for one statement via client.batch, `chunk` rows per transaction.
+def retry_with_backoff(fn, what, retries=3):
+    """Call fn(), retrying with exponential backoff (0.5s, 1s, 2s, ...) up to `retries` times.
+
+    Re-raises the last error once the retries are exhausted. `what` names the
+    operation in the retry log line.
+    """
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except Exception as ex:
+            if attempt >= retries:
+                raise
+            delay = 0.5 * (2 ** attempt)
+            print(f"  {what} failed (attempt {attempt + 1}/{retries + 1}): {ex}; retrying in {delay}s",
+                  file=sys.stderr)
+            time.sleep(delay)
+
+
+def write_statements(client, statements, chunk=500, retries=3):
+    """Run (sql, params) statements in order via client.batch, `chunk` statements per transaction.
 
     Works on SqliteClientWrapper and libsql_client sync clients (both accept
     (sql, params) tuples). Each chunk is retried with exponential backoff
     (0.5s, 1s, 2s, ...) up to `retries` times, then the error is re-raised.
     """
-    for start in range(0, len(rows), chunk):
-        statements = [(sql, list(params)) for params in rows[start:start + chunk]]
-        for attempt in range(retries + 1):
-            try:
-                client.batch(statements)
-                break
-            except Exception as ex:
-                if attempt >= retries:
-                    raise
-                delay = 0.5 * (2 ** attempt)
-                print(f"  Batch write failed (rows {start}-{start + len(statements) - 1}, "
-                      f"attempt {attempt + 1}/{retries + 1}): {ex}; retrying in {delay}s", file=sys.stderr)
-                time.sleep(delay)
+    for start in range(0, len(statements), chunk):
+        part = [(sql, list(params)) for sql, params in statements[start:start + chunk]]
+        retry_with_backoff(
+            lambda: client.batch(part),
+            f"Batch write (rows {start}-{start + len(part) - 1})",
+            retries,
+        )
+
+
+def write_rows(client, sql, rows, chunk=500, retries=3):
+    """Write parameter lists for one statement via write_statements."""
+    write_statements(client, [(sql, params) for params in rows], chunk=chunk, retries=retries)
 
 
 # Live topic tables and their column definitions. Results are written to
@@ -177,38 +201,60 @@ def drop_staging_topic_tables(client):
             print(f"  Warning: could not drop {name}_next: {ex}", file=sys.stderr)
 
 
-def staging_swap_committed(client):
+def staging_swap_committed(client, now):
     """After a swap exception, True if the swap actually committed (response lost).
 
-    The swap drops topics_next inside its transaction, so its absence means the
-    transaction committed. If the check itself fails, return False (keep the failure).
+    The swap drops topics_next inside its transaction, so its absence suggests
+    the transaction committed; we also require the live `topics` rows to carry
+    this run's `created_at` (`now`), so a stray missing staging table cannot be
+    mistaken for a commit. If the check itself fails, return False (keep the failure).
     """
     try:
         rows = client.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'topics_next'"
         ).rows
-        return len(rows) == 0
+        if len(rows) != 0:
+            return False
+        live = client.execute("SELECT 1 AS ok FROM topics WHERE created_at = ? LIMIT 1", [now]).rows
+        return len(live) > 0
     except Exception:
         return False
 
 
-def publish_staged_topics(client):
+TOPICS_GENERATION_KEY = "topics_generation"
+
+
+def publish_staged_topics(client, now):
     """Swap staged rows into the live topic tables in ONE transaction.
 
     For each table: DELETE live, INSERT live from staging (explicit columns),
-    DROP staging. If any statement fails the whole batch rolls back and the
-    live tables keep their previous rows.
+    DROP staging. The same transaction bumps the `topics_generation` setting to
+    `now` so web processes can invalidate cached topic slices. If any statement
+    fails the whole batch rolls back and the live tables keep their previous rows.
+    Refuses to swap (raises) when staged topics or assignments are empty.
     """
+    for name in ("topics_next", "document_topics_next"):
+        n = client.execute(f"SELECT COUNT(*) AS c FROM {name}").rows[0]["c"]
+        if not n:
+            raise RuntimeError(f"Refusing to publish: staging table {name} is empty")
+    client.execute(
+        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT NOT NULL)"
+    )
     statements = []
     for name, columns in TOPIC_TABLE_COLUMNS.items():
         cols = ", ".join(columns)
         statements.append((f"DELETE FROM {name}", []))
         statements.append((f"INSERT INTO {name} ({cols}) SELECT {cols} FROM {name}_next", []))
         statements.append((f"DROP TABLE {name}_next", []))
+    statements.append((
+        "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        [TOPICS_GENERATION_KEY, now, now],
+    ))
     client.batch(statements)
 
 
-EMBEDDING_PAGE_SIZE = 1000
+EMBEDDING_PAGE_SIZE = 500  # 500 x 768-float JSON is ~7 MB per Turso response
 
 
 def load_cached_embeddings(client, doc_ids, page_size=EMBEDDING_PAGE_SIZE):
@@ -229,11 +275,15 @@ def load_cached_embeddings(client, doc_ids, page_size=EMBEDDING_PAGE_SIZE):
     matrix = None
     dim = None
     mismatched = 0
+    malformed = 0
     last_id = ""
     while True:
-        res = client.execute(
-            "SELECT doc_id, embedding FROM document_embeddings WHERE doc_id > ? ORDER BY doc_id LIMIT ?",
-            [last_id, page_size],
+        res = retry_with_backoff(
+            lambda: client.execute(
+                "SELECT doc_id, embedding FROM document_embeddings WHERE doc_id > ? ORDER BY doc_id LIMIT ?",
+                [last_id, page_size],
+            ),
+            f"Embedding page read (after {last_id!r})",
         )
         rows = res.rows
         if not rows:
@@ -243,7 +293,15 @@ def load_cached_embeddings(client, doc_ids, page_size=EMBEDDING_PAGE_SIZE):
             targets = indices_by_doc.get(row["doc_id"])
             if not targets:
                 continue
-            vec = json.loads(row["embedding"])
+            try:
+                vec = json.loads(row["embedding"])
+                if not isinstance(vec, list):
+                    raise ValueError("not a JSON array")
+            except (ValueError, TypeError) as ex:
+                malformed += 1
+                if malformed <= MAX_MISMATCH_LOG_LINES:
+                    print(f"  Ignoring malformed cached embedding for {row['doc_id']}: {ex}")
+                continue
             if dim is None:
                 dim = len(vec)
                 matrix = np.empty((len(doc_ids), dim), dtype=np.float32)
@@ -261,6 +319,8 @@ def load_cached_embeddings(client, doc_ids, page_size=EMBEDDING_PAGE_SIZE):
             break
     if mismatched:
         print(f"  {mismatched} cached embeddings had a mismatched dimension and will be re-encoded.")
+    if malformed:
+        print(f"  {malformed} cached embeddings were malformed and will be re-encoded.")
     return matrix, filled, dim
 
 
@@ -574,7 +634,7 @@ def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key, r
         )
 
     prompt = (
-        "You are labeling topics discovered by clustering ~418 Education doctoral dissertation abstracts "
+        f"You are labeling topics discovered by clustering {len(abstracts)} Education doctoral dissertation abstracts "
         "from UBC (University of British Columbia). For each topic below, generate a short, descriptive "
         "label (3-6 words) that captures the core research theme. The label should be a noun phrase "
         "(e.g. 'Indigenous Education Policy', 'Teacher Identity & Resilience', 'Reading Comprehension Assessment').\n\n"
@@ -1123,21 +1183,25 @@ def save_topic_label_candidates(client, candidates_by_topic, backend, model_name
         row = client.execute("SELECT MAX(id) AS id FROM topic_label_runs").rows[0]
         run_id = int(row["id"])
 
+    statements = []
     for topic_id, rows in candidates_by_topic.items():
-        client.execute("UPDATE topic_label_candidates SET status = 'rejected' WHERE topic_id = ? AND status = 'pending'", [topic_id])
+        statements.append((
+            "UPDATE topic_label_candidates SET status = 'rejected' WHERE topic_id = ? AND status = 'pending'",
+            [topic_id],
+        ))
         for row in rows:
-            status = "pending"
-            client.execute(
+            statements.append((
                 """
                 INSERT INTO topic_label_candidates
                   (run_id, topic_id, label, source, score, status, warnings_json, evidence_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    int(run_id), topic_id, row["label"], row["source"], float(row["score"]), status,
+                    int(run_id), topic_id, row["label"], row["source"], float(row["score"]), "pending",
                     json.dumps(row["warnings"]), json.dumps(row["evidence"]), now
-                ]
-            )
+                ],
+            ))
+    write_statements(client, statements)
     return int(run_id)
 
 
@@ -1166,16 +1230,18 @@ def choose_topic_labels(topic_model, topic_info, candidates_by_topic, overrides=
 
 
 def mark_auto_selected_candidates(client, candidates_by_topic, labels, overrides=None):
+    statements = []
     for topic_id, label in labels.items():
         if topic_id == -1 or (overrides and overrides.get(topic_id)):
             continue
         for candidate in candidates_by_topic.get(topic_id, []):
             if normalize_label_key(candidate["label"]) == normalize_label_key(label) and candidate["score"] >= 80 and not candidate["warnings"]:
-                client.execute(
+                statements.append((
                     "UPDATE topic_label_candidates SET status = 'auto_selected' WHERE topic_id = ? AND label = ? AND status = 'pending'",
-                    [topic_id, candidate["label"]]
-                )
+                    [topic_id, candidate["label"]],
+                ))
                 break
+    write_statements(client, statements)
 
 
 class ExistingTopicInfo:
@@ -1542,7 +1608,7 @@ def main():
                     "compute_embeddings",
                     "Computing Embeddings",
                     status="completed",
-                    detail=f"Successfully encoded and cached {len(docs_to_encode)} documents.",
+                    detail=f"Encoded {len(docs_to_encode)} documents; cached {cached_new}.",
                     counts={"processed": len(docs_to_encode), "total": len(docs_to_encode)},
                     next_task="Clustering Topics"
                 )
@@ -1766,9 +1832,9 @@ def main():
 
         # Atomically replace live topic tables with the staged results
         try:
-            publish_staged_topics(client)
+            publish_staged_topics(client, now)
         except Exception as swap_error:
-            if not staging_swap_committed(client):
+            if not staging_swap_committed(client, now):
                 raise
             print(f"  Swap reported an error ({swap_error}) but staging tables are gone; "
                   "the swap committed. Continuing as success.", file=sys.stderr)

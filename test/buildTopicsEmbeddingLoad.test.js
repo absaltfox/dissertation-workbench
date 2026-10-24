@@ -88,3 +88,57 @@ print(json.dumps({"matrix": m is None, "dim": dim, "filled": filled.tolist()}))
   assert.equal(r.dim, null);
   assert.deepEqual(r.filled, [false, false]);
 });
+
+test('load_cached_embeddings retries a transient page read failure instead of discarding the cache', { skip }, () => {
+  const r = runPython(`
+import time
+time.sleep = lambda s: None
+for i in range(4):
+    put(f"d{i}", [i, i])
+class Flaky:
+    def __init__(self, inner):
+        self.inner = inner
+        self.calls = 0
+    def execute(self, sql, params=None):
+        self.calls += 1
+        if self.calls in (2, 3):
+            raise RuntimeError("transient turso error")
+        return self.inner.execute(sql, params)
+flaky = Flaky(client)
+m, filled, dim = bt.load_cached_embeddings(flaky, [f"d{i}" for i in range(4)], page_size=2)
+class Dead:
+    def execute(self, sql, params=None):
+        raise RuntimeError("down")
+try:
+    bt.load_cached_embeddings(Dead(), ["d0"])
+    raised = False
+except RuntimeError:
+    raised = True
+print(json.dumps({"filled": filled.tolist(), "calls": flaky.calls, "raised": raised}))
+`);
+  assert.deepEqual(r.filled, [true, true, true, true]);
+  assert.ok(r.calls >= 4);
+  assert.equal(r.raised, true);
+});
+
+test('load_cached_embeddings treats malformed JSON rows as missing and caps the log', { skip }, () => {
+  const r = runPython(`
+import io, contextlib
+put("a", [1, 2])
+for i in range(7):
+    client.execute("INSERT INTO document_embeddings VALUES (?, ?, 'x')", [f"b{i}", "{not json"])
+client.execute("INSERT INTO document_embeddings VALUES ('c', '\\"scalar\\"', 'x')")
+put("d", [3, 4])
+ids = ["a"] + [f"b{i}" for i in range(7)] + ["c", "d"]
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    m, filled, dim = bt.load_cached_embeddings(client, ids, page_size=3)
+lines = buf.getvalue().splitlines()
+print(json.dumps({"filled": filled.tolist(), "logged": sum("malformed cached embedding for" in l for l in lines),
+  "summary": [l for l in lines if "were malformed" in l], "dim": dim}))
+`);
+  assert.deepEqual(r.filled, [true, ...Array(7).fill(false), false, true]);
+  assert.equal(r.dim, 2);
+  assert.equal(r.logged, 5);
+  assert.match(r.summary[0], /8 cached/);
+});
