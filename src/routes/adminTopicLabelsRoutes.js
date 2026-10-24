@@ -19,6 +19,17 @@ export function createAdminTopicLabelsRouter({ clearMetricsCache }) {
       res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
       return;
     }
+    // A bertopic run swaps in fresh topics and candidates; a concurrent labels
+    // job would update live labels the swap then overwrites.
+    const bertopicRunningId = await hasRunningAdminJob('bertopic');
+    if (bertopicRunningId) {
+      res.status(409).json({
+        error: 'A BERTopic rebuild is running; wait for it to finish before regenerating labels.',
+        bertopicRunning: true,
+        jobId: bertopicRunningId,
+      });
+      return;
+    }
     const topicId = req.body?.topicId != null ? Number(req.body.topicId) : null;
     if (topicId != null && !Number.isInteger(topicId)) {
       res.status(400).json({ error: 'Invalid topic id.' });

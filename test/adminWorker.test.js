@@ -291,7 +291,52 @@ test('BERTOPIC_WORKER_MEMORY_MB ignores invalid values', async () => {
     return Number(stdout.trim());
   };
   assert.equal(await read('4096'), 4096);
-  for (const bad of ['', '0', '-5', 'abc', '12abc', '1.5']) assert.equal(await read(bad), 0, bad);
+  for (const bad of ['', '0', '-5', 'abc', '12abc', '1.5', '99999999999999999999']) assert.equal(await read(bad), 0, bad);
+});
+
+test('BERTOPIC_WORKER_MEMORY_MB is clamped to [2048, 32768]', async () => {
+  const read = async (value) => {
+    const { stdout } = await execFileAsync(process.execPath, ['--input-type=module', '-e',
+      "import { BERTOPIC_WORKER_MEMORY_MB as m } from './src/config.js'; console.log(m);"], {
+      cwd: process.cwd(),
+      env: { ...process.env, SKIP_LOCAL_ENV: '1', BERTOPIC_WORKER_MEMORY_MB: value },
+    });
+    return Number(stdout.trim());
+  };
+  assert.equal(await read('512'), 2048);
+  assert.equal(await read('2048'), 2048);
+  assert.equal(await read('32768'), 32768);
+  assert.equal(await read('1000000'), 32768);
+});
+
+test('bertopic Fly workers receive BERTOPIC_MIN_TOPIC_SIZE and BERTOPIC_MAX_TOPICS only when set', () => {
+  const saved = {
+    image: process.env.BERTOPIC_WORKER_IMAGE,
+    min: process.env.BERTOPIC_MIN_TOPIC_SIZE,
+    max: process.env.BERTOPIC_MAX_TOPICS,
+  };
+  process.env.BERTOPIC_WORKER_IMAGE = 'registry.fly.io/dissertation-workbench:worker-latest';
+  const envFor = (jobType) => buildFlyWorkerMachinePayload({
+    image: 'registry.fly.io/dissertation-workbench:deployment-123',
+    jobId: 61, token: 't', timeoutMs: 1, jobType,
+  }).config.env;
+  try {
+    delete process.env.BERTOPIC_MIN_TOPIC_SIZE;
+    delete process.env.BERTOPIC_MAX_TOPICS;
+    assert.ok(!('BERTOPIC_MIN_TOPIC_SIZE' in envFor('bertopic')));
+    assert.ok(!('BERTOPIC_MAX_TOPICS' in envFor('bertopic')));
+    process.env.BERTOPIC_MIN_TOPIC_SIZE = '28';
+    process.env.BERTOPIC_MAX_TOPICS = ' 60 ';
+    const env = envFor('bertopic');
+    assert.equal(env.BERTOPIC_MIN_TOPIC_SIZE, '28');
+    assert.equal(env.BERTOPIC_MAX_TOPICS, '60');
+    assert.ok(!('BERTOPIC_MIN_TOPIC_SIZE' in envFor('topic_labels')));
+  } finally {
+    for (const [key, value] of [['BERTOPIC_WORKER_IMAGE', saved.image], ['BERTOPIC_MIN_TOPIC_SIZE', saved.min], ['BERTOPIC_MAX_TOPICS', saved.max]]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 });
 
 test('topic label Fly worker payload uses labeler image and labels-only command', () => {
@@ -689,8 +734,10 @@ test('legacy BERTopic runner completes and fails through its claimed execution l
   successfulChild.emit('close', 0, null);
   await waitFor(async () => (await getAdminJob(successfulJobId)).status === 'completed');
   assert.deepEqual((await getAdminJob(successfulJobId)).result, { topics: 12 });
-  // Topics are swapped in by the child before it exits; the metrics cache is
-  // cleared only after completion, never at job start.
+  // Topics are swapped in by the child before it exits; this legacy in-process
+  // runner clears the metrics cache after completion, not at spawn. (The
+  // production Fly path has no web-side completion hook: the web process
+  // watches the `topics_generation` setting instead, see metricsRoutes.js.)
   assert.equal(cacheClearsBeforeClose, 0);
   await waitFor(async () => cacheClears === 1);
   await new Promise((resolve) => setTimeout(resolve, 50));

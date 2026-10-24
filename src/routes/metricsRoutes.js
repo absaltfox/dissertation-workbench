@@ -8,7 +8,7 @@ import {
 import {
   applyCitationCountsToDocuments, applyCommitteeMembersToDocuments,
   applyStoredFileMetricsToDocuments, getDocumentCacheStats, getDocumentServingAnalytics, getDocumentServingSummary,
-  getTopicByYearCounts, hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics,
+  getSetting, getTopicByYearCounts, hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics,
   queryCachedDocumentPage, queryCitationDocumentPage, queryConceptTermsByDoc, queryPeoplePage, queryPersonDetailPage,
   queryRelatedDocuments, queryTopicDocumentPage
 } from '../db.js';
@@ -413,7 +413,46 @@ function startBackgroundSliceRefresh(cache, inflight, key, compute) {
   inflight.set(key, promise);
 }
 
+// The BERTopic worker (a separate Fly machine) swaps topic tables directly in
+// the database and bumps the `topics_generation` setting in the same
+// transaction. The web process cannot observe job completion reliably, so it
+// watches that setting (memoised, one DB read per TOPICS_GENERATION_MEMO_MS) and
+// drops the whole slice cache when it changes; otherwise slices expire
+// independently and could merge mismatched topic ids.
+export const TOPICS_GENERATION_MEMO_MS = 30_000;
+const topicsGenerationState = new WeakMap();
+
+export function resetTopicsGenerationMemo(cache) {
+  topicsGenerationState.delete(cache);
+}
+
+export async function syncTopicsGeneration(cache, {
+  read = () => getSetting('topics_generation'), now = Date.now,
+} = {}) {
+  let state = topicsGenerationState.get(cache);
+  if (!state) {
+    state = { value: undefined, checkedAt: -Infinity, pending: null };
+    topicsGenerationState.set(cache, state);
+  }
+  if (state.pending) return state.pending;
+  if (now() - state.checkedAt < TOPICS_GENERATION_MEMO_MS) return undefined;
+  state.pending = (async () => {
+    try {
+      const value = (await read()) ?? null;
+      if (state.value !== undefined && value !== state.value) cache.clear();
+      state.value = value;
+    } catch {
+      // Keep serving from cache if the setting cannot be read right now.
+    } finally {
+      state.checkedAt = now();
+      state.pending = null;
+    }
+  })();
+  return state.pending;
+}
+
 async function cachedSlice(cache, inflight, key, refresh, compute) {
+  await syncTopicsGeneration(cache);
   const cached = cache.get(key);
   if (!refresh) {
     if (cached && Date.now() - cached.timestamp < WORKBENCH_SLICE_TTL_MS) return cached.payload;
@@ -548,6 +587,9 @@ export async function buildWorkbenchVisualizationsPayload(params, filters, loadS
 }
 
 export async function warmWorkbenchLandingCache({ metricsCache, metricsInflight, loadSyncModule, params }) {
+  // Record the topics generation before computing so a swap that lands during
+  // warmup is noticed by the first request.
+  await syncTopicsGeneration(metricsCache);
   // Match activeFilters(req)'s shape for an unfiltered request so the cache
   // key here lines up exactly with what the routes compute for real traffic.
   const filters = { degree: '', program: '', affiliation: '' };
