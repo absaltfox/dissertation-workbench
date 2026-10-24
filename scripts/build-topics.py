@@ -96,6 +96,61 @@ def write_rows(client, sql, rows, chunk=500, retries=3):
                 time.sleep(delay)
 
 
+EMBEDDING_PAGE_SIZE = 1000
+
+
+def load_cached_embeddings(client, doc_ids, page_size=EMBEDDING_PAGE_SIZE):
+    """Load cached embeddings for doc_ids into a float32 matrix using keyset pagination.
+
+    Returns (matrix, filled_mask, dim). Row i of matrix belongs to doc_ids[i];
+    filled_mask[i] is True when a usable cached vector was loaded for it. Rows
+    whose dimension differs from the first cached vector are treated as missing.
+    If nothing is cached, returns (None, filled_mask of all False, None) and the
+    caller allocates the matrix once it knows the dimension.
+    """
+    import numpy as np
+
+    indices_by_doc = {}
+    for idx, doc_id in enumerate(doc_ids):
+        indices_by_doc.setdefault(doc_id, []).append(idx)
+    filled = np.zeros(len(doc_ids), dtype=bool)
+    matrix = None
+    dim = None
+    mismatched = 0
+    last_id = ""
+    while True:
+        res = client.execute(
+            "SELECT doc_id, embedding FROM document_embeddings WHERE doc_id > ? ORDER BY doc_id LIMIT ?",
+            [last_id, page_size],
+        )
+        rows = res.rows
+        if not rows:
+            break
+        last_id = rows[-1]["doc_id"]
+        for row in rows:
+            targets = indices_by_doc.get(row["doc_id"])
+            if not targets:
+                continue
+            vec = json.loads(row["embedding"])
+            if dim is None:
+                dim = len(vec)
+                matrix = np.empty((len(doc_ids), dim), dtype=np.float32)
+            if len(vec) != dim:
+                mismatched += 1
+                print(f"  Ignoring cached embedding for {row['doc_id']}: dimension {len(vec)} != {dim}")
+                continue
+            for idx in targets:
+                matrix[idx] = vec
+                filled[idx] = True
+        n_rows = len(rows)
+        del rows, res
+        if n_rows < page_size:
+            break
+    if mismatched:
+        print(f"  {mismatched} cached embeddings had a mismatched dimension and will be re-encoded.")
+    return matrix, filled, dim
+
+
 class DatabaseLogger:
     def __init__(self, client, job_id, original_stdout, execution_id):
         self.client = client
@@ -1268,12 +1323,11 @@ def main():
                 detail="Retrieving cached embeddings from database..."
             )
         print("Checking for stored embeddings in database...")
-        stored_embeddings = {}
+        embeddings_matrix = None
+        filled_mask = None
         try:
-            embeddings_res = client.execute("SELECT doc_id, embedding FROM document_embeddings")
-            for row in embeddings_res.rows:
-                stored_embeddings[row["doc_id"]] = json.loads(row["embedding"])
-            print(f"Found {len(stored_embeddings)} cached embeddings in database.")
+            embeddings_matrix, filled_mask, _dim = load_cached_embeddings(client, doc_ids)
+            print(f"Found {int(filled_mask.sum())} cached embeddings in database.")
         except Exception as e:
             print(f"Could not load stored embeddings (table might not exist yet): {e}")
 
@@ -1282,23 +1336,17 @@ def main():
                 "check_cache",
                 "Checking Cache",
                 status="completed",
-                detail=f"Retrieved {len(stored_embeddings)} cached embeddings.",
+                detail=f"Retrieved {int(filled_mask.sum()) if filled_mask is not None else 0} cached embeddings.",
                 next_task="Computing Embeddings"
             )
 
         # 2. Compute embeddings incrementally
         import numpy as np
-        final_embeddings = []
-        docs_to_encode = []
-        docs_to_encode_indices = []
-
-        for idx, (doc_id, abstract) in enumerate(zip(doc_ids, abstracts)):
-            if doc_id in stored_embeddings:
-                final_embeddings.append(np.array(stored_embeddings[doc_id], dtype=np.float32))
-            else:
-                docs_to_encode.append(abstract)
-                docs_to_encode_indices.append(idx)
-                final_embeddings.append(None) # placeholder
+        if filled_mask is None:
+            filled_mask = np.zeros(len(doc_ids), dtype=bool)
+        docs_to_encode_indices = [i for i in range(len(doc_ids)) if not filled_mask[i]]
+        docs_to_encode = [abstracts[i] for i in docs_to_encode_indices]
+        cached_new = 0
 
         if docs_to_encode:
             print(f"Loading embedding model to encode {len(docs_to_encode)} new documents: {MODEL_NAME}")
@@ -1332,7 +1380,9 @@ def main():
                 cache_rows = []
                 for j, new_emb in enumerate(batch_embeddings):
                     orig_idx = docs_to_encode_indices[i + j]
-                    final_embeddings[orig_idx] = new_emb
+                    if embeddings_matrix is None:
+                        embeddings_matrix = np.empty((len(doc_ids), len(new_emb)), dtype=np.float32)
+                    embeddings_matrix[orig_idx] = new_emb
                     cache_rows.append([doc_ids[orig_idx], json.dumps(new_emb.tolist()), now_iso])
                 try:
                     write_rows(
@@ -1340,10 +1390,14 @@ def main():
                         "INSERT OR REPLACE INTO document_embeddings (doc_id, embedding, created_at) VALUES (?, ?, ?)",
                         cache_rows,
                     )
+                    cached_new += len(cache_rows)
                 except Exception as ex:
                     print(f"Failed to cache {len(cache_rows)} embeddings: {ex}")
-            
-            print(f"Successfully cached {len(docs_to_encode)} new embeddings.")
+
+            if cached_new == len(docs_to_encode):
+                print(f"Successfully cached {cached_new} new embeddings.")
+            else:
+                print(f"Cached {cached_new} of {len(docs_to_encode)} new embeddings; the rest will be re-encoded next run.")
             
             # Explicitly free up SentenceTransformer to save memory
             del embedding_model
@@ -1373,9 +1427,6 @@ def main():
                     counts={"processed": 0, "total": 0},
                     next_task="Clustering Topics"
                 )
-
-        # Convert final_embeddings list to a single numpy array
-        embeddings_matrix = np.vstack(final_embeddings)
 
         # Run BERTopic
         from bertopic import BERTopic
