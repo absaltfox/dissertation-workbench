@@ -164,6 +164,14 @@ export function buildFlyWorkerMachinePayload({
     NUMEXPR_NUM_THREADS: '1',
     TORCH_NUM_THREADS: '1',
   };
+  if (isBertopic) {
+    // Tuning knobs read by scripts/build-topics.py; forward only when set so
+    // the worker's own defaults apply otherwise.
+    for (const name of ['BERTOPIC_MIN_TOPIC_SIZE', 'BERTOPIC_MAX_TOPICS']) {
+      const value = (process.env[name] || '').trim();
+      if (value) env[name] = value;
+    }
+  }
   const config = {
     image: workerImage,
     auto_destroy: true,
