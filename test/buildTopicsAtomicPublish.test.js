@@ -100,3 +100,19 @@ print(json.dumps({"n": count("topics_next") + count("document_topics_next") + co
 `);
   assert.equal(r.n, 0);
 });
+
+test('staging_swap_committed distinguishes a committed swap from a rolled-back one', () => {
+  const r = runPython(`
+stage()
+rolled_back = bt.staging_swap_committed(client)
+bt.publish_staged_topics(client)
+committed = bt.staging_swap_committed(client)
+class Broken:
+    def execute(self, *a, **k):
+        raise RuntimeError("down")
+print(json.dumps({"rolled_back": rolled_back, "committed": committed, "broken": bt.staging_swap_committed(Broken())}))
+`);
+  assert.equal(r.rolled_back, false);
+  assert.equal(r.committed, true);
+  assert.equal(r.broken, false);
+});

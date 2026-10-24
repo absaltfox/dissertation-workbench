@@ -146,6 +146,21 @@ def drop_staging_topic_tables(client):
             print(f"  Warning: could not drop {name}_next: {ex}", file=sys.stderr)
 
 
+def staging_swap_committed(client):
+    """After a swap exception, True if the swap actually committed (response lost).
+
+    The swap drops topics_next inside its transaction, so its absence means the
+    transaction committed. If the check itself fails, return False (keep the failure).
+    """
+    try:
+        rows = client.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'topics_next'"
+        ).rows
+        return len(rows) == 0
+    except Exception:
+        return False
+
+
 def publish_staged_topics(client):
     """Swap staged rows into the live topic tables in ONE transaction.
 
@@ -1685,7 +1700,13 @@ def main():
         print(f"  Saved 2D coordinates for {len(doc_ids)} documents")
 
         # Atomically replace live topic tables with the staged results
-        publish_staged_topics(client)
+        try:
+            publish_staged_topics(client)
+        except Exception as swap_error:
+            if not staging_swap_committed(client):
+                raise
+            print(f"  Swap reported an error ({swap_error}) but staging tables are gone; "
+                  "the swap committed. Continuing as success.", file=sys.stderr)
         print("  Published topics, assignments, hierarchy and coordinates")
         if reporter:
             reporter.report(
@@ -1728,7 +1749,8 @@ def main():
             
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
-        drop_staging_topic_tables(client)
+        if not args.labels_only:
+            drop_staging_topic_tables(client)
         if reporter:
             reporter.report(
                 reporter.tasks[-1]["key"] if reporter.tasks else "run",

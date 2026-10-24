@@ -662,6 +662,8 @@ test('legacy BERTopic runner completes and fails through its claimed execution l
   // cleared only after completion, never at job start.
   assert.equal(cacheClearsBeforeClose, 0);
   await waitFor(async () => cacheClears === 1);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(cacheClears, 1);
 
   const failedJobId = await createAdminJob({
     type: 'bertopic', label: 'Legacy BERTopic failure', timeoutAt: new Date(Date.now() + 60_000).toISOString(),
