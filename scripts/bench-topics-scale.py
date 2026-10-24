@@ -16,8 +16,12 @@ counts empty reads (there must be none, since old topics were pre-seeded).
 --inject-failure first raises mid-write (before the swap) and asserts the live
 topic tables are unchanged.
 
-Remote safety: the seeding step DELETEs rows. If TURSO_DATABASE_URL is set the
-harness refuses to run unless --allow-remote is given.
+Remote safety: the seeding step DROPs and recreates `documents`,
+`document_embeddings`, the topic tables and their staging tables. If
+TURSO_DATABASE_URL is set the harness refuses to run (exit 2) unless
+`--allow-remote <host>` exactly equals that URL's hostname, and it additionally
+refuses if the remote `documents` table exists and has any rows (only empty
+scratch databases are allowed). Remote readers poll every 50 ms.
 
 The last stdout line is a single JSON summary.
 """
@@ -32,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 DIM = 768
@@ -53,7 +58,7 @@ def peak_rss_mb(who=resource.RUSAGE_SELF):
     return round(rss / (1024 * 1024) if sys.platform == "darwin" else rss / 1024, 1)
 
 
-def reader_main(db_path, stop, out):
+def reader_main(db_path, stop, out, interval=0.001):
     """Poll COUNT(*) FROM topics until stop is set; report reads and empty reads."""
     bt = load_build_topics()
     client = bt.get_db_client(db_path)
@@ -66,7 +71,7 @@ def reader_main(db_path, stop, out):
                 empty += 1
         except Exception:
             errors += 1  # transient lock/network errors are not empty reads
-        time.sleep(0.001)
+        time.sleep(interval)
     out.put({"reads": reads, "empty_reads": empty, "read_errors": errors})
 
 
@@ -187,8 +192,9 @@ def run_io(bt, client, doc_ids):
     assert matrix is not None and dim == DIM and bool(filled.all()), "embedding load incomplete"
     rows = int(filled.sum())
     del matrix
-    staged_write(bt, counted, doc_ids, time.strftime("%Y-%m-%dT%H:%M:%S"))
-    bt.publish_staged_topics(counted)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    staged_write(bt, counted, doc_ids, now)
+    bt.publish_staged_topics(counted, now)
     live = client.execute("SELECT COUNT(*) FROM topics").rows[0][0]
     dt = client.execute("SELECT COUNT(*) FROM document_topics").rows[0][0]
     assert live == N_TOPICS and dt == len(doc_ids), f"unexpected live counts topics={live} document_topics={dt}"
@@ -202,18 +208,32 @@ def main():
     mode.add_argument("--io-only", action="store_true", help="DB-I/O paths only (default)")
     mode.add_argument("--full", action="store_true", help="run build-topics.py as a subprocess")
     ap.add_argument("--inject-failure", action="store_true", help="assert a mid-write failure leaves live topics unchanged")
-    ap.add_argument("--allow-remote", action="store_true", help="permit seeding/DELETE against TURSO_DATABASE_URL")
+    ap.add_argument("--allow-remote", metavar="HOST", default=None,
+                    help="permit DROP/seed against TURSO_DATABASE_URL; must equal its hostname, and the remote "
+                         "`documents` table must be empty or absent")
     args = ap.parse_args()
 
     remote = os.environ.get("TURSO_DATABASE_URL", "").strip()
-    if remote and not args.allow_remote:
-        print("Refusing to seed/DELETE against TURSO_DATABASE_URL without --allow-remote.", file=sys.stderr)
-        return 2
+    if remote:
+        host = urlparse(remote).hostname or ""
+        if not host or args.allow_remote != host:
+            print(f"Refusing to DROP/seed tables on TURSO_DATABASE_URL: pass --allow-remote {host or '<host>'} "
+                  "(must exactly match the database hostname).", file=sys.stderr)
+            return 2
 
     bt = load_build_topics()
     tmp = tempfile.mkdtemp(prefix="bench-topics-")
     db_path = os.path.join(tmp, "bench.sqlite")
     client = bt.get_db_client(db_path)
+    if remote:
+        try:
+            existing = client.execute("SELECT COUNT(*) FROM documents").rows[0][0]
+        except Exception:
+            existing = 0  # no documents table: nothing to destroy
+        if existing:
+            print(f"Refusing: remote `documents` table already has {existing} rows; "
+                  "only empty scratch databases are allowed.", file=sys.stderr)
+            return 2
     if not remote:
         client.execute("PRAGMA journal_mode=WAL")  # temp DB only: readers are not blocked by the writer
     t0 = time.time()
@@ -225,7 +245,7 @@ def main():
 
     ctx = mp.get_context("spawn")
     stop, out = ctx.Event(), ctx.Queue()
-    reader = ctx.Process(target=reader_main, args=(db_path, stop, out))
+    reader = ctx.Process(target=reader_main, args=(db_path, stop, out, 0.05 if remote else 0.001))
     reader.start()
 
     t0 = time.time()

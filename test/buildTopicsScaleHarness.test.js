@@ -39,12 +39,23 @@ test('scale harness io-only run with failure injection succeeds', { skip, timeou
   assert.ok(summary.peak_rss_mb > 0);
 });
 
-test('scale harness refuses to seed a remote database without --allow-remote', { skip }, () => {
-  const r = spawnSync(PYTHON, ['scripts/bench-topics-scale.py', '-n', '10'], {
+test('scale harness refuses a remote database without a matching --allow-remote host', () => {
+  const run = (...extra) => spawnSync(PYTHON, ['scripts/bench-topics-scale.py', '-n', '10', ...extra], {
     cwd: process.cwd(),
     encoding: 'utf8',
     env: env({ TURSO_DATABASE_URL: 'libsql://example.invalid' }),
   });
+  for (const args of [[], ['--allow-remote', 'wrong.example.com'], ['--allow-remote', 'example.invalid.evil.com']]) {
+    const r = run(...args);
+    assert.equal(r.status, 2, args.join(' '));
+    assert.match(r.stderr, /allow-remote/);
+    assert.match(r.stderr, /example\.invalid/);
+  }
+});
+
+test('scale harness argparse requires a value for --allow-remote', () => {
+  const r = spawnSync(PYTHON, ['scripts/bench-topics-scale.py', '--allow-remote'], {
+    cwd: process.cwd(), encoding: 'utf8', env: env(),
+  });
   assert.equal(r.status, 2);
-  assert.match(r.stderr, /allow-remote/);
 });
