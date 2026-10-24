@@ -171,11 +171,18 @@ function renderTopicCluster() {
     y: yScale(d.umapY),
     color: colorMap.get(d.topicId) || '#999',
   }));
-  const quadtree = d3.quadtree().x(p => p.x).y(p => p.y).addAll(points);
-
   const BASE_RADIUS = 4;
   const HOVER_RADIUS = 8;
   const activeTids = new Set(topicIds);
+  // Hit-testing indexes only active (non-dimmed) points, so a dimmed point can
+  // never shadow an active neighbour within the hover radius. Rebuilt whenever
+  // the legend toggles a topic.
+  let quadtree;
+  function rebuildQuadtree() {
+    quadtree = d3.quadtree().x(p => p.x).y(p => p.y)
+      .addAll(points.filter(p => activeTids.has(p.doc.topicId)));
+  }
+  rebuildQuadtree();
   let transform = d3.zoomIdentity;
   let hovered = null;
 
@@ -233,8 +240,7 @@ function renderTopicCluster() {
     const v = viewTransform();
     const x = (sx - v.x) / v.k;
     const y = (sy - v.y) / v.k;
-    const hit = quadtree.find(x, y, HOVER_RADIUS);
-    return hit && activeTids.has(hit.doc.topicId) ? hit : null;
+    return quadtree.find(x, y, HOVER_RADIUS) || null;
   }
 
   const tooltip = d3.select(topicClusterTooltipEl);
@@ -316,6 +322,7 @@ function renderTopicCluster() {
       activeTids.add(tid);
       d3.select(this).classed('dimmed', false);
     }
+    rebuildQuadtree();
     if (hovered && !activeTids.has(hovered.doc.topicId)) {
       hovered = null;
       tooltip.style('display', 'none');
