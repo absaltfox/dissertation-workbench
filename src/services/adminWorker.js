@@ -4,7 +4,7 @@ import {
   ADMIN_WORKER_GRACE_MS, ADMIN_WORKER_MODE, ADMIN_WORKER_TIMEOUT_MS,
   BERTOPIC_WORKER_IMAGE,
   FLY_API_HOSTNAME, FLY_API_TOKEN, FLY_APP_NAME, FLY_MACHINE_ID,
-  FLY_WORKER_CPUS, FLY_WORKER_CPU_KIND, FLY_WORKER_MEMORY_MB, LABELER_WORKER_IMAGE,
+  FLY_WORKER_CPUS, FLY_WORKER_CPU_KIND, FLY_WORKER_MEMORY_MB, BERTOPIC_WORKER_MEMORY_MB, LABELER_WORKER_IMAGE,
   LOCAL_LABEL_BACKEND, LOCAL_LABEL_MODEL_PATH,
   FLY_WORKER_REGION, IS_PRODUCTION, WORKER_IMAGE
 } from '../config.js';
@@ -121,7 +121,9 @@ export function buildFlyWorkerMachinePayload({
     : isBertopic
     ? ['python3', 'scripts/build-topics.py']
     : ['node', 'src/jobWorker.js'];
-  const memoryMb = isBertopic || isTopicLabels || isConceptRebuild
+  const memoryMb = isBertopic && BERTOPIC_WORKER_MEMORY_MB > 0
+    ? BERTOPIC_WORKER_MEMORY_MB
+    : isBertopic || isTopicLabels || isConceptRebuild
     ? Math.max(2048, FLY_WORKER_MEMORY_MB)
     : FLY_WORKER_MEMORY_MB;
 

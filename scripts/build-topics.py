@@ -23,6 +23,7 @@ try:
 except ImportError:
     pass
 
+import gc
 import json
 import math
 import re
@@ -38,6 +39,36 @@ MODEL_NAME = "allenai/specter2_base"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 MIN_TOPIC_SIZE = 5  # increased from 3 for cleaner, more cohesive clusters
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "metrics.sqlite")
+MIN_TOPIC_SIZE_DOCS_PER_TOPIC = 500  # default min_topic_size scales as n_docs / 500
+MAX_MISMATCH_LOG_LINES = 5
+
+
+def _positive_int_env(name):
+    """Return env var `name` as a positive int, or None if unset/invalid (invalid warns)."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    print(f"Warning: ignoring invalid {name}={raw!r} (expected a positive integer)", file=sys.stderr)
+    return None
+
+
+def resolve_min_topic_size(n_docs):
+    """BERTOPIC_MIN_TOPIC_SIZE if valid, else max(MIN_TOPIC_SIZE, round(n_docs / 500))."""
+    override = _positive_int_env("BERTOPIC_MIN_TOPIC_SIZE")
+    if override is not None:
+        return override
+    return max(MIN_TOPIC_SIZE, round(n_docs / MIN_TOPIC_SIZE_DOCS_PER_TOPIC))
+
+
+def resolve_max_topics():
+    """BERTOPIC_MAX_TOPICS (positive int) or None for no cap."""
+    return _positive_int_env("BERTOPIC_MAX_TOPICS")
 
 
 # DB connection and logging utilities
@@ -218,7 +249,8 @@ def load_cached_embeddings(client, doc_ids, page_size=EMBEDDING_PAGE_SIZE):
                 matrix = np.empty((len(doc_ids), dim), dtype=np.float32)
             if len(vec) != dim:
                 mismatched += 1
-                print(f"  Ignoring cached embedding for {row['doc_id']}: dimension {len(vec)} != {dim}")
+                if mismatched <= MAX_MISMATCH_LOG_LINES:
+                    print(f"  Ignoring cached embedding for {row['doc_id']}: dimension {len(vec)} != {dim}")
                 continue
             for idx in targets:
                 matrix[idx] = vec
@@ -1406,6 +1438,7 @@ def main():
         print("Checking for stored embeddings in database...")
         embeddings_matrix = None
         filled_mask = None
+        _dim = None
         try:
             embeddings_matrix, filled_mask, _dim = load_cached_embeddings(client, doc_ids)
             print(f"Found {int(filled_mask.sum())} cached embeddings in database.")
@@ -1428,6 +1461,8 @@ def main():
         docs_to_encode_indices = [i for i in range(len(doc_ids)) if not filled_mask[i]]
         docs_to_encode = [abstracts[i] for i in docs_to_encode_indices]
         cached_new = 0
+        batch_embeddings = None
+        cache_rows = None
 
         if docs_to_encode:
             print(f"Loading embedding model to encode {len(docs_to_encode)} new documents: {MODEL_NAME}")
@@ -1444,7 +1479,8 @@ def main():
             
             # Encode incrementally in batches of 32 to report real-time progress
             batch_size = 32
-            for i in range(0, len(docs_to_encode), batch_size):
+            i = 0
+            while i < len(docs_to_encode):
                 batch = docs_to_encode[i:i+batch_size]
                 if reporter:
                     reporter.report(
@@ -1455,6 +1491,19 @@ def main():
                         counts={"processed": i, "total": len(docs_to_encode)}
                     )
                 batch_embeddings = embedding_model.encode(batch, show_progress_bar=False)
+
+                # The encoder's dimension can differ from the cached matrix (model changed,
+                # or the cache mixes dimensions). Nothing from this batch is written yet, so
+                # discard the cached matrix and re-encode every document at the new dimension.
+                if embeddings_matrix is not None and batch_embeddings.shape[1] != embeddings_matrix.shape[1]:
+                    print(f"Encoder dimension {batch_embeddings.shape[1]} != cached dimension "
+                          f"{embeddings_matrix.shape[1]}; discarding cached embeddings and re-encoding all "
+                          f"{len(doc_ids)} documents.")
+                    embeddings_matrix = None
+                    docs_to_encode_indices = list(range(len(doc_ids)))
+                    docs_to_encode = list(abstracts)
+                    i = 0
+                    continue
 
                 # Flush this batch to the cache now so progress survives a crash
                 now_iso = datetime.now(timezone.utc).isoformat()
@@ -1474,6 +1523,7 @@ def main():
                     cached_new += len(cache_rows)
                 except Exception as ex:
                     print(f"Failed to cache {len(cache_rows)} embeddings: {ex}")
+                i += batch_size
 
             if cached_new == len(docs_to_encode):
                 print(f"Successfully cached {cached_new} new embeddings.")
@@ -1482,7 +1532,6 @@ def main():
             
             # Explicitly free up SentenceTransformer to save memory
             del embedding_model
-            import gc
             import torch
             gc.collect()
             if torch.cuda.is_available():
@@ -1509,6 +1558,10 @@ def main():
                     next_task="Clustering Topics"
                 )
 
+        # The embedding matrix is complete; release the cache-loading intermediates
+        del filled_mask, _dim, docs_to_encode, docs_to_encode_indices, batch_embeddings, cache_rows
+        gc.collect()
+
         # Run BERTopic
         from bertopic import BERTopic
         from hdbscan import HDBSCAN
@@ -1526,8 +1579,10 @@ def main():
 
         vectorizer_model = CountVectorizer(stop_words=stop_words)
 
+        min_topic_size = resolve_min_topic_size(len(abstracts))
+        nr_topics = resolve_max_topics()
         hdbscan_model = HDBSCAN(
-            min_cluster_size=MIN_TOPIC_SIZE,
+            min_cluster_size=min_topic_size,
             min_samples=1,
             metric="euclidean",
             prediction_data=True,
@@ -1538,15 +1593,17 @@ def main():
                 "cluster_topics",
                 "Clustering Topics",
                 status="running",
-                detail="Fitting BERTopic model (UMAP & HDBSCAN)..."
+                detail=f"Fitting BERTopic model (UMAP & HDBSCAN, min_topic_size={min_topic_size}, nr_topics={nr_topics})..."
             )
-        print(f"Fitting BERTopic (min_topic_size={MIN_TOPIC_SIZE}, min_samples=1)...")
+        print(f"Fitting BERTopic (min_topic_size={min_topic_size}, nr_topics={nr_topics}, min_samples=1)...")
+        bertopic_kwargs = {"nr_topics": nr_topics} if nr_topics is not None else {}
         topic_model = BERTopic(
             embedding_model=MODEL_NAME,
-            min_topic_size=MIN_TOPIC_SIZE,
+            min_topic_size=min_topic_size,
             hdbscan_model=hdbscan_model,
             vectorizer_model=vectorizer_model,
             verbose=True,
+            **bertopic_kwargs,
         )
         topics, probs = topic_model.fit_transform(abstracts, embeddings=embeddings_matrix)
 
@@ -1603,13 +1660,14 @@ def main():
         existing_labels = load_existing_topic_labels(client)
         label_overrides = load_topic_label_overrides(client)
 
-        print(f"\nDiscovered {len(topic_info) - 1} topics (plus outlier cluster)")
+        print(f"\nDiscovered {len(topic_info) - 1} topics (plus outlier cluster); "
+              f"min_topic_size={min_topic_size}, nr_topics={nr_topics}")
         if reporter:
             reporter.report(
                 "cluster_topics",
                 "Clustering Topics",
                 status="completed",
-                detail=f"Discovered {len(topic_info) - 1} topics.",
+                detail=f"Discovered {len(topic_info) - 1} topics (min_topic_size={min_topic_size}, nr_topics={nr_topics}).",
                 next_task="Generating Labels"
             )
 
@@ -1683,6 +1741,13 @@ def main():
                 [leaf_topic_ids_json, linkage_json, now],
             )
             print(f"  Saved topic hierarchy ({len(all_topic_ids)} leaves, {len(linkage_matrix)} merges)")
+
+        # Release what the 2-D UMAP fit and the rest of the run no longer need
+        # (still needed: topic_model, topic_info, topic_labels, topics, doc_ids, abstracts, embeddings_matrix)
+        probs = doc_topic_rows = topic_rows = label_candidates = claude_labels = None
+        existing_labels = label_overrides = embeddings_raw = hierarchy_embeddings = None
+        dist_matrix = condensed = linkage_matrix = linkage_json = None
+        gc.collect()
 
         # Extract 2D UMAP projection for scatter plot visualization
         import umap

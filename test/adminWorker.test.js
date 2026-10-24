@@ -152,6 +152,7 @@ test.before(async () => {
   process.env.PDF_CACHE_DIR = path.join(testDataDir, 'pdf-cache');
   process.env.FULL_TEXT_CACHE_DIR = path.join(testDataDir, 'full-text-cache');
   process.env.NODE_ENV = 'test';
+  process.env.BERTOPIC_WORKER_MEMORY_MB = '6144';
 
   ({ buildFlyWorkerMachinePayload, cancelAdminWorkerJob } = await import('../src/services/adminWorker.js'));
   ({ cancelInProcessAdminJob, runBertopicJob, runCatalogueLookupJob } = await import('../src/services/adminJobs.js'));
@@ -261,6 +262,36 @@ test('BERTopic Fly worker payload uses the Python worker image and labeling env'
     if (previousAnthropicKey === undefined) delete process.env.ANTHROPIC_API_KEY;
     else process.env.ANTHROPIC_API_KEY = previousAnthropicKey;
   }
+});
+
+test('BERTOPIC_WORKER_MEMORY_MB overrides memory for bertopic jobs only', () => {
+  const previous = process.env.BERTOPIC_WORKER_IMAGE;
+  process.env.BERTOPIC_WORKER_IMAGE = 'registry.fly.io/dissertation-workbench:worker-latest';
+  try {
+    const memoryFor = (jobType) => buildFlyWorkerMachinePayload({
+      image: 'registry.fly.io/dissertation-workbench:deployment-123',
+      jobId: 60, token: 't', timeoutMs: 1, jobType,
+    }).config.guest.memory_mb;
+    assert.equal(memoryFor('bertopic'), 6144);
+    assert.equal(memoryFor('concept_rebuild'), 2048);
+    assert.equal(memoryFor('topic_labels'), 2048);
+  } finally {
+    if (previous === undefined) delete process.env.BERTOPIC_WORKER_IMAGE;
+    else process.env.BERTOPIC_WORKER_IMAGE = previous;
+  }
+});
+
+test('BERTOPIC_WORKER_MEMORY_MB ignores invalid values', async () => {
+  const read = async (value) => {
+    const { stdout } = await execFileAsync(process.execPath, ['--input-type=module', '-e',
+      "import { BERTOPIC_WORKER_MEMORY_MB as m } from './src/config.js'; console.log(m);"], {
+      cwd: process.cwd(),
+      env: { ...process.env, SKIP_LOCAL_ENV: '1', BERTOPIC_WORKER_MEMORY_MB: value },
+    });
+    return Number(stdout.trim());
+  };
+  assert.equal(await read('4096'), 4096);
+  for (const bad of ['', '0', '-5', 'abc', '12abc', '1.5']) assert.equal(await read(bad), 0, bad);
 });
 
 test('topic label Fly worker payload uses labeler image and labels-only command', () => {

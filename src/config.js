@@ -80,6 +80,10 @@ export const FLY_APP_NAME = process.env.FLY_APP_NAME || '';
 export const FLY_MACHINE_ID = process.env.FLY_MACHINE_ID || '';
 export const FLY_REGION = process.env.FLY_REGION || process.env.PRIMARY_REGION || '';
 export const FLY_WORKER_MEMORY_MB = Number(process.env.FLY_WORKER_MEMORY_MB || 2048);
+// Optional memory override (MB) for BERTopic Fly workers only; 0 = unset or invalid (ignored).
+export const BERTOPIC_WORKER_MEMORY_MB = /^[1-9]\d*$/.test((process.env.BERTOPIC_WORKER_MEMORY_MB || '').trim())
+  ? Number(process.env.BERTOPIC_WORKER_MEMORY_MB.trim())
+  : 0;
 export const FLY_WORKER_CPUS = Number(process.env.FLY_WORKER_CPUS || 1);
 export const FLY_WORKER_CPU_KIND = process.env.FLY_WORKER_CPU_KIND || 'shared';
 export const FLY_WORKER_REGION = process.env.FLY_WORKER_REGION || FLY_REGION || '';
