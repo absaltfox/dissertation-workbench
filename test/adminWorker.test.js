@@ -641,19 +641,27 @@ test('legacy BERTopic runner completes and fails through its claimed execution l
   });
   const successfulChild = new FakeChild();
   let childEnv;
+  let cacheClearsBeforeClose = null;
+  let cacheClears = 0;
   assert.equal(await runBertopicJob(successfulJobId, {
     spawnProcess: (_command, _args, options) => {
       childEnv = options.env;
       return successfulChild;
     },
+    clearMetricsCache: () => { cacheClears += 1; },
     getStatus: async () => ({ topics: 12 }),
   }), successfulChild);
   const claimed = await getAdminJob(successfulJobId);
   assert.equal(childEnv.ADMIN_JOB_ID, String(successfulJobId));
   assert.equal(childEnv.ADMIN_JOB_EXECUTION_ID, claimed.executionId);
+  cacheClearsBeforeClose = cacheClears;
   successfulChild.emit('close', 0, null);
   await waitFor(async () => (await getAdminJob(successfulJobId)).status === 'completed');
   assert.deepEqual((await getAdminJob(successfulJobId)).result, { topics: 12 });
+  // Topics are swapped in by the child before it exits; the metrics cache is
+  // cleared only after completion, never at job start.
+  assert.equal(cacheClearsBeforeClose, 0);
+  await waitFor(async () => cacheClears === 1);
 
   const failedJobId = await createAdminJob({
     type: 'bertopic', label: 'Legacy BERTopic failure', timeoutAt: new Date(Date.now() + 60_000).toISOString(),

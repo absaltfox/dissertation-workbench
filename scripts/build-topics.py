@@ -96,6 +96,72 @@ def write_rows(client, sql, rows, chunk=500, retries=3):
                 time.sleep(delay)
 
 
+# Live topic tables and their column definitions. Results are written to
+# "<name>_next" staging tables and swapped in with one transaction, so a failed
+# or interrupted job never leaves the live tables empty or half-written.
+# Table names are hard-coded constants (never built from external input).
+TOPIC_TABLE_SCHEMAS = {
+    "topics": (
+        "topic_id INTEGER PRIMARY KEY, label TEXT NOT NULL, top_terms TEXT NOT NULL, "
+        "doc_count INTEGER NOT NULL, model_name TEXT NOT NULL, created_at TEXT NOT NULL"
+    ),
+    "document_topics": (
+        "doc_id TEXT NOT NULL, topic_id INTEGER NOT NULL, probability REAL, "
+        "PRIMARY KEY (doc_id, topic_id)"
+    ),
+    "topic_hierarchy_meta": (
+        "id INTEGER PRIMARY KEY DEFAULT 1, leaf_topic_ids TEXT NOT NULL, "
+        "linkage_json TEXT NOT NULL, created_at TEXT NOT NULL"
+    ),
+    "document_topic_coords": (
+        "doc_id TEXT PRIMARY KEY, umap_x REAL NOT NULL, umap_y REAL NOT NULL"
+    ),
+}
+TOPIC_TABLE_COLUMNS = {
+    "topics": ["topic_id", "label", "top_terms", "doc_count", "model_name", "created_at"],
+    "document_topics": ["doc_id", "topic_id", "probability"],
+    "topic_hierarchy_meta": ["id", "leaf_topic_ids", "linkage_json", "created_at"],
+    "document_topic_coords": ["doc_id", "umap_x", "umap_y"],
+}
+
+
+def ensure_live_topic_tables(client):
+    for name, schema in TOPIC_TABLE_SCHEMAS.items():
+        client.execute(f"CREATE TABLE IF NOT EXISTS {name} ({schema})")
+
+
+def prepare_staging_topic_tables(client):
+    """Create the staging tables (same schema as live) and empty them."""
+    for name, schema in TOPIC_TABLE_SCHEMAS.items():
+        client.execute(f"CREATE TABLE IF NOT EXISTS {name}_next ({schema})")
+        client.execute(f"DELETE FROM {name}_next")
+
+
+def drop_staging_topic_tables(client):
+    """Best-effort cleanup of the staging tables; never raises."""
+    for name in TOPIC_TABLE_SCHEMAS:
+        try:
+            client.execute(f"DROP TABLE IF EXISTS {name}_next")
+        except Exception as ex:
+            print(f"  Warning: could not drop {name}_next: {ex}", file=sys.stderr)
+
+
+def publish_staged_topics(client):
+    """Swap staged rows into the live topic tables in ONE transaction.
+
+    For each table: DELETE live, INSERT live from staging (explicit columns),
+    DROP staging. If any statement fails the whole batch rolls back and the
+    live tables keep their previous rows.
+    """
+    statements = []
+    for name, columns in TOPIC_TABLE_COLUMNS.items():
+        cols = ", ".join(columns)
+        statements.append((f"DELETE FROM {name}", []))
+        statements.append((f"INSERT INTO {name} ({cols}) SELECT {cols} FROM {name}_next", []))
+        statements.append((f"DROP TABLE {name}_next", []))
+    client.batch(statements)
+
+
 EMBEDDING_PAGE_SIZE = 1000
 
 
@@ -1554,38 +1620,9 @@ def main():
                 detail="Writing topics and assignments to database..."
             )
 
-        # Create tables
-        client.execute("""
-            CREATE TABLE IF NOT EXISTS topics (
-                topic_id    INTEGER PRIMARY KEY,
-                label       TEXT NOT NULL,
-                top_terms   TEXT NOT NULL,
-                doc_count   INTEGER NOT NULL,
-                model_name  TEXT NOT NULL,
-                created_at  TEXT NOT NULL
-            )
-        """)
-        client.execute("""
-            CREATE TABLE IF NOT EXISTS document_topics (
-                doc_id      TEXT NOT NULL,
-                topic_id    INTEGER NOT NULL,
-                probability REAL,
-                PRIMARY KEY (doc_id, topic_id)
-            )
-        """)
-        client.execute("""
-            CREATE TABLE IF NOT EXISTS topic_hierarchy_meta (
-                id              INTEGER PRIMARY KEY DEFAULT 1,
-                leaf_topic_ids  TEXT NOT NULL,
-                linkage_json    TEXT NOT NULL,
-                created_at      TEXT NOT NULL
-            )
-        """)
-
-        # Clear existing data (idempotent)
-        client.execute("DELETE FROM document_topics")
-        client.execute("DELETE FROM topics")
-        client.execute("DELETE FROM topic_hierarchy_meta")
+        # Live tables must exist (for the swap); results go to staging tables first
+        ensure_live_topic_tables(client)
+        prepare_staging_topic_tables(client)
 
         # Write topic rows
         topic_rows = []
@@ -1604,7 +1641,7 @@ def main():
             topic_rows.append([topic_id, label, top_terms_json, count, MODEL_NAME, now])
         write_rows(
             client,
-            "INSERT INTO topics (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO topics_next (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             topic_rows,
         )
         mark_auto_selected_candidates(client, label_candidates, topic_labels, label_overrides)
@@ -1620,14 +1657,14 @@ def main():
             doc_topic_rows.append([doc_id, int(topic_id), prob])
         write_rows(
             client,
-            "INSERT INTO document_topics (doc_id, topic_id, probability) VALUES (?, ?, ?)",
+            "INSERT OR REPLACE INTO document_topics_next (doc_id, topic_id, probability) VALUES (?, ?, ?)",
             doc_topic_rows,
         )
 
         # Save topic hierarchy linkage
         if leaf_topic_ids_json and linkage_json:
             client.execute(
-                "INSERT INTO topic_hierarchy_meta (id, leaf_topic_ids, linkage_json, created_at) VALUES (1, ?, ?, ?)",
+                "INSERT OR REPLACE INTO topic_hierarchy_meta_next (id, leaf_topic_ids, linkage_json, created_at) VALUES (1, ?, ?, ?)",
                 [leaf_topic_ids_json, linkage_json, now],
             )
             print(f"  Saved topic hierarchy ({len(all_topic_ids)} leaves, {len(linkage_matrix)} merges)")
@@ -1640,21 +1677,16 @@ def main():
         reducer = umap.UMAP(n_components=2, random_state=42, metric="cosine")
         coords_2d = reducer.fit_transform(embeddings)
 
-        client.execute("""
-            CREATE TABLE IF NOT EXISTS document_topic_coords (
-                doc_id  TEXT PRIMARY KEY,
-                umap_x  REAL NOT NULL,
-                umap_y  REAL NOT NULL
-            )
-        """)
-        client.execute("DELETE FROM document_topic_coords")
-
         write_rows(
             client,
-            "INSERT INTO document_topic_coords (doc_id, umap_x, umap_y) VALUES (?, ?, ?)",
+            "INSERT OR REPLACE INTO document_topic_coords_next (doc_id, umap_x, umap_y) VALUES (?, ?, ?)",
             [[doc_id, float(coords_2d[i, 0]), float(coords_2d[i, 1])] for i, doc_id in enumerate(doc_ids)],
         )
         print(f"  Saved 2D coordinates for {len(doc_ids)} documents")
+
+        # Atomically replace live topic tables with the staged results
+        publish_staged_topics(client)
+        print("  Published topics, assignments, hierarchy and coordinates")
         if reporter:
             reporter.report(
                 "save_results",
@@ -1696,6 +1728,7 @@ def main():
             
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
+        drop_staging_topic_tables(client)
         if reporter:
             reporter.report(
                 reporter.tasks[-1]["key"] if reporter.tasks else "run",
