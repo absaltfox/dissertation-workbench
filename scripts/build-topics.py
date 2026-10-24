@@ -30,6 +30,7 @@ import sqlite3
 import argparse
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -59,8 +60,40 @@ class SqliteClientWrapper:
         self.conn.commit()
         return ResultSet(cursor)
     
+    def batch(self, statements):
+        """Run (sql, params) statements in one transaction; roll back all on error."""
+        try:
+            for sql, params in statements:
+                self.conn.execute(sql, tuple(params) if params is not None else ())
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def close(self):
         self.conn.close()
+
+
+def write_rows(client, sql, rows, chunk=500, retries=3):
+    """Write parameter lists for one statement via client.batch, `chunk` rows per transaction.
+
+    Works on SqliteClientWrapper and libsql_client sync clients (both accept
+    (sql, params) tuples). Each chunk is retried with exponential backoff
+    (0.5s, 1s, 2s, ...) up to `retries` times, then the error is re-raised.
+    """
+    for start in range(0, len(rows), chunk):
+        statements = [(sql, list(params)) for params in rows[start:start + chunk]]
+        for attempt in range(retries + 1):
+            try:
+                client.batch(statements)
+                break
+            except Exception as ex:
+                if attempt >= retries:
+                    raise
+                delay = 0.5 * (2 ** attempt)
+                print(f"  Batch write failed (rows {start}-{start + len(statements) - 1}, "
+                      f"attempt {attempt + 1}/{retries + 1}): {ex}; retrying in {delay}s", file=sys.stderr)
+                time.sleep(delay)
 
 
 class DatabaseLogger:
@@ -1282,7 +1315,6 @@ def main():
             
             # Encode incrementally in batches of 32 to report real-time progress
             batch_size = 32
-            new_embeddings_list = []
             for i in range(0, len(docs_to_encode), batch_size):
                 batch = docs_to_encode[i:i+batch_size]
                 if reporter:
@@ -1294,23 +1326,23 @@ def main():
                         counts={"processed": i, "total": len(docs_to_encode)}
                     )
                 batch_embeddings = embedding_model.encode(batch, show_progress_bar=False)
-                new_embeddings_list.extend(batch_embeddings)
-            new_embeddings = new_embeddings_list
-            
-            # Save new embeddings back to database and update placeholders
-            for i, new_emb in enumerate(new_embeddings):
-                orig_idx = docs_to_encode_indices[i]
-                doc_id = doc_ids[orig_idx]
-                emb_list = new_emb.tolist()
-                final_embeddings[orig_idx] = new_emb
-                
+
+                # Flush this batch to the cache now so progress survives a crash
+                now_iso = datetime.now(timezone.utc).isoformat()
+                cache_rows = []
+                for j, new_emb in enumerate(batch_embeddings):
+                    orig_idx = docs_to_encode_indices[i + j]
+                    final_embeddings[orig_idx] = new_emb
+                    cache_rows.append([doc_ids[orig_idx], json.dumps(new_emb.tolist()), now_iso])
                 try:
-                    client.execute(
+                    write_rows(
+                        client,
                         "INSERT OR REPLACE INTO document_embeddings (doc_id, embedding, created_at) VALUES (?, ?, ?)",
-                        [doc_id, json.dumps(emb_list), datetime.now(timezone.utc).isoformat()]
+                        cache_rows,
                     )
                 except Exception as ex:
-                    print(f"Failed to cache embedding for {doc_id}: {ex}")
+                    print(f"Failed to cache {len(cache_rows)} embeddings: {ex}")
+            
             print(f"Successfully cached {len(docs_to_encode)} new embeddings.")
             
             # Explicitly free up SentenceTransformer to save memory
@@ -1505,6 +1537,7 @@ def main():
         client.execute("DELETE FROM topic_hierarchy_meta")
 
         # Write topic rows
+        topic_rows = []
         for _, row in topic_info.iterrows():
             topic_id = int(row["Topic"])
             label = topic_labels.get(topic_id, bertopic_default_label(topic_model, topic_id, row))
@@ -1517,23 +1550,28 @@ def main():
             else:
                 top_terms_json = "[]"
 
-            client.execute(
-                "INSERT INTO topics (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                [topic_id, label, top_terms_json, count, MODEL_NAME, now],
-            )
+            topic_rows.append([topic_id, label, top_terms_json, count, MODEL_NAME, now])
+        write_rows(
+            client,
+            "INSERT INTO topics (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            topic_rows,
+        )
         mark_auto_selected_candidates(client, label_candidates, topic_labels, label_overrides)
 
         # Write document-topic assignments
+        doc_topic_rows = []
         for i, (doc_id, topic_id) in enumerate(zip(doc_ids, topics)):
             prob = float(probs[i]) if probs is not None and len(probs) > i else None
             # probs can be a numpy array or list; handle both
             if hasattr(probs, "ndim") and probs.ndim == 2:
                 # Multi-topic probability matrix — take the max
                 prob = float(probs[i].max())
-            client.execute(
-                "INSERT INTO document_topics (doc_id, topic_id, probability) VALUES (?, ?, ?)",
-                [doc_id, int(topic_id), prob],
-            )
+            doc_topic_rows.append([doc_id, int(topic_id), prob])
+        write_rows(
+            client,
+            "INSERT INTO document_topics (doc_id, topic_id, probability) VALUES (?, ?, ?)",
+            doc_topic_rows,
+        )
 
         # Save topic hierarchy linkage
         if leaf_topic_ids_json and linkage_json:
@@ -1560,11 +1598,11 @@ def main():
         """)
         client.execute("DELETE FROM document_topic_coords")
 
-        for i, doc_id in enumerate(doc_ids):
-            client.execute(
-                "INSERT INTO document_topic_coords (doc_id, umap_x, umap_y) VALUES (?, ?, ?)",
-                [doc_id, float(coords_2d[i, 0]), float(coords_2d[i, 1])],
-            )
+        write_rows(
+            client,
+            "INSERT INTO document_topic_coords (doc_id, umap_x, umap_y) VALUES (?, ?, ?)",
+            [[doc_id, float(coords_2d[i, 0]), float(coords_2d[i, 1])] for i, doc_id in enumerate(doc_ids)],
+        )
         print(f"  Saved 2D coordinates for {len(doc_ids)} documents")
         if reporter:
             reporter.report(
