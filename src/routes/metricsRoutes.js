@@ -8,7 +8,7 @@ import {
 import {
   applyCitationCountsToDocuments, applyCommitteeMembersToDocuments,
   applyStoredFileMetricsToDocuments, getDocumentCacheStats, getDocumentServingAnalytics, getDocumentServingSummary,
-  hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics,
+  getTopicByYearCounts, hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics,
   queryCachedDocumentPage, queryCitationDocumentPage, queryConceptTermsByDoc, queryPeoplePage, queryPersonDetailPage,
   queryRelatedDocuments, queryTopicDocumentPage
 } from '../db.js';
@@ -506,7 +506,7 @@ export async function buildWorkbenchAnalyticsPayload(params, filters, loadSyncMo
   };
 }
 
-export async function buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule) {
+export async function buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule, { documentLimit = VISUALIZATION_DOCUMENT_LIMIT } = {}) {
   if (!await hasTopics()) {
     return {
       generatedAt: new Date().toISOString(),
@@ -521,7 +521,7 @@ export async function buildWorkbenchVisualizationsPayload(params, filters, loadS
   const page = await queryTopicDocumentPage({
     syncKey: documentCache.syncKey,
     filters,
-    limit: VISUALIZATION_DOCUMENT_LIMIT,
+    limit: documentLimit,
     offset: 0,
   });
   const sourceMeta = {
@@ -531,12 +531,19 @@ export async function buildWorkbenchVisualizationsPayload(params, filters, loadS
     documentsAvailable: page.total,
     documentsReturned: page.documents.length,
     documentsTruncated: page.total > page.documents.length,
-    visualizationDocumentLimit: VISUALIZATION_DOCUMENT_LIMIT,
+    visualizationDocumentLimit: documentLimit,
     readOnlyFileEnrichment: true,
   };
   const full = await buildMetricsPayloadFromRecords(page.documents, sourceMeta, params.subjectLimit, {
     persistRun: params.isAdminRequest && params.refresh,
   });
+  // The document page above is bounded, so topicData.byYear computed from it
+  // would undercount on large corpora (and, once merged client-side, would
+  // overwrite the full-corpus analytics counts). Source it from SQL instead.
+  if (full.topicData) {
+    const byYear = await getTopicByYearCounts({ syncKey: documentCache.syncKey, filters });
+    if (byYear) full.topicData.byYear = byYear;
+  }
   return visualizationSlice(full);
 }
 

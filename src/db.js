@@ -2163,6 +2163,20 @@ async function computeTopicDataByYearSql(filters, qualifier, topics, hierarchy) 
     : buildTopicsByYearFromCounts(topics, countRows);
 }
 
+/**
+ * Full-corpus topicData.byYear for the active filters, independent of any
+ * document page size. The visualizations payload only carries a bounded page
+ * of documents (for the scatter), so its by-year counts must come from here.
+ */
+export async function getTopicByYearCounts({ syncKey = null, filters: requestedFilters = {} } = {}) {
+  if (!await hasTopics()) return null;
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  const topics = await loadTopics();
+  const hierarchy = await loadTopicHierarchy();
+  return computeTopicDataByYearSql(filters, qualifier, topics, hierarchy);
+}
+
 // #15 supervisorNgramMatrix filter decision (per the plan's review
 // correction): role IN ('Supervisor', 'Co-Supervisor') regardless of
 // `source`, DISTINCT person_key. The JS path's `rec.supervisors` (what
