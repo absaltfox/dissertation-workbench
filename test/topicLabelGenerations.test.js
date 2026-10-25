@@ -106,6 +106,42 @@ test('selecting a candidate or saving a manual label records the current generat
   assert.deepEqual(rows.map((r) => r.generation), ['g-new', 'g-new']);
 });
 
+test('a legacy override is archived, not lost, when the topic is relabelled in the current generation', async () => {
+  await reset('g-new');
+  await client.execute('DELETE FROM topic_label_overrides_archive');
+  await addOverride(0, null);
+  // Re-run the schema migration twice (closeDb resets the schema-ready latch).
+  for (let i = 0; i < 2; i++) {
+    await db.closeDb();
+    client = await db.getDb();
+  }
+  const archived = (await client.execute('SELECT label FROM topic_label_overrides_archive WHERE topic_id = 0')).rows;
+  assert.equal(archived.length, 1);
+  await client.execute({
+    sql: 'INSERT OR IGNORE INTO topics (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (0, ?, ?, 1, ?, ?)',
+    args: ['Topic 0', '[]', 'm', NOW],
+  });
+  await db.updateTopicManualLabel(0, 'New label');
+  const current = (await client.execute('SELECT label, generation FROM topic_label_overrides WHERE topic_id = 0')).rows;
+  assert.deepEqual(current.map((r) => [r.label, r.generation]), [['New label', 'g-new']]);
+  const after = (await client.execute('SELECT label FROM topic_label_overrides_archive WHERE topic_id = 0')).rows;
+  assert.deepEqual(after.map((r) => r.label), ['Old']);
+  // A stale row from a later-superseded generation is archived too.
+  await db.setSetting('topics_generation', 'g-newer');
+  await db.updateTopicManualLabel(0, 'Newer label');
+  const labels = (await client.execute('SELECT label FROM topic_label_overrides_archive WHERE topic_id = 0 ORDER BY label')).rows.map((r) => r.label);
+  assert.deepEqual(labels, ['New label', 'Old']);
+});
+
+test('deleting an override only touches the current generation', async () => {
+  await reset('g-new');
+  await addOverride(1, 'g-old');
+  assert.equal(await db.deleteTopicLabelOverride(1), false);
+  assert.equal((await client.execute('SELECT * FROM topic_label_overrides WHERE topic_id = 1')).rows.length, 1);
+  await db.setSetting('topics_generation', 'g-old');
+  assert.equal(await db.deleteTopicLabelOverride(1), true);
+});
+
 function runPython(body) {
   const source = `
 import importlib.util, json, os, tempfile

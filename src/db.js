@@ -742,6 +742,32 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_source_url TEXT');
   await addColumnIfMissing(client, 'topic_label_runs', 'generation', 'TEXT');
   await addColumnIfMissing(client, 'topic_label_overrides', 'generation', 'TEXT');
+  await client.execute(`
+    CREATE TABLE IF NOT EXISTS topic_label_overrides_archive (
+      topic_id     INTEGER NOT NULL,
+      label        TEXT NOT NULL,
+      source       TEXT NOT NULL,
+      candidate_id INTEGER,
+      created_at   TEXT NOT NULL,
+      updated_at   TEXT NOT NULL,
+      generation   TEXT,
+      archived_at  TEXT NOT NULL
+    )
+  `);
+  await client.execute({
+    sql: `
+      INSERT INTO topic_label_overrides_archive
+        (topic_id, label, source, candidate_id, created_at, updated_at, generation, archived_at)
+      SELECT o.topic_id, o.label, o.source, o.candidate_id, o.created_at, o.updated_at, o.generation, ?
+      FROM topic_label_overrides o
+      WHERE o.generation IS NULL
+        AND NOT EXISTS (
+          SELECT 1 FROM topic_label_overrides_archive a
+          WHERE a.topic_id = o.topic_id AND a.label = o.label AND a.created_at = o.created_at
+        )
+    `,
+    args: [new Date().toISOString()],
+  });
   await addColumnIfMissing(client, 'file_metrics', 'content_source', 'TEXT');
   await addColumnIfMissing(client, 'file_metrics', 'content_checksum', 'TEXT');
   await addColumnIfMissing(client, 'file_metrics', 'content_source_url', 'TEXT');
@@ -6345,6 +6371,20 @@ export async function listTopicLabelReviews() {
   };
 }
 
+async function archiveStaleOverride(topicId, generation) {
+  await run(`
+    INSERT INTO topic_label_overrides_archive
+      (topic_id, label, source, candidate_id, created_at, updated_at, generation, archived_at)
+    SELECT o.topic_id, o.label, o.source, o.candidate_id, o.created_at, o.updated_at, o.generation, ?
+    FROM topic_label_overrides o
+    WHERE o.topic_id = ? AND o.generation IS NOT ?
+      AND NOT EXISTS (
+        SELECT 1 FROM topic_label_overrides_archive a
+        WHERE a.topic_id = o.topic_id AND a.label = o.label AND a.created_at = o.created_at
+      )
+  `, [new Date().toISOString(), Number(topicId), generation]);
+}
+
 export async function selectTopicLabelCandidate(topicId, candidateId) {
   const candidate = await get(`
     SELECT id, topic_id, label
@@ -6354,6 +6394,7 @@ export async function selectTopicLabelCandidate(topicId, candidateId) {
   if (!candidate) return null;
   const now = new Date().toISOString();
   const generation = await getSetting('topics_generation');
+  await archiveStaleOverride(topicId, generation);
   await run('UPDATE topic_label_candidates SET status = ? WHERE topic_id = ? AND status != ?', ['rejected', Number(topicId), 'rejected']);
   await run('UPDATE topic_label_candidates SET status = ? WHERE id = ?', ['selected', Number(candidateId)]);
   await run('UPDATE topics SET label = ? WHERE topic_id = ?', [candidate.label, Number(topicId)]);
@@ -6377,6 +6418,7 @@ export async function updateTopicManualLabel(topicId, label) {
   if (!existing) return null;
   const now = new Date().toISOString();
   const generation = await getSetting('topics_generation');
+  await archiveStaleOverride(topicId, generation);
   await run('UPDATE topics SET label = ? WHERE topic_id = ?', [normalized, Number(topicId)]);
   await run(`
     INSERT INTO topic_label_overrides (topic_id, label, source, candidate_id, created_at, updated_at, generation)
@@ -6392,7 +6434,9 @@ export async function updateTopicManualLabel(topicId, label) {
 }
 
 export async function deleteTopicLabelOverride(topicId) {
-  const result = await run('DELETE FROM topic_label_overrides WHERE topic_id = ?', [Number(topicId)]);
+  const generation = await getSetting('topics_generation');
+  if (generation == null) return false;
+  const result = await run('DELETE FROM topic_label_overrides WHERE topic_id = ? AND generation = ?', [Number(topicId), generation]);
   return result.changes > 0;
 }
 
