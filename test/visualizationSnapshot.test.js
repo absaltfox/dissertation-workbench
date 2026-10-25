@@ -54,8 +54,15 @@ test.after(async () => {
   await fs.rm(tempDir, { recursive: true, force: true });
 });
 
+const FILTERS = JSON.stringify({ degree: '', program: '', affiliation: '' });
+const vizKeyFor = (params) => `workbench:visualizations:${routes.sourceCacheKey(params)}:${FILTERS}`;
+// The cache key a default (no source params) request computes.
+const DEFAULT_REQUEST_PARAMS = { subjectLimit: 25 };
+const wrap = (data, params = DEFAULT_REQUEST_PARAMS) => ({ cacheKey: vizKeyFor(params), data });
+
 test.beforeEach(async () => {
   await client.execute('DELETE FROM serving_snapshots');
+  routes.registerLandingSource?.(DEFAULT_REQUEST_PARAMS);
 });
 
 test('save then load round-trips the payload', async () => {
@@ -71,7 +78,7 @@ test('save then load round-trips the payload', async () => {
 });
 
 test('a cold cache is seeded from a matching-generation snapshot without rebuilding', async () => {
-  await db.saveServingSnapshot(routes.VISUALIZATIONS_SNAPSHOT_KEY, 'g1', { generatedAt: SENTINEL });
+  await db.saveServingSnapshot(routes.VISUALIZATIONS_SNAPSHOT_KEY, 'g1', wrap({ generatedAt: SENTINEL }));
   await db.setSetting('topics_generation', 'g1');
   const res = await request(makeApp()).get('/api/workbench/visualizations');
   assert.equal(res.status, 200);
@@ -79,7 +86,7 @@ test('a cold cache is seeded from a matching-generation snapshot without rebuild
 });
 
 test('a snapshot from an older generation is ignored', async () => {
-  await db.saveServingSnapshot(routes.VISUALIZATIONS_SNAPSHOT_KEY, 'g1', { generatedAt: SENTINEL });
+  await db.saveServingSnapshot(routes.VISUALIZATIONS_SNAPSHOT_KEY, 'g1', wrap({ generatedAt: SENTINEL }));
   await db.setSetting('topics_generation', 'g2');
   const res = await request(makeApp()).get('/api/workbench/visualizations');
   assert.equal(res.status, 200);
@@ -99,7 +106,7 @@ test('an undecodable snapshot falls through to a build', async () => {
 });
 
 test('filtered requests neither read nor write snapshots', async () => {
-  await db.saveServingSnapshot(routes.VISUALIZATIONS_SNAPSHOT_KEY, 'g4', { generatedAt: SENTINEL });
+  await db.saveServingSnapshot(routes.VISUALIZATIONS_SNAPSHOT_KEY, 'g4', wrap({ generatedAt: SENTINEL }));
   await db.setSetting('topics_generation', 'g4');
   const before = await snapshotRow();
   const res = await request(makeApp()).get('/api/workbench/visualizations?degree=MA');
@@ -121,7 +128,7 @@ async function warmWith(updatedAt, generation) {
   await client.execute({
     sql: 'INSERT INTO serving_snapshots (snapshot_key, generation, payload_gz, updated_at) VALUES (?, ?, ?, ?)',
     args: [routes.VISUALIZATIONS_SNAPSHOT_KEY, generation,
-      new Uint8Array(gzipSync(JSON.stringify({ generatedAt: SENTINEL }))), updatedAt],
+      new Uint8Array(gzipSync(JSON.stringify(wrap({ generatedAt: SENTINEL }, warmParams)))), updatedAt],
   });
   const metricsCache = new Map();
   await routes.warmWorkbenchLandingCache({
@@ -139,4 +146,52 @@ test('warmup serves a fresh matching snapshot without rebuilding the visualizati
 test('warmup rebuilds when the snapshot is older than the TTL', async () => {
   const payload = await warmWith('2000-01-01T00:00:00.000Z', 'g6');
   assert.notEqual(payload.generatedAt, SENTINEL);
+});
+
+test('a request with different source params neither seeds from nor overwrites the landing snapshot', async () => {
+  await db.saveServingSnapshot(routes.VISUALIZATIONS_SNAPSHOT_KEY, 'g7', wrap({ generatedAt: SENTINEL }));
+  await db.setSetting('topics_generation', 'g7');
+  const before = await snapshotRow();
+  const res = await request(makeApp()).get('/api/workbench/visualizations?query=x');
+  assert.equal(res.status, 200);
+  assert.ok(res.body.generatedAt);
+  assert.notEqual(res.body.generatedAt, SENTINEL);
+  assert.deepEqual(await snapshotRow(), before);
+  const stored = await db.loadServingSnapshot(routes.VISUALIZATIONS_SNAPSHOT_KEY);
+  assert.equal(stored.payload.data.generatedAt, SENTINEL);
+});
+
+test('a snapshot saved for another source key is not seeded into the landing key', async () => {
+  await db.saveServingSnapshot(routes.VISUALIZATIONS_SNAPSHOT_KEY, 'g8',
+    wrap({ generatedAt: SENTINEL }, { subjectLimit: 25, query: 'other' }));
+  await db.setSetting('topics_generation', 'g8');
+  const res = await request(makeApp()).get('/api/workbench/visualizations');
+  assert.equal(res.status, 200);
+  assert.ok(res.body.generatedAt);
+  assert.notEqual(res.body.generatedAt, SENTINEL);
+});
+
+test('the snapshot is saved under the generation read before the build', async () => {
+  await db.setSetting('topics_generation', 'gOld');
+  // With topics present the build consults the sync module.
+  await client.execute({
+    sql: "INSERT INTO topics (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (1, 'T', '[]', 1, 'm', ?)",
+    args: [new Date().toISOString()],
+  });
+  // The sync module is consulted during the build; swap the generation there.
+  const swappingSync = async () => {
+    await db.setSetting('topics_generation', 'gNew');
+    return { getSyncKeyForOptions: () => SYNC_KEY };
+  };
+  const app = express();
+  app.use('/api', routes.createMetricsRouter({
+    metricsCache: new Map(), metricsInflight: new Map(), loadSyncModule: swappingSync,
+  }));
+  try {
+    const res = await request(app).get('/api/workbench/visualizations');
+    assert.equal(res.status, 200);
+    assert.equal((await snapshotRow()).generation, 'gOld');
+  } finally {
+    await client.execute('DELETE FROM topics');
+  }
 });

@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
+import { promisify } from 'node:util';
 import { createClient } from '@libsql/client';
 import { SQLITE_PATH, PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL } from './config.js';
 import { logger } from './logger.js';
@@ -4124,8 +4125,11 @@ export async function setSetting(key, value) {
 
 // --- Serving snapshots (gzipped JSON payloads keyed by topics generation) ---
 
+const gzipAsync = promisify(zlib.gzip);
+const gunzipAsync = promisify(zlib.gunzip);
+
 export async function saveServingSnapshot(key, generation, payload) {
-  const gz = zlib.gzipSync(JSON.stringify(payload));
+  const gz = await gzipAsync(JSON.stringify(payload));
   const bytes = new Uint8Array(gz.buffer, gz.byteOffset, gz.byteLength);
   await run(`
     INSERT INTO serving_snapshots (snapshot_key, generation, payload_gz, updated_at)
@@ -4145,7 +4149,7 @@ export async function loadServingSnapshot(key) {
   try {
     const raw = row.payload_gz;
     const buf = raw instanceof ArrayBuffer ? Buffer.from(raw) : Buffer.from(raw.buffer ?? raw, raw.byteOffset, raw.byteLength);
-    const payload = JSON.parse(zlib.gunzipSync(buf).toString('utf8'));
+    const payload = JSON.parse((await gunzipAsync(buf)).toString('utf8'));
     return { generation: row.generation, payload, updatedAt: row.updated_at };
   } catch (error) {
     logger.warn('Ignoring undecodable serving snapshot', { key, error: error?.message || String(error) });

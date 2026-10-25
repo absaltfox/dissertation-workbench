@@ -31,9 +31,8 @@ const ANALYTICS_TERM_SAMPLE_LIMIT = 5000;
 // runs every JS aggregator in buildMetricsPayloadFromRecords over whatever
 // record count it is handed and synchronously serializes the whole `documents`
 // array; without a ceiling an admin request (e.g. maxRecords=56000) can stall
-// the event loop and risk exceeding V8's max string length. Matches
-// VISUALIZATION_DOCUMENT_LIMIT for consistency with every other route in this
-// phase. Admins who need the full corpus should page through
+// the event loop and risk exceeding V8's max string length. The ceiling is
+// 5000 records. Admins who need the full corpus should page through
 // /api/workbench/* instead (already scale-tested, cursor-paged).
 const ADMIN_MAX_RECORDS_CEILING = 5000;
 
@@ -460,17 +459,28 @@ export const VISUALIZATIONS_SNAPSHOT_KEY = 'workbench:visualizations:unfiltered'
 
 const isUnfiltered = (filters) => !filters.degree && !filters.program && !filters.affiliation;
 
+// The single persisted snapshot belongs to the landing source (the params
+// warmWorkbenchLandingCache uses). Requests with any other source params must
+// neither seed from nor overwrite it.
+let landingSourceKey = null;
+
+export function registerLandingSource(params) {
+  landingSourceKey = sourceCacheKey(params);
+}
+
+const isLandingSource = (params) => landingSourceKey !== null && sourceCacheKey(params) === landingSourceKey;
+
 // Seeds an empty in-memory slice from the persisted snapshot when it was built
-// for the current topics generation. Never throws.
+// for the current topics generation and for this exact cache key. Never throws.
 export async function seedSliceFromSnapshot(cache, key) {
   try {
     if (cache.get(key)) return false;
     const snapshot = await loadServingSnapshot(VISUALIZATIONS_SNAPSHOT_KEY);
-    if (!snapshot) return false;
+    if (!snapshot || snapshot.payload?.cacheKey !== key) return false;
     const generation = await getSetting('topics_generation');
     if (generation == null || snapshot.generation !== generation) return false;
     const timestamp = Date.parse(snapshot.updatedAt);
-    cache.set(key, { timestamp: Number.isFinite(timestamp) ? timestamp : 0, payload: snapshot.payload });
+    cache.set(key, { timestamp: Number.isFinite(timestamp) ? timestamp : 0, payload: snapshot.payload.data });
     return true;
   } catch (error) {
     logger.warn('Could not seed visualizations from snapshot', { error: error?.message || String(error) });
@@ -478,14 +488,27 @@ export async function seedSliceFromSnapshot(cache, key) {
   }
 }
 
-async function saveVisualizationsSnapshot(payload) {
+async function saveVisualizationsSnapshot(key, generation, payload) {
   try {
-    const generation = await getSetting('topics_generation');
     if (generation == null) return;
-    await saveServingSnapshot(VISUALIZATIONS_SNAPSHOT_KEY, generation, payload);
+    await saveServingSnapshot(VISUALIZATIONS_SNAPSHOT_KEY, generation, { cacheKey: key, data: payload });
   } catch (error) {
     logger.warn('Could not save visualizations snapshot', { error: error?.message || String(error) });
   }
+}
+
+// Reads the topics generation before building so a swap landing mid-build
+// cannot label old-topics data with the new generation.
+async function buildAndSaveSnapshot(key, build) {
+  let generation = null;
+  try {
+    generation = await getSetting('topics_generation');
+  } catch {
+    // Without a generation the snapshot is simply not saved.
+  }
+  const payload = await build();
+  await saveVisualizationsSnapshot(key, generation, payload);
+  return payload;
 }
 
 async function cachedSlice(cache, inflight, key, refresh, compute) {
@@ -626,6 +649,7 @@ export async function warmWorkbenchLandingCache({ metricsCache, metricsInflight,
   // Record the topics generation before computing so a swap that lands during
   // warmup is noticed by the first request.
   await syncTopicsGeneration(metricsCache);
+  registerLandingSource(params);
   // Match activeFilters(req)'s shape for an unfiltered request so the cache
   // key here lines up exactly with what the routes compute for real traffic.
   const filters = { degree: '', program: '', affiliation: '' };
@@ -645,11 +669,10 @@ export async function warmWorkbenchLandingCache({ metricsCache, metricsInflight,
     },
     {
       key: `workbench:visualizations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`,
-      compute: async () => {
-        const payload = await buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule);
-        await saveVisualizationsSnapshot(payload);
-        return payload;
-      },
+      compute: () => buildAndSaveSnapshot(
+        `workbench:visualizations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`,
+        () => buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule),
+      ),
     },
   ];
   const vizKey = slices[3].key;
@@ -762,15 +785,14 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     if (!params) return;
     const filters = activeFilters(req);
     const key = `workbench:visualizations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`;
-    const unfiltered = isUnfiltered(filters);
-    if (unfiltered && !params.refresh) {
+    const snapshotEligible = isUnfiltered(filters) && isLandingSource(params);
+    if (snapshotEligible && !params.refresh) {
       await syncTopicsGeneration(metricsCache);
       await seedSliceFromSnapshot(metricsCache, key);
     }
     const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
-      const built = await buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule);
-      if (unfiltered) await saveVisualizationsSnapshot(built);
-      return built;
+      const build = () => buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule);
+      return snapshotEligible ? buildAndSaveSnapshot(key, build) : build();
     });
     res.status(200).json(payload);
   }));
