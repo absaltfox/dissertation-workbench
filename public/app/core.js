@@ -240,6 +240,7 @@ const state = {
   analyticsLoadingKey: '',
   analyticsLoadingPromise: null,
   analyticsRequestToken: 0,
+  visualizationRequestToken: 0,
   user: null, // { username } or null
   pendingLogin: null,
   csrfToken: '',
@@ -270,6 +271,10 @@ const state = {
   selectedDocIds: new Set(),
   selectedCitationIds: new Set(),
   activeFilters: { degree: '', program: '', affiliation: '' },
+  // Rows from /api/workbench/visualizations for the current filters. The server
+  // already applied the facets; these slim rows lack degree/program/affiliation,
+  // so they must not be re-filtered client-side.
+  visualizationDocuments: [],
   peopleRows: [],
   peopleDetailByKey: new Map(),
   peoplePager: {

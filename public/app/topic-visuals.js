@@ -10,8 +10,6 @@ import {
   loadVisualizationData,
 } from './data.js';
 import {
-  getFilteredDocs,
-  docsForTopic,
   openMatchesModal,
   openRecord,
 } from './documents.js';
@@ -64,7 +62,7 @@ function initTopicVisuals() {
 async function loadAndRenderVisualizations() {
   try {
     await ensureD3Library();
-    await loadVisualizationData();
+    if (!await loadVisualizationData()) return;
   } catch (error) {
     setStatus(`Failed to load visualizations: ${error.message}`, true);
     return;
@@ -116,7 +114,7 @@ let _topicClusterDocs = [];
 let _topicClusterTd = null;
 
 function renderTopicCluster() {
-  const docs = getFilteredDocs();
+  const docs = state.visualizationDocuments || [];
   const td = getAnalytics()?.topicData;
   if (!td?.topics?.length || !topicClusterChartEl) {
     if (topicClusterPanelEl) topicClusterPanelEl.hidden = true;
@@ -506,7 +504,8 @@ function renderTopicDendrogram() {
   })
   .on('click', function(event, d) {
     const label = topicDisplayLabel(d.data.topic.label);
-    openMatchesModal(`Topic: ${label}`, docsForTopic(d.data.topic.topicId));
+    const topicId = d.data.topic.topicId;
+    openMatchesModal(`Topic: ${label}`, (state.visualizationDocuments || []).filter((doc) => doc.topicId === topicId));
   });
 }
 
@@ -870,7 +869,7 @@ function renderConceptNetwork() {
       .attr('r', 5 + (d.freq / maxFreq) * 14);
   })
   .on('click', function(event, d) {
-    const docs = state.payload?.documents || [];
+    const docs = state.visualizationDocuments || [];
     const matches = docs.filter(doc => (doc.conceptTerms || []).some(t => t.toLowerCase() === d.id.toLowerCase()));
     openMatchesModal(`Concept: ${d.id}`, matches);
   });
@@ -1158,7 +1157,7 @@ function renderMethTopicBubble() {
       .attr('r', Math.max(3, Math.sqrt(d.val / Math.max(maxVal, 1)) * maxR));
   })
   .on('click', function(event, d) {
-    const docs = state.payload?.documents || [];
+    const docs = state.visualizationDocuments || [];
     const matches = docs.filter(doc =>
       (doc.methodologies || []).includes(d.meth) && doc.topicId === d.topic.topicId
     );
