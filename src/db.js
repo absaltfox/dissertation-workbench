@@ -1762,6 +1762,63 @@ export async function queryTopicDocumentPage({
 }
 
 /**
+ * Slim per-document projection for the visualizations payload (#59): one row
+ * per topic-assigned eligible document, built in SQL so no metadata_json is
+ * transferred or parsed. Uses each document's highest-probability topic.
+ * Restricted/embargoed documents are excluded by the analytics access filter
+ * and have no document_terms rows. No LIMIT: callers get the full corpus.
+ */
+export async function queryVisualizationDocuments({ syncKey = null, filters = {} } = {}) {
+  const f = analyticalDocumentFilters({ syncKey, ...filters });
+  const rows = await all(`
+    SELECT d.doc_id AS id, d.title AS title, d.author AS author, d.year AS year,
+           bt.topic_id AS topic_id, bt.probability AS topic_probability,
+           c.umap_x AS umap_x, c.umap_y AS umap_y,
+           (SELECT json_group_array(t.term) FROM document_terms t
+             WHERE t.doc_id = d.doc_id AND t.kind = 'concept') AS concept_terms,
+           (SELECT json_group_array(t.term) FROM document_terms t
+             WHERE t.doc_id = d.doc_id AND t.kind = 'methodology') AS methodologies,
+           (SELECT json_group_array(p.name) FROM (
+              SELECT person_key, MIN(name) AS name FROM document_people
+              WHERE doc_id = d.doc_id AND role IN ('Supervisor', 'Co-Supervisor', 'Committee Member')
+              GROUP BY person_key
+            ) p) AS supervisors
+    FROM documents d
+    JOIN (
+      SELECT doc_id, topic_id, probability,
+             ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY probability DESC, topic_id ASC) AS rn
+      FROM document_topics
+    ) bt ON bt.doc_id = d.doc_id AND bt.rn = 1
+    LEFT JOIN document_topic_coords c ON c.doc_id = d.doc_id
+    ${f.where}
+    ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
+  `, f.args);
+  const parseList = (raw) => {
+    try {
+      const list = JSON.parse(raw || '[]');
+      return Array.isArray(list) ? list : [];
+    } catch {
+      return [];
+    }
+  };
+  const num = (v) => (v == null ? null : Number(v));
+  const documents = rows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    author: r.author,
+    year: num(r.year),
+    topicId: Number(r.topic_id),
+    topicProbability: num(r.topic_probability),
+    umapX: num(r.umap_x),
+    umapY: num(r.umap_y),
+    conceptTerms: parseList(r.concept_terms),
+    methodologies: parseList(r.methodologies),
+    supervisors: parseList(r.supervisors),
+  }));
+  return { total: documents.length, documents };
+}
+
+/**
  * Full-corpus per-document concept term lists from the document_terms
  * projection (kind='concept'), for feeding buildTermCooccurrence() without
  * transferring the whole metadata_json blob for every document. Docs that
