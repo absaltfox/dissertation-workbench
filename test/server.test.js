@@ -182,6 +182,35 @@ test('citation scan never overlaps an active run (route and scheduler share the 
   }
 });
 
+test('bertopic start is single-flight and blocks topic label regeneration while running', async () => {
+  const runningJobId = await createAdminJob({
+    type: 'bertopic', label: 'Existing BERTopic', params: {}, runnerType: 'local',
+  });
+  const token = createSession('admin');
+  try {
+    const csrf = getSessionCsrfToken(token);
+    const start = await request(app)
+      .post('/api/admin/jobs/bertopic')
+      .set('Cookie', `session=${token}`).set('x-csrf-token', csrf)
+      .send({})
+      .expect(202);
+    assert.equal(start.body.alreadyRunning, true);
+    assert.equal(start.body.jobId, runningJobId);
+
+    const labels = await request(app)
+      .post('/api/admin/topics/labels/regenerate')
+      .set('Cookie', `session=${token}`).set('x-csrf-token', csrf)
+      .send({})
+      .expect(409);
+    assert.equal(labels.body.bertopicRunning, true);
+    assert.equal(labels.body.jobId, runningJobId);
+    assert.match(labels.body.error, /BERTopic rebuild is running/);
+  } finally {
+    await finishAdminJob(runningJobId, { status: 'completed', runnerState: 'completed' });
+    destroySession(token);
+  }
+});
+
 test('citation scan preview counts pending documents and honors retryFailures without starting a job', async () => {
   const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const degree = `Scan Route ${suffix}`;

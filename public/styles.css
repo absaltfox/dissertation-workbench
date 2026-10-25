@@ -2346,6 +2346,14 @@ svg[viewBox] {
   display: block;
 }
 
+#topicClusterChart {
+  width: 100%;
+  height: auto;
+  aspect-ratio: 940 / 600;
+  display: block;
+  touch-action: none;
+}
+
 /* --- Responsive --- */
 
 @media (max-width: 1020px) {

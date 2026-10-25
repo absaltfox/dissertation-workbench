@@ -249,13 +249,15 @@ test('person detail returns corpus aggregates with a bounded document page', asy
   assert.equal(page.person.roles.includes('Supervisor'), true);
 });
 
-test('topic visualizations expose an explicit bounded document sample', async () => {
+test('topic visualizations return every topic-assigned document', async () => {
   const response = await request(app)
     .get('/api/workbench/visualizations')
     .expect('content-type', /application\/json/)
     .expect(200);
   assert.equal(response.body.source.documentsAvailable, TOTAL_DOCUMENTS);
-  assert.equal(response.body.source.documentsReturned, 5000);
-  assert.equal(response.body.source.documentsTruncated, true);
-  assert.equal(response.body.documents.length, 5000);
+  assert.equal(response.body.source.documentsReturned, TOTAL_DOCUMENTS);
+  assert.equal(response.body.source.documentsTruncated, false);
+  assert.equal(response.body.documents.length, 5100);
+  // Per-doc size guard: slim visualization rows are ~400 bytes each.
+  assert.ok(JSON.stringify(response.body).length < 400 * 5100);
 });

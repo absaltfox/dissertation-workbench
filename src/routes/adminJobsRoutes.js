@@ -167,17 +167,21 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
   }));
 
   router.post('/jobs/bertopic', asyncHandler(async (_req, res) => {
-    const runningId = await hasRunningAdminJob('bertopic');
-    if (runningId) {
-      res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
-      return;
-    }
+    // singleInstance makes the check-and-create atomic: shared *_next staging
+    // tables mean two overlapping runs could publish empty or partial topics.
+    // The metrics cache is not cleared here: topics only change at the worker's
+    // swap, which bumps `topics_generation`; metricsRoutes drops stale slices
+    // when it observes that.
     const result = await createAndStartAdminWorkerJob({
       type: 'bertopic',
       label: 'BERTopic Rebuild',
       params: { script: 'scripts/build-topics.py' },
+      singleInstance: true,
     });
-    clearMetricsCache();
+    if (result.alreadyRunning) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: result.jobId });
+      return;
+    }
     res.status(202).json({ ok: true, started: true, jobId: result.jobId });
   }));
 

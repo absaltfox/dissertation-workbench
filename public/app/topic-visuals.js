@@ -138,10 +138,6 @@ function renderTopicCluster() {
   const minX = d3.min(xs), maxX = d3.max(xs);
   const minY = d3.min(ys), maxY = d3.max(ys);
 
-  const svg = d3.select(topicClusterChartEl)
-    .attr('viewBox', `0 0 ${width} ${height}`);
-  svg.selectAll('*').remove();
-
   const topicIds = [...new Set(plotDocs.map(d => d.topicId))].sort((a, b) => a - b);
   const hueStep = 360 / Math.max(topicIds.length, 1);
   const colorMap = new Map();
@@ -159,72 +155,148 @@ function renderTopicCluster() {
     .domain([minY, maxY])
     .range([pad.t, height - pad.b]);
 
-  const gContainer = svg.append('g');
+  // Points are drawn on a canvas (one SVG node per document does not scale to
+  // ~14k documents). The backing store is the logical chart area times the
+  // device pixel ratio; CSS keeps it fluid. Positions are precomputed once in
+  // chart coordinates and re-projected through the zoom transform on redraw.
+  const dpr = window.devicePixelRatio || 1;
+  const canvas = topicClusterChartEl;
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  const ctx = canvas.getContext('2d');
+
+  const points = plotDocs.map(d => ({
+    doc: d,
+    x: xScale(d.umapX),
+    y: yScale(d.umapY),
+    color: colorMap.get(d.topicId) || '#999',
+  }));
+  const BASE_RADIUS = 4;
+  const HOVER_RADIUS = 8;
+  const activeTids = new Set(topicIds);
+  // Hit-testing indexes only active (non-dimmed) points, so a dimmed point can
+  // never shadow an active neighbour within the hover radius. Rebuilt whenever
+  // the legend toggles a topic.
+  let quadtree;
+  function rebuildQuadtree() {
+    quadtree = d3.quadtree().x(p => p.x).y(p => p.y)
+      .addAll(points.filter(p => activeTids.has(p.doc.topicId)));
+  }
+  rebuildQuadtree();
+  let transform = d3.zoomIdentity;
+  let hovered = null;
+
+  // d3.zoom works in CSS pixels; the canvas draws in chart units (width x
+  // height), which differ whenever the canvas is displayed at another size.
+  function viewTransform() {
+    const rect = canvas.getBoundingClientRect();
+    const cssScale = rect.width ? rect.width / width : 1;
+    return { k: transform.k, x: transform.x / cssScale, y: transform.y / cssScale };
+  }
+
+  function drawPoint(p, radius, fillOpacity, strokeOpacity) {
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, radius, 0, 2 * Math.PI);
+    ctx.globalAlpha = fillOpacity;
+    ctx.fillStyle = p.color;
+    ctx.fill();
+    ctx.globalAlpha = strokeOpacity;
+    ctx.strokeStyle = p.color;
+    ctx.stroke();
+  }
+
+  function draw() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // Matches the previous SVG group transform: dpr scale, then zoom.
+    const v = viewTransform();
+    ctx.setTransform(dpr * v.k, 0, 0, dpr * v.k, dpr * v.x, dpr * v.y);
+    ctx.lineWidth = 1;
+    // Dimmed points first so active ones paint on top.
+    for (const p of points) {
+      if (!activeTids.has(p.doc.topicId)) drawPoint(p, BASE_RADIUS, 0.05, 0.02);
+    }
+    for (const p of points) {
+      if (p !== hovered && activeTids.has(p.doc.topicId)) drawPoint(p, BASE_RADIUS, 0.7, 0.3);
+    }
+    if (hovered) drawPoint(hovered, HOVER_RADIUS, 1, 0.3);
+    ctx.globalAlpha = 1;
+  }
+
+  let drawQueued = false;
+  function scheduleDraw() {
+    if (drawQueued) return;
+    drawQueued = true;
+    requestAnimationFrame(() => { drawQueued = false; draw(); });
+  }
+
+  // Nearest active point under the pointer, via the quadtree in chart
+  // coordinates (the pointer is mapped back through the zoom transform).
+  function hitTest(event) {
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    const sx = (event.clientX - rect.left) * (width / rect.width);
+    const sy = (event.clientY - rect.top) * (height / rect.height);
+    const v = viewTransform();
+    const x = (sx - v.x) / v.k;
+    const y = (sy - v.y) / v.k;
+    return quadtree.find(x, y, HOVER_RADIUS) || null;
+  }
+
+  const tooltip = d3.select(topicClusterTooltipEl);
+
+  function moveTooltip(event) {
+    const rect = topicClusterContainerEl.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 12) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+  }
+
+  const sel = d3.select(canvas);
+  sel.style('cursor', 'default');
+
+  sel.on('mousemove', (event) => {
+    const hit = hitTest(event);
+    if (hit !== hovered) {
+      hovered = hit;
+      scheduleDraw();
+      sel.style('cursor', hit ? 'pointer' : 'default');
+      if (hit) {
+        const d = hit.doc;
+        const topic = td?.topics?.find(t => t.topicId === d.topicId);
+        const label = d.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || '');
+        const confidence = typeof d.topicProbability === 'number' ? ` · ${Math.round(d.topicProbability * 100)}% confidence` : '';
+        tooltip.style('display', 'block')
+          .html(`
+        <div class="tooltip-title">${escapeHtml((d.title || '').slice(0, 100))}</div>
+        <div class="tooltip-meta">${d.year || '—'} · ${escapeHtml(label)}${escapeHtml(confidence)}</div>
+      `);
+      } else {
+        tooltip.style('display', 'none');
+      }
+    }
+    if (hit) moveTooltip(event);
+  })
+  .on('mouseleave', () => {
+    if (hovered) {
+      hovered = null;
+      scheduleDraw();
+    }
+    sel.style('cursor', 'default');
+    tooltip.style('display', 'none');
+  })
+  .on('click', (event) => {
+    const hit = hitTest(event);
+    if (hit) openRecord(hit.doc.id, 'analytics');
+  });
 
   const zoom = d3.zoom()
     .scaleExtent([0.5, 10])
     .on('zoom', (event) => {
-      gContainer.attr('transform', event.transform);
+      transform = event.transform;
+      scheduleDraw();
     });
-  svg.call(zoom);
+  sel.call(zoom).call(zoom.transform, d3.zoomIdentity);
 
-  const dots = gContainer.selectAll('.cluster-dot')
-    .data(plotDocs)
-    .enter()
-    .append('circle')
-    .attr('class', 'cluster-dot')
-    .attr('cx', d => xScale(d.umapX))
-    .attr('cy', d => yScale(d.umapY))
-    .attr('r', 4)
-    .attr('fill', d => colorMap.get(d.topicId) || '#999')
-    .attr('fill-opacity', 0.7)
-    .attr('stroke', d => colorMap.get(d.topicId) || '#999')
-    .attr('stroke-opacity', 0.3)
-    .attr('stroke-width', 1)
-    .style('cursor', 'pointer');
-
-  const tooltip = d3.select(topicClusterTooltipEl);
-
-  dots.on('mouseover', function(event, d) {
-    const topic = td?.topics?.find(t => t.topicId === d.topicId);
-    const label = d.topicId === -1 ? 'Uncategorized' : topicDisplayLabel(topic?.label || '');
-    const confidence = typeof d.topicProbability === 'number' ? ` \u00B7 ${Math.round(d.topicProbability * 100)}% confidence` : '';
-    
-    d3.select(this)
-      .transition()
-      .duration(100)
-      .attr('r', 8)
-      .attr('fill-opacity', 1);
-
-    tooltip.style('display', 'block')
-      .html(`
-        <div class="tooltip-title">${escapeHtml((d.title || '').slice(0, 100))}</div>
-        <div class="tooltip-meta">${d.year || '\u2014'} \u00B7 ${escapeHtml(label)}${escapeHtml(confidence)}</div>
-      `);
-    
-    const rect = topicClusterContainerEl.getBoundingClientRect();
-    tooltip.style('left', (event.clientX - rect.left + 12) + 'px')
-      .style('top', (event.clientY - rect.top - 10) + 'px');
-  })
-  .on('mousemove', function(event) {
-    const rect = topicClusterContainerEl.getBoundingClientRect();
-    tooltip.style('left', (event.clientX - rect.left + 12) + 'px')
-      .style('top', (event.clientY - rect.top - 10) + 'px');
-  })
-  .on('mouseout', function() {
-    d3.select(this)
-      .transition()
-      .duration(100)
-      .attr('r', 4)
-      .attr('fill-opacity', 0.7);
-
-    tooltip.style('display', 'none');
-  })
-  .on('click', function(event, d) {
-    openRecord(d.id, 'analytics');
-  });
-
-  const activeTids = new Set(topicIds);
   const legendContainer = d3.select(topicClusterLegendEl);
   legendContainer.selectAll('*').remove();
 
@@ -250,12 +322,12 @@ function renderTopicCluster() {
       activeTids.add(tid);
       d3.select(this).classed('dimmed', false);
     }
-
-    dots.transition()
-      .duration(200)
-      .attr('fill-opacity', d => activeTids.has(d.topicId) ? 0.7 : 0.05)
-      .attr('stroke-opacity', d => activeTids.has(d.topicId) ? 0.3 : 0.02)
-      .style('pointer-events', d => activeTids.has(d.topicId) ? 'auto' : 'none');
+    rebuildQuadtree();
+    if (hovered && !activeTids.has(hovered.doc.topicId)) {
+      hovered = null;
+      tooltip.style('display', 'none');
+    }
+    scheduleDraw();
   });
 }
 

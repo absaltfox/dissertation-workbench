@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import {
-  buildMetricsPayloadFromRecords, collectMetricRecords, collectMetrics, enrichDocumentSignals, buildTermCooccurrence
+  buildMetricsPayloadFromRecords, collectMetricRecords, collectMetrics, enrichDocumentSignals, buildTermCooccurrence,
+  buildTopicVisualizations, buildCitationCooccurrenceNetwork
 } from '../metrics.js';
 import {
   ALLOW_PUBLIC_REFRESH, CACHE_TTL_MS, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT
@@ -8,10 +9,11 @@ import {
 import {
   applyCitationCountsToDocuments, applyCommitteeMembersToDocuments,
   applyStoredFileMetricsToDocuments, getDocumentCacheStats, getDocumentServingAnalytics, getDocumentServingSummary,
-  hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics,
+  getSetting, loadServingSnapshot, saveServingSnapshot, getTopicByYearCounts, hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics, loadTopicHierarchy,
   queryCachedDocumentPage, queryCitationDocumentPage, queryConceptTermsByDoc, queryPeoplePage, queryPersonDetailPage,
-  queryRelatedDocuments, queryTopicDocumentPage
+  queryRelatedDocuments, queryVisualizationDocuments
 } from '../db.js';
+import { logger } from '../logger.js';
 import { authenticate } from '../auth.js';
 import { getConfiguredApiKey } from '../secrets.js';
 import { parseBooleanParam, parseNumberParam, validateMetricsParams } from '../validate.js';
@@ -21,14 +23,16 @@ import { hasValidCsrf } from '../middleware/adminAuth.js';
 const WORKBENCH_SLICE_TTL_MS = CACHE_TTL_MS;
 const ANALYTICS_DOCUMENT_SAMPLE_LIMIT = 100;
 const DETAILED_ANALYTICS_RECORD_LIMIT = 5000;
-const VISUALIZATION_DOCUMENT_LIMIT = 5000;
+const VISUALIZATION_DOCUMENT_LIMIT = Infinity;
+// Analytics termCooccurrence sample (a separate endpoint). Kept bounded: it is
+// a pairwise self-join, and must not inherit the visualization scatter limit.
+const ANALYTICS_TERM_SAMPLE_LIMIT = 5000;
 // Hard server-side ceiling on /api/metrics regardless of role (#24). This route
 // runs every JS aggregator in buildMetricsPayloadFromRecords over whatever
 // record count it is handed and synchronously serializes the whole `documents`
 // array; without a ceiling an admin request (e.g. maxRecords=56000) can stall
-// the event loop and risk exceeding V8's max string length. Matches
-// VISUALIZATION_DOCUMENT_LIMIT for consistency with every other route in this
-// phase. Admins who need the full corpus should page through
+// the event loop and risk exceeding V8's max string length. The ceiling is
+// 5000 records. Admins who need the full corpus should page through
 // /api/workbench/* instead (already scale-tested, cursor-paged).
 const ADMIN_MAX_RECORDS_CEILING = 5000;
 
@@ -413,7 +417,102 @@ function startBackgroundSliceRefresh(cache, inflight, key, compute) {
   inflight.set(key, promise);
 }
 
+// The BERTopic worker (a separate Fly machine) swaps topic tables directly in
+// the database and bumps the `topics_generation` setting in the same
+// transaction. The web process cannot observe job completion reliably, so it
+// watches that setting (memoised, one DB read per TOPICS_GENERATION_MEMO_MS) and
+// drops the whole slice cache when it changes; otherwise slices expire
+// independently and could merge mismatched topic ids.
+export const TOPICS_GENERATION_MEMO_MS = 30_000;
+const topicsGenerationState = new WeakMap();
+
+export function resetTopicsGenerationMemo(cache) {
+  topicsGenerationState.delete(cache);
+}
+
+export async function syncTopicsGeneration(cache, {
+  read = () => getSetting('topics_generation'), now = Date.now,
+} = {}) {
+  let state = topicsGenerationState.get(cache);
+  if (!state) {
+    state = { value: undefined, checkedAt: -Infinity, pending: null };
+    topicsGenerationState.set(cache, state);
+  }
+  if (state.pending) return state.pending;
+  if (now() - state.checkedAt < TOPICS_GENERATION_MEMO_MS) return undefined;
+  state.pending = (async () => {
+    try {
+      const value = (await read()) ?? null;
+      if (state.value !== undefined && value !== state.value) cache.clear();
+      state.value = value;
+    } catch {
+      // Keep serving from cache if the setting cannot be read right now.
+    } finally {
+      state.checkedAt = now();
+      state.pending = null;
+    }
+  })();
+  return state.pending;
+}
+
+export const VISUALIZATIONS_SNAPSHOT_KEY = 'workbench:visualizations:unfiltered';
+
+const isUnfiltered = (filters) => !filters.degree && !filters.program && !filters.affiliation;
+
+// The single persisted snapshot belongs to the landing source (the params
+// warmWorkbenchLandingCache uses). Requests with any other source params must
+// neither seed from nor overwrite it.
+let landingSourceKey = null;
+
+export function registerLandingSource(params) {
+  landingSourceKey = sourceCacheKey(params);
+}
+
+const isLandingSource = (params) => landingSourceKey !== null && sourceCacheKey(params) === landingSourceKey;
+
+// Seeds an empty in-memory slice from the persisted snapshot when it was built
+// for the current topics generation and for this exact cache key. Never throws.
+export async function seedSliceFromSnapshot(cache, key) {
+  try {
+    if (cache.get(key)) return false;
+    const snapshot = await loadServingSnapshot(VISUALIZATIONS_SNAPSHOT_KEY);
+    if (!snapshot || snapshot.payload?.cacheKey !== key) return false;
+    const generation = await getSetting('topics_generation');
+    if (generation == null || snapshot.generation !== generation) return false;
+    const timestamp = Date.parse(snapshot.updatedAt);
+    cache.set(key, { timestamp: Number.isFinite(timestamp) ? timestamp : 0, payload: snapshot.payload.data });
+    return true;
+  } catch (error) {
+    logger.warn('Could not seed visualizations from snapshot', { error: error?.message || String(error) });
+    return false;
+  }
+}
+
+async function saveVisualizationsSnapshot(key, generation, payload) {
+  try {
+    if (generation == null) return;
+    await saveServingSnapshot(VISUALIZATIONS_SNAPSHOT_KEY, generation, { cacheKey: key, data: payload });
+  } catch (error) {
+    logger.warn('Could not save visualizations snapshot', { error: error?.message || String(error) });
+  }
+}
+
+// Reads the topics generation before building so a swap landing mid-build
+// cannot label old-topics data with the new generation.
+async function buildAndSaveSnapshot(key, build) {
+  let generation = null;
+  try {
+    generation = await getSetting('topics_generation');
+  } catch {
+    // Without a generation the snapshot is simply not saved.
+  }
+  const payload = await build();
+  await saveVisualizationsSnapshot(key, generation, payload);
+  return payload;
+}
+
 async function cachedSlice(cache, inflight, key, refresh, compute) {
+  await syncTopicsGeneration(cache);
   const cached = cache.get(key);
   if (!refresh) {
     if (cached && Date.now() - cached.timestamp < WORKBENCH_SLICE_TTL_MS) return cached.payload;
@@ -477,7 +576,7 @@ export async function buildWorkbenchAnalyticsPayload(params, filters, loadSyncMo
     const termSample = await queryCachedDocumentPage({
       syncKey: documentCache.syncKey,
       filters,
-      limit: VISUALIZATION_DOCUMENT_LIMIT,
+      limit: ANALYTICS_TERM_SAMPLE_LIMIT,
       offset: 0,
     });
     termCooccurrence = buildTermCooccurrence(enrichDocumentSignals(termSample.documents));
@@ -506,7 +605,7 @@ export async function buildWorkbenchAnalyticsPayload(params, filters, loadSyncMo
   };
 }
 
-export async function buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule) {
+export async function buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule, { documentLimit = VISUALIZATION_DOCUMENT_LIMIT } = {}) {
   if (!await hasTopics()) {
     return {
       generatedAt: new Date().toISOString(),
@@ -518,29 +617,39 @@ export async function buildWorkbenchVisualizationsPayload(params, filters, loadS
     };
   }
   const documentCache = await documentCacheForParams(params, loadSyncModule);
-  const page = await queryTopicDocumentPage({
-    syncKey: documentCache.syncKey,
-    filters,
-    limit: VISUALIZATION_DOCUMENT_LIMIT,
-    offset: 0,
+  const result = await queryVisualizationDocuments({ syncKey: documentCache.syncKey, filters });
+  const documents = Number.isFinite(documentLimit) ? result.documents.slice(0, documentLimit) : result.documents;
+  const [topics, hierarchy, byYear] = await Promise.all([
+    loadTopics(),
+    loadTopicHierarchy(),
+    getTopicByYearCounts({ syncKey: documentCache.syncKey, filters }),
+  ]);
+  const aggregates = buildTopicVisualizations(documents, { topics, hierarchy, byYear });
+  const docIds = documents.map((doc) => doc.id).filter(Boolean);
+  const citationCooccurrence = await buildCitationCooccurrenceNetwork(docIds);
+  return visualizationSlice({
+    generatedAt: new Date().toISOString(),
+    source: {
+      documentCache,
+      filters,
+      aggregateSource: 'visualization-projection',
+      documentsAvailable: result.total,
+      documentsReturned: documents.length,
+      documentsTruncated: result.total > documents.length,
+      visualizationDocumentLimit: documentLimit,
+      readOnlyFileEnrichment: true,
+    },
+    ...aggregates,
+    citationCooccurrence,
+    documents,
   });
-  const sourceMeta = {
-    documentCache,
-    filters,
-    aggregateSource: 'bounded-topic-document-page',
-    documentsAvailable: page.total,
-    documentsReturned: page.documents.length,
-    documentsTruncated: page.total > page.documents.length,
-    visualizationDocumentLimit: VISUALIZATION_DOCUMENT_LIMIT,
-    readOnlyFileEnrichment: true,
-  };
-  const full = await buildMetricsPayloadFromRecords(page.documents, sourceMeta, params.subjectLimit, {
-    persistRun: params.isAdminRequest && params.refresh,
-  });
-  return visualizationSlice(full);
 }
 
 export async function warmWorkbenchLandingCache({ metricsCache, metricsInflight, loadSyncModule, params }) {
+  // Record the topics generation before computing so a swap that lands during
+  // warmup is noticed by the first request.
+  await syncTopicsGeneration(metricsCache);
+  registerLandingSource(params);
   // Match activeFilters(req)'s shape for an unfiltered request so the cache
   // key here lines up exactly with what the routes compute for real traffic.
   const filters = { degree: '', program: '', affiliation: '' };
@@ -560,11 +669,22 @@ export async function warmWorkbenchLandingCache({ metricsCache, metricsInflight,
     },
     {
       key: `workbench:visualizations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`,
-      compute: () => buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule),
+      compute: () => buildAndSaveSnapshot(
+        `workbench:visualizations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`,
+        () => buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule),
+      ),
     },
   ];
+  const vizKey = slices[3].key;
+  await seedSliceFromSnapshot(metricsCache, vizKey);
 
   const results = await Promise.all(slices.map(({ key, compute }) => {
+    // A fresh snapshot-seeded visualizations entry is served as-is; the normal
+    // stale-while-revalidate path rebuilds it once it ages out.
+    const existing = key === vizKey ? metricsCache.get(key) : null;
+    if (existing && Date.now() - existing.timestamp < WORKBENCH_SLICE_TTL_MS) {
+      return Promise.resolve(existing.payload);
+    }
     if (metricsInflight.has(key)) return metricsInflight.get(key);
     const promise = compute().then((payload) => {
       metricsCache.set(key, { timestamp: Date.now(), payload });
@@ -665,9 +785,15 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     if (!params) return;
     const filters = activeFilters(req);
     const key = `workbench:visualizations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`;
-    const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => (
-      buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule)
-    ));
+    const snapshotEligible = isUnfiltered(filters) && isLandingSource(params);
+    if (snapshotEligible && !params.refresh) {
+      await syncTopicsGeneration(metricsCache);
+      await seedSliceFromSnapshot(metricsCache, key);
+    }
+    const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
+      const build = () => buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule);
+      return snapshotEligible ? buildAndSaveSnapshot(key, build) : build();
+    });
     res.status(200).json(payload);
   }));
 

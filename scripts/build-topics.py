@@ -23,6 +23,7 @@ try:
 except ImportError:
     pass
 
+import gc
 import json
 import math
 import re
@@ -30,6 +31,7 @@ import sqlite3
 import argparse
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -37,6 +39,43 @@ MODEL_NAME = "allenai/specter2_base"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 MIN_TOPIC_SIZE = 5  # increased from 3 for cleaner, more cohesive clusters
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "metrics.sqlite")
+MIN_TOPIC_SIZE_DOCS_PER_TOPIC = 500  # default min_topic_size scales as n_docs / 500
+MAX_MISMATCH_LOG_LINES = 5
+
+
+def _positive_int_env(name):
+    """Return env var `name` as a positive int, or None if unset/invalid (invalid warns)."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    print(f"Warning: ignoring invalid {name}={raw!r} (expected a positive integer)", file=sys.stderr)
+    return None
+
+
+def resolve_min_topic_size(n_docs):
+    """BERTOPIC_MIN_TOPIC_SIZE if valid, else max(MIN_TOPIC_SIZE, round(n_docs / 500))."""
+    override = _positive_int_env("BERTOPIC_MIN_TOPIC_SIZE")
+    if override is not None:
+        if override >= 2:
+            return override
+        print(f"Warning: ignoring BERTOPIC_MIN_TOPIC_SIZE={override} (HDBSCAN needs at least 2); using the default",
+              file=sys.stderr)
+    return max(MIN_TOPIC_SIZE, round(n_docs / MIN_TOPIC_SIZE_DOCS_PER_TOPIC))
+
+
+def resolve_max_topics():
+    """BERTOPIC_MAX_TOPICS (positive int) or None for no cap."""
+    value = _positive_int_env("BERTOPIC_MAX_TOPICS")
+    if value is not None and value < 2:
+        print(f"Warning: ignoring BERTOPIC_MAX_TOPICS={value} (needs at least 2); no cap applied", file=sys.stderr)
+        return None
+    return value
 
 
 # DB connection and logging utilities
@@ -59,8 +98,230 @@ class SqliteClientWrapper:
         self.conn.commit()
         return ResultSet(cursor)
     
+    def batch(self, statements):
+        """Run (sql, params) statements in one transaction; roll back all on error."""
+        try:
+            for sql, params in statements:
+                self.conn.execute(sql, tuple(params) if params is not None else ())
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def close(self):
         self.conn.close()
+
+
+def retry_with_backoff(fn, what, retries=3):
+    """Call fn(), retrying with exponential backoff (0.5s, 1s, 2s, ...) up to `retries` times.
+
+    Re-raises the last error once the retries are exhausted. `what` names the
+    operation in the retry log line.
+    """
+    for attempt in range(retries + 1):
+        try:
+            return fn()
+        except Exception as ex:
+            if attempt >= retries:
+                raise
+            delay = 0.5 * (2 ** attempt)
+            print(f"  {what} failed (attempt {attempt + 1}/{retries + 1}): {ex}; retrying in {delay}s",
+                  file=sys.stderr)
+            time.sleep(delay)
+
+
+def write_statements(client, statements, chunk=500, retries=3):
+    """Run (sql, params) statements in order via client.batch, `chunk` statements per transaction.
+
+    Works on SqliteClientWrapper and libsql_client sync clients (both accept
+    (sql, params) tuples). Each chunk is retried with exponential backoff
+    (0.5s, 1s, 2s, ...) up to `retries` times, then the error is re-raised.
+    """
+    for start in range(0, len(statements), chunk):
+        part = [(sql, list(params)) for sql, params in statements[start:start + chunk]]
+        retry_with_backoff(
+            lambda: client.batch(part),
+            f"Batch write (rows {start}-{start + len(part) - 1})",
+            retries,
+        )
+
+
+def write_rows(client, sql, rows, chunk=500, retries=3):
+    """Write parameter lists for one statement via write_statements."""
+    write_statements(client, [(sql, params) for params in rows], chunk=chunk, retries=retries)
+
+
+# Live topic tables and their column definitions. Results are written to
+# "<name>_next" staging tables and swapped in with one transaction, so a failed
+# or interrupted job never leaves the live tables empty or half-written.
+# Table names are hard-coded constants (never built from external input).
+TOPIC_TABLE_SCHEMAS = {
+    "topics": (
+        "topic_id INTEGER PRIMARY KEY, label TEXT NOT NULL, top_terms TEXT NOT NULL, "
+        "doc_count INTEGER NOT NULL, model_name TEXT NOT NULL, created_at TEXT NOT NULL"
+    ),
+    "document_topics": (
+        "doc_id TEXT NOT NULL, topic_id INTEGER NOT NULL, probability REAL, "
+        "PRIMARY KEY (doc_id, topic_id)"
+    ),
+    "topic_hierarchy_meta": (
+        "id INTEGER PRIMARY KEY DEFAULT 1, leaf_topic_ids TEXT NOT NULL, "
+        "linkage_json TEXT NOT NULL, created_at TEXT NOT NULL"
+    ),
+    "document_topic_coords": (
+        "doc_id TEXT PRIMARY KEY, umap_x REAL NOT NULL, umap_y REAL NOT NULL"
+    ),
+}
+TOPIC_TABLE_COLUMNS = {
+    "topics": ["topic_id", "label", "top_terms", "doc_count", "model_name", "created_at"],
+    "document_topics": ["doc_id", "topic_id", "probability"],
+    "topic_hierarchy_meta": ["id", "leaf_topic_ids", "linkage_json", "created_at"],
+    "document_topic_coords": ["doc_id", "umap_x", "umap_y"],
+}
+
+
+def ensure_live_topic_tables(client):
+    for name, schema in TOPIC_TABLE_SCHEMAS.items():
+        client.execute(f"CREATE TABLE IF NOT EXISTS {name} ({schema})")
+
+
+def prepare_staging_topic_tables(client):
+    """Create the staging tables (same schema as live) and empty them."""
+    for name, schema in TOPIC_TABLE_SCHEMAS.items():
+        client.execute(f"CREATE TABLE IF NOT EXISTS {name}_next ({schema})")
+        client.execute(f"DELETE FROM {name}_next")
+
+
+def drop_staging_topic_tables(client):
+    """Best-effort cleanup of the staging tables; never raises."""
+    for name in TOPIC_TABLE_SCHEMAS:
+        try:
+            client.execute(f"DROP TABLE IF EXISTS {name}_next")
+        except Exception as ex:
+            print(f"  Warning: could not drop {name}_next: {ex}", file=sys.stderr)
+
+
+def staging_swap_committed(client, now):
+    """After a swap exception, True if the swap actually committed (response lost).
+
+    The swap drops topics_next inside its transaction, so its absence suggests
+    the transaction committed; we also require the live `topics` rows to carry
+    this run's `created_at` (`now`), so a stray missing staging table cannot be
+    mistaken for a commit. If the check itself fails, return False (keep the failure).
+    """
+    try:
+        rows = client.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'topics_next'"
+        ).rows
+        if len(rows) != 0:
+            return False
+        live = client.execute("SELECT 1 AS ok FROM topics WHERE created_at = ? LIMIT 1", [now]).rows
+        return len(live) > 0
+    except Exception:
+        return False
+
+
+TOPICS_GENERATION_KEY = "topics_generation"
+
+
+def publish_staged_topics(client, now):
+    """Swap staged rows into the live topic tables in ONE transaction.
+
+    For each table: DELETE live, INSERT live from staging (explicit columns),
+    DROP staging. The same transaction bumps the `topics_generation` setting to
+    `now` so web processes can invalidate cached topic slices. If any statement
+    fails the whole batch rolls back and the live tables keep their previous rows.
+    Refuses to swap (raises) when staged topics or assignments are empty.
+    """
+    for name in ("topics_next", "document_topics_next"):
+        n = client.execute(f"SELECT COUNT(*) AS c FROM {name}").rows[0]["c"]
+        if not n:
+            raise RuntimeError(f"Refusing to publish: staging table {name} is empty")
+    client.execute(
+        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT NOT NULL)"
+    )
+    statements = []
+    for name, columns in TOPIC_TABLE_COLUMNS.items():
+        cols = ", ".join(columns)
+        statements.append((f"DELETE FROM {name}", []))
+        statements.append((f"INSERT INTO {name} ({cols}) SELECT {cols} FROM {name}_next", []))
+        statements.append((f"DROP TABLE {name}_next", []))
+    statements.append((
+        "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        [TOPICS_GENERATION_KEY, now, now],
+    ))
+    client.batch(statements)
+
+
+EMBEDDING_PAGE_SIZE = 500  # 500 x 768-float JSON is ~7 MB per Turso response
+
+
+def load_cached_embeddings(client, doc_ids, page_size=EMBEDDING_PAGE_SIZE):
+    """Load cached embeddings for doc_ids into a float32 matrix using keyset pagination.
+
+    Returns (matrix, filled_mask, dim). Row i of matrix belongs to doc_ids[i];
+    filled_mask[i] is True when a usable cached vector was loaded for it. Rows
+    whose dimension differs from the first cached vector are treated as missing.
+    If nothing is cached, returns (None, filled_mask of all False, None) and the
+    caller allocates the matrix once it knows the dimension.
+    """
+    import numpy as np
+
+    indices_by_doc = {}
+    for idx, doc_id in enumerate(doc_ids):
+        indices_by_doc.setdefault(doc_id, []).append(idx)
+    filled = np.zeros(len(doc_ids), dtype=bool)
+    matrix = None
+    dim = None
+    mismatched = 0
+    malformed = 0
+    last_id = ""
+    while True:
+        res = retry_with_backoff(
+            lambda: client.execute(
+                "SELECT doc_id, embedding FROM document_embeddings WHERE doc_id > ? ORDER BY doc_id LIMIT ?",
+                [last_id, page_size],
+            ),
+            f"Embedding page read (after {last_id!r})",
+        )
+        rows = res.rows
+        if not rows:
+            break
+        last_id = rows[-1]["doc_id"]
+        for row in rows:
+            targets = indices_by_doc.get(row["doc_id"])
+            if not targets:
+                continue
+            try:
+                vec = json.loads(row["embedding"])
+                if not isinstance(vec, list):
+                    raise ValueError("not a JSON array")
+            except (ValueError, TypeError) as ex:
+                malformed += 1
+                if malformed <= MAX_MISMATCH_LOG_LINES:
+                    print(f"  Ignoring malformed cached embedding for {row['doc_id']}: {ex}")
+                continue
+            if dim is None:
+                dim = len(vec)
+                matrix = np.empty((len(doc_ids), dim), dtype=np.float32)
+            if len(vec) != dim:
+                mismatched += 1
+                if mismatched <= MAX_MISMATCH_LOG_LINES:
+                    print(f"  Ignoring cached embedding for {row['doc_id']}: dimension {len(vec)} != {dim}")
+                continue
+            for idx in targets:
+                matrix[idx] = vec
+                filled[idx] = True
+        n_rows = len(rows)
+        del rows, res
+        if n_rows < page_size:
+            break
+    if mismatched:
+        print(f"  {mismatched} cached embeddings had a mismatched dimension and will be re-encoded.")
+    if malformed:
+        print(f"  {malformed} cached embeddings were malformed and will be re-encoded.")
+    return matrix, filled, dim
 
 
 class DatabaseLogger:
@@ -373,7 +634,7 @@ def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key, r
         )
 
     prompt = (
-        "You are labeling topics discovered by clustering ~418 Education doctoral dissertation abstracts "
+        f"You are labeling topics discovered by clustering {len(abstracts)} Education doctoral dissertation abstracts "
         "from UBC (University of British Columbia). For each topic below, generate a short, descriptive "
         "label (3-6 words) that captures the core research theme. The label should be a noun phrase "
         "(e.g. 'Indigenous Education Policy', 'Teacher Identity & Resilience', 'Reading Comprehension Assessment').\n\n"
@@ -922,21 +1183,25 @@ def save_topic_label_candidates(client, candidates_by_topic, backend, model_name
         row = client.execute("SELECT MAX(id) AS id FROM topic_label_runs").rows[0]
         run_id = int(row["id"])
 
+    statements = []
     for topic_id, rows in candidates_by_topic.items():
-        client.execute("UPDATE topic_label_candidates SET status = 'rejected' WHERE topic_id = ? AND status = 'pending'", [topic_id])
+        statements.append((
+            "UPDATE topic_label_candidates SET status = 'rejected' WHERE topic_id = ? AND status = 'pending'",
+            [topic_id],
+        ))
         for row in rows:
-            status = "pending"
-            client.execute(
+            statements.append((
                 """
                 INSERT INTO topic_label_candidates
                   (run_id, topic_id, label, source, score, status, warnings_json, evidence_json, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
-                    int(run_id), topic_id, row["label"], row["source"], float(row["score"]), status,
+                    int(run_id), topic_id, row["label"], row["source"], float(row["score"]), "pending",
                     json.dumps(row["warnings"]), json.dumps(row["evidence"]), now
-                ]
-            )
+                ],
+            ))
+    write_statements(client, statements)
     return int(run_id)
 
 
@@ -965,16 +1230,18 @@ def choose_topic_labels(topic_model, topic_info, candidates_by_topic, overrides=
 
 
 def mark_auto_selected_candidates(client, candidates_by_topic, labels, overrides=None):
+    statements = []
     for topic_id, label in labels.items():
         if topic_id == -1 or (overrides and overrides.get(topic_id)):
             continue
         for candidate in candidates_by_topic.get(topic_id, []):
             if normalize_label_key(candidate["label"]) == normalize_label_key(label) and candidate["score"] >= 80 and not candidate["warnings"]:
-                client.execute(
+                statements.append((
                     "UPDATE topic_label_candidates SET status = 'auto_selected' WHERE topic_id = ? AND label = ? AND status = 'pending'",
-                    [topic_id, candidate["label"]]
-                )
+                    [topic_id, candidate["label"]],
+                ))
                 break
+    write_statements(client, statements)
 
 
 class ExistingTopicInfo:
@@ -1235,12 +1502,12 @@ def main():
                 detail="Retrieving cached embeddings from database..."
             )
         print("Checking for stored embeddings in database...")
-        stored_embeddings = {}
+        embeddings_matrix = None
+        filled_mask = None
+        _dim = None
         try:
-            embeddings_res = client.execute("SELECT doc_id, embedding FROM document_embeddings")
-            for row in embeddings_res.rows:
-                stored_embeddings[row["doc_id"]] = json.loads(row["embedding"])
-            print(f"Found {len(stored_embeddings)} cached embeddings in database.")
+            embeddings_matrix, filled_mask, _dim = load_cached_embeddings(client, doc_ids)
+            print(f"Found {int(filled_mask.sum())} cached embeddings in database.")
         except Exception as e:
             print(f"Could not load stored embeddings (table might not exist yet): {e}")
 
@@ -1249,23 +1516,19 @@ def main():
                 "check_cache",
                 "Checking Cache",
                 status="completed",
-                detail=f"Retrieved {len(stored_embeddings)} cached embeddings.",
+                detail=f"Retrieved {int(filled_mask.sum()) if filled_mask is not None else 0} cached embeddings.",
                 next_task="Computing Embeddings"
             )
 
         # 2. Compute embeddings incrementally
         import numpy as np
-        final_embeddings = []
-        docs_to_encode = []
-        docs_to_encode_indices = []
-
-        for idx, (doc_id, abstract) in enumerate(zip(doc_ids, abstracts)):
-            if doc_id in stored_embeddings:
-                final_embeddings.append(np.array(stored_embeddings[doc_id], dtype=np.float32))
-            else:
-                docs_to_encode.append(abstract)
-                docs_to_encode_indices.append(idx)
-                final_embeddings.append(None) # placeholder
+        if filled_mask is None:
+            filled_mask = np.zeros(len(doc_ids), dtype=bool)
+        docs_to_encode_indices = [i for i in range(len(doc_ids)) if not filled_mask[i]]
+        docs_to_encode = [abstracts[i] for i in docs_to_encode_indices]
+        cached_new = 0
+        batch_embeddings = None
+        cache_rows = None
 
         if docs_to_encode:
             print(f"Loading embedding model to encode {len(docs_to_encode)} new documents: {MODEL_NAME}")
@@ -1282,8 +1545,8 @@ def main():
             
             # Encode incrementally in batches of 32 to report real-time progress
             batch_size = 32
-            new_embeddings_list = []
-            for i in range(0, len(docs_to_encode), batch_size):
+            i = 0
+            while i < len(docs_to_encode):
                 batch = docs_to_encode[i:i+batch_size]
                 if reporter:
                     reporter.report(
@@ -1294,28 +1557,47 @@ def main():
                         counts={"processed": i, "total": len(docs_to_encode)}
                     )
                 batch_embeddings = embedding_model.encode(batch, show_progress_bar=False)
-                new_embeddings_list.extend(batch_embeddings)
-            new_embeddings = new_embeddings_list
-            
-            # Save new embeddings back to database and update placeholders
-            for i, new_emb in enumerate(new_embeddings):
-                orig_idx = docs_to_encode_indices[i]
-                doc_id = doc_ids[orig_idx]
-                emb_list = new_emb.tolist()
-                final_embeddings[orig_idx] = new_emb
-                
+
+                # The encoder's dimension can differ from the cached matrix (model changed,
+                # or the cache mixes dimensions). Nothing from this batch is written yet, so
+                # discard the cached matrix and re-encode every document at the new dimension.
+                if embeddings_matrix is not None and batch_embeddings.shape[1] != embeddings_matrix.shape[1]:
+                    print(f"Encoder dimension {batch_embeddings.shape[1]} != cached dimension "
+                          f"{embeddings_matrix.shape[1]}; discarding cached embeddings and re-encoding all "
+                          f"{len(doc_ids)} documents.")
+                    embeddings_matrix = None
+                    docs_to_encode_indices = list(range(len(doc_ids)))
+                    docs_to_encode = list(abstracts)
+                    i = 0
+                    continue
+
+                # Flush this batch to the cache now so progress survives a crash
+                now_iso = datetime.now(timezone.utc).isoformat()
+                cache_rows = []
+                for j, new_emb in enumerate(batch_embeddings):
+                    orig_idx = docs_to_encode_indices[i + j]
+                    if embeddings_matrix is None:
+                        embeddings_matrix = np.empty((len(doc_ids), len(new_emb)), dtype=np.float32)
+                    embeddings_matrix[orig_idx] = new_emb
+                    cache_rows.append([doc_ids[orig_idx], json.dumps(new_emb.tolist()), now_iso])
                 try:
-                    client.execute(
+                    write_rows(
+                        client,
                         "INSERT OR REPLACE INTO document_embeddings (doc_id, embedding, created_at) VALUES (?, ?, ?)",
-                        [doc_id, json.dumps(emb_list), datetime.now(timezone.utc).isoformat()]
+                        cache_rows,
                     )
+                    cached_new += len(cache_rows)
                 except Exception as ex:
-                    print(f"Failed to cache embedding for {doc_id}: {ex}")
-            print(f"Successfully cached {len(docs_to_encode)} new embeddings.")
+                    print(f"Failed to cache {len(cache_rows)} embeddings: {ex}")
+                i += batch_size
+
+            if cached_new == len(docs_to_encode):
+                print(f"Successfully cached {cached_new} new embeddings.")
+            else:
+                print(f"Cached {cached_new} of {len(docs_to_encode)} new embeddings; the rest will be re-encoded next run.")
             
             # Explicitly free up SentenceTransformer to save memory
             del embedding_model
-            import gc
             import torch
             gc.collect()
             if torch.cuda.is_available():
@@ -1326,7 +1608,7 @@ def main():
                     "compute_embeddings",
                     "Computing Embeddings",
                     status="completed",
-                    detail=f"Successfully encoded and cached {len(docs_to_encode)} documents.",
+                    detail=f"Encoded {len(docs_to_encode)} documents; cached {cached_new}.",
                     counts={"processed": len(docs_to_encode), "total": len(docs_to_encode)},
                     next_task="Clustering Topics"
                 )
@@ -1342,8 +1624,9 @@ def main():
                     next_task="Clustering Topics"
                 )
 
-        # Convert final_embeddings list to a single numpy array
-        embeddings_matrix = np.vstack(final_embeddings)
+        # The embedding matrix is complete; release the cache-loading intermediates
+        del filled_mask, _dim, docs_to_encode, docs_to_encode_indices, batch_embeddings, cache_rows
+        gc.collect()
 
         # Run BERTopic
         from bertopic import BERTopic
@@ -1362,8 +1645,10 @@ def main():
 
         vectorizer_model = CountVectorizer(stop_words=stop_words)
 
+        min_topic_size = resolve_min_topic_size(len(abstracts))
+        nr_topics = resolve_max_topics()
         hdbscan_model = HDBSCAN(
-            min_cluster_size=MIN_TOPIC_SIZE,
+            min_cluster_size=min_topic_size,
             min_samples=1,
             metric="euclidean",
             prediction_data=True,
@@ -1374,15 +1659,17 @@ def main():
                 "cluster_topics",
                 "Clustering Topics",
                 status="running",
-                detail="Fitting BERTopic model (UMAP & HDBSCAN)..."
+                detail=f"Fitting BERTopic model (UMAP & HDBSCAN, min_topic_size={min_topic_size}, nr_topics={nr_topics})..."
             )
-        print(f"Fitting BERTopic (min_topic_size={MIN_TOPIC_SIZE}, min_samples=1)...")
+        print(f"Fitting BERTopic (min_topic_size={min_topic_size}, nr_topics={nr_topics}, min_samples=1)...")
+        bertopic_kwargs = {"nr_topics": nr_topics} if nr_topics is not None else {}
         topic_model = BERTopic(
             embedding_model=MODEL_NAME,
-            min_topic_size=MIN_TOPIC_SIZE,
+            min_topic_size=min_topic_size,
             hdbscan_model=hdbscan_model,
             vectorizer_model=vectorizer_model,
             verbose=True,
+            **bertopic_kwargs,
         )
         topics, probs = topic_model.fit_transform(abstracts, embeddings=embeddings_matrix)
 
@@ -1439,13 +1726,14 @@ def main():
         existing_labels = load_existing_topic_labels(client)
         label_overrides = load_topic_label_overrides(client)
 
-        print(f"\nDiscovered {len(topic_info) - 1} topics (plus outlier cluster)")
+        print(f"\nDiscovered {len(topic_info) - 1} topics (plus outlier cluster); "
+              f"min_topic_size={min_topic_size}, nr_topics={nr_topics}")
         if reporter:
             reporter.report(
                 "cluster_topics",
                 "Clustering Topics",
                 status="completed",
-                detail=f"Discovered {len(topic_info) - 1} topics.",
+                detail=f"Discovered {len(topic_info) - 1} topics (min_topic_size={min_topic_size}, nr_topics={nr_topics}).",
                 next_task="Generating Labels"
             )
 
@@ -1471,40 +1759,12 @@ def main():
                 detail="Writing topics and assignments to database..."
             )
 
-        # Create tables
-        client.execute("""
-            CREATE TABLE IF NOT EXISTS topics (
-                topic_id    INTEGER PRIMARY KEY,
-                label       TEXT NOT NULL,
-                top_terms   TEXT NOT NULL,
-                doc_count   INTEGER NOT NULL,
-                model_name  TEXT NOT NULL,
-                created_at  TEXT NOT NULL
-            )
-        """)
-        client.execute("""
-            CREATE TABLE IF NOT EXISTS document_topics (
-                doc_id      TEXT NOT NULL,
-                topic_id    INTEGER NOT NULL,
-                probability REAL,
-                PRIMARY KEY (doc_id, topic_id)
-            )
-        """)
-        client.execute("""
-            CREATE TABLE IF NOT EXISTS topic_hierarchy_meta (
-                id              INTEGER PRIMARY KEY DEFAULT 1,
-                leaf_topic_ids  TEXT NOT NULL,
-                linkage_json    TEXT NOT NULL,
-                created_at      TEXT NOT NULL
-            )
-        """)
-
-        # Clear existing data (idempotent)
-        client.execute("DELETE FROM document_topics")
-        client.execute("DELETE FROM topics")
-        client.execute("DELETE FROM topic_hierarchy_meta")
+        # Live tables must exist (for the swap); results go to staging tables first
+        ensure_live_topic_tables(client)
+        prepare_staging_topic_tables(client)
 
         # Write topic rows
+        topic_rows = []
         for _, row in topic_info.iterrows():
             topic_id = int(row["Topic"])
             label = topic_labels.get(topic_id, bertopic_default_label(topic_model, topic_id, row))
@@ -1517,31 +1777,43 @@ def main():
             else:
                 top_terms_json = "[]"
 
-            client.execute(
-                "INSERT INTO topics (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                [topic_id, label, top_terms_json, count, MODEL_NAME, now],
-            )
+            topic_rows.append([topic_id, label, top_terms_json, count, MODEL_NAME, now])
+        write_rows(
+            client,
+            "INSERT OR REPLACE INTO topics_next (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            topic_rows,
+        )
         mark_auto_selected_candidates(client, label_candidates, topic_labels, label_overrides)
 
         # Write document-topic assignments
+        doc_topic_rows = []
         for i, (doc_id, topic_id) in enumerate(zip(doc_ids, topics)):
             prob = float(probs[i]) if probs is not None and len(probs) > i else None
             # probs can be a numpy array or list; handle both
             if hasattr(probs, "ndim") and probs.ndim == 2:
                 # Multi-topic probability matrix — take the max
                 prob = float(probs[i].max())
-            client.execute(
-                "INSERT INTO document_topics (doc_id, topic_id, probability) VALUES (?, ?, ?)",
-                [doc_id, int(topic_id), prob],
-            )
+            doc_topic_rows.append([doc_id, int(topic_id), prob])
+        write_rows(
+            client,
+            "INSERT OR REPLACE INTO document_topics_next (doc_id, topic_id, probability) VALUES (?, ?, ?)",
+            doc_topic_rows,
+        )
 
         # Save topic hierarchy linkage
         if leaf_topic_ids_json and linkage_json:
             client.execute(
-                "INSERT INTO topic_hierarchy_meta (id, leaf_topic_ids, linkage_json, created_at) VALUES (1, ?, ?, ?)",
+                "INSERT OR REPLACE INTO topic_hierarchy_meta_next (id, leaf_topic_ids, linkage_json, created_at) VALUES (1, ?, ?, ?)",
                 [leaf_topic_ids_json, linkage_json, now],
             )
             print(f"  Saved topic hierarchy ({len(all_topic_ids)} leaves, {len(linkage_matrix)} merges)")
+
+        # Release what the 2-D UMAP fit and the rest of the run no longer need
+        # (still needed: topic_model, topic_info, topic_labels, topics, doc_ids, abstracts, embeddings_matrix)
+        probs = doc_topic_rows = topic_rows = label_candidates = claude_labels = None
+        existing_labels = label_overrides = embeddings_raw = hierarchy_embeddings = None
+        dist_matrix = condensed = linkage_matrix = linkage_json = None
+        gc.collect()
 
         # Extract 2D UMAP projection for scatter plot visualization
         import umap
@@ -1551,21 +1823,22 @@ def main():
         reducer = umap.UMAP(n_components=2, random_state=42, metric="cosine")
         coords_2d = reducer.fit_transform(embeddings)
 
-        client.execute("""
-            CREATE TABLE IF NOT EXISTS document_topic_coords (
-                doc_id  TEXT PRIMARY KEY,
-                umap_x  REAL NOT NULL,
-                umap_y  REAL NOT NULL
-            )
-        """)
-        client.execute("DELETE FROM document_topic_coords")
-
-        for i, doc_id in enumerate(doc_ids):
-            client.execute(
-                "INSERT INTO document_topic_coords (doc_id, umap_x, umap_y) VALUES (?, ?, ?)",
-                [doc_id, float(coords_2d[i, 0]), float(coords_2d[i, 1])],
-            )
+        write_rows(
+            client,
+            "INSERT OR REPLACE INTO document_topic_coords_next (doc_id, umap_x, umap_y) VALUES (?, ?, ?)",
+            [[doc_id, float(coords_2d[i, 0]), float(coords_2d[i, 1])] for i, doc_id in enumerate(doc_ids)],
+        )
         print(f"  Saved 2D coordinates for {len(doc_ids)} documents")
+
+        # Atomically replace live topic tables with the staged results
+        try:
+            publish_staged_topics(client, now)
+        except Exception as swap_error:
+            if not staging_swap_committed(client, now):
+                raise
+            print(f"  Swap reported an error ({swap_error}) but staging tables are gone; "
+                  "the swap committed. Continuing as success.", file=sys.stderr)
+        print("  Published topics, assignments, hierarchy and coordinates")
         if reporter:
             reporter.report(
                 "save_results",
@@ -1607,6 +1880,8 @@ def main():
             
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
+        if not args.labels_only:
+            drop_staging_topic_tables(client)
         if reporter:
             reporter.report(
                 reporter.tasks[-1]["key"] if reporter.tasks else "run",
@@ -1625,11 +1900,6 @@ def main():
         db_logger.flush()
     client.close()
     print("Done.")
-
-
-if __name__ == "__main__":
-    main()
-
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
+import { promisify } from 'node:util';
 import { createClient } from '@libsql/client';
 import { SQLITE_PATH, PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL } from './config.js';
 import { logger } from './logger.js';
@@ -85,13 +87,27 @@ async function run(sql, args = []) {
   return { changes: changes(result) };
 }
 
+// Read-only statements are always safe to re-run, so get/all retry them on a
+// transient error. On Turso a long synchronous stretch (e.g. building a payload
+// over thousands of documents) lets the server close an idle keep-alive socket;
+// undici then reuses it and the next query fails with "fetch failed" / "other
+// side closed". Anything that is not a plain SELECT/WITH read keeps the
+// no-blanket-retry rule below.
+const READ_ONLY_SQL = /^\s*(SELECT|WITH)\b/i;
+const WRITE_KEYWORD = /\b(INSERT|UPDATE|DELETE|REPLACE|UPSERT)\b/i;
+
+function executeRead(sql, args) {
+  if (!READ_ONLY_SQL.test(sql) || WRITE_KEYWORD.test(sql)) return execute(sql, args);
+  return withDbRetry(() => execute(sql, args), { label: 'read' });
+}
+
 async function get(sql, args = []) {
-  const result = await execute(sql, args);
+  const result = await executeRead(sql, args);
   return result.rows[0] || null;
 }
 
 async function all(sql, args = []) {
-  const result = await execute(sql, args);
+  const result = await executeRead(sql, args);
   return result.rows;
 }
 
@@ -300,6 +316,13 @@ async function ensureSchema(client) {
     CREATE TABLE IF NOT EXISTS serving_projection_state (
       projection_key TEXT PRIMARY KEY,
       projection_value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS serving_snapshots (
+      snapshot_key TEXT PRIMARY KEY,
+      generation TEXT NOT NULL,
+      payload_gz BLOB NOT NULL,
       updated_at TEXT NOT NULL
     );
 
@@ -1748,6 +1771,63 @@ export async function queryTopicDocumentPage({
 }
 
 /**
+ * Slim per-document projection for the visualizations payload (#59): one row
+ * per topic-assigned eligible document, built in SQL so no metadata_json is
+ * transferred or parsed. Uses each document's highest-probability topic.
+ * Restricted/embargoed documents are excluded by the analytics access filter
+ * and have no document_terms rows. No LIMIT: callers get the full corpus.
+ */
+export async function queryVisualizationDocuments({ syncKey = null, filters = {} } = {}) {
+  const f = analyticalDocumentFilters({ syncKey, ...filters });
+  const rows = await all(`
+    SELECT d.doc_id AS id, d.title AS title, d.author AS author, d.year AS year,
+           bt.topic_id AS topic_id, bt.probability AS topic_probability,
+           c.umap_x AS umap_x, c.umap_y AS umap_y,
+           (SELECT json_group_array(t.term) FROM document_terms t
+             WHERE t.doc_id = d.doc_id AND t.kind = 'concept') AS concept_terms,
+           (SELECT json_group_array(t.term) FROM document_terms t
+             WHERE t.doc_id = d.doc_id AND t.kind = 'methodology') AS methodologies,
+           (SELECT json_group_array(p.name) FROM (
+              SELECT person_key, MIN(name) AS name FROM document_people
+              WHERE doc_id = d.doc_id AND role IN ('Supervisor', 'Co-Supervisor', 'Committee Member')
+              GROUP BY person_key
+            ) p) AS supervisors
+    FROM documents d
+    JOIN (
+      SELECT doc_id, topic_id, probability,
+             ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY probability DESC, topic_id ASC) AS rn
+      FROM document_topics
+    ) bt ON bt.doc_id = d.doc_id AND bt.rn = 1
+    LEFT JOIN document_topic_coords c ON c.doc_id = d.doc_id
+    ${f.where}
+    ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
+  `, f.args);
+  const parseList = (raw) => {
+    try {
+      const list = JSON.parse(raw || '[]');
+      return Array.isArray(list) ? list : [];
+    } catch {
+      return [];
+    }
+  };
+  const num = (v) => (v == null ? null : Number(v));
+  const documents = rows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    author: r.author,
+    year: num(r.year),
+    topicId: Number(r.topic_id),
+    topicProbability: num(r.topic_probability),
+    umapX: num(r.umap_x),
+    umapY: num(r.umap_y),
+    conceptTerms: parseList(r.concept_terms),
+    methodologies: parseList(r.methodologies),
+    supervisors: parseList(r.supervisors),
+  }));
+  return { total: documents.length, documents };
+}
+
+/**
  * Full-corpus per-document concept term lists from the document_terms
  * projection (kind='concept'), for feeding buildTermCooccurrence() without
  * transferring the whole metadata_json blob for every document. Docs that
@@ -2161,6 +2241,20 @@ async function computeTopicDataByYearSql(filters, qualifier, topics, hierarchy) 
   return parentInfo
     ? buildTopicsByYearFromCounts(parentInfo.parentClusters, countRows, parentInfo.leafToParent)
     : buildTopicsByYearFromCounts(topics, countRows);
+}
+
+/**
+ * Full-corpus topicData.byYear for the active filters, independent of any
+ * document page size. The visualizations payload only carries a bounded page
+ * of documents (for the scatter), so its by-year counts must come from here.
+ */
+export async function getTopicByYearCounts({ syncKey = null, filters: requestedFilters = {} } = {}) {
+  if (!await hasTopics()) return null;
+  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
+  const qualifier = filters.where ? 'AND' : 'WHERE';
+  const topics = await loadTopics();
+  const hierarchy = await loadTopicHierarchy();
+  return computeTopicDataByYearSql(filters, qualifier, topics, hierarchy);
 }
 
 // #15 supervisorNgramMatrix filter decision (per the plan's review
@@ -4027,6 +4121,40 @@ export async function setSetting(key, value) {
       value = excluded.value,
       updated_at = excluded.updated_at
   `, [key, value, now]);
+}
+
+// --- Serving snapshots (gzipped JSON payloads keyed by topics generation) ---
+
+const gzipAsync = promisify(zlib.gzip);
+const gunzipAsync = promisify(zlib.gunzip);
+
+export async function saveServingSnapshot(key, generation, payload) {
+  const gz = await gzipAsync(JSON.stringify(payload));
+  const bytes = new Uint8Array(gz.buffer, gz.byteOffset, gz.byteLength);
+  await run(`
+    INSERT INTO serving_snapshots (snapshot_key, generation, payload_gz, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(snapshot_key) DO UPDATE SET
+      generation = excluded.generation,
+      payload_gz = excluded.payload_gz,
+      updated_at = excluded.updated_at
+  `, [key, String(generation), bytes, new Date().toISOString()]);
+}
+
+export async function loadServingSnapshot(key) {
+  const row = await get(
+    'SELECT generation, payload_gz, updated_at FROM serving_snapshots WHERE snapshot_key = ?', [key]
+  );
+  if (!row) return null;
+  try {
+    const raw = row.payload_gz;
+    const buf = raw instanceof ArrayBuffer ? Buffer.from(raw) : Buffer.from(raw.buffer ?? raw, raw.byteOffset, raw.byteLength);
+    const payload = JSON.parse((await gunzipAsync(buf)).toString('utf8'));
+    return { generation: row.generation, payload, updatedAt: row.updated_at };
+  } catch (error) {
+    logger.warn('Ignoring undecodable serving snapshot', { key, error: error?.message || String(error) });
+    return null;
+  }
 }
 
 export async function getAllSettings() {

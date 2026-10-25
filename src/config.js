@@ -80,6 +80,25 @@ export const FLY_APP_NAME = process.env.FLY_APP_NAME || '';
 export const FLY_MACHINE_ID = process.env.FLY_MACHINE_ID || '';
 export const FLY_REGION = process.env.FLY_REGION || process.env.PRIMARY_REGION || '';
 export const FLY_WORKER_MEMORY_MB = Number(process.env.FLY_WORKER_MEMORY_MB || 2048);
+// Optional memory override (MB) for BERTopic Fly workers only. 0 = unset or
+// invalid (ignored); valid values are clamped to [2048, 32768] with a warning.
+export const BERTOPIC_WORKER_MEMORY_MIN_MB = 2048;
+export const BERTOPIC_WORKER_MEMORY_MAX_MB = 32768;
+export function parseBertopicWorkerMemoryMb(raw) {
+  const text = String(raw ?? '').trim();
+  if (!text) return 0;
+  const value = /^[1-9]\d*$/.test(text) ? Number(text) : NaN;
+  if (!Number.isSafeInteger(value)) {
+    console.warn(`Ignoring invalid BERTOPIC_WORKER_MEMORY_MB=${JSON.stringify(text)} (expected a positive integer)`);
+    return 0;
+  }
+  const clamped = Math.min(BERTOPIC_WORKER_MEMORY_MAX_MB, Math.max(BERTOPIC_WORKER_MEMORY_MIN_MB, value));
+  if (clamped !== value) {
+    console.warn(`BERTOPIC_WORKER_MEMORY_MB=${value} is outside [${BERTOPIC_WORKER_MEMORY_MIN_MB}, ${BERTOPIC_WORKER_MEMORY_MAX_MB}]; using ${clamped}`);
+  }
+  return clamped;
+}
+export const BERTOPIC_WORKER_MEMORY_MB = parseBertopicWorkerMemoryMb(process.env.BERTOPIC_WORKER_MEMORY_MB);
 export const FLY_WORKER_CPUS = Number(process.env.FLY_WORKER_CPUS || 1);
 export const FLY_WORKER_CPU_KIND = process.env.FLY_WORKER_CPU_KIND || 'shared';
 export const FLY_WORKER_REGION = process.env.FLY_WORKER_REGION || FLY_REGION || '';
