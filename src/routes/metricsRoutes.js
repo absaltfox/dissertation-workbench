@@ -652,9 +652,16 @@ export async function warmWorkbenchLandingCache({ metricsCache, metricsInflight,
       },
     },
   ];
-  await seedSliceFromSnapshot(metricsCache, slices[3].key);
+  const vizKey = slices[3].key;
+  await seedSliceFromSnapshot(metricsCache, vizKey);
 
   const results = await Promise.all(slices.map(({ key, compute }) => {
+    // A fresh snapshot-seeded visualizations entry is served as-is; the normal
+    // stale-while-revalidate path rebuilds it once it ages out.
+    const existing = key === vizKey ? metricsCache.get(key) : null;
+    if (existing && Date.now() - existing.timestamp < WORKBENCH_SLICE_TTL_MS) {
+      return Promise.resolve(existing.payload);
+    }
     if (metricsInflight.has(key)) return metricsInflight.get(key);
     const promise = compute().then((payload) => {
       metricsCache.set(key, { timestamp: Date.now(), payload });

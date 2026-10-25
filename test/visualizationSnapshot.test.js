@@ -107,3 +107,36 @@ test('filtered requests neither read nor write snapshots', async () => {
   assert.notEqual(res.body.generatedAt, SENTINEL);
   assert.deepEqual(await snapshotRow(), before);
 });
+
+const warmParams = {
+  maxRecords: 200, pageSize: 20, scanLimit: 1000, subjectLimit: 20, index: '', query: undefined,
+  term: undefined, source: undefined, apiKey: undefined, downloadFiles: false, forceDownload: false,
+  recomputeFromCache: false, refresh: false, isAdminRequest: false,
+  requestedDownloadFiles: false, requestedRecomputeFromCache: false,
+};
+
+async function warmWith(updatedAt, generation) {
+  await db.setSetting('topics_generation', generation);
+  const { gzipSync } = await import('node:zlib');
+  await client.execute({
+    sql: 'INSERT INTO serving_snapshots (snapshot_key, generation, payload_gz, updated_at) VALUES (?, ?, ?, ?)',
+    args: [routes.VISUALIZATIONS_SNAPSHOT_KEY, generation,
+      new Uint8Array(gzipSync(JSON.stringify({ generatedAt: SENTINEL }))), updatedAt],
+  });
+  const metricsCache = new Map();
+  await routes.warmWorkbenchLandingCache({
+    metricsCache, metricsInflight: new Map(), loadSyncModule, params: warmParams,
+  });
+  const key = [...metricsCache.keys()].find((k) => k.startsWith('workbench:visualizations:'));
+  return metricsCache.get(key).payload;
+}
+
+test('warmup serves a fresh matching snapshot without rebuilding the visualizations slice', async () => {
+  const payload = await warmWith(new Date().toISOString(), 'g5');
+  assert.equal(payload.generatedAt, SENTINEL);
+});
+
+test('warmup rebuilds when the snapshot is older than the TTL', async () => {
+  const payload = await warmWith('2000-01-01T00:00:00.000Z', 'g6');
+  assert.notEqual(payload.generatedAt, SENTINEL);
+});
