@@ -39,7 +39,13 @@ MODEL_NAME = "allenai/specter2_base"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 MIN_TOPIC_SIZE = 5  # increased from 3 for cleaner, more cohesive clusters
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "metrics.sqlite")
-MIN_TOPIC_SIZE_DOCS_PER_TOPIC = 500  # default min_topic_size scales as n_docs / 500
+MIN_TOPIC_SIZE_DOCS_PER_TOPIC = 700  # default min_topic_size scales as n_docs / 700 (20 at ~14k docs)
+# Fixed seed so a rebuild over unchanged data and settings reproduces the same topics.
+# Chosen once; never tune it to make results look better.
+TOPIC_RANDOM_STATE = 42
+# Merge clusters closer than this in UMAP space; a five-seed sweep (2026-10-25) showed
+# 1-2 points fewer outliers and more stable assignments than 0.
+HDBSCAN_CLUSTER_SELECTION_EPSILON = 0.1
 MAX_MISMATCH_LOG_LINES = 5
 
 
@@ -59,7 +65,7 @@ def _positive_int_env(name):
 
 
 def resolve_min_topic_size(n_docs):
-    """BERTOPIC_MIN_TOPIC_SIZE if valid, else max(MIN_TOPIC_SIZE, round(n_docs / 500))."""
+    """BERTOPIC_MIN_TOPIC_SIZE if valid, else max(MIN_TOPIC_SIZE, round(n_docs / MIN_TOPIC_SIZE_DOCS_PER_TOPIC))."""
     override = _positive_int_env("BERTOPIC_MIN_TOPIC_SIZE")
     if override is not None:
         if override >= 2:
@@ -67,6 +73,29 @@ def resolve_min_topic_size(n_docs):
         print(f"Warning: ignoring BERTOPIC_MIN_TOPIC_SIZE={override} (HDBSCAN needs at least 2); using the default",
               file=sys.stderr)
     return max(MIN_TOPIC_SIZE, round(n_docs / MIN_TOPIC_SIZE_DOCS_PER_TOPIC))
+
+
+def cluster_model_params(min_topic_size):
+    """Return (umap_kwargs, hdbscan_kwargs) for the BERTopic clustering fit.
+
+    UMAP uses BERTopic's default shape with the shared seed; HDBSCAN keeps
+    min_samples=1 and merges clusters closer than HDBSCAN_CLUSTER_SELECTION_EPSILON.
+    """
+    umap_kwargs = {
+        "n_neighbors": 15,
+        "n_components": 5,
+        "min_dist": 0.0,
+        "metric": "cosine",
+        "random_state": TOPIC_RANDOM_STATE,
+    }
+    hdbscan_kwargs = {
+        "min_cluster_size": min_topic_size,
+        "min_samples": 1,
+        "metric": "euclidean",
+        "cluster_selection_epsilon": HDBSCAN_CLUSTER_SELECTION_EPSILON,
+        "prediction_data": True,
+    }
+    return umap_kwargs, hdbscan_kwargs
 
 
 def resolve_max_topics():
@@ -1658,6 +1687,7 @@ def main():
         # Run BERTopic
         from bertopic import BERTopic
         from hdbscan import HDBSCAN
+        from umap import UMAP
         from sklearn.feature_extraction.text import CountVectorizer
         from sklearn.feature_extraction import text
 
@@ -1674,12 +1704,9 @@ def main():
 
         min_topic_size = resolve_min_topic_size(len(abstracts))
         nr_topics = resolve_max_topics()
-        hdbscan_model = HDBSCAN(
-            min_cluster_size=min_topic_size,
-            min_samples=1,
-            metric="euclidean",
-            prediction_data=True,
-        )
+        umap_kwargs, hdbscan_kwargs = cluster_model_params(min_topic_size)
+        umap_model = UMAP(**umap_kwargs)
+        hdbscan_model = HDBSCAN(**hdbscan_kwargs)
 
         if reporter:
             reporter.report(
@@ -1688,11 +1715,13 @@ def main():
                 status="running",
                 detail=f"Fitting BERTopic model (UMAP & HDBSCAN, min_topic_size={min_topic_size}, nr_topics={nr_topics})..."
             )
-        print(f"Fitting BERTopic (min_topic_size={min_topic_size}, nr_topics={nr_topics}, min_samples=1)...")
+        print(f"Fitting BERTopic (min_topic_size={min_topic_size}, nr_topics={nr_topics}, min_samples=1, "
+              f"cluster_selection_epsilon={HDBSCAN_CLUSTER_SELECTION_EPSILON}, seed={TOPIC_RANDOM_STATE})...")
         bertopic_kwargs = {"nr_topics": nr_topics} if nr_topics is not None else {}
         topic_model = BERTopic(
             embedding_model=MODEL_NAME,
             min_topic_size=min_topic_size,
+            umap_model=umap_model,
             hdbscan_model=hdbscan_model,
             vectorizer_model=vectorizer_model,
             verbose=True,
@@ -1847,7 +1876,7 @@ def main():
 
         print("\nComputing 2D UMAP projection for visualization...")
         embeddings = embeddings_matrix
-        reducer = umap.UMAP(n_components=2, random_state=42, metric="cosine")
+        reducer = umap.UMAP(n_components=2, random_state=TOPIC_RANDOM_STATE, metric="cosine")
         coords_2d = reducer.fit_transform(embeddings)
 
         write_rows(
