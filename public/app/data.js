@@ -683,12 +683,14 @@ async function loadVisualizationData() {
     const cached = state.tabData.visualizationsByFilterKey.get(key);
     Object.assign(state.payload, cached);
     mergeDocuments(cached.documents || []);
+    state.visualizationDocuments = cached.documents || [];
     return;
   }
   const data = await fetchWorkbenchJson('/api/workbench/visualizations', { filters: true });
   state.tabData.visualizationsByFilterKey.set(key, data);
   Object.assign(state.payload, data);
   mergeDocuments(data.documents || []);
+  state.visualizationDocuments = data.documents || [];
 }
 
 async function loadData({ refresh = false } = {}) {
@@ -716,6 +718,7 @@ async function loadData({ refresh = false } = {}) {
     state.detailByDocId = new Map();
     state.tabData.analyticsByFilterKey = new Map();
     state.tabData.visualizationsByFilterKey = new Map();
+    state.visualizationDocuments = [];
     state.tabData.peopleByFilterKey = new Map();
     state.tabData.citationsByFilterKey = new Map();
     state.citationDocs = [];

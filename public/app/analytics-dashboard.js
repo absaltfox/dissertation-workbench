@@ -77,8 +77,10 @@ async function setActiveAnalyticsTab(tabName) {
     section.classList.toggle('active', section.id === `analytics-${tabName}`);
   }
   if (tabName === 'visualizations' && state.payload) {
+    // Load (or reuse the per-filter cache of) the current facets' payload;
+    // facets may have changed while another sub-tab was showing.
     const visuals = await analyticsIntegrations.ensureTopicVisuals();
-    visuals?.renderVisualizations?.();
+    await visuals?.loadAndRenderVisualizations?.();
     return;
   }
   renderAnalytics();

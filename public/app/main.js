@@ -231,6 +231,10 @@ async function onFacetChange() {
     }
     if (analyticsTabActive) {
       await activeAnalytics.loadAndRenderAnalytics();
+      if (topicVisualsModulePromise && document.querySelector('#analytics-visualizations.active')) {
+        const visuals = await topicVisualsModulePromise;
+        await visuals.loadAndRenderVisualizations();
+      }
     } else {
       scheduleAnalyticsWarmup();
     }

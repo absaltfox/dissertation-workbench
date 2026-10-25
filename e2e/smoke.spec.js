@@ -58,6 +58,25 @@ test('analytics dashboard renders year charts', async ({ page }) => {
   }
 });
 
+test('facet filters narrow the topic cluster scatter', async ({ page }) => {
+  await openTab(page, 'analytics');
+  await page.locator('.sub-tab-btn[data-analytics-tab="visualizations"]').click();
+  const legend = page.locator('#topicClusterLegend');
+  await expect(legend).toContainText('Mathematics and Teacher Identity (3)');
+  await expect(legend).toContainText('Assessment and Literacy (2)');
+
+  // e2e-doc-5 is the only MA document, assigned to topic 1.
+  await page.locator('#filterDegree').selectOption('Master of Arts - MA');
+  await expect(legend).toContainText('Assessment and Literacy (1)');
+  await expect(legend).not.toContainText('Mathematics and Teacher Identity');
+
+  // Switching sub-tabs away and back keeps the filtered view.
+  await page.locator('.sub-tab-btn[data-analytics-tab="dashboard"]').click();
+  await page.locator('.sub-tab-btn[data-analytics-tab="visualizations"]').click();
+  await expect(legend).toContainText('Assessment and Literacy (1)');
+  await expect(legend).not.toContainText('Mathematics and Teacher Identity');
+});
+
 test('about tab renders without errors', async ({ page }) => {
   await openTab(page, 'about');
 });
