@@ -70,4 +70,4 @@
 
 ## After merge (needs approval)
 
-Push `worker-latest` and `labeler-latest` (both carry `build-topics.py`), deploy the web app, then run one full BERTopic rebuild: it publishes stop-word-free terms and labels chosen only from the new model's candidates (or BERTopic defaults). The 46 legacy overrides stay in the table, inert. Review labels in Admin → Topic Labels afterwards.
+Order matters. (1) Push `worker-latest` and `labeler-latest` first (both carry `build-topics.py`); an old worker image would still read `topics.label`/overrides and write runs with no generation. (2) Deploy the web app (its migration adds the columns and archives the 46 legacy overrides). (3) Run one full BERTopic rebuild **before any labels-only run**: until then `topics.label` holds the stale labels, and `run_label_only` seeds its fallback from `topics.label`. The rebuild publishes stop-word-free terms and labels chosen only from the new model's candidates (or BERTopic defaults). The 46 legacy overrides stay in the table, inert. Review labels in Admin → Topic Labels afterwards.
