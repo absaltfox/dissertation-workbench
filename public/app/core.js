@@ -240,6 +240,7 @@ const state = {
   analyticsLoadingKey: '',
   analyticsLoadingPromise: null,
   analyticsRequestToken: 0,
+  visualizationRequestToken: 0,
   user: null, // { username } or null
   pendingLogin: null,
   csrfToken: '',

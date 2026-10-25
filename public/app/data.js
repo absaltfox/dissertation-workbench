@@ -676,21 +676,25 @@ async function loadPersonDetail(personKey) {
   return person;
 }
 
+// Returns true when the current facets' payload was applied to state, false
+// when there is nothing to show or a newer load superseded this one.
 async function loadVisualizationData() {
-  if (!state.payload) return;
+  if (!state.payload) return false;
   const key = dataKey();
-  if (state.tabData.visualizationsByFilterKey.has(key)) {
-    const cached = state.tabData.visualizationsByFilterKey.get(key);
-    Object.assign(state.payload, cached);
-    mergeDocuments(cached.documents || []);
-    state.visualizationDocuments = cached.documents || [];
-    return;
+  // Every load takes a token, so an older in-flight fetch can't land on top
+  // of a newer (possibly cached) one.
+  const requestToken = state.visualizationRequestToken + 1;
+  state.visualizationRequestToken = requestToken;
+  let data = state.tabData.visualizationsByFilterKey.get(key);
+  if (!data) {
+    data = await fetchWorkbenchJson('/api/workbench/visualizations', { filters: true });
+    state.tabData.visualizationsByFilterKey.set(key, data);
+    if (requestToken !== state.visualizationRequestToken || key !== dataKey()) return false;
   }
-  const data = await fetchWorkbenchJson('/api/workbench/visualizations', { filters: true });
-  state.tabData.visualizationsByFilterKey.set(key, data);
   Object.assign(state.payload, data);
   mergeDocuments(data.documents || []);
   state.visualizationDocuments = data.documents || [];
+  return true;
 }
 
 async function loadData({ refresh = false } = {}) {

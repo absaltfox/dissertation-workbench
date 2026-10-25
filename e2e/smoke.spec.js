@@ -77,6 +77,29 @@ test('facet filters narrow the topic cluster scatter', async ({ page }) => {
   await expect(legend).not.toContainText('Mathematics and Teacher Identity');
 });
 
+test('a facet chosen on the dashboard sub-tab applies when visualizations open', async ({ page }) => {
+  await openTab(page, 'analytics');
+  await page.locator('#filterDegree').selectOption('Master of Arts - MA');
+  await page.locator('.sub-tab-btn[data-analytics-tab="visualizations"]').click();
+  const legend = page.locator('#topicClusterLegend');
+  await expect(legend).toContainText('Assessment and Literacy (1)');
+  await expect(legend).not.toContainText('Mathematics and Teacher Identity');
+});
+
+test('a facet chosen on another tab applies when returning to visualizations', async ({ page }) => {
+  await openTab(page, 'analytics');
+  await page.locator('.sub-tab-btn[data-analytics-tab="visualizations"]').click();
+  const legend = page.locator('#topicClusterLegend');
+  await expect(legend).toContainText('Mathematics and Teacher Identity (3)');
+
+  await openTab(page, 'records');
+  await page.locator('#filterDegree').selectOption('Master of Arts - MA');
+  await expect(docRows(page)).toHaveCount(1);
+  await openTab(page, 'analytics');
+  await expect(legend).toContainText('Assessment and Literacy (1)');
+  await expect(legend).not.toContainText('Mathematics and Teacher Identity');
+});
+
 test('about tab renders without errors', async ({ page }) => {
   await openTab(page, 'about');
 });

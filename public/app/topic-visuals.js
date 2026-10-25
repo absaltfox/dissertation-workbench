@@ -62,7 +62,7 @@ function initTopicVisuals() {
 async function loadAndRenderVisualizations() {
   try {
     await ensureD3Library();
-    await loadVisualizationData();
+    if (!await loadVisualizationData()) return;
   } catch (error) {
     setStatus(`Failed to load visualizations: ${error.message}`, true);
     return;

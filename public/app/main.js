@@ -85,6 +85,14 @@ async function ensurePeopleModule() {
   return peopleModulePromise;
 }
 
+// The Visualizations sub-tab keeps its own per-facet payload; reload it
+// whenever it is showing and the facets or data may have changed.
+async function refreshVisibleVisualizations() {
+  if (!document.querySelector('#analytics-visualizations.active')) return;
+  const visuals = await ensureTopicVisualsModule();
+  await visuals.loadAndRenderVisualizations();
+}
+
 async function ensureTopicVisualsModule() {
   if (!topicVisualsModulePromise) {
     topicVisualsModulePromise = import('./topic-visuals.js').then(async (mod) => {
@@ -167,6 +175,7 @@ async function activateTab(tabName, { updateUrl = true, resetToken = '' } = {}) 
   if (tabName === 'analytics' && state.payload) {
     const analytics = await ensureAnalyticsModule();
     await analytics.loadAndRenderAnalytics();
+    await refreshVisibleVisualizations();
   }
 
   if (tabName === 'admin') {
@@ -231,10 +240,7 @@ async function onFacetChange() {
     }
     if (analyticsTabActive) {
       await activeAnalytics.loadAndRenderAnalytics();
-      if (topicVisualsModulePromise && document.querySelector('#analytics-visualizations.active')) {
-        const visuals = await topicVisualsModulePromise;
-        await visuals.loadAndRenderVisualizations();
-      }
+      await refreshVisibleVisualizations();
     } else {
       scheduleAnalyticsWarmup();
     }
