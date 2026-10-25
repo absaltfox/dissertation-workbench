@@ -570,7 +570,8 @@ async function ensureSchema(client) {
       config_json  TEXT,
       error        TEXT,
       started_at   TEXT NOT NULL,
-      finished_at  TEXT
+      finished_at  TEXT,
+      generation   TEXT
     );
 
     CREATE TABLE IF NOT EXISTS topic_label_candidates (
@@ -593,7 +594,8 @@ async function ensureSchema(client) {
       source       TEXT NOT NULL,
       candidate_id INTEGER,
       created_at   TEXT NOT NULL,
-      updated_at   TEXT NOT NULL
+      updated_at   TEXT NOT NULL,
+      generation   TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_topic_label_candidates_topic ON topic_label_candidates(topic_id, created_at);
@@ -738,6 +740,8 @@ async function ensureSchema(client) {
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_path TEXT');
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_bytes INTEGER');
   await tryExec(client, 'ALTER TABLE file_metrics ADD COLUMN full_text_source_url TEXT');
+  await addColumnIfMissing(client, 'topic_label_runs', 'generation', 'TEXT');
+  await addColumnIfMissing(client, 'topic_label_overrides', 'generation', 'TEXT');
   await addColumnIfMissing(client, 'file_metrics', 'content_source', 'TEXT');
   await addColumnIfMissing(client, 'file_metrics', 'content_checksum', 'TEXT');
   await addColumnIfMissing(client, 'file_metrics', 'content_source_url', 'TEXT');
@@ -6227,10 +6231,11 @@ function mapTopicLabelCandidate(row) {
 
 export async function createTopicLabelRun({ backend, modelName, status = 'running', config = null }) {
   const now = new Date().toISOString();
+  const generation = await getSetting('topics_generation');
   const result = await execute(`
-    INSERT INTO topic_label_runs (backend, model_name, status, config_json, started_at)
-    VALUES (?, ?, ?, ?, ?)
-  `, [backend || 'unknown', modelName || 'unknown', status, config ? JSON.stringify(config) : null, now]);
+    INSERT INTO topic_label_runs (backend, model_name, status, config_json, started_at, generation)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `, [backend || 'unknown', modelName || 'unknown', status, config ? JSON.stringify(config) : null, now, generation]);
   return Number(result.lastInsertRowid || result.lastInsertId || 0);
 }
 
@@ -6243,14 +6248,16 @@ export async function finishTopicLabelRun(runId, { status = 'completed', error =
 }
 
 export async function listTopicLabelReviews() {
+  const generation = await getSetting('topics_generation');
   const [topics, candidates, overrides, docRows, runs] = await Promise.all([
     all('SELECT topic_id, label, top_terms, doc_count, model_name, created_at FROM topics ORDER BY doc_count DESC'),
     all(`
       SELECT id, run_id, topic_id, label, source, score, status, warnings_json, evidence_json, created_at
       FROM topic_label_candidates
+      WHERE run_id IN (SELECT id FROM topic_label_runs WHERE generation = ?)
       ORDER BY topic_id, score DESC, created_at DESC
-    `),
-    all('SELECT topic_id, label, source, candidate_id, created_at, updated_at FROM topic_label_overrides'),
+    `, [generation]),
+    all('SELECT topic_id, label, source, candidate_id, created_at, updated_at FROM topic_label_overrides WHERE generation = ?', [generation]),
     all(`
       SELECT dt.topic_id, d.metadata_json
       FROM document_topics dt
@@ -6346,18 +6353,20 @@ export async function selectTopicLabelCandidate(topicId, candidateId) {
   `, [Number(candidateId), Number(topicId)]);
   if (!candidate) return null;
   const now = new Date().toISOString();
+  const generation = await getSetting('topics_generation');
   await run('UPDATE topic_label_candidates SET status = ? WHERE topic_id = ? AND status != ?', ['rejected', Number(topicId), 'rejected']);
   await run('UPDATE topic_label_candidates SET status = ? WHERE id = ?', ['selected', Number(candidateId)]);
   await run('UPDATE topics SET label = ? WHERE topic_id = ?', [candidate.label, Number(topicId)]);
   await run(`
-    INSERT INTO topic_label_overrides (topic_id, label, source, candidate_id, created_at, updated_at)
-    VALUES (?, ?, 'selected', ?, ?, ?)
+    INSERT INTO topic_label_overrides (topic_id, label, source, candidate_id, created_at, updated_at, generation)
+    VALUES (?, ?, 'selected', ?, ?, ?, ?)
     ON CONFLICT(topic_id) DO UPDATE SET
       label = excluded.label,
       source = excluded.source,
       candidate_id = excluded.candidate_id,
-      updated_at = excluded.updated_at
-  `, [Number(topicId), candidate.label, Number(candidateId), now, now]);
+      updated_at = excluded.updated_at,
+      generation = excluded.generation
+  `, [Number(topicId), candidate.label, Number(candidateId), now, now, generation]);
   return { topicId: Number(topicId), label: candidate.label, candidateId: Number(candidateId) };
 }
 
@@ -6367,16 +6376,18 @@ export async function updateTopicManualLabel(topicId, label) {
   const existing = await get('SELECT topic_id FROM topics WHERE topic_id = ?', [Number(topicId)]);
   if (!existing) return null;
   const now = new Date().toISOString();
+  const generation = await getSetting('topics_generation');
   await run('UPDATE topics SET label = ? WHERE topic_id = ?', [normalized, Number(topicId)]);
   await run(`
-    INSERT INTO topic_label_overrides (topic_id, label, source, candidate_id, created_at, updated_at)
-    VALUES (?, ?, 'manual', NULL, ?, ?)
+    INSERT INTO topic_label_overrides (topic_id, label, source, candidate_id, created_at, updated_at, generation)
+    VALUES (?, ?, 'manual', NULL, ?, ?, ?)
     ON CONFLICT(topic_id) DO UPDATE SET
       label = excluded.label,
       source = excluded.source,
       candidate_id = NULL,
-      updated_at = excluded.updated_at
-  `, [Number(topicId), normalized, now, now]);
+      updated_at = excluded.updated_at,
+      generation = excluded.generation
+  `, [Number(topicId), normalized, now, now, generation]);
   return { topicId: Number(topicId), label: normalized };
 }
 
@@ -6386,14 +6397,16 @@ export async function deleteTopicLabelOverride(topicId) {
 }
 
 export async function publishPassingTopicLabels() {
+  const generation = await getSetting('topics_generation');
   const rows = await all(`
     SELECT c.id, c.topic_id, c.label, c.score, c.warnings_json
     FROM topic_label_candidates c
-    LEFT JOIN topic_label_overrides o ON o.topic_id = c.topic_id
+    LEFT JOIN topic_label_overrides o ON o.topic_id = c.topic_id AND o.generation = ?
     WHERE o.topic_id IS NULL
+      AND c.run_id IN (SELECT id FROM topic_label_runs WHERE generation = ?)
       AND c.status IN ('pending', 'selected', 'auto_selected')
     ORDER BY c.topic_id, c.score DESC, c.created_at DESC
-  `);
+  `, [generation, generation]);
   const bestByTopic = new Map();
   for (const row of rows) {
     const topicId = Number(row.topic_id);
