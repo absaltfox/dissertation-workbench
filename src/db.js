@@ -754,7 +754,17 @@ async function ensureSchema(client) {
       archived_at  TEXT NOT NULL
     )
   `);
-  await client.execute({
+  // Read first so an up-to-date database takes no write lock on startup.
+  const unarchived = await client.execute(`
+    SELECT 1 FROM topic_label_overrides o
+    WHERE o.generation IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM topic_label_overrides_archive a
+        WHERE a.topic_id = o.topic_id AND a.label = o.label AND a.created_at = o.created_at
+      )
+    LIMIT 1
+  `);
+  if (unarchived.rows.length) await client.execute({
     sql: `
       INSERT INTO topic_label_overrides_archive
         (topic_id, label, source, candidate_id, created_at, updated_at, generation, archived_at)
