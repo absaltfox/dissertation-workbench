@@ -1,6 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import { createClient } from '@libsql/client';
 import { SQLITE_PATH, PDF_CACHE_DIR, FULL_TEXT_CACHE_DIR, TURSO_AUTH_TOKEN, TURSO_DATABASE_URL } from './config.js';
 import { logger } from './logger.js';
@@ -314,6 +315,13 @@ async function ensureSchema(client) {
     CREATE TABLE IF NOT EXISTS serving_projection_state (
       projection_key TEXT PRIMARY KEY,
       projection_value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS serving_snapshots (
+      snapshot_key TEXT PRIMARY KEY,
+      generation TEXT NOT NULL,
+      payload_gz BLOB NOT NULL,
       updated_at TEXT NOT NULL
     );
 
@@ -4112,6 +4120,37 @@ export async function setSetting(key, value) {
       value = excluded.value,
       updated_at = excluded.updated_at
   `, [key, value, now]);
+}
+
+// --- Serving snapshots (gzipped JSON payloads keyed by topics generation) ---
+
+export async function saveServingSnapshot(key, generation, payload) {
+  const gz = zlib.gzipSync(JSON.stringify(payload));
+  const bytes = new Uint8Array(gz.buffer, gz.byteOffset, gz.byteLength);
+  await run(`
+    INSERT INTO serving_snapshots (snapshot_key, generation, payload_gz, updated_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(snapshot_key) DO UPDATE SET
+      generation = excluded.generation,
+      payload_gz = excluded.payload_gz,
+      updated_at = excluded.updated_at
+  `, [key, String(generation), bytes, new Date().toISOString()]);
+}
+
+export async function loadServingSnapshot(key) {
+  const row = await get(
+    'SELECT generation, payload_gz, updated_at FROM serving_snapshots WHERE snapshot_key = ?', [key]
+  );
+  if (!row) return null;
+  try {
+    const raw = row.payload_gz;
+    const buf = raw instanceof ArrayBuffer ? Buffer.from(raw) : Buffer.from(raw.buffer ?? raw, raw.byteOffset, raw.byteLength);
+    const payload = JSON.parse(zlib.gunzipSync(buf).toString('utf8'));
+    return { generation: row.generation, payload, updatedAt: row.updated_at };
+  } catch (error) {
+    logger.warn('Ignoring undecodable serving snapshot', { key, error: error?.message || String(error) });
+    return null;
+  }
 }
 
 export async function getAllSettings() {

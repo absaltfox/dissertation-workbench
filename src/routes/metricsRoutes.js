@@ -9,10 +9,11 @@ import {
 import {
   applyCitationCountsToDocuments, applyCommitteeMembersToDocuments,
   applyStoredFileMetricsToDocuments, getDocumentCacheStats, getDocumentServingAnalytics, getDocumentServingSummary,
-  getSetting, getTopicByYearCounts, hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics, loadTopicHierarchy,
+  getSetting, loadServingSnapshot, saveServingSnapshot, getTopicByYearCounts, hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics, loadTopicHierarchy,
   queryCachedDocumentPage, queryCitationDocumentPage, queryConceptTermsByDoc, queryPeoplePage, queryPersonDetailPage,
   queryRelatedDocuments, queryVisualizationDocuments
 } from '../db.js';
+import { logger } from '../logger.js';
 import { authenticate } from '../auth.js';
 import { getConfiguredApiKey } from '../secrets.js';
 import { parseBooleanParam, parseNumberParam, validateMetricsParams } from '../validate.js';
@@ -455,6 +456,38 @@ export async function syncTopicsGeneration(cache, {
   return state.pending;
 }
 
+export const VISUALIZATIONS_SNAPSHOT_KEY = 'workbench:visualizations:unfiltered';
+
+const isUnfiltered = (filters) => !filters.degree && !filters.program && !filters.affiliation;
+
+// Seeds an empty in-memory slice from the persisted snapshot when it was built
+// for the current topics generation. Never throws.
+export async function seedSliceFromSnapshot(cache, key) {
+  try {
+    if (cache.get(key)) return false;
+    const snapshot = await loadServingSnapshot(VISUALIZATIONS_SNAPSHOT_KEY);
+    if (!snapshot) return false;
+    const generation = await getSetting('topics_generation');
+    if (generation == null || snapshot.generation !== generation) return false;
+    const timestamp = Date.parse(snapshot.updatedAt);
+    cache.set(key, { timestamp: Number.isFinite(timestamp) ? timestamp : 0, payload: snapshot.payload });
+    return true;
+  } catch (error) {
+    logger.warn('Could not seed visualizations from snapshot', { error: error?.message || String(error) });
+    return false;
+  }
+}
+
+async function saveVisualizationsSnapshot(payload) {
+  try {
+    const generation = await getSetting('topics_generation');
+    if (generation == null) return;
+    await saveServingSnapshot(VISUALIZATIONS_SNAPSHOT_KEY, generation, payload);
+  } catch (error) {
+    logger.warn('Could not save visualizations snapshot', { error: error?.message || String(error) });
+  }
+}
+
 async function cachedSlice(cache, inflight, key, refresh, compute) {
   await syncTopicsGeneration(cache);
   const cached = cache.get(key);
@@ -612,9 +645,14 @@ export async function warmWorkbenchLandingCache({ metricsCache, metricsInflight,
     },
     {
       key: `workbench:visualizations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`,
-      compute: () => buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule),
+      compute: async () => {
+        const payload = await buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule);
+        await saveVisualizationsSnapshot(payload);
+        return payload;
+      },
     },
   ];
+  await seedSliceFromSnapshot(metricsCache, slices[3].key);
 
   const results = await Promise.all(slices.map(({ key, compute }) => {
     if (metricsInflight.has(key)) return metricsInflight.get(key);
@@ -717,9 +755,16 @@ export function createMetricsRouter({ metricsCache, metricsInflight, loadSyncMod
     if (!params) return;
     const filters = activeFilters(req);
     const key = `workbench:visualizations:${sourceCacheKey(params)}:${JSON.stringify(filters)}`;
-    const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => (
-      buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule)
-    ));
+    const unfiltered = isUnfiltered(filters);
+    if (unfiltered && !params.refresh) {
+      await syncTopicsGeneration(metricsCache);
+      await seedSliceFromSnapshot(metricsCache, key);
+    }
+    const payload = await cachedSlice(metricsCache, metricsInflight, key, params.refresh, async () => {
+      const built = await buildWorkbenchVisualizationsPayload(params, filters, loadSyncModule);
+      if (unfiltered) await saveVisualizationsSnapshot(built);
+      return built;
+    });
     res.status(200).json(payload);
   }));
 
