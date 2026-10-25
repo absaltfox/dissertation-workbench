@@ -78,6 +78,15 @@ def resolve_max_topics():
     return value
 
 
+def refresh_topic_representation(topic_model, docs, topics, vectorizer_model):
+    """Recompute topic representations while keeping the stop-word vectorizer.
+
+    BERTopic's update_topics() falls back to a default CountVectorizer when
+    vectorizer_model is omitted, which silently drops the stop-word list.
+    """
+    topic_model.update_topics(docs, topics=topics, vectorizer_model=vectorizer_model)
+
+
 # DB connection and logging utilities
 class SqliteClientWrapper:
     def __init__(self, db_path):
@@ -1681,7 +1690,7 @@ def main():
         if outlier_count > 0:
             print(f"\nReducing outliers ({outlier_count} docs) using c-TF-IDF strategy...")
             topics = topic_model.reduce_outliers(abstracts, topics, strategy="c-tf-idf", threshold=0.15)
-            topic_model.update_topics(abstracts, topics=topics)
+            refresh_topic_representation(topic_model, abstracts, topics, vectorizer_model)
             new_outliers = sum(1 for t in topics if t == -1)
             print(f"  Outliers reduced: {outlier_count} -> {new_outliers}")
 
