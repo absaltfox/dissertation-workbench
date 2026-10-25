@@ -85,13 +85,27 @@ async function run(sql, args = []) {
   return { changes: changes(result) };
 }
 
+// Read-only statements are always safe to re-run, so get/all retry them on a
+// transient error. On Turso a long synchronous stretch (e.g. building a payload
+// over thousands of documents) lets the server close an idle keep-alive socket;
+// undici then reuses it and the next query fails with "fetch failed" / "other
+// side closed". Anything that is not a plain SELECT/WITH read keeps the
+// no-blanket-retry rule below.
+const READ_ONLY_SQL = /^\s*(SELECT|WITH)\b/i;
+const WRITE_KEYWORD = /\b(INSERT|UPDATE|DELETE|REPLACE|UPSERT)\b/i;
+
+function executeRead(sql, args) {
+  if (!READ_ONLY_SQL.test(sql) || WRITE_KEYWORD.test(sql)) return execute(sql, args);
+  return withDbRetry(() => execute(sql, args), { label: 'read' });
+}
+
 async function get(sql, args = []) {
-  const result = await execute(sql, args);
+  const result = await executeRead(sql, args);
   return result.rows[0] || null;
 }
 
 async function all(sql, args = []) {
-  const result = await execute(sql, args);
+  const result = await executeRead(sql, args);
   return result.rows;
 }
 
