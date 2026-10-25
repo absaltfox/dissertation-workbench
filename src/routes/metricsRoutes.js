@@ -22,7 +22,10 @@ import { hasValidCsrf } from '../middleware/adminAuth.js';
 const WORKBENCH_SLICE_TTL_MS = CACHE_TTL_MS;
 const ANALYTICS_DOCUMENT_SAMPLE_LIMIT = 100;
 const DETAILED_ANALYTICS_RECORD_LIMIT = 5000;
-const VISUALIZATION_DOCUMENT_LIMIT = 5000;
+const VISUALIZATION_DOCUMENT_LIMIT = Infinity;
+// Analytics termCooccurrence sample (a separate endpoint). Kept bounded: it is
+// a pairwise self-join, and must not inherit the visualization scatter limit.
+const ANALYTICS_TERM_SAMPLE_LIMIT = 5000;
 // Hard server-side ceiling on /api/metrics regardless of role (#24). This route
 // runs every JS aggregator in buildMetricsPayloadFromRecords over whatever
 // record count it is handed and synchronously serializes the whole `documents`
@@ -517,7 +520,7 @@ export async function buildWorkbenchAnalyticsPayload(params, filters, loadSyncMo
     const termSample = await queryCachedDocumentPage({
       syncKey: documentCache.syncKey,
       filters,
-      limit: VISUALIZATION_DOCUMENT_LIMIT,
+      limit: ANALYTICS_TERM_SAMPLE_LIMIT,
       offset: 0,
     });
     termCooccurrence = buildTermCooccurrence(enrichDocumentSignals(termSample.documents));
@@ -559,7 +562,7 @@ export async function buildWorkbenchVisualizationsPayload(params, filters, loadS
   }
   const documentCache = await documentCacheForParams(params, loadSyncModule);
   const result = await queryVisualizationDocuments({ syncKey: documentCache.syncKey, filters });
-  const documents = result.documents.slice(0, documentLimit);
+  const documents = Number.isFinite(documentLimit) ? result.documents.slice(0, documentLimit) : result.documents;
   const [topics, hierarchy, byYear] = await Promise.all([
     loadTopics(),
     loadTopicHierarchy(),
