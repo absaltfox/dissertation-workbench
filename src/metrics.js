@@ -787,7 +787,7 @@ export function buildSupervisorNetwork(records, minEdge = 1, topN = 30) {
 // document sample the rest of this payload is scoped to, instead of the
 // caller's bound silently being ignored while this one panel's cost tracks
 // the full corpus's citation-table size.
-async function buildCitationCooccurrenceNetwork(docIds = null) {
+export async function buildCitationCooccurrenceNetwork(docIds = null) {
   const rows = await getCitationCooccurrence(100, docIds);
   const nodeMap = new Map();
 
@@ -844,6 +844,25 @@ function buildMethodologyTopicMatrix(records, topics) {
     methodologies: topMethodologies,
     topics: validTopics.map(t => ({ topicId: t.topicId, label: t.label })),
     matrix
+  };
+}
+
+// #59: pure, synchronous aggregates for the visualizations slice. Takes the
+// slim projection documents (already topic-assigned and access-filtered in
+// SQL) and builds only the panels the slice returns. A non-null byYear (full
+// corpus from SQL) wins over one derived from the supplied documents.
+export function buildTopicVisualizations(documents, { topics, hierarchy = null, byYear = null } = {}) {
+  let resolvedByYear = byYear;
+  if (!resolvedByYear) {
+    const parentInfo = hierarchy ? buildParentClusters(hierarchy, topics) : null;
+    resolvedByYear = parentInfo
+      ? buildTopicsByYear(parentInfo.parentClusters, documents, parentInfo.leafToParent)
+      : buildTopicsByYear(topics, documents);
+  }
+  return {
+    topicData: { topics, byYear: resolvedByYear, hierarchy },
+    supervisorNetwork: buildSupervisorNetwork(documents),
+    methodologyTopicMatrix: buildMethodologyTopicMatrix(documents, topics),
   };
 }
 

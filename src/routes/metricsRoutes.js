@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import {
-  buildMetricsPayloadFromRecords, collectMetricRecords, collectMetrics, enrichDocumentSignals, buildTermCooccurrence
+  buildMetricsPayloadFromRecords, collectMetricRecords, collectMetrics, enrichDocumentSignals, buildTermCooccurrence,
+  buildTopicVisualizations, buildCitationCooccurrenceNetwork
 } from '../metrics.js';
 import {
   ALLOW_PUBLIC_REFRESH, CACHE_TTL_MS, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT
@@ -8,9 +9,9 @@ import {
 import {
   applyCitationCountsToDocuments, applyCommitteeMembersToDocuments,
   applyStoredFileMetricsToDocuments, getDocumentCacheStats, getDocumentServingAnalytics, getDocumentServingSummary,
-  getSetting, getTopicByYearCounts, hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics,
+  getSetting, getTopicByYearCounts, hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics, loadTopicHierarchy,
   queryCachedDocumentPage, queryCitationDocumentPage, queryConceptTermsByDoc, queryPeoplePage, queryPersonDetailPage,
-  queryRelatedDocuments, queryTopicDocumentPage
+  queryRelatedDocuments, queryVisualizationDocuments
 } from '../db.js';
 import { authenticate } from '../auth.js';
 import { getConfiguredApiKey } from '../secrets.js';
@@ -557,33 +558,32 @@ export async function buildWorkbenchVisualizationsPayload(params, filters, loadS
     };
   }
   const documentCache = await documentCacheForParams(params, loadSyncModule);
-  const page = await queryTopicDocumentPage({
-    syncKey: documentCache.syncKey,
-    filters,
-    limit: documentLimit,
-    offset: 0,
+  const result = await queryVisualizationDocuments({ syncKey: documentCache.syncKey, filters });
+  const documents = result.documents.slice(0, documentLimit);
+  const [topics, hierarchy, byYear] = await Promise.all([
+    loadTopics(),
+    loadTopicHierarchy(),
+    getTopicByYearCounts({ syncKey: documentCache.syncKey, filters }),
+  ]);
+  const aggregates = buildTopicVisualizations(documents, { topics, hierarchy, byYear });
+  const docIds = documents.map((doc) => doc.id).filter(Boolean);
+  const citationCooccurrence = await buildCitationCooccurrenceNetwork(docIds);
+  return visualizationSlice({
+    generatedAt: new Date().toISOString(),
+    source: {
+      documentCache,
+      filters,
+      aggregateSource: 'visualization-projection',
+      documentsAvailable: result.total,
+      documentsReturned: documents.length,
+      documentsTruncated: result.total > documents.length,
+      visualizationDocumentLimit: documentLimit,
+      readOnlyFileEnrichment: true,
+    },
+    ...aggregates,
+    citationCooccurrence,
+    documents,
   });
-  const sourceMeta = {
-    documentCache,
-    filters,
-    aggregateSource: 'bounded-topic-document-page',
-    documentsAvailable: page.total,
-    documentsReturned: page.documents.length,
-    documentsTruncated: page.total > page.documents.length,
-    visualizationDocumentLimit: documentLimit,
-    readOnlyFileEnrichment: true,
-  };
-  const full = await buildMetricsPayloadFromRecords(page.documents, sourceMeta, params.subjectLimit, {
-    persistRun: params.isAdminRequest && params.refresh,
-  });
-  // The document page above is bounded, so topicData.byYear computed from it
-  // would undercount on large corpora (and, once merged client-side, would
-  // overwrite the full-corpus analytics counts). Source it from SQL instead.
-  if (full.topicData) {
-    const byYear = await getTopicByYearCounts({ syncKey: documentCache.syncKey, filters });
-    if (byYear) full.topicData.byYear = byYear;
-  }
-  return visualizationSlice(full);
 }
 
 export async function warmWorkbenchLandingCache({ metricsCache, metricsInflight, loadSyncModule, params }) {
