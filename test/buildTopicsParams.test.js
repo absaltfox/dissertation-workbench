@@ -33,17 +33,17 @@ ${body}
 }
 
 test('resolve_min_topic_size scales with corpus size and floors at 5', () => {
-  const r = runPython(`print(json.dumps([bt.resolve_min_topic_size(n) for n in (10, 100, 3500, 13655, 14000)]))`);
-  assert.deepEqual(r, [5, 5, 5, 20, 20]);
+  const r = runPython(`print(json.dumps([bt.resolve_min_topic_size(n) for n in (10, 100, 2500, 13655, 14000)]))`);
+  assert.deepEqual(r, [5, 5, 5, 27, 28]);
 });
 
-test('cluster_model_params seeds UMAP and merges nearby HDBSCAN clusters', () => {
+test('cluster_model_params seeds UMAP and does not merge HDBSCAN clusters', () => {
   const r = runPython(`
-umap_kw, hdb_kw = bt.cluster_model_params(20)
+umap_kw, hdb_kw = bt.cluster_model_params(27)
 print(json.dumps({"umap": umap_kw, "hdbscan": hdb_kw, "seed": bt.TOPIC_RANDOM_STATE}))`);
   assert.deepEqual(r.umap, { n_neighbors: 15, n_components: 5, min_dist: 0.0, metric: 'cosine', random_state: 42 });
   assert.deepEqual(r.hdbscan, {
-    min_cluster_size: 20, min_samples: 1, metric: 'euclidean', cluster_selection_epsilon: 0.1, prediction_data: true,
+    min_cluster_size: 27, min_samples: 1, metric: 'euclidean', prediction_data: true,
   });
   assert.equal(r.seed, 42);
 });
@@ -63,7 +63,7 @@ test('resolve_min_topic_size honours a valid env override', () => {
 test('resolve_min_topic_size falls back on invalid env values', () => {
   for (const bad of ['abc', '0', '-3', '2.5', '1']) {
     const r = runPython(`print(json.dumps(bt.resolve_min_topic_size(14000)))`, { BERTOPIC_MIN_TOPIC_SIZE: bad });
-    assert.equal(r, 20, bad);
+    assert.equal(r, 28, bad);
   }
 });
 

@@ -39,13 +39,10 @@ MODEL_NAME = "allenai/specter2_base"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 MIN_TOPIC_SIZE = 5  # increased from 3 for cleaner, more cohesive clusters
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "metrics.sqlite")
-MIN_TOPIC_SIZE_DOCS_PER_TOPIC = 700  # default min_topic_size scales as n_docs / 700 (20 at ~14k docs)
+MIN_TOPIC_SIZE_DOCS_PER_TOPIC = 500  # default min_topic_size scales as n_docs / 500
 # Fixed seed so a rebuild over unchanged data and settings reproduces the same topics.
 # Chosen once; never tune it to make results look better.
 TOPIC_RANDOM_STATE = 42
-# Merge clusters closer than this in UMAP space; a five-seed sweep (2026-10-25) showed
-# 1-2 points fewer outliers and more stable assignments than 0.
-HDBSCAN_CLUSTER_SELECTION_EPSILON = 0.1
 MAX_MISMATCH_LOG_LINES = 5
 
 
@@ -94,6 +91,7 @@ NON_ENGLISH_STOP_WORDS = {
     "sous", "entre", "vers", "chez", "est", "sont", "être", "été", "était", "ont", "avoir", "pas",
     "ne", "plus", "aussi", "comme", "très", "tout", "tous", "toute", "toutes", "autre", "autres",
     "même", "cela", "ceci", "ainsi", "lors", "selon", "afin", "peut", "son", "deux", "fait",
+    "lui", "avons", "si",
     # French elisions as they appear once apostrophes are stripped (d'un -> dun, c'est -> cest)
     "dun", "dune", "cest", "quil", "quils", "quelle", "quelles", "quon", "nest", "sest", "lon",
     # Spanish
@@ -140,8 +138,9 @@ def build_topic_vectorizer():
 def cluster_model_params(min_topic_size):
     """Return (umap_kwargs, hdbscan_kwargs) for the BERTopic clustering fit.
 
-    UMAP uses BERTopic's default shape with the shared seed; HDBSCAN keeps
-    min_samples=1 and merges clusters closer than HDBSCAN_CLUSTER_SELECTION_EPSILON.
+    UMAP uses BERTopic's default shape with the shared seed. HDBSCAN keeps
+    min_samples=1 and no cluster_selection_epsilon: in an offline sweep, 0.1 merged
+    distinct fields (maths, physics, zoology, forestry) into one topic.
     """
     umap_kwargs = {
         "n_neighbors": 15,
@@ -154,7 +153,6 @@ def cluster_model_params(min_topic_size):
         "min_cluster_size": min_topic_size,
         "min_samples": 1,
         "metric": "euclidean",
-        "cluster_selection_epsilon": HDBSCAN_CLUSTER_SELECTION_EPSILON,
         "prediction_data": True,
     }
     return umap_kwargs, hdbscan_kwargs
@@ -1767,7 +1765,7 @@ def main():
                 detail=f"Fitting BERTopic model (UMAP & HDBSCAN, min_topic_size={min_topic_size}, nr_topics={nr_topics})..."
             )
         print(f"Fitting BERTopic (min_topic_size={min_topic_size}, nr_topics={nr_topics}, min_samples=1, "
-              f"cluster_selection_epsilon={HDBSCAN_CLUSTER_SELECTION_EPSILON}, seed={TOPIC_RANDOM_STATE})...")
+              f"seed={TOPIC_RANDOM_STATE})...")
         bertopic_kwargs = {"nr_topics": nr_topics} if nr_topics is not None else {}
         topic_model = BERTopic(
             embedding_model=MODEL_NAME,
