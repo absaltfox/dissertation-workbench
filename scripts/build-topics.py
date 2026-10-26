@@ -78,6 +78,15 @@ def resolve_max_topics():
     return value
 
 
+def refresh_topic_representation(topic_model, docs, topics, vectorizer_model):
+    """Recompute topic representations while keeping the stop-word vectorizer.
+
+    BERTopic's update_topics() falls back to a default CountVectorizer when
+    vectorizer_model is omitted, which silently drops the stop-word list.
+    """
+    topic_model.update_topics(docs, topics=topics, vectorizer_model=vectorizer_model)
+
+
 # DB connection and logging utilities
 class SqliteClientWrapper:
     def __init__(self, db_path):
@@ -1053,7 +1062,8 @@ def ensure_topic_label_tables(client):
           config_json  TEXT,
           error        TEXT,
           started_at   TEXT NOT NULL,
-          finished_at  TEXT
+          finished_at  TEXT,
+          generation   TEXT
         )
     """)
     client.execute("""
@@ -1077,9 +1087,23 @@ def ensure_topic_label_tables(client):
           source       TEXT NOT NULL,
           candidate_id INTEGER,
           created_at   TEXT NOT NULL,
-          updated_at   TEXT NOT NULL
+          updated_at   TEXT NOT NULL,
+          generation   TEXT
         )
     """)
+    for table in ("topic_label_runs", "topic_label_overrides"):
+        try:
+            client.execute(f"ALTER TABLE {table} ADD COLUMN generation TEXT")
+        except Exception:
+            pass  # column already exists
+
+
+def load_topics_generation(client):
+    try:
+        rows = client.execute("SELECT value FROM settings WHERE key = 'topics_generation'").rows
+        return rows[0]["value"] if rows else None
+    except Exception:
+        return None
 
 
 def load_existing_topic_labels(client):
@@ -1092,10 +1116,12 @@ def load_existing_topic_labels(client):
     return labels
 
 
-def load_topic_label_overrides(client):
+def load_topic_label_overrides(client, generation):
     overrides = {}
+    if generation is None:
+        return overrides
     try:
-        for row in client.execute("SELECT topic_id, label FROM topic_label_overrides").rows:
+        for row in client.execute("SELECT topic_id, label FROM topic_label_overrides WHERE generation = ?", [generation]).rows:
             overrides[int(row["topic_id"])] = row["label"]
     except Exception:
         pass
@@ -1171,12 +1197,12 @@ def build_candidate_rows(topic_model, topic_info, generated_labels, abstracts, t
     return candidates_by_topic
 
 
-def save_topic_label_candidates(client, candidates_by_topic, backend, model_name, config=None):
+def save_topic_label_candidates(client, candidates_by_topic, backend, model_name, config=None, generation=None):
     ensure_topic_label_tables(client)
     now = datetime.now(timezone.utc).isoformat()
     result = client.execute(
-        "INSERT INTO topic_label_runs (backend, model_name, status, config_json, started_at) VALUES (?, ?, 'completed', ?, ?)",
-        [backend, model_name, json.dumps(config or {}), now]
+        "INSERT INTO topic_label_runs (backend, model_name, status, config_json, started_at, generation) VALUES (?, ?, 'completed', ?, ?, ?)",
+        [backend, model_name, json.dumps(config or {}), now, generation]
     )
     run_id = getattr(result, "last_insert_rowid", None) or getattr(result, "lastInsertRowid", None)
     if not run_id:
@@ -1285,7 +1311,8 @@ def run_label_only(client, topic_id=None, reporter=None):
     ensure_topic_label_tables(client)
     topic_rows = client.execute("SELECT topic_id, label, top_terms, doc_count FROM topics ORDER BY topic_id").rows
     existing_labels = {int(row["topic_id"]): row["label"] for row in topic_rows}
-    overrides = load_topic_label_overrides(client)
+    generation = load_topics_generation(client)
+    overrides = load_topic_label_overrides(client, generation)
     selected_topic_ids = {
         int(row["topic_id"]) for row in topic_rows
         if int(row["topic_id"]) != -1 and (topic_id is None or int(row["topic_id"]) == int(topic_id))
@@ -1351,7 +1378,7 @@ def run_label_only(client, topic_id=None, reporter=None):
     backend = os.environ.get("LOCAL_LABEL_BACKEND", "transformers")
     model_name = os.environ.get("LOCAL_LABEL_MODEL", os.environ.get("LOCAL_LABEL_MODEL_PATH", "Qwen/Qwen2.5-0.5B-Instruct"))
     candidates = build_candidate_rows(topic_model, topic_info, generated, abstracts, assignments, existing_labels, titles_by_topic, documents_by_topic)
-    save_topic_label_candidates(client, candidates, backend, model_name, {"labelsOnly": True, "topicId": topic_id})
+    save_topic_label_candidates(client, candidates, backend, model_name, {"labelsOnly": True, "topicId": topic_id}, generation)
     labels = choose_topic_labels(topic_model, topic_info, candidates, overrides, existing_labels)
     for tid, label in labels.items():
         if tid == -1:
@@ -1681,7 +1708,7 @@ def main():
         if outlier_count > 0:
             print(f"\nReducing outliers ({outlier_count} docs) using c-TF-IDF strategy...")
             topics = topic_model.reduce_outliers(abstracts, topics, strategy="c-tf-idf", threshold=0.15)
-            topic_model.update_topics(abstracts, topics=topics)
+            refresh_topic_representation(topic_model, abstracts, topics, vectorizer_model)
             new_outliers = sum(1 for t in topics if t == -1)
             print(f"  Outliers reduced: {outlier_count} -> {new_outliers}")
 
@@ -1723,8 +1750,6 @@ def main():
         topic_info = topic_model.get_topic_info()
         now = datetime.now(timezone.utc).isoformat()
         ensure_topic_label_tables(client)
-        existing_labels = load_existing_topic_labels(client)
-        label_overrides = load_topic_label_overrides(client)
 
         print(f"\nDiscovered {len(topic_info) - 1} topics (plus outlier cluster); "
               f"min_topic_size={min_topic_size}, nr_topics={nr_topics}")
@@ -1739,7 +1764,7 @@ def main():
 
         # Generate human-readable labels (Claude API or local Qwen model fallback)
         claude_labels = generate_labels(topic_model, abstracts, topics, reporter)
-        label_candidates = build_candidate_rows(topic_model, topic_info, claude_labels, abstracts, topics, existing_labels)
+        label_candidates = build_candidate_rows(topic_model, topic_info, claude_labels, abstracts, topics)
         backend = "claude" if os.environ.get("ANTHROPIC_API_KEY", "").strip() else os.environ.get("LOCAL_LABEL_BACKEND", "transformers")
         label_model_name = CLAUDE_MODEL if backend == "claude" else os.environ.get("LOCAL_LABEL_MODEL", os.environ.get("LOCAL_LABEL_MODEL_PATH", "Qwen/Qwen2.5-0.5B-Instruct"))
         save_topic_label_candidates(
@@ -1747,9 +1772,11 @@ def main():
             label_candidates,
             backend,
             label_model_name,
-            {"autoPublish": os.environ.get("TOPIC_LABEL_AUTO_PUBLISH", "passing_only")}
+            {"autoPublish": os.environ.get("TOPIC_LABEL_AUTO_PUBLISH", "passing_only")},
+            # Same string publish_staged_topics stamps as the new topics_generation
+            now,
         )
-        topic_labels = choose_topic_labels(topic_model, topic_info, label_candidates, label_overrides, existing_labels)
+        topic_labels = choose_topic_labels(topic_model, topic_info, label_candidates)
 
         if reporter:
             reporter.report(
@@ -1783,7 +1810,7 @@ def main():
             "INSERT OR REPLACE INTO topics_next (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
             topic_rows,
         )
-        mark_auto_selected_candidates(client, label_candidates, topic_labels, label_overrides)
+        mark_auto_selected_candidates(client, label_candidates, topic_labels)
 
         # Write document-topic assignments
         doc_topic_rows = []
@@ -1811,7 +1838,7 @@ def main():
         # Release what the 2-D UMAP fit and the rest of the run no longer need
         # (still needed: topic_model, topic_info, topic_labels, topics, doc_ids, abstracts, embeddings_matrix)
         probs = doc_topic_rows = topic_rows = label_candidates = claude_labels = None
-        existing_labels = label_overrides = embeddings_raw = hierarchy_embeddings = None
+        embeddings_raw = hierarchy_embeddings = None
         dist_matrix = condensed = linkage_matrix = linkage_json = None
         gc.collect()
 

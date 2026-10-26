@@ -57,6 +57,7 @@ let reextractDocumentCitations;
 let saveCitationExtractionState;
 let saveFileMetric;
 let selectTopicLabelCandidate;
+let setSetting;
 let updateTopicManualLabel;
 let deleteTopicLabelOverride;
 let validateAdminJobArtifactToken;
@@ -195,6 +196,7 @@ test.before(async () => {
     saveCitationExtractionState,
     saveFileMetric,
     selectTopicLabelCandidate,
+    setSetting,
     updateTopicManualLabel,
     deleteTopicLabelOverride,
     updateAdminJob,
@@ -446,6 +448,7 @@ test('PatternRank Fly worker fails closed without a Python worker image', () => 
 
 test('topic label candidates can be reviewed, selected, edited, unlocked, and bulk-published', async () => {
   await ensureStorage();
+  await setSetting('topics_generation', 'test-generation');
   const db = await getDb();
   const suffix = Date.now();
   await db.execute({
@@ -453,8 +456,8 @@ test('topic label candidates can be reviewed, selected, edited, unlocked, and bu
     args: [7001, 'Old Label', JSON.stringify([['teacher', 0.9], ['identity', 0.8]]), 12, 'test-model', new Date().toISOString()],
   });
   await db.execute({
-    sql: 'INSERT INTO topic_label_runs (backend, model_name, status, config_json, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?)',
-    args: ['test', 'test-model', 'completed', '{}', new Date().toISOString(), new Date().toISOString()],
+    sql: 'INSERT INTO topic_label_runs (backend, model_name, status, config_json, started_at, finished_at, generation) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    args: ['test', 'test-model', 'completed', '{}', new Date().toISOString(), new Date().toISOString(), 'test-generation'],
   });
   const runId = Number((await db.execute('SELECT MAX(id) AS id FROM topic_label_runs')).rows[0].id);
   await db.execute({
