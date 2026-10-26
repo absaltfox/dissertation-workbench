@@ -75,6 +75,68 @@ def resolve_min_topic_size(n_docs):
     return max(MIN_TOPIC_SIZE, round(n_docs / MIN_TOPIC_SIZE_DOCS_PER_TOPIC))
 
 
+# Topic-term vocabulary. These only shape c-TF-IDF terms (and the c-TF-IDF outlier
+# step), never the embeddings.
+TOPIC_ACADEMIC_STOP_WORDS = {
+    "chapter", "study", "research", "thesis", "dissertation", "university",
+    "ubc", "british", "columbia", "participants", "findings", "methodology",
+    "results", "methods", "data", "analysis", "chapters", "approach",
+    "participant", "abstract", "introduction", "conclusion",
+    "my", "our", "we", "i",
+}
+# Function words for the corpus's other abstract languages (French, Spanish, Italian, German).
+NON_ENGLISH_STOP_WORDS = {
+    # French
+    "le", "la", "les", "un", "une", "des", "du", "de", "au", "aux", "et", "ou", "mais", "donc",
+    "car", "ni", "que", "qui", "quoi", "dont", "où", "ce", "cet", "cette", "ces", "se", "sa", "ses",
+    "leur", "leurs", "mon", "ma", "mes", "notre", "nos", "votre", "vos", "il", "ils", "elle",
+    "elles", "on", "nous", "vous", "je", "tu", "en", "dans", "par", "pour", "sur", "avec", "sans",
+    "sous", "entre", "vers", "chez", "est", "sont", "être", "été", "était", "ont", "avoir", "pas",
+    "ne", "plus", "aussi", "comme", "très", "tout", "tous", "toute", "toutes", "autre", "autres",
+    "même", "cela", "ceci", "ainsi", "lors", "selon", "afin", "peut", "son", "deux", "fait",
+    # French elisions as they appear once apostrophes are stripped (d'un -> dun, c'est -> cest)
+    "dun", "dune", "cest", "quil", "quils", "quelle", "quelles", "quon", "nest", "sest", "lon",
+    # Spanish
+    "el", "los", "las", "una", "unos", "unas", "del", "al", "en", "con", "por", "para", "sobre",
+    "como", "más", "pero", "su", "sus", "lo", "es", "está", "están", "ser", "fue", "fueron", "ha",
+    "han", "hay", "este", "esta", "estos", "estas", "ese", "esa", "esos", "esas", "muy", "también",
+    "ya", "desde", "hasta", "donde", "cuando", "porque", "cual", "cuales", "nos", "mi",
+    # Italian
+    "lo", "gli", "uno", "di", "da", "per", "tra", "fra", "ed", "che", "chi", "non", "della",
+    "dei", "delle", "degli", "alla", "alle", "dal", "dalla", "nel", "nella", "nei", "sul", "sulla",
+    "è", "sono", "più", "anche", "ma", "suo", "sua", "suoi", "sue", "questo", "questa", "questi",
+    "queste", "quello", "quella", "essere", "stato",
+    # German
+    "der", "das", "den", "dem", "des", "ein", "eine", "einer", "eines", "einem", "einen", "und",
+    "oder", "aber", "nicht", "mit", "von", "zu", "zur", "zum", "im", "auf", "für", "aus", "bei",
+    "nach", "über", "unter", "durch", "ist", "sind", "wird", "werden", "wurde", "sich", "auch",
+    "als", "wie", "dass", "daß", "es", "er", "sie", "wir", "ihr", "ihre", "sein", "seine",
+    "dieser", "diese", "dieses", "noch", "nur", "schon", "um",
+}
+# "Chapter" in each language, like the English academic list.
+NON_ENGLISH_STOP_WORDS |= {"chapitre", "chapitres", "capítulo", "capitolo", "kapitel"}
+# Leftovers of formulas stripped from mathematics abstracts.
+PLACEHOLDER_STOP_WORDS = {"omitted", "superscript", "subscript", "let"}
+# Foreign function words that are also meaningful English topic terms.
+ENGLISH_HOMOGRAPHS_TO_KEEP = {"war", "die", "sin", "era", "come", "art", "man", "ai", "eu"}
+# Letters only, two or more: keeps "eu"/"ai", drops "05", "1990s" and "x2".
+TOPIC_TOKEN_PATTERN = r"(?u)\b[^\W\d_]{2,}\b"
+
+
+def topic_extra_stop_words():
+    """Stop words added to scikit-learn's English list for topic terms."""
+    words = TOPIC_ACADEMIC_STOP_WORDS | NON_ENGLISH_STOP_WORDS | PLACEHOLDER_STOP_WORDS
+    return words - ENGLISH_HOMOGRAPHS_TO_KEEP
+
+
+def build_topic_vectorizer():
+    """CountVectorizer for BERTopic's topic terms (English + extra stop words, letters-only tokens)."""
+    from sklearn.feature_extraction import text
+    from sklearn.feature_extraction.text import CountVectorizer
+    stop_words = sorted(text.ENGLISH_STOP_WORDS.union(topic_extra_stop_words()))
+    return CountVectorizer(stop_words=stop_words, token_pattern=TOPIC_TOKEN_PATTERN)
+
+
 def cluster_model_params(min_topic_size):
     """Return (umap_kwargs, hdbscan_kwargs) for the BERTopic clustering fit.
 
@@ -1688,19 +1750,8 @@ def main():
         from bertopic import BERTopic
         from hdbscan import HDBSCAN
         from umap import UMAP
-        from sklearn.feature_extraction.text import CountVectorizer
-        from sklearn.feature_extraction import text
 
-        # Custom stop words list to filter out academic noise
-        stop_words = list(text.ENGLISH_STOP_WORDS.union([
-            "chapter", "study", "research", "thesis", "dissertation", "university",
-            "ubc", "british", "columbia", "participants", "findings", "methodology",
-            "results", "methods", "data", "analysis", "chapters", "approach",
-            "participant", "abstract", "introduction", "conclusion",
-            "my", "our", "we", "i"
-        ]))
-
-        vectorizer_model = CountVectorizer(stop_words=stop_words)
+        vectorizer_model = build_topic_vectorizer()
 
         min_topic_size = resolve_min_topic_size(len(abstracts))
         nr_topics = resolve_max_topics()
