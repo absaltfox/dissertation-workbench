@@ -40,6 +40,9 @@ CLAUDE_MODEL = "claude-haiku-4-5-20251001"
 MIN_TOPIC_SIZE = 5  # increased from 3 for cleaner, more cohesive clusters
 DB_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "metrics.sqlite")
 MIN_TOPIC_SIZE_DOCS_PER_TOPIC = 500  # default min_topic_size scales as n_docs / 500
+# Fixed seed so a rebuild over unchanged data and settings reproduces the same topics.
+# Chosen once; never tune it to make results look better.
+TOPIC_RANDOM_STATE = 42
 MAX_MISMATCH_LOG_LINES = 5
 
 
@@ -59,7 +62,7 @@ def _positive_int_env(name):
 
 
 def resolve_min_topic_size(n_docs):
-    """BERTOPIC_MIN_TOPIC_SIZE if valid, else max(MIN_TOPIC_SIZE, round(n_docs / 500))."""
+    """BERTOPIC_MIN_TOPIC_SIZE if valid, else max(MIN_TOPIC_SIZE, round(n_docs / MIN_TOPIC_SIZE_DOCS_PER_TOPIC))."""
     override = _positive_int_env("BERTOPIC_MIN_TOPIC_SIZE")
     if override is not None:
         if override >= 2:
@@ -67,6 +70,92 @@ def resolve_min_topic_size(n_docs):
         print(f"Warning: ignoring BERTOPIC_MIN_TOPIC_SIZE={override} (HDBSCAN needs at least 2); using the default",
               file=sys.stderr)
     return max(MIN_TOPIC_SIZE, round(n_docs / MIN_TOPIC_SIZE_DOCS_PER_TOPIC))
+
+
+# Topic-term vocabulary. These only shape c-TF-IDF terms (and the c-TF-IDF outlier
+# step), never the embeddings.
+TOPIC_ACADEMIC_STOP_WORDS = {
+    "chapter", "study", "research", "thesis", "dissertation", "university",
+    "ubc", "british", "columbia", "participants", "findings", "methodology",
+    "results", "methods", "data", "analysis", "chapters", "approach",
+    "participant", "abstract", "introduction", "conclusion",
+    "my", "our", "we", "i",
+}
+# Function words for the corpus's other abstract languages (French, Spanish, Italian, German).
+NON_ENGLISH_STOP_WORDS = {
+    # French
+    "le", "la", "les", "un", "une", "des", "du", "de", "au", "aux", "et", "ou", "mais", "donc",
+    "car", "ni", "que", "qui", "quoi", "dont", "où", "ce", "cet", "cette", "ces", "se", "sa", "ses",
+    "leur", "leurs", "mon", "ma", "mes", "notre", "nos", "votre", "vos", "il", "ils", "elle",
+    "elles", "on", "nous", "vous", "je", "tu", "en", "dans", "par", "pour", "sur", "avec", "sans",
+    "sous", "entre", "vers", "chez", "est", "sont", "être", "été", "était", "ont", "avoir", "pas",
+    "ne", "plus", "aussi", "comme", "très", "tout", "tous", "toute", "toutes", "autre", "autres",
+    "même", "cela", "ceci", "ainsi", "lors", "selon", "afin", "peut", "son", "deux", "fait",
+    "lui", "avons", "si",
+    # French elisions as they appear once apostrophes are stripped (d'un -> dun, c'est -> cest)
+    "dun", "dune", "cest", "quil", "quils", "quelle", "quelles", "quon", "nest", "sest", "lon",
+    # Spanish
+    "el", "los", "las", "una", "unos", "unas", "del", "al", "en", "con", "por", "para", "sobre",
+    "como", "más", "pero", "su", "sus", "lo", "es", "está", "están", "ser", "fue", "fueron", "ha",
+    "han", "hay", "este", "esta", "estos", "estas", "ese", "esa", "esos", "esas", "muy", "también",
+    "ya", "desde", "hasta", "donde", "cuando", "porque", "cual", "cuales", "nos", "mi",
+    # Italian
+    "lo", "gli", "uno", "di", "da", "per", "tra", "fra", "ed", "che", "chi", "non", "della",
+    "dei", "delle", "degli", "alla", "alle", "dal", "dalla", "nel", "nella", "nei", "sul", "sulla",
+    "è", "sono", "più", "anche", "ma", "suo", "sua", "suoi", "sue", "questo", "questa", "questi",
+    "queste", "quello", "quella", "essere", "stato",
+    # German
+    "der", "das", "den", "dem", "des", "ein", "eine", "einer", "eines", "einem", "einen", "und",
+    "oder", "aber", "nicht", "mit", "von", "zu", "zur", "zum", "im", "auf", "für", "aus", "bei",
+    "nach", "über", "unter", "durch", "ist", "sind", "wird", "werden", "wurde", "sich", "auch",
+    "als", "wie", "dass", "daß", "es", "er", "sie", "wir", "ihr", "ihre", "sein", "seine",
+    "dieser", "diese", "dieses", "noch", "nur", "schon", "um",
+}
+# "Chapter" in each language, like the English academic list.
+NON_ENGLISH_STOP_WORDS |= {"chapitre", "chapitres", "capítulo", "capitolo", "kapitel"}
+# Leftovers of formulas stripped from mathematics abstracts.
+PLACEHOLDER_STOP_WORDS = {"omitted", "superscript", "subscript", "let"}
+# Foreign function words that are also meaningful English topic terms.
+ENGLISH_HOMOGRAPHS_TO_KEEP = {"war", "die", "sin", "era", "come", "art", "man", "ai", "eu"}
+# Letters only, two or more: keeps "eu"/"ai", drops "05", "1990s" and "x2".
+TOPIC_TOKEN_PATTERN = r"(?u)\b[^\W\d_]{2,}\b"
+
+
+def topic_extra_stop_words():
+    """Stop words added to scikit-learn's English list for topic terms."""
+    words = TOPIC_ACADEMIC_STOP_WORDS | NON_ENGLISH_STOP_WORDS | PLACEHOLDER_STOP_WORDS
+    return words - ENGLISH_HOMOGRAPHS_TO_KEEP
+
+
+def build_topic_vectorizer():
+    """CountVectorizer for BERTopic's topic terms (English + extra stop words, letters-only tokens)."""
+    from sklearn.feature_extraction import text
+    from sklearn.feature_extraction.text import CountVectorizer
+    stop_words = sorted(text.ENGLISH_STOP_WORDS.union(topic_extra_stop_words()))
+    return CountVectorizer(stop_words=stop_words, token_pattern=TOPIC_TOKEN_PATTERN)
+
+
+def cluster_model_params(min_topic_size):
+    """Return (umap_kwargs, hdbscan_kwargs) for the BERTopic clustering fit.
+
+    UMAP uses BERTopic's default shape with the shared seed. HDBSCAN keeps
+    min_samples=1 and no cluster_selection_epsilon: in an offline sweep, 0.1 merged
+    distinct fields (maths, physics, zoology, forestry) into one topic.
+    """
+    umap_kwargs = {
+        "n_neighbors": 15,
+        "n_components": 5,
+        "min_dist": 0.0,
+        "metric": "cosine",
+        "random_state": TOPIC_RANDOM_STATE,
+    }
+    hdbscan_kwargs = {
+        "min_cluster_size": min_topic_size,
+        "min_samples": 1,
+        "metric": "euclidean",
+        "prediction_data": True,
+    }
+    return umap_kwargs, hdbscan_kwargs
 
 
 def resolve_max_topics():
@@ -1658,28 +1747,15 @@ def main():
         # Run BERTopic
         from bertopic import BERTopic
         from hdbscan import HDBSCAN
-        from sklearn.feature_extraction.text import CountVectorizer
-        from sklearn.feature_extraction import text
+        from umap import UMAP
 
-        # Custom stop words list to filter out academic noise
-        stop_words = list(text.ENGLISH_STOP_WORDS.union([
-            "chapter", "study", "research", "thesis", "dissertation", "university",
-            "ubc", "british", "columbia", "participants", "findings", "methodology",
-            "results", "methods", "data", "analysis", "chapters", "approach",
-            "participant", "abstract", "introduction", "conclusion",
-            "my", "our", "we", "i"
-        ]))
-
-        vectorizer_model = CountVectorizer(stop_words=stop_words)
+        vectorizer_model = build_topic_vectorizer()
 
         min_topic_size = resolve_min_topic_size(len(abstracts))
         nr_topics = resolve_max_topics()
-        hdbscan_model = HDBSCAN(
-            min_cluster_size=min_topic_size,
-            min_samples=1,
-            metric="euclidean",
-            prediction_data=True,
-        )
+        umap_kwargs, hdbscan_kwargs = cluster_model_params(min_topic_size)
+        umap_model = UMAP(**umap_kwargs)
+        hdbscan_model = HDBSCAN(**hdbscan_kwargs)
 
         if reporter:
             reporter.report(
@@ -1688,11 +1764,13 @@ def main():
                 status="running",
                 detail=f"Fitting BERTopic model (UMAP & HDBSCAN, min_topic_size={min_topic_size}, nr_topics={nr_topics})..."
             )
-        print(f"Fitting BERTopic (min_topic_size={min_topic_size}, nr_topics={nr_topics}, min_samples=1)...")
+        print(f"Fitting BERTopic (min_topic_size={min_topic_size}, nr_topics={nr_topics}, min_samples=1, "
+              f"seed={TOPIC_RANDOM_STATE})...")
         bertopic_kwargs = {"nr_topics": nr_topics} if nr_topics is not None else {}
         topic_model = BERTopic(
             embedding_model=MODEL_NAME,
             min_topic_size=min_topic_size,
+            umap_model=umap_model,
             hdbscan_model=hdbscan_model,
             vectorizer_model=vectorizer_model,
             verbose=True,
@@ -1847,7 +1925,7 @@ def main():
 
         print("\nComputing 2D UMAP projection for visualization...")
         embeddings = embeddings_matrix
-        reducer = umap.UMAP(n_components=2, random_state=42, metric="cosine")
+        reducer = umap.UMAP(n_components=2, random_state=TOPIC_RANDOM_STATE, metric="cosine")
         coords_2d = reducer.fit_transform(embeddings)
 
         write_rows(

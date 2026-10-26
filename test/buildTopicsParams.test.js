@@ -33,8 +33,26 @@ ${body}
 }
 
 test('resolve_min_topic_size scales with corpus size and floors at 5', () => {
-  const r = runPython(`print(json.dumps([bt.resolve_min_topic_size(n) for n in (10, 100, 2500, 14000)]))`);
-  assert.deepEqual(r, [5, 5, 5, 28]);
+  const r = runPython(`print(json.dumps([bt.resolve_min_topic_size(n) for n in (10, 100, 2500, 13655, 14000)]))`);
+  assert.deepEqual(r, [5, 5, 5, 27, 28]);
+});
+
+test('cluster_model_params seeds UMAP and does not merge HDBSCAN clusters', () => {
+  const r = runPython(`
+umap_kw, hdb_kw = bt.cluster_model_params(27)
+print(json.dumps({"umap": umap_kw, "hdbscan": hdb_kw, "seed": bt.TOPIC_RANDOM_STATE}))`);
+  assert.deepEqual(r.umap, { n_neighbors: 15, n_components: 5, min_dist: 0.0, metric: 'cosine', random_state: 42 });
+  assert.deepEqual(r.hdbscan, {
+    min_cluster_size: 27, min_samples: 1, metric: 'euclidean', prediction_data: true,
+  });
+  assert.equal(r.seed, 42);
+});
+
+test('the clustering fit and the 2D projection use the shared seed', () => {
+  const source = readFileSync('scripts/build-topics.py', 'utf8');
+  assert.match(source, /umap_model=umap_model/);
+  assert.match(source, /umap\.UMAP\(n_components=2, random_state=TOPIC_RANDOM_STATE/);
+  assert.doesNotMatch(source, /random_state=42/);
 });
 
 test('resolve_min_topic_size honours a valid env override', () => {
