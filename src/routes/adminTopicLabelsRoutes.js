@@ -74,7 +74,12 @@ export function createAdminTopicLabelsRouter({ clearMetricsCache }) {
       type: 'topic_bands',
       label: 'Rebuild Research Areas',
       params: {},
+      singleInstance: true,
     });
+    if (result.alreadyRunning) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: result.jobId });
+      return;
+    }
     res.status(202).json({ ok: true, started: true, ...result });
   }));
 

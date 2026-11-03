@@ -1789,6 +1789,11 @@ def refresh_band_labels(client, new_topic_labels, topic_terms, titles_by_topic, 
     print(f"Regenerated names for {len(bands)} research-area bands.")
 
 
+def read_topics_generation(client):
+    rows = client.execute("SELECT value FROM settings WHERE key = 'topics_generation'").rows
+    return rows[0]["value"] if rows else None
+
+
 def run_bands_only(client, reporter=None):
     """Rebuild the hierarchy and research-area bands for the CURRENT topics generation.
 
@@ -1801,6 +1806,7 @@ def run_bands_only(client, reporter=None):
     client.execute(
         "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT NOT NULL)"
     )
+    generation_at_start = read_topics_generation(client)
     if reporter:
         reporter.report("build_bands", "Building Research Areas", status="running",
                         detail="Loading topic assignments and cached embeddings...")
@@ -1866,6 +1872,14 @@ def run_bands_only(client, reporter=None):
             [b["band_id"], band_labels[b["band_id"]], json.dumps(b["child_topic_ids"]), b["doc_count"], now],
         ))
     statements.append(bands_version_statement(now))
+    # A full rebuild swaps topics (and bumps topics_generation) while this job
+    # runs; bands computed from the old topics must not be written over them.
+    generation_now = read_topics_generation(client)
+    if generation_now != generation_at_start:
+        raise RuntimeError(
+            f"topics_generation changed during the bands-only run ({generation_at_start!r} -> "
+            f"{generation_now!r}); nothing was written. Re-run after the topic rebuild finishes."
+        )
     client.batch(statements)
     print(f"Saved {len(bands)} research-area bands over {len(topic_ids)} topics.")
     if reporter:

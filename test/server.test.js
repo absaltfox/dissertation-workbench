@@ -241,6 +241,25 @@ test('bands rebuild route returns 409 while bertopic or topic_labels runs; label
   }
 });
 
+test('bertopic start returns 409 while a topic_bands job is running', async () => {
+  const bandsId = await createAdminJob({ type: 'topic_bands', label: 'Existing bands', params: {}, runnerType: 'local' });
+  const token = createSession('admin');
+  try {
+    const csrf = getSessionCsrfToken(token);
+    const res = await request(app)
+      .post('/api/admin/jobs/bertopic')
+      .set('Cookie', `session=${token}`).set('x-csrf-token', csrf)
+      .send({})
+      .expect(409);
+    assert.equal(res.body.jobId, bandsId);
+    assert.equal(res.body.runningType, 'topic_bands');
+    assert.match(res.body.error, /research-area rebuild is running/);
+  } finally {
+    await finishAdminJob(bandsId, { status: 'completed', runnerState: 'completed' });
+    destroySession(token);
+  }
+});
+
 test('citation scan preview counts pending documents and honors retryFailures without starting a job', async () => {
   const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const degree = `Scan Route ${suffix}`;

@@ -307,3 +307,22 @@ print(json.dumps({"err": err, "bands": bands, "meta": meta, "v": v}))`);
   assert.deepEqual(r.meta, [[1, '[1]', '[]', 'old']]);
   assert.equal(r.v, 'oldv');
 });
+
+test('bands-only refuses to write when topics_generation changes during the run', { skip: skipScipy }, () => {
+  const r = runPython(`SKIP_TOPIC = None
+${BANDS_DB_SETUP}
+client.execute("INSERT INTO topic_bands VALUES (0, 'Old', '[1]', 1, 'old')")
+def swap(bands, *a, **k):
+    client.execute("UPDATE settings SET value = 'g2' WHERE key = 'topics_generation'")
+    return {b["band_id"]: "Named" for b in bands}
+bt.generate_band_labels = swap
+try:
+    bt.run_bands_only(client)
+    err = None
+except Exception as e:
+    err = str(e)
+bands = [tuple(r) for r in client.execute("SELECT * FROM topic_bands").rows]
+print(json.dumps({"err": err, "bands": bands}))`);
+  assert.match(r.err, /topics_generation changed/);
+  assert.deepEqual(r.bands, [[0, 'Old', '[1]', 1, 'old']]);
+});

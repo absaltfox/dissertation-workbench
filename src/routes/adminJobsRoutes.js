@@ -167,6 +167,17 @@ export function createAdminJobsRouter({ loadSyncModule, clearMetricsCache }) {
   }));
 
   router.post('/jobs/bertopic', asyncHandler(async (_req, res) => {
+    // A bands-only run reads the current topics generation; a full rebuild
+    // swaps it mid-run, so refuse to start one while bands are rebuilding.
+    const bandsRunningId = await hasRunningAdminJob('topic_bands');
+    if (bandsRunningId) {
+      res.status(409).json({
+        error: 'A research-area rebuild is running; wait for it to finish before rebuilding topics.',
+        jobId: bandsRunningId,
+        runningType: 'topic_bands',
+      });
+      return;
+    }
     // singleInstance makes the check-and-create atomic: shared *_next staging
     // tables mean two overlapping runs could publish empty or partial topics.
     // The metrics cache is not cleared here: topics only change at the worker's
