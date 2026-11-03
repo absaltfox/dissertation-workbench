@@ -2005,8 +2005,10 @@ async function aggregateNumericSeries({ filters, valueSql, reliabilitySql }) {
   return rows.map((row) => ({ year: Number(row.year), ...numericStats(row) }));
 }
 
-// #15: SQL ports of five of the six panels that previously went silently
-// empty above DETAILED_ANALYTICS_RECORD_LIMIT. Each mirrors a JS aggregator
+// #15: SQL ports of four of the five panels that previously went silently
+// empty above DETAILED_ANALYTICS_RECORD_LIMIT (conceptTimeline,
+// methodologyConceptMatrix, methodologyTopicMatrix, topicData.byYear; the
+// supervisor n-gram matrix has since been removed entirely). Each mirrors a JS aggregator
 // in metrics.js closely enough to be behaviorally equivalent on real
 // ingested data (docConceptTerms() short-circuits to the stored
 // `conceptTerms` array for every real document, so a direct
@@ -2493,7 +2495,7 @@ export async function getDocumentServingAnalytics({ syncKey = null, filters: req
     wordCloud: themes.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
     ngramCloud: concepts.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
     methodologies: methodologies.map((row) => ({ methodology: row.term, count: Number(row.count || 0) })),
-    // #15: five of six panels are now real SQL-backed aggregates, computed
+    // #15: four of the five panels are real SQL-backed aggregates, computed
     // above next to the other bounded aggregates in this function.
     // termCooccurrence has no SQL port (see the comment above this
     // function) — it stays null here; the caller (metricsRoutes.js) is

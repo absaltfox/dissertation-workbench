@@ -326,3 +326,26 @@ print(json.dumps({"err": err, "bands": bands}))`);
   assert.match(r.err, /topics_generation changed/);
   assert.deepEqual(r.bands, [[0, 'Old', '[1]', 1, 'old']]);
 });
+
+test('band naming reports under its own task key with the real band count', () => {
+  const r = runPython(`${BIG_BAND_SETUP}
+bands = bands + [{"band_id": 1, "child_topic_ids": [1, 2], "doc_count": 5, "child_doc_counts": {1: 3, 2: 2}}]
+calls = []
+class R:
+    def report(self, key, label, **kw):
+        calls.append({"key": key, "label": label, "status": kw.get("status"), "counts": kw.get("counts")})
+os.environ.pop("ANTHROPIC_API_KEY", None)
+os.environ.pop("LOCAL_LABEL_BACKEND", None)
+bt.load_local_chat_model = lambda name: ("tok", "model")
+bt.local_chat_complete = lambda tok, model, system, prompt, max_new_tokens=18, sample=False: "Some Band Name"
+out = bt.generate_band_labels(bands, labels, terms, titles, R())
+print(json.dumps({"out": out, "calls": calls}))`);
+  assert.equal(r.out['0'], 'Some Band Name');
+  assert.ok(r.calls.length > 0);
+  for (const c of r.calls) {
+    assert.equal(c.key, 'generate_band_labels');
+    assert.equal(c.label, 'Naming Research Areas');
+    assert.equal(c.counts.total, 2);
+  }
+  assert.equal(r.calls.at(-1).status, 'completed');
+});

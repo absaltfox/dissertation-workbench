@@ -297,11 +297,14 @@ No code. Each step starts only after the owner says go.
 - [ ] **Step 1: Whole-branch verification.** `npm test`, `npx eslint .` and `npx playwright test` all pass. Open a PR to `main`.
 - [ ] **Step 2: Push the worker image** (bands code runs on worker/labeler machines). Follow memory `fly-worker-image-deploy`: push `worker-latest`, retag `labeler-latest`, and confirm both tag digests moved.
 - [ ] **Step 3: Set the admin allow-list secret:** `fly secrets set ADMIN_ALLOWED_NETWORKS=<owner-home-ip> --stage`, so it applies with the deploy in Step 4.
-- [ ] **Step 4: `fly deploy`.** Verify from the owner's network: the Admin tab is present. Then verify from elsewhere, e.g. `curl -s -o /dev/null -w '%{http_code}' https://dissertation-workbench.fly.dev/api/auth/session` from a non-home host, which should print `404`. `/api/health` is 200.
+- [ ] **Step 4: `fly deploy`.** Verify from the owner's network: the Admin tab is present. Then verify from elsewhere, e.g. `curl -s -o /dev/null -w '%{http_code}' https://dissertation-workbench.fly.dev/api/auth/session` from a non-home host, which should print `404`. `/api/health` is 200. Also:
+  - Check that the `ip` in the request log lines is the real client address, not a Fly proxy address.
+  - From outside the allowed network, try to spoof the header: `curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: <owner-home-ip>' https://dissertation-workbench.fly.dev/api/auth/available`. Expect `404`.
+  - Watch for 429s on public routes right after the deploy. Too few trusted hops would collapse every visitor into one rate-limit bucket. If that happens, set `TRUST_PROXY=2` or revert the deploy.
+  - Possible follow-up: read the client address from Fly's `Fly-Client-IP` header instead of counting proxy hops.
 - [ ] **Step 5: Admin › Operations › Recompute Stored Themes.** When it finishes, `curl -s https://dissertation-workbench.fly.dev/api/metrics | python3 -c "import json,sys;print([w for w in json.load(sys.stdin)['wordCloud'] if 'unspec' in w['term']])"` prints `[]`.
-- [ ] **Step 6: Admin › Topic Labels › Rebuild Research Areas.** When the job finishes:
+- [ ] **Step 6 (optional): Admin › Topic Labels › Rebuild Research Areas (API-only).** Without Tasks 9–11 this job only writes the `topic_bands` table and the hierarchy. Topic Evolution still shows the top-10 clusters named after their largest child, and there is no Rebuild button in the UI, so the band names are not user-visible until Task 9 ships. Recommendation: defer this step to the Task 9 rollout. If it is run now, trigger it through the API and check:
   - the log reports k = 9 on today's topics (or the k the gap rule picks; record it);
-  - Topic Evolution shows k bands with names that cover their children;
   - `topics_generation` is unchanged;
   - the topic-label override count is still 104.
-- [ ] **Step 7:** Owner spot-checks band names and renames any that need it.
+- [ ] **Step 7:** Once the bands are user-visible (Task 9 shipped and Step 6 run), owner spot-checks band names and renames any that need it.

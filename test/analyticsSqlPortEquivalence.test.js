@@ -86,9 +86,9 @@ test.before(async () => {
 
   // Task 6a: one extra doc with 12 conceptTerms (docConceptTerms can emit up
   // to 12 in production — see src/metrics.js), exercising the
-  // `term.key < 10` ordinal cutoff that computeSupervisorNgramMatrixSql's
-  // legacy json_each form applies. document_terms has no stored array
-  // position, so the projected branch reconstructs it via ROW_NUMBER()
+  // `term.key < 10` ordinal cutoff that the legacy json_each form of the
+  // concept SQL ports (e.g. computeMethodologyConceptMatrixSql) applies.
+  // document_terms has no stored array position, so the projected branch reconstructs it via ROW_NUMBER()
   // OVER (PARTITION BY doc_id ORDER BY rowid).
   //
   // Positions 0-9 reuse the fixture's 8 existing high-count concept names
@@ -267,13 +267,13 @@ test('Task 6b: methodologyConceptMatrix + methodologyTopicMatrix — document_te
 
 test('Task 6a/6b fix (round 1 review + Task 6b reuse): methodologyConceptMatrix — legacy distinct-first-10 selection matches the document_terms projection when a document has a duplicate conceptTerm inside its first 10 raw array positions', async () => {
   // Isolated in its own syncKey/doc, deliberately NOT added to the shared
-  // 222-doc SYNC_KEY corpus: the JS reference path (buildSupervisorNgramMatrix
-  // -> docConceptTerms -> rec.conceptTerms.slice(0, 10)) truncates by RAW
+  // 222-doc SYNC_KEY corpus: the JS reference path (the metrics.js
+  // methodology/concept matrix builders -> docConceptTerms -> rec.conceptTerms.slice(0, 10)) truncates by RAW
   // array position with no dedup, so on a document with a duplicate in its
   // first 10 positions it would disagree with the (correct, post-fix)
   // distinct-based SQL truncation used by both branches here. That's a
   // separate, pre-existing JS-vs-SQL semantic gap outside this task's scope
-  // (computeSupervisorNgramMatrixSql's two *SQL* branches, not the JS port);
+  // (the SQL ports' two *SQL* branches, not the JS port);
   // keeping this fixture off SYNC_KEY avoids corrupting the unrelated #15
   // JS-vs-SQL cross-check above with that unrelated gap.
   const dupSyncKey = 'sql-port-dup-boundary';
