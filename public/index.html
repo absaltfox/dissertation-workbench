@@ -801,6 +801,19 @@
 
           <!-- Topic Labels -->
           <div id="admin-labels" class="admin-panel-section">
+            <article class="panel" id="researchAreasPanel">
+              <div class="section-heading-row">
+                <div>
+                  <h2>Research Areas</h2>
+                  <p class="meta">Groups of topics shown in Topic Evolution. Rename an area, or reset it to its automatic name. Manual names are kept until the topics change.</p>
+                </div>
+                <div class="row-actions">
+                  <button type="button" id="refreshResearchAreasBtn" class="btn ghost btn-sm">Refresh</button>
+                  <button type="button" id="rebuildResearchAreasBtn" class="btn btn-sm">Rebuild Research Areas</button>
+                </div>
+              </div>
+              <div id="researchAreasList" class="research-area-list" aria-live="polite"></div>
+            </article>
             <article class="panel">
               <div class="section-heading-row">
                 <div>

@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import {
-  deleteTopicLabelOverride, hasRunningAdminJob, listTopicLabelReviews,
-  publishPassingTopicLabels, selectTopicLabelCandidate, updateTopicManualLabel
+  deleteTopicBandLabelOverride, deleteTopicLabelOverride, getSetting, hasRunningAdminJob,
+  listTopicLabelReviews, loadTopicBands, loadTopics, publishPassingTopicLabels,
+  selectTopicLabelCandidate, updateTopicBandManualLabel, updateTopicManualLabel
 } from '../db.js';
 import { createAndStartAdminWorkerJob } from '../services/adminWorker.js';
 import { asyncHandler } from '../middleware/http.js';
@@ -81,6 +82,55 @@ export function createAdminTopicLabelsRouter({ clearMetricsCache }) {
       return;
     }
     res.status(202).json({ ok: true, started: true, ...result });
+  }));
+
+  router.get('/topics/bands', asyncHandler(async (_req, res) => {
+    const [bands, topics, generation] = await Promise.all([
+      loadTopicBands(), loadTopics(), getSetting('topics_generation'),
+    ]);
+    const topicById = new Map(topics.map((t) => [t.topicId, t]));
+    res.status(200).json({
+      generation: generation ?? null,
+      bands: (bands || []).map((band) => ({
+        ...band,
+        children: band.children.map((topicId) => ({
+          topicId,
+          label: topicById.get(topicId)?.label ?? `Topic ${topicId}`,
+          docCount: topicById.get(topicId)?.docCount ?? 0,
+        })),
+      })),
+    });
+  }));
+
+  router.patch('/topics/bands/:bandId/label', asyncHandler(async (req, res) => {
+    const bandId = Number(req.params.bandId);
+    const label = String(req.body?.label || '').trim();
+    if (!Number.isInteger(bandId) || !label) {
+      res.status(400).json({ error: 'A band id and non-empty label are required.' });
+      return;
+    }
+    if (label.length > 120) {
+      res.status(400).json({ error: 'Label must be 120 characters or fewer.' });
+      return;
+    }
+    const result = await updateTopicBandManualLabel(bandId, label);
+    if (!result) {
+      res.status(404).json({ error: 'Research area not found.' });
+      return;
+    }
+    clearMetricsCache();
+    res.status(200).json({ ok: true, ...result });
+  }));
+
+  router.delete('/topics/bands/:bandId/label/override', asyncHandler(async (req, res) => {
+    const bandId = Number(req.params.bandId);
+    if (!Number.isInteger(bandId)) {
+      res.status(400).json({ error: 'Invalid band id.' });
+      return;
+    }
+    const removed = await deleteTopicBandLabelOverride(bandId);
+    if (removed) clearMetricsCache();
+    res.status(200).json({ ok: true, removed });
   }));
 
   router.post('/topics/:topicId/labels/select', asyncHandler(async (req, res) => {
