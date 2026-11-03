@@ -16,8 +16,18 @@ test('people notice sits under the filter row', () => {
   assert.match(html, re);
 });
 
+const ALLOW = /Dissertation Workbench|theses and dissertations|thesis and dissertation|dissertation or thesis|\.dissertations\b|(^|[{,])\s*dissertations:|dissertations\.(bib|ris)|^\s*(\/\/|\*)/;
+
+function isFlagged(line) {
+  return /\bdissertations?\b/i.test(line) && !ALLOW.test(line);
+}
+
+test('copy scan flags visible labels but allows object keys', () => {
+  assert.equal(isFlagged('<p><strong>Linked dissertations:</strong> 3</p>'), true);
+  assert.equal(isFlagged('    dissertations: supervised,'), false);
+});
+
 test('no user-visible "dissertation" outside the allow-list', () => {
-  const allow = /Dissertation Workbench|theses and dissertations|thesis and dissertation|dissertation or thesis|\.dissertations\b|\bdissertations:|dissertations\.(bib|ris)|^\s*(\/\/|\*)/;
   const files = [
     'public/index.html',
     ...readdirSync('public/app').filter((f) => f.endsWith('.js')).map((f) => `public/app/${f}`),
@@ -26,7 +36,7 @@ test('no user-visible "dissertation" outside the allow-list', () => {
   const bad = [];
   for (const f of files) {
     readFileSync(f, 'utf8').split('\n').forEach((line, i) => {
-      if (/\bdissertations?\b/i.test(line) && !allow.test(line)) bad.push(`${f}:${i + 1}: ${line.trim()}`);
+      if (isFlagged(line)) bad.push(`${f}:${i + 1}: ${line.trim()}`);
     });
   }
   assert.deepEqual(bad, []);

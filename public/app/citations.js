@@ -374,7 +374,7 @@ async function showCitingDissertations(citationId, citationText, totalDocs = nul
     const bodyHtml = `
       <div class="meta">
         <p><strong>Citation:</strong> ${escapeHtml(shortText)}</p>
-        <p><strong>Linked dissertations:</strong> ${formatNum(linkedCount)}</p>
+        <p><strong>Linked manuscripts:</strong> ${formatNum(linkedCount)}</p>
         <p>${formatNum(docs.length)} manuscript(s) loaded from index</p>
       </div>
       ${list}
