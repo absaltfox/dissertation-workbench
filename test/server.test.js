@@ -822,6 +822,15 @@ test('admin research-area band routes list, rename, reset, validate, and require
     await request(app).patch('/api/admin/topics/bands/0/label').set('Cookie', cookie)
       .send({ label: 'No csrf' }).expect(403);
 
+    await api('patch', '/api/admin/topics/bands/abc/label').send({ label: 'Nope' }).expect(400);
+    await api('patch', '/api/admin/topics/bands/0/label').send({ label: 123 }).expect(400);
+    await api('patch', '/api/admin/topics/bands/0/label').send({}).expect(400);
+    await api('delete', '/api/admin/topics/bands/abc/label/override').expect(400);
+    await client.execute({ sql: "DELETE FROM settings WHERE key = 'topics_generation'", args: [] });
+    const noGen = await api('patch', '/api/admin/topics/bands/0/label').send({ label: 'Renamed' }).expect(409);
+    assert.equal(noGen.body.error, 'Rebuild topics before renaming research areas.');
+    await setSetting('topics_generation', 'test-gen');
+
     await api('patch', '/api/admin/topics/bands/0/label').send({ label: '  Renamed  ' }).expect(200);
     let after = (await api('get', '/api/admin/topics/bands').expect(200)).body.bands.find((b) => b.bandId === 0);
     assert.equal(after.hasOverride, true);

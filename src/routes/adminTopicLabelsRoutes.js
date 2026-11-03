@@ -103,14 +103,22 @@ export function createAdminTopicLabelsRouter({ clearMetricsCache }) {
   }));
 
   router.patch('/topics/bands/:bandId/label', asyncHandler(async (req, res) => {
+    if (!/^\d+$/.test(req.params.bandId) || typeof req.body?.label !== 'string') {
+      res.status(400).json({ error: 'A band id and non-empty label are required.' });
+      return;
+    }
     const bandId = Number(req.params.bandId);
-    const label = String(req.body?.label || '').trim();
-    if (!Number.isInteger(bandId) || !label) {
+    const label = req.body.label.trim();
+    if (!label) {
       res.status(400).json({ error: 'A band id and non-empty label are required.' });
       return;
     }
     if (label.length > 120) {
       res.status(400).json({ error: 'Label must be 120 characters or fewer.' });
+      return;
+    }
+    if ((await getSetting('topics_generation')) == null) {
+      res.status(409).json({ error: 'Rebuild topics before renaming research areas.' });
       return;
     }
     const result = await updateTopicBandManualLabel(bandId, label);
@@ -123,11 +131,11 @@ export function createAdminTopicLabelsRouter({ clearMetricsCache }) {
   }));
 
   router.delete('/topics/bands/:bandId/label/override', asyncHandler(async (req, res) => {
-    const bandId = Number(req.params.bandId);
-    if (!Number.isInteger(bandId)) {
+    if (!/^\d+$/.test(req.params.bandId)) {
       res.status(400).json({ error: 'Invalid band id.' });
       return;
     }
+    const bandId = Number(req.params.bandId);
     const removed = await deleteTopicBandLabelOverride(bandId);
     if (removed) clearMetricsCache();
     res.status(200).json({ ok: true, removed });

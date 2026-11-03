@@ -349,3 +349,11 @@ print(json.dumps({"out": out, "calls": calls}))`);
   }
   assert.equal(r.calls.at(-1).status, 'completed');
 });
+
+test('generate_band_labels uses the child label for a one-topic band', () => {
+  const r = runPython(`
+bands = [{"band_id": 0, "child_topic_ids": [1], "doc_count": 10, "child_doc_counts": {1: 10}}]
+bt.complete_band_names = lambda *a, **k: {}
+print(json.dumps(bt.generate_band_labels(bands, {1: "Gill Function"}, {1: []}, {1: []})))`);
+  assert.deepEqual(r, { 0: 'Gill Function' });
+});
