@@ -154,18 +154,18 @@ function openMatchesModal(title, matches) {
           .join('')}
       </div>
     `
-    : '<p class="meta">No matching dissertations found in the current result set.</p>';
+    : '<p class="meta">No matching manuscripts found in the current result set.</p>';
 
   const bodyHtml = `
     <div class="meta">
       <p><strong>${escapeHtml(title)}</strong></p>
-      <p>${formatNum(list.length)} dissertation(s)</p>
+      <p>${formatNum(list.length)} manuscript(s)</p>
     </div>
     ${body}
   `;
   openResponsivePanel({
     title,
-    eyebrow: `${formatNum(list.length)} dissertation(s)`,
+    eyebrow: `${formatNum(list.length)} manuscript(s)`,
     bodyHtml,
     onMount: attachRelatedItemHandlers,
   });

@@ -70,7 +70,7 @@ function updateFacetCount() {
     `</span>`
   ).join('');
   if (facetToggleSummaryEl) {
-    facetToggleSummaryEl.textContent = chips.length ? `${chips.length} active` : 'All dissertations';
+    facetToggleSummaryEl.textContent = chips.length ? `${chips.length} active` : 'All manuscripts';
   }
 }
 

@@ -145,7 +145,7 @@ function renderKpis() {
     : null;
 
   const cards = [
-    { label: 'Dissertations', value: formatNum(metrics.recordCount) },
+    { label: 'Manuscripts', value: formatNum(metrics.recordCount) },
     {
       label: 'Pages',
       value: `${formatNum(metrics.overallPageCount.min)}\u2013${formatNum(metrics.overallPageCount.max)}`,
@@ -246,7 +246,7 @@ function renderDissertationsByYear() {
     data: {
       labels: rows.map((d) => d.year),
       datasets: [{
-        label: 'Dissertations',
+        label: 'Manuscripts',
         data: rows.map((d) => d.count || 0),
         backgroundColor: '#1b808c',
         borderRadius: 4
@@ -339,23 +339,23 @@ function renderWordCloud() {
     });
   }
 
-  themeResultsEl.innerHTML = '<p>Select a theme to view tagged dissertations.</p>';
+  themeResultsEl.innerHTML = '<p>Select a theme to view tagged manuscripts.</p>';
 }
 
 function renderThemeResults() {
   if (!state.selectedTheme) {
-    themeResultsEl.innerHTML = '<p>Select a theme to view tagged dissertations.</p>';
+    themeResultsEl.innerHTML = '<p>Select a theme to view tagged manuscripts.</p>';
     return;
   }
 
   const matches = docsForTheme(state.selectedTheme);
   if (!matches.length) {
-    themeResultsEl.innerHTML = `<p>No dissertations tagged with <strong>${escapeHtml(state.selectedTheme)}</strong>.</p>`;
+    themeResultsEl.innerHTML = `<p>No manuscripts tagged with <strong>${escapeHtml(state.selectedTheme)}</strong>.</p>`;
     return;
   }
 
   themeResultsEl.innerHTML = `
-    <p><strong>${escapeHtml(state.selectedTheme)}</strong> &middot; ${formatNum(matches.length)} dissertation(s)</p>
+    <p><strong>${escapeHtml(state.selectedTheme)}</strong> &middot; ${formatNum(matches.length)} manuscript(s)</p>
     <div class="related-list">
       ${matches
         .map(
@@ -572,7 +572,7 @@ function renderCooccurrence() {
         <div class="bar-row">
           <span class="bar-label" title="${escapeHtml(label)}">${escapeHtml(label)}</span>
           <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
-          <button class="bar-value" title="${entry.count} dissertations${escapeHtml(liftStr)}" data-co-term-a="${escapeHtml(entry.termA)}" data-co-term-b="${escapeHtml(entry.termB)}">${formatNum(entry.count)}</button>
+          <button class="bar-value" title="${entry.count} manuscripts${escapeHtml(liftStr)}" data-co-term-a="${escapeHtml(entry.termA)}" data-co-term-b="${escapeHtml(entry.termB)}">${formatNum(entry.count)}</button>
         </div>
       `;
     })
@@ -691,7 +691,7 @@ function renderTopicDistribution() {
     const detail = [modelName, createdAt ? `run ${new Date(createdAt).toLocaleDateString()}` : '']
       .filter(Boolean)
       .join('; ');
-    topicModelMetaEl.textContent = `Topics discovered by BERTopic clustering of dissertation abstracts${detail ? ` (${detail})` : ''}.`;
+    topicModelMetaEl.textContent = `Topics discovered by BERTopic clustering of manuscript abstracts${detail ? ` (${detail})` : ''}.`;
   }
 
   const regular = td.topics.filter((t) => t.topicId !== -1);

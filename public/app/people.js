@@ -171,7 +171,7 @@ function roleGroupsForPerson(person) {
   }
   const groups = new Map();
   for (const doc of (person.docs || [])) {
-    const roles = Array.isArray(doc.personRoles) && doc.personRoles.length ? doc.personRoles : ['Dissertations'];
+    const roles = Array.isArray(doc.personRoles) && doc.personRoles.length ? doc.personRoles : ['Manuscripts'];
     for (const role of roles) {
       if (!groups.has(role)) groups.set(role, []);
       groups.get(role).push(doc);
@@ -182,12 +182,12 @@ function roleGroupsForPerson(person) {
 
 function renderRoleGroupedDissertations(person) {
   const groups = roleGroupsForPerson(person);
-  if (!groups.length) return '<p class="meta">No dissertations found.</p>';
+  if (!groups.length) return '<p class="meta">No manuscripts found.</p>';
   return groups.map((group) => `
     <section class="person-role-group">
       <div class="person-role-group-heading">
         <span>${escapeHtml(group.role || 'Role')}</span>
-        <span>${formatNum(group.docs.length)} ${group.docs.length === 1 ? 'dissertation' : 'dissertations'}</span>
+        <span>${formatNum(group.docs.length)} ${group.docs.length === 1 ? 'manuscript' : 'manuscripts'}</span>
       </div>
       <div class="related-list">${group.docs.map(renderRelatedDocumentItem).join('')}</div>
     </section>
@@ -217,14 +217,14 @@ function renderSupervisorProfile(profile) {
 
   const dissertationList = profile.dissertations.length
     ? profile.dissertations.map(renderRelatedDocumentItem).join('')
-    : '<p class="meta">No dissertations found.</p>';
+    : '<p class="meta">No manuscripts found.</p>';
 
   const topicTokens = renderTopicTokens(profile.dissertations);
 
   const bodyHtml = `
     <div class="meta">
       <p><strong>${escapeHtml(profile.name)}</strong></p>
-      <p>${formatNum(profile.count)} dissertation(s) &middot; ${profile.yearRange}</p>
+      <p>${formatNum(profile.count)} manuscript(s) &middot; ${profile.yearRange}</p>
     </div>
     ${topicTokens ? `<div><p class="detail-section-title">Topics</p><div class="token-list">${topicTokens}</div></div>` : ''}
     <div>
@@ -236,14 +236,14 @@ function renderSupervisorProfile(profile) {
       <div class="bars">${methBars}</div>
     </div>
     <div>
-      <p class="detail-section-title">Supervised Dissertations</p>
+      <p class="detail-section-title">Supervised Manuscripts</p>
       <div class="related-list">${dissertationList}</div>
     </div>
   `;
 
   openResponsivePanel({
     title: profile.name,
-    eyebrow: `${formatNum(profile.count)} dissertation(s)`,
+    eyebrow: `${formatNum(profile.count)} manuscript(s)`,
     bodyHtml,
     onMount: (root) => {
       for (const item of root.querySelectorAll('.related-item[data-related-id]')) {
@@ -481,7 +481,7 @@ async function renderPersonDetail(personKey) {
   const bodyHtml = `
     ${isPhoneView() ? '' : `<h2 style="margin-bottom:0.3rem">${escapeHtml(person.name)}</h2>`}
     <div class="meta">
-      <p>${formatNum(person.docCount)} dissertation(s) &middot; ${person.yearRange}</p>
+      <p>${formatNum(person.docCount)} manuscript(s) &middot; ${person.yearRange}</p>
     </div>
     <div class="detail-body">
       <div>
@@ -507,7 +507,7 @@ async function renderPersonDetail(personKey) {
       </div>
       ${coSupHtml ? `<div><p class="detail-section-title">Supervisory Network</p><div class="token-list">${coSupHtml}</div></div>` : ''}
       <div>
-        <p class="detail-section-title">Dissertations by Role</p>
+        <p class="detail-section-title">Manuscripts by Role</p>
         ${dissertationList}
       </div>
     </div>
@@ -516,7 +516,7 @@ async function renderPersonDetail(personKey) {
   if (isPhoneView()) {
     openResponsivePanel({
       title: person.name,
-      eyebrow: `${formatNum(person.docCount)} dissertation(s)`,
+      eyebrow: `${formatNum(person.docCount)} manuscript(s)`,
       bodyHtml,
       onMount: (root) => attachPersonDetailHandlers(root, person),
     });

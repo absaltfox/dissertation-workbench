@@ -544,7 +544,7 @@ function setRefreshRuleFromPayload() {
   refreshRuleEl.classList.remove('error');
   refreshRuleEl.innerHTML = [
     `Last refreshed ${escapeHtml(formatRefreshDate(state.payload?.generatedAt))}`,
-    `${formatNum(documentTotal)} dissertations`,
+    `${formatNum(documentTotal)} manuscripts`,
     `${formatNum(supervisorTotal)} supervisors`
   ].map((part) => `<span>${part}</span>`).join('<span class="dot" aria-hidden="true"></span>');
 }
