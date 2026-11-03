@@ -2298,9 +2298,7 @@ async function computeTopicDataByYearSql(filters, qualifier, topics, hierarchy, 
     topicId: Number(row.topic_id), year: Number(row.year), count: Number(row.count || 0),
   }));
   return parentInfo
-    ? buildTopicsByYearFromCounts(
-      parentInfo.parentClusters, countRows, parentInfo.leafToParent, bands?.length ? bands.length : 10,
-    )
+    ? buildTopicsByYearFromCounts(parentInfo.parentClusters, countRows, parentInfo.leafToParent, parentInfo.limit)
     : buildTopicsByYearFromCounts(topics, countRows);
 }
 
@@ -6414,36 +6412,40 @@ function parseChildIds(text) {
   } catch { return []; }
 }
 
-// Persisted research-area bands (written by the Python worker). One query for
-// bands plus one for overrides; null when the table is missing or empty.
+// Persisted research-area bands (written by the Python worker). One round
+// trip: bands LEFT JOIN the override for the current generation. Null when the
+// table is missing or empty; any other failure propagates so a transient error
+// is never cached as a "no bands" fallback.
 export async function loadTopicBands() {
+  let rows;
   try {
-    const [bandRows, generation] = await Promise.all([
-      all('SELECT band_id, label, child_topic_ids, doc_count FROM topic_bands ORDER BY band_id'),
-      getSetting('topics_generation'),
-    ]);
-    if (!bandRows.length) return null;
-    const overrides = new Map();
-    if (generation != null) {
-      const rows = await all(
-        'SELECT band_id, label, child_topic_ids FROM topic_band_label_overrides WHERE generation = ?', [generation],
-      );
-      for (const row of rows) overrides.set(Number(row.band_id), row);
-    }
-    return bandRows.map((row) => {
-      const children = parseChildIds(row.child_topic_ids);
-      const override = overrides.get(Number(row.band_id));
-      const hasOverride = Boolean(override) && JSON.stringify(parseChildIds(override.child_topic_ids)) === JSON.stringify(children);
-      return {
-        bandId: Number(row.band_id),
-        label: hasOverride ? override.label : row.label,
-        autoLabel: row.label,
-        docCount: Number(row.doc_count || 0),
-        children,
-        hasOverride,
-      };
-    });
-  } catch { return null; }
+    rows = await all(`
+      SELECT b.band_id, b.label, b.child_topic_ids, b.doc_count,
+             o.label AS o_label, o.child_topic_ids AS o_children
+      FROM topic_bands b
+      LEFT JOIN topic_band_label_overrides o
+        ON o.band_id = b.band_id
+       AND o.generation = (SELECT value FROM settings WHERE key = 'topics_generation')
+      ORDER BY b.band_id
+    `);
+  } catch (error) {
+    if (/no such table/i.test(error?.message || '')) return null;
+    throw error;
+  }
+  if (!rows.length) return null;
+  return rows.map((row) => {
+    const children = parseChildIds(row.child_topic_ids);
+    const hasOverride = row.o_label != null
+      && JSON.stringify(parseChildIds(row.o_children)) === JSON.stringify(children);
+    return {
+      bandId: Number(row.band_id),
+      label: hasOverride ? row.o_label : row.label,
+      autoLabel: row.label,
+      docCount: Number(row.doc_count || 0),
+      children,
+      hasOverride,
+    };
+  });
 }
 
 export async function updateTopicBandManualLabel(bandId, label) {
@@ -6468,7 +6470,7 @@ export async function updateTopicBandManualLabel(bandId, label) {
 
 export async function deleteTopicBandLabelOverride(bandId) {
   const result = await run('DELETE FROM topic_band_label_overrides WHERE band_id = ?', [Number(bandId)]);
-  await setSetting('topic_bands_version', new Date().toISOString());
+  if (result.changes > 0) await setSetting('topic_bands_version', new Date().toISOString());
   return result.changes > 0;
 }
 

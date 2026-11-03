@@ -77,9 +77,10 @@ export function resolveTopicGrouping(hierarchy, topics, bands) {
     }));
     const leafToParent = new Map();
     for (const p of parentClusters) for (const tid of p.children) leafToParent.set(tid, p.parentId);
-    return { parentClusters, leafToParent };
+    return { parentClusters, leafToParent, limit: parentClusters.length };
   }
-  return hierarchy ? buildParentClusters(hierarchy, topics) : null;
+  if (!hierarchy) return null;
+  return { ...buildParentClusters(hierarchy, topics), limit: 10 };
 }
 
 // Count-row-based aggregation: takes pre-aggregated {topicId, year, count}

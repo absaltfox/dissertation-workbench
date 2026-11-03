@@ -794,7 +794,7 @@ export function buildTopicVisualizations(documents, { topics, hierarchy = null, 
   if (!resolvedByYear) {
     const parentInfo = resolveTopicGrouping(hierarchy, topics, bands);
     resolvedByYear = parentInfo
-      ? buildTopicsByYear(parentInfo.parentClusters, documents, parentInfo.leafToParent, bands?.length ? bands.length : 10)
+      ? buildTopicsByYear(parentInfo.parentClusters, documents, parentInfo.leafToParent, parentInfo.limit)
       : buildTopicsByYear(topics, documents);
   }
   return {
@@ -959,7 +959,7 @@ export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjec
     topicData = {
       topics,
       byYear: parentInfo
-        ? buildTopicsByYear(parentInfo.parentClusters, normalizedRecords, parentInfo.leafToParent, bands?.length ? bands.length : 10)
+        ? buildTopicsByYear(parentInfo.parentClusters, normalizedRecords, parentInfo.leafToParent, parentInfo.limit)
         : buildTopicsByYear(topics, normalizedRecords),
       hierarchy,
     };

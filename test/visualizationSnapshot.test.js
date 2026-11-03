@@ -106,6 +106,25 @@ test('a snapshot saved before a bands change is not seeded after it', async () =
   await client.execute("DELETE FROM settings WHERE key = 'topic_bands_version'");
 });
 
+test('a bands read failure fails the build and saves no snapshot', async () => {
+  await db.setSetting('topics_generation', 'gBands');
+  await client.execute({
+    sql: "INSERT INTO topics (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (1, 'T', '[]', 1, 'm', ?)",
+    args: [new Date().toISOString()],
+  });
+  await client.execute('ALTER TABLE topic_bands RENAME TO topic_bands_real');
+  await client.execute("CREATE VIEW topic_bands AS SELECT json('{') AS band_id, 'x' AS label, '[]' AS child_topic_ids, 0 AS doc_count, 'x' AS created_at");
+  try {
+    const res = await request(makeApp()).get('/api/workbench/visualizations');
+    assert.notEqual(res.status, 200);
+    assert.equal(await snapshotRow(), undefined);
+  } finally {
+    await client.execute('DROP VIEW topic_bands');
+    await client.execute('ALTER TABLE topic_bands_real RENAME TO topic_bands');
+    await client.execute('DELETE FROM topics');
+  }
+});
+
 test('an undecodable snapshot falls through to a build', async () => {
   await db.setSetting('topics_generation', 'g3');
   await client.execute({

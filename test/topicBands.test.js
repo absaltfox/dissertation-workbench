@@ -138,3 +138,35 @@ test('cache version changes when bands change', async () => {
   await client.execute("DELETE FROM settings WHERE key = 'topics_generation'");
   assert.equal(await db.getTopicsCacheVersion(), null);
 });
+
+test('Python-spaced override children still match', async () => {
+  await seed();
+  await client.execute("UPDATE topic_bands SET child_topic_ids = '[0,5]' WHERE band_id = 0");
+  await client.execute({
+    sql: "INSERT INTO topic_band_label_overrides (band_id, label, child_topic_ids, generation, created_at, updated_at) VALUES (0, 'Spaced', '[0, 5]', 'g1', ?, ?)",
+    args: [NOW, NOW],
+  });
+  const b0 = (await db.loadTopicBands())[0];
+  assert.equal(b0.label, 'Spaced');
+  assert.equal(b0.hasOverride, true);
+});
+
+test('a non-"no such table" bands failure rejects instead of falling back', async () => {
+  await seed();
+  await client.execute('ALTER TABLE topic_bands RENAME TO topic_bands_real');
+  await client.execute("CREATE VIEW topic_bands AS SELECT json('{') AS band_id, 'x' AS label, '[]' AS child_topic_ids, 0 AS doc_count, 'x' AS created_at");
+  try {
+    await assert.rejects(db.loadTopicBands(), /malformed JSON/i);
+    await assert.rejects(db.getTopicByYearCounts({ syncKey: SYNC_KEY }), /malformed JSON/i);
+  } finally {
+    await client.execute('DROP VIEW topic_bands');
+    await client.execute('ALTER TABLE topic_bands_real RENAME TO topic_bands');
+  }
+});
+
+test('delete of a missing override does not bump the cache version', async () => {
+  await seed();
+  const before = await db.getTopicsCacheVersion();
+  assert.equal(await db.deleteTopicBandLabelOverride(3), false);
+  assert.equal(await db.getTopicsCacheVersion(), before);
+});
