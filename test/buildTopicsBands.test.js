@@ -49,8 +49,12 @@ test('choose_band_count returns n when n is at or below the minimum', () => {
 
 test('choose_band_count does not divide by zero', () => {
   const r = runPython(`print(json.dumps(bt.choose_band_count([0,0,0,1,2,3,4,5,6], 10, 6, 9)))`);
-  assert.equal(typeof r, 'number');
-  assert.ok(Number.isInteger(r));
+  assert.equal(r, 7);
+});
+
+test('choose_band_count never scores k=1 when k_min is 1', () => {
+  const r = runPython(`print(json.dumps(bt.choose_band_count([1.,2.,3.], 4, 1, 3)))`);
+  assert.ok(r >= 2 && r <= 3);
 });
 
 test('choose_band_count falls back to k_min when every candidate is skipped', () => {
@@ -101,4 +105,32 @@ test('resolve_band_range defaults, honours env, and rejects min > max', () => {
   assert.deepEqual(runPython(`print(json.dumps(bt.resolve_band_range()))`), [6, 15]);
   assert.deepEqual(runPython(`print(json.dumps(bt.resolve_band_range()))`, { TOPIC_BANDS_MIN: '4', TOPIC_BANDS_MAX: '9' }), [4, 9]);
   assert.deepEqual(runPython(`print(json.dumps(bt.resolve_band_range()))`, { TOPIC_BANDS_MIN: '10', TOPIC_BANDS_MAX: '5' }), [6, 15]);
+});
+
+test('resolve_band_range clamps the minimum to 2 and keeps defaults when min > max after clamping', () => {
+  assert.deepEqual(runPython(`print(json.dumps(bt.resolve_band_range()))`, { TOPIC_BANDS_MIN: '1', TOPIC_BANDS_MAX: '9' }), [2, 9]);
+  assert.deepEqual(runPython(`print(json.dumps(bt.resolve_band_range()))`, { TOPIC_BANDS_MIN: '1', TOPIC_BANDS_MAX: '1' }), [6, 15]);
+});
+
+test('cut_bands may return fewer than k bands with contiguous ids when heights tie', { skip: skipScipy }, () => {
+  const r = runPython(`
+import numpy as np
+cent = np.array([[1,0,0],[1,0,0],[1,0,0],[0,1,0]], dtype=float)
+Z = bt.centroid_linkage(cent)
+print(json.dumps(bt.cut_bands(Z, [1, 2, 3, 4], {1: 1, 2: 1, 3: 1, 4: 1}, 3)))
+`);
+  assert.ok(r.length <= 3);
+  assert.deepEqual(r.map((b) => b.band_id), r.map((_, i) => i));
+  assert.equal(r.reduce((a, b) => a + b.doc_count, 0), 4);
+});
+
+test('cut_bands breaks doc_count ties by smallest child topic id', { skip: skipScipy }, () => {
+  const r = runPython(`
+import numpy as np
+cent = np.array([[0,1,0],[0.01,1.01,0],[0,0.99,0.01],[1,0,0],[1.01,0.01,0],[0.99,0,0.01]], dtype=float)
+ids = [20, 21, 22, 10, 11, 12]
+counts = {t: 4 for t in ids}
+print(json.dumps(bt.cut_bands(bt.centroid_linkage(cent), ids, counts, 2)))
+`);
+  assert.deepEqual(r.map((b) => b.child_topic_ids[0]), [10, 20]);
 });

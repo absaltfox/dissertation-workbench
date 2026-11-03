@@ -177,6 +177,7 @@ def resolve_band_range():
     hi = _positive_int_env("TOPIC_BANDS_MAX")
     lo = DEFAULT_BANDS_MIN if lo is None else lo
     hi = DEFAULT_BANDS_MAX if hi is None else hi
+    lo = max(lo, 2)  # k=1 has no merge-height gap to score
     if lo > hi:
         print(f"Warning: TOPIC_BANDS_MIN={lo} exceeds TOPIC_BANDS_MAX={hi}; using defaults "
               f"({DEFAULT_BANDS_MIN}, {DEFAULT_BANDS_MAX})", file=sys.stderr)
@@ -219,8 +220,10 @@ def choose_band_count(heights, n, k_min, k_max):
     """Pick the band count k whose cut has the largest relative merge-height gap.
 
     `heights` are the n-1 ascending merge heights; gap(k) = (h[n-k] - h[n-k-1]) / h[n-k-1].
-    Ties go to the smaller k. Returns n when n <= k_min.
+    Ties go to the smaller k. Returns n when n <= k_min. k=1 cannot be scored, so
+    the search starts at max(k_min, 2).
     """
+    k_min = max(k_min, 2)
     if n <= k_min:
         return n
     best_k, best_gap = None, -1.0
@@ -239,7 +242,11 @@ def choose_band_count(heights, n, k_min, k_max):
 
 
 def cut_bands(linkage_matrix, topic_ids, doc_counts, k):
-    """Cut the hierarchy into k bands, numbered 0..k-1 by paper count desc (ties: smallest child id)."""
+    """Cut the hierarchy into at most k bands, numbered 0..len-1 by paper count desc (ties: smallest child id).
+
+    fcluster(maxclust) may return fewer than k bands when merge heights tie (e.g. duplicate
+    centroids); ids stay contiguous, so callers must use len(result), not k.
+    """
     from scipy.cluster.hierarchy import fcluster
     labels = fcluster(linkage_matrix, k, "maxclust")
     groups = {}
