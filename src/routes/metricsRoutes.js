@@ -429,6 +429,14 @@ export function resetTopicsGenerationMemo(cache) {
   topicsGenerationState.delete(cache);
 }
 
+// For a topics/bands write made by this instance: drop the cache and forget
+// the memo, so the next sync re-baselines instead of seeing our own version
+// bump as a foreign change and rebuilding a second time.
+export function clearCacheAfterLocalTopicsWrite(cache) {
+  cache.clear();
+  resetTopicsGenerationMemo(cache);
+}
+
 export async function syncTopicsGeneration(cache, {
   read = () => getTopicsCacheVersion(), now = Date.now,
 } = {}) {

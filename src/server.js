@@ -36,6 +36,7 @@ import { createAdminTopicLabelsRouter } from './routes/adminTopicLabelsRoutes.js
 import { createAdminUsersRouter } from './routes/adminUsersRoutes.js';
 import { createInternalWorkerRouter } from './routes/internalWorkerRoutes.js';
 import {
+  clearCacheAfterLocalTopicsWrite,
   createMetricsRouter,
   warmWorkbenchLandingCache,
 } from './routes/metricsRoutes.js';
@@ -152,11 +153,12 @@ app.get('/api/health', (_req, res) => {
 app.use('/api/auth', createAuthRouter({ getClientIp }));
 
 const clearMetricsCache = () => metricsCache.clear();
+const clearAfterBandWrite = () => clearCacheAfterLocalTopicsWrite(metricsCache);
 
 app.use('/api/admin', requireAdmin, createAdminUsersRouter());
 app.use('/api/admin', requireAdmin, createAdminImportRouter({ loadSyncModule, clearMetricsCache }));
 app.use('/api/admin', requireAdmin, createAdminOperationsRouter({ loadSyncModule, clearMetricsCache }));
-app.use('/api/admin', requireAdmin, createAdminTopicLabelsRouter({ clearMetricsCache }));
+app.use('/api/admin', requireAdmin, createAdminTopicLabelsRouter({ clearMetricsCache, clearAfterBandWrite }));
 app.use('/api/admin', requireAdmin, createAdminJobsRouter({ loadSyncModule, clearMetricsCache }));
 app.use('/api', createPublicRateLimit());
 app.use('/api', createPublicRouter());

@@ -7,7 +7,7 @@ import {
 import { createAndStartAdminWorkerJob } from '../services/adminWorker.js';
 import { asyncHandler } from '../middleware/http.js';
 
-export function createAdminTopicLabelsRouter({ clearMetricsCache }) {
+export function createAdminTopicLabelsRouter({ clearMetricsCache, clearAfterBandWrite = clearMetricsCache }) {
   const router = Router();
 
   router.get('/topics/labels', asyncHandler(async (_req, res) => {
@@ -126,7 +126,7 @@ export function createAdminTopicLabelsRouter({ clearMetricsCache }) {
       res.status(404).json({ error: 'Research area not found.' });
       return;
     }
-    clearMetricsCache();
+    clearAfterBandWrite();
     res.status(200).json({ ok: true, ...result });
   }));
 
@@ -137,7 +137,7 @@ export function createAdminTopicLabelsRouter({ clearMetricsCache }) {
     }
     const bandId = Number(req.params.bandId);
     const removed = await deleteTopicBandLabelOverride(bandId);
-    if (removed) clearMetricsCache();
+    if (removed) clearAfterBandWrite();
     res.status(200).json({ ok: true, removed });
   }));
 

@@ -37,7 +37,7 @@ const NTOPICS = 12;
 let docs = [];
 
 async function seed({ bands = true, generation = 'g1' } = {}) {
-  for (const t of ['topics', 'document_topics', 'topic_bands', 'topic_band_label_overrides', 'topic_hierarchy_meta', 'documents']) {
+  for (const t of ['topics', 'document_topics', 'topic_bands', 'topic_band_label_overrides', 'topic_band_label_overrides_archive', 'topic_hierarchy_meta', 'documents']) {
     await client.execute(`DELETE FROM ${t}`);
   }
   await db.setSetting('topics_generation', generation);
@@ -169,4 +169,70 @@ test('delete of a missing override does not bump the cache version', async () =>
   const before = await db.getTopicsCacheVersion();
   assert.equal(await db.deleteTopicBandLabelOverride(3), false);
   assert.equal(await db.getTopicsCacheVersion(), before);
+});
+
+async function archiveRows() {
+  return (await client.execute('SELECT band_id, label, generation, child_topic_ids FROM topic_band_label_overrides_archive ORDER BY rowid')).rows;
+}
+
+test('renaming after a generation change archives the stale name', async () => {
+  await seed();
+  await db.updateTopicBandManualLabel(0, 'Old Name');
+  assert.equal((await archiveRows()).length, 0, 'same generation and children is not archived');
+  await db.updateTopicBandManualLabel(0, 'Same Gen Edit');
+  assert.equal((await archiveRows()).length, 0);
+  await db.setSetting('topics_generation', 'g2');
+  await db.updateTopicBandManualLabel(0, 'New Name');
+  const rows = await archiveRows();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].label, 'Same Gen Edit');
+  assert.equal(rows[0].generation, 'g1');
+  assert.equal((await db.loadTopicBands())[0].label, 'New Name');
+});
+
+test('renaming after the band children changed archives the old name', async () => {
+  await seed();
+  await db.updateTopicBandManualLabel(2, 'Kept');
+  await client.execute("UPDATE topic_bands SET child_topic_ids = '[2,7]' WHERE band_id = 2");
+  await db.updateTopicBandManualLabel(2, 'Fresh');
+  const rows = await archiveRows();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].label, 'Kept');
+  assert.equal(rows[0].child_topic_ids, '[2]');
+});
+
+test('deleting a stale override archives it without bumping the cache version', async () => {
+  await seed();
+  await db.updateTopicBandManualLabel(1, 'Stale');
+  await db.setSetting('topics_generation', 'g2');
+  const before = await db.getTopicsCacheVersion();
+  assert.equal(await db.deleteTopicBandLabelOverride(1), true);
+  assert.equal(await db.getTopicsCacheVersion(), before);
+  const rows = await archiveRows();
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].label, 'Stale');
+  assert.equal((await client.execute('SELECT 1 FROM topic_band_label_overrides WHERE band_id = 1')).rows.length, 0);
+});
+
+test('deleting the active override bumps the cache version and is not archived', async () => {
+  await seed();
+  await db.updateTopicBandManualLabel(1, 'Active');
+  const before = await db.getTopicsCacheVersion();
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(await db.deleteTopicBandLabelOverride(1), true);
+  assert.notEqual(await db.getTopicsCacheVersion(), before);
+  assert.equal((await archiveRows()).length, 0);
+});
+
+test('getTopicsCacheVersion reads both settings in one query', async () => {
+  await seed();
+  const original = client.execute.bind(client);
+  const sqls = [];
+  client.execute = (arg) => { sqls.push(typeof arg === 'string' ? arg : arg.sql); return original(arg); };
+  try {
+    assert.match(await db.getTopicsCacheVersion(), /^g1\|/);
+  } finally {
+    client.execute = original;
+  }
+  assert.equal(sqls.length, 1);
 });

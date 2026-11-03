@@ -639,6 +639,16 @@ async function ensureSchema(client) {
       updated_at       TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS topic_band_label_overrides_archive (
+      band_id          INTEGER NOT NULL,
+      label            TEXT NOT NULL,
+      child_topic_ids  TEXT NOT NULL,
+      generation       TEXT,
+      created_at       TEXT NOT NULL,
+      updated_at       TEXT NOT NULL,
+      archived_at      TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS document_embeddings (
       doc_id      TEXT PRIMARY KEY,
       embedding   TEXT NOT NULL,
@@ -6448,6 +6458,25 @@ export async function loadTopicBands() {
   });
 }
 
+// Copies the band's override into the archive when it no longer applies (a
+// different generation, or the band's topics changed) so a rebuild never loses
+// a manual name. Returns the existing row and whether it was the active one.
+async function archiveStaleBandOverride(bandId, band, generation) {
+  const existing = await get('SELECT * FROM topic_band_label_overrides WHERE band_id = ?', [Number(bandId)]);
+  if (!existing) return { existing: null, active: false };
+  const active = existing.generation === generation
+    && JSON.stringify(parseChildIds(existing.child_topic_ids)) === JSON.stringify(parseChildIds(band?.child_topic_ids));
+  if (!active) {
+    await run(`
+      INSERT INTO topic_band_label_overrides_archive
+        (band_id, label, child_topic_ids, generation, created_at, updated_at, archived_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [existing.band_id, existing.label, existing.child_topic_ids, existing.generation,
+      existing.created_at, existing.updated_at, new Date().toISOString()]);
+  }
+  return { existing, active };
+}
+
 export async function updateTopicBandManualLabel(bandId, label) {
   const normalized = String(label || '').trim();
   if (!normalized) return null;
@@ -6455,6 +6484,7 @@ export async function updateTopicBandManualLabel(bandId, label) {
   if (!band) return null;
   const now = new Date().toISOString();
   const generation = await getSetting('topics_generation');
+  await archiveStaleBandOverride(bandId, band, generation);
   await run(`
     INSERT INTO topic_band_label_overrides (band_id, label, child_topic_ids, generation, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?)
@@ -6469,17 +6499,25 @@ export async function updateTopicBandManualLabel(bandId, label) {
 }
 
 export async function deleteTopicBandLabelOverride(bandId) {
-  const result = await run('DELETE FROM topic_band_label_overrides WHERE band_id = ?', [Number(bandId)]);
-  if (result.changes > 0) await setSetting('topic_bands_version', new Date().toISOString());
-  return result.changes > 0;
+  const band = await get('SELECT band_id, child_topic_ids FROM topic_bands WHERE band_id = ?', [Number(bandId)]);
+  const generation = await getSetting('topics_generation');
+  const { existing, active } = await archiveStaleBandOverride(bandId, band, generation);
+  if (!existing) return false;
+  await run('DELETE FROM topic_band_label_overrides WHERE band_id = ?', [Number(bandId)]);
+  // Only an active override affected the displayed label.
+  if (active) await setSetting('topic_bands_version', new Date().toISOString());
+  return true;
 }
 
 // Cache key for anything derived from topics or bands. Null while no topics
 // generation exists.
 export async function getTopicsCacheVersion() {
-  const [generation, bandsVersion] = await Promise.all([
-    getSetting('topics_generation'), getSetting('topic_bands_version'),
-  ]);
+  const rows = await all(
+    "SELECT key, value FROM settings WHERE key IN ('topics_generation','topic_bands_version')",
+  );
+  const byKey = new Map(rows.map((row) => [row.key, row.value]));
+  const generation = byKey.get('topics_generation');
+  const bandsVersion = byKey.get('topic_bands_version');
   return generation == null ? null : `${generation}|${bandsVersion ?? ''}`;
 }
 
