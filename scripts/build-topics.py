@@ -270,6 +270,26 @@ def refresh_topic_representation(topic_model, docs, topics, vectorizer_model):
 
 
 # DB connection and logging utilities
+def compute_bands(linkage_matrix, topic_ids, topic_doc_counts):
+    """Choose k, cut the hierarchy, and attach the transient `child_doc_counts` used for naming.
+
+    `child_doc_counts` is for generate_band_labels only; never store it.
+    """
+    k_min, k_max = resolve_band_range()
+    heights = [float(row[2]) for row in linkage_matrix]
+    n = len(topic_ids)
+    k = choose_band_count(heights, n, k_min, k_max)
+    bands = cut_bands(linkage_matrix, topic_ids, topic_doc_counts, k)
+    if 1 <= k < n:
+        gap = (heights[n - k] - heights[n - k - 1]) / heights[n - k - 1] if heights[n - k - 1] > 0 else float("inf")
+        print(f"  Band cut: k={k} (range {k_min}-{k_max}), gap={gap:.3f}, bands={len(bands)}")
+    else:
+        print(f"  Band cut: k={k} (range {k_min}-{k_max}), bands={len(bands)}")
+    for band in bands:
+        band["child_doc_counts"] = {t: topic_doc_counts.get(t, 0) for t in band["child_topic_ids"]}
+    return bands
+
+
 class SqliteClientWrapper:
     def __init__(self, db_path):
         self.conn = sqlite3.connect(db_path)
@@ -418,6 +438,15 @@ def staging_swap_committed(client, now):
 
 
 TOPICS_GENERATION_KEY = "topics_generation"
+TOPIC_BANDS_VERSION_KEY = "topic_bands_version"
+
+
+def bands_version_statement(now):
+    return (
+        "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        [TOPIC_BANDS_VERSION_KEY, now, now],
+    )
 
 
 def publish_staged_topics(client, now):
@@ -447,6 +476,7 @@ def publish_staged_topics(client, now):
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         [TOPICS_GENERATION_KEY, now, now],
     ))
+    statements.append(bands_version_statement(now))
     client.batch(statements)
 
 
@@ -1630,6 +1660,124 @@ def run_label_only(client, topic_id=None, reporter=None):
         client.execute("UPDATE topics SET label = ? WHERE topic_id = ?", [label, tid])
     mark_auto_selected_candidates(client, candidates, labels, overrides)
     print(f"Regenerated labels for {len(selected_topic_ids)} topics.")
+    if topic_id is None:
+        refresh_band_labels(client, labels, topic_terms, titles_by_topic, topic_rows, reporter)
+
+
+def refresh_band_labels(client, new_topic_labels, topic_terms, titles_by_topic, topic_rows, reporter=None):
+    """Rename existing bands from the refreshed topic labels; membership is never changed."""
+    client.execute(
+        "CREATE TABLE IF NOT EXISTS topic_bands (" + TOPIC_TABLE_SCHEMAS["topic_bands"] + ")"
+    )
+    band_rows = client.execute(
+        "SELECT band_id, child_topic_ids, doc_count FROM topic_bands ORDER BY band_id"
+    ).rows
+    if not band_rows:
+        return
+    topic_labels = {int(r["topic_id"]): r["label"] for r in topic_rows}
+    topic_labels.update({int(t): l for t, l in new_topic_labels.items() if int(t) != -1})
+    topic_counts = {int(r["topic_id"]): int(r["doc_count"] or 0) for r in topic_rows}
+    bands = []
+    for r in band_rows:
+        children = [int(t) for t in json.loads(r["child_topic_ids"])]
+        bands.append({
+            "band_id": int(r["band_id"]),
+            "child_topic_ids": children,
+            "doc_count": int(r["doc_count"]),
+            "child_doc_counts": {t: topic_counts.get(t, 0) for t in children},
+        })
+    band_labels = generate_band_labels(bands, topic_labels, topic_terms, titles_by_topic, reporter)
+    now = datetime.now(timezone.utc).isoformat()
+    client.batch(
+        [("UPDATE topic_bands SET label = ? WHERE band_id = ?", [label, bid]) for bid, label in band_labels.items()]
+        + [bands_version_statement(now)]
+    )
+    print(f"Regenerated names for {len(bands)} research-area bands.")
+
+
+def run_bands_only(client, reporter=None):
+    """Rebuild the hierarchy and research-area bands for the CURRENT topics generation.
+
+    Reads document_topics and cached embeddings only; never touches topics,
+    document_topics, topic_label_overrides or topics_generation. All live writes
+    happen in one batch, so a failure leaves the previous rows in place.
+    """
+    import numpy as np
+    ensure_live_topic_tables(client)
+    client.execute(
+        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT NOT NULL)"
+    )
+    if reporter:
+        reporter.report("build_bands", "Building Research Areas", status="running",
+                        detail="Loading topic assignments and cached embeddings...")
+    topic_rows = client.execute("SELECT topic_id, label, top_terms FROM topics WHERE topic_id != -1").rows
+    topic_labels = {int(r["topic_id"]): r["label"] for r in topic_rows}
+    topic_terms = {int(r["topic_id"]): parse_top_terms(r["top_terms"]) for r in topic_rows}
+    assign_rows = client.execute(
+        "SELECT doc_id, topic_id FROM document_topics WHERE topic_id != -1 ORDER BY doc_id"
+    ).rows
+    doc_ids = [r["doc_id"] for r in assign_rows]
+    doc_topic = [int(r["topic_id"]) for r in assign_rows]
+    topic_ids = sorted(set(doc_topic))
+    if len(topic_ids) < 2:
+        raise ValueError("Need at least 2 topics with assigned documents to build research areas")
+    matrix, filled, _dim = load_cached_embeddings(client, doc_ids)
+    if matrix is None or not filled.any():
+        raise ValueError("No cached embeddings found for assigned documents")
+    missing = int((~filled).sum())
+    if missing:
+        print(f"  Dropping {missing} of {len(doc_ids)} assigned documents with no cached embedding")
+    keep = np.nonzero(filled)[0]
+    kept_ids = [doc_ids[i] for i in keep]
+    kept_topics = [doc_topic[i] for i in keep]
+    centroids = topic_centroids(matrix[keep], kept_topics, topic_ids)  # raises if a topic lost all vectors
+    linkage_matrix = centroid_linkage(centroids)
+
+    doc_counts = {}
+    for t in doc_topic:  # paper count = all non-outlier assignments, not just embedded ones
+        doc_counts[t] = doc_counts.get(t, 0) + 1
+    bands = compute_bands(linkage_matrix, topic_ids, doc_counts)
+
+    titles_by_topic = {}
+    meta_rows = client.execute("""
+        SELECT dt.topic_id, d.metadata_json
+        FROM document_topics dt
+        JOIN documents d ON d.doc_id = dt.doc_id
+        WHERE dt.topic_id != -1
+          AND COALESCE(json_extract(d.metadata_json, '$.accessStatus'), 'unknown')
+                NOT IN ('embargoed', 'verification_due')
+        ORDER BY dt.topic_id, dt.probability DESC
+    """).rows
+    for r in meta_rows:
+        try:
+            title = str(json.loads(r["metadata_json"] or "{}").get("title") or "").strip()
+        except Exception:
+            continue
+        if title:
+            bucket = titles_by_topic.setdefault(int(r["topic_id"]), [])
+            if title not in bucket:
+                bucket.append(title)
+    band_labels = generate_band_labels(bands, topic_labels, topic_terms, titles_by_topic, reporter)
+
+    now = datetime.now(timezone.utc).isoformat()
+    statements = [
+        ("DELETE FROM topic_hierarchy_meta", []),
+        ("INSERT INTO topic_hierarchy_meta (id, leaf_topic_ids, linkage_json, created_at) VALUES (1, ?, ?, ?)",
+         [json.dumps(topic_ids), json.dumps(linkage_matrix.tolist()), now]),
+        ("DELETE FROM topic_bands", []),
+    ]
+    for b in bands:
+        statements.append((
+            "INSERT INTO topic_bands (band_id, label, child_topic_ids, doc_count, created_at) VALUES (?, ?, ?, ?, ?)",
+            [b["band_id"], band_labels[b["band_id"]], json.dumps(b["child_topic_ids"]), b["doc_count"], now],
+        ))
+    statements.append(bands_version_statement(now))
+    client.batch(statements)
+    print(f"Saved {len(bands)} research-area bands over {len(topic_ids)} topics.")
+    if reporter:
+        reporter.report("build_bands", "Building Research Areas", status="completed",
+                        detail=f"Built {len(bands)} research-area bands.", next_task="Completed")
+    return {"bands": len(bands), "leaves": len(topic_ids)}
 
 
 import threading
@@ -1674,6 +1822,7 @@ def finish_job(client, job_id, execution_id, status, error=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--labels-only", action="store_true")
+    parser.add_argument("--bands-only", action="store_true")
     parser.add_argument("--topic-id", type=int)
     args = parser.parse_args()
 
@@ -1701,6 +1850,16 @@ def main():
         reporter = ProgressReporter(client, job_id, execution_id)
 
     try:
+        if args.bands_only:
+            run_bands_only(client, reporter=reporter)
+            if job_id:
+                finish_job(client, job_id, execution_id, "completed")
+            if db_logger:
+                db_logger.flush()
+            client.close()
+            print("Done.")
+            return
+
         if args.labels_only:
             if reporter:
                 reporter.report(
@@ -2062,18 +2221,7 @@ def main():
 
         # Research-area bands: cut the hierarchy, name the bands, stage them with the topics
         if linkage_matrix is not None:
-            k_min, k_max = resolve_band_range()
-            heights = [float(row[2]) for row in linkage_matrix]
-            k = choose_band_count(heights, len(all_topic_ids), k_min, k_max)
-            bands = cut_bands(linkage_matrix, all_topic_ids, topic_doc_counts, k)
-            n = len(all_topic_ids)
-            if 1 <= k < n:
-                gap = (heights[n - k] - heights[n - k - 1]) / heights[n - k - 1] if heights[n - k - 1] > 0 else float("inf")
-                print(f"  Band cut: k={k} (range {k_min}-{k_max}), gap={gap:.3f}, bands={len(bands)}")
-            else:
-                print(f"  Band cut: k={k} (range {k_min}-{k_max}), bands={len(bands)}")
-            for band in bands:
-                band["child_doc_counts"] = {t: topic_doc_counts.get(t, 0) for t in band["child_topic_ids"]}
+            bands = compute_bands(linkage_matrix, all_topic_ids, topic_doc_counts)
             titles_by_topic = {}
             for title, t in zip(doc_titles, topics):
                 if title and int(t) != -1:
@@ -2164,7 +2312,7 @@ def main():
             
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
-        if not args.labels_only:
+        if not (args.labels_only or args.bands_only):
             drop_staging_topic_tables(client)
         if reporter:
             reporter.report(

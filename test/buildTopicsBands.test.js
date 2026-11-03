@@ -177,3 +177,97 @@ test('the full-rebuild hierarchy no longer uses topic_embeddings_', () => {
   assert.ok(!main.includes('topic_embeddings_'));
   assert.ok(!main.includes('cosine_similarity('));
 });
+
+const BANDS_DB_SETUP = `
+import tempfile, sqlite3
+tmp = tempfile.mkdtemp()
+db = os.path.join(tmp, "t.sqlite")
+client = bt.SqliteClientWrapper(db)
+client.execute("CREATE TABLE documents (doc_id TEXT PRIMARY KEY, metadata_json TEXT)")
+client.execute("CREATE TABLE document_embeddings (doc_id TEXT PRIMARY KEY, embedding TEXT NOT NULL, created_at TEXT NOT NULL)")
+client.execute("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT NOT NULL)")
+client.execute("CREATE TABLE topic_label_overrides (topic_id INTEGER, generation TEXT, label TEXT)")
+bt.ensure_live_topic_tables(client)
+client.execute("INSERT INTO settings VALUES ('topics_generation', 'g1', 'x')")
+client.execute("INSERT INTO topic_label_overrides VALUES (3, 'g1', 'Manual Name')")
+import random
+rnd = random.Random(1)
+def vec(t):
+    base = [0.0] * 6
+    base[0 if t < 4 else 3] = 5.0
+    base[1 + t % 2] += 1.0 * (t % 4)
+    return [b + rnd.gauss(0, 0.05) for b in base]
+for t in range(8):
+    client.execute("INSERT INTO topics VALUES (?, ?, ?, ?, 'm', 'c')", [t, f"Topic {t}", json.dumps([[f"term{t}", 0.5]]), 3])
+    for j in range(3):
+        d = f"d{t}_{j}"
+        client.execute("INSERT INTO document_topics VALUES (?, ?, 0.9)", [d, t])
+        client.execute("INSERT INTO documents VALUES (?, ?)", [d, json.dumps({"title": f"Title {d}", "abstract": "x" * 60})])
+        if not (SKIP_TOPIC is not None and t == SKIP_TOPIC):
+            client.execute("INSERT INTO document_embeddings VALUES (?, ?, 'c')", [d, json.dumps(vec(t))])
+def snap():
+    return {n: [tuple(r) for r in client.execute(f"SELECT * FROM {n} ORDER BY 1, 2").rows]
+            for n in ("topics", "document_topics", "topic_label_overrides", "settings")}
+bt.generate_labels = lambda model, abstracts, assignments, reporter=None: {}
+os.environ["TOPIC_BANDS_MIN"] = "2"
+os.environ["TOPIC_BANDS_MAX"] = "3"
+`;
+
+test('bands-only writes bands and hierarchy for the current generation', { skip: skipScipy }, () => {
+  const r = runPython(`SKIP_TOPIC = None
+${BANDS_DB_SETUP}
+before = snap()
+out = bt.run_bands_only(client)
+after = snap()
+bands = [dict(r) for r in client.execute("SELECT * FROM topic_bands ORDER BY band_id").rows]
+meta = dict(client.execute("SELECT * FROM topic_hierarchy_meta WHERE id = 1").rows[0])
+settings = {r["key"]: r["value"] for r in client.execute("SELECT key, value FROM settings").rows}
+tb = {k: v for k, v in before.items() if k != "settings"}
+ta = {k: v for k, v in after.items() if k != "settings"}
+print(json.dumps({"out": out, "bands": bands, "leaf": meta["leaf_topic_ids"], "settings": settings, "same": tb == ta}))`);
+  assert.equal(r.out.leaves, 8);
+  assert.equal(r.out.bands, r.bands.length);
+  assert.ok(r.bands.length >= 2 && r.bands.length <= 3);
+  const kids = r.bands.flatMap((b) => JSON.parse(b.child_topic_ids)).sort((a, b) => a - b);
+  assert.deepEqual(kids, [0, 1, 2, 3, 4, 5, 6, 7]);
+  assert.deepEqual(JSON.parse(r.leaf), [0, 1, 2, 3, 4, 5, 6, 7]);
+  assert.equal(r.settings.topics_generation, 'g1');
+  assert.ok(r.settings.topic_bands_version);
+  assert.equal(r.same, true);
+});
+
+test('bands-only leaves live tables intact on failure', { skip: skipScipy }, () => {
+  const r = runPython(`SKIP_TOPIC = 5
+${BANDS_DB_SETUP}
+client.execute("INSERT INTO topic_bands VALUES (0, 'Old', '[1]', 1, 'old')")
+client.execute("INSERT INTO topic_hierarchy_meta VALUES (1, '[1]', '[]', 'old')")
+try:
+    bt.run_bands_only(client)
+    err = None
+except Exception as e:
+    err = str(e)
+bands = [tuple(r) for r in client.execute("SELECT * FROM topic_bands").rows]
+meta = [tuple(r) for r in client.execute("SELECT * FROM topic_hierarchy_meta").rows]
+print(json.dumps({"err": err, "bands": bands, "meta": meta}))`);
+  assert.ok(r.err && !/no attribute/.test(r.err), r.err);
+  assert.deepEqual(r.bands, [[0, 'Old', '[1]', 1, 'old']]);
+  assert.deepEqual(r.meta, [[1, '[1]', '[]', 'old']]);
+});
+
+test('labels-only refreshes band names but not membership', { skip: skipScipy }, () => {
+  const r = runPython(`SKIP_TOPIC = None
+${BANDS_DB_SETUP}
+client.execute("INSERT INTO topic_bands VALUES (0, 'Stale', '[0, 1, 2, 3]', 12, 'old')")
+client.execute("INSERT INTO topic_bands VALUES (1, 'Stale 2', '[4, 5, 6, 7]', 12, 'old')")
+bt.run_label_only(client)
+rows = [dict(r) for r in client.execute("SELECT * FROM topic_bands ORDER BY band_id").rows]
+v1 = client.execute("SELECT value FROM settings WHERE key = 'topic_bands_version'").rows[0]["value"]
+bt.run_label_only(client, topic_id=2)
+rows2 = [dict(r) for r in client.execute("SELECT * FROM topic_bands ORDER BY band_id").rows]
+v2 = client.execute("SELECT value FROM settings WHERE key = 'topic_bands_version'").rows[0]["value"]
+print(json.dumps({"rows": rows, "rows2": rows2, "v1": v1, "v2": v2}))`);
+  assert.deepEqual(r.rows.map((b) => b.child_topic_ids), ['[0, 1, 2, 3]', '[4, 5, 6, 7]']);
+  assert.ok(r.rows.every((b) => b.label !== 'Stale' && b.label !== 'Stale 2'));
+  assert.deepEqual(r.rows2, r.rows);
+  assert.equal(r.v1, r.v2);
+});
