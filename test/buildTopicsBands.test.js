@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 const PYTHON = existsSync('.venv/bin/python') ? '.venv/bin/python' : 'python3';
@@ -133,4 +134,46 @@ counts = {t: 4 for t in ids}
 print(json.dumps(bt.cut_bands(bt.centroid_linkage(cent), ids, counts, 2)))
 `);
   assert.deepEqual(r.map((b) => b.child_topic_ids[0]), [10, 20]);
+});
+
+const BAND_SETUP = `
+bands = [{"band_id": 0, "child_topic_ids": [1, 2], "doc_count": 30, "child_doc_counts": {1: 10, 2: 20}}]
+labels = {1: "Gill Function", 2: "Fish Physiology"}
+terms = {1: [("gill", 0.5)], 2: [("fish", 0.9), ("gill", 0.1)]}
+titles = {1: ["T one"], 2: ["T two", "T three", "T four"]}
+`;
+
+test('generate_band_labels falls back to a whole-band name', () => {
+  const r = runPython(`${BAND_SETUP}
+bt.generate_labels = lambda *a, **k: {}
+print(json.dumps(bt.generate_band_labels(bands, labels, terms, titles)))`);
+  assert.deepEqual(r, { 0: 'Fish Physiology and related topics' });
+});
+
+test('generate_band_labels passes band evidence to the labeller', () => {
+  const r = runPython(`${BAND_SETUP}
+seen = {}
+def fake(model, abstracts, assignments, reporter=None):
+    seen["abstracts"] = abstracts
+    seen["assignments"] = assignments
+    seen["terms"] = model.get_topic(0)
+    seen["info"] = [dict(r) for _, r in model.get_topic_info().iterrows()]
+    return {0: "Aquatic Animal Biology"}
+bt.generate_labels = fake
+out = bt.generate_band_labels(bands, labels, terms, titles)
+print(json.dumps({"out": out, **seen}))`);
+  assert.equal(r.out['0'], 'Aquatic Animal Biology');
+  assert.equal(r.abstracts.length, 1);
+  assert.ok(r.abstracts[0].includes('Gill Function') && r.abstracts[0].includes('Fish Physiology'));
+  assert.ok(r.abstracts[0].includes('T two') && r.abstracts[0].includes('T three') && !r.abstracts[0].includes('T four'));
+  assert.deepEqual(r.assignments, [0]);
+  assert.equal(r.terms[0][0], 'fish');
+  assert.equal(r.info[0].Count, 30);
+});
+
+test('the full-rebuild hierarchy no longer uses topic_embeddings_', () => {
+  const src = readFileSync('scripts/build-topics.py', 'utf8');
+  const main = src.slice(src.indexOf('\ndef main('));
+  assert.ok(!main.includes('topic_embeddings_'));
+  assert.ok(!main.includes('cosine_similarity('));
 });

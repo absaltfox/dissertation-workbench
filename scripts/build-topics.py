@@ -362,12 +362,17 @@ TOPIC_TABLE_SCHEMAS = {
     "document_topic_coords": (
         "doc_id TEXT PRIMARY KEY, umap_x REAL NOT NULL, umap_y REAL NOT NULL"
     ),
+    "topic_bands": (
+        "band_id INTEGER PRIMARY KEY, label TEXT NOT NULL, child_topic_ids TEXT NOT NULL, "
+        "doc_count INTEGER NOT NULL, created_at TEXT NOT NULL"
+    ),
 }
 TOPIC_TABLE_COLUMNS = {
     "topics": ["topic_id", "label", "top_terms", "doc_count", "model_name", "created_at"],
     "document_topics": ["doc_id", "topic_id", "probability"],
     "topic_hierarchy_meta": ["id", "leaf_topic_ids", "linkage_json", "created_at"],
     "document_topic_coords": ["doc_id", "umap_x", "umap_y"],
+    "topic_bands": ["band_id", "label", "child_topic_ids", "doc_count", "created_at"],
 }
 
 
@@ -1476,6 +1481,63 @@ class ExistingTopicModel:
         return self.topic_info
 
 
+def generate_band_labels(bands, topic_labels, topic_terms, titles_by_topic, reporter=None):
+    """Name each research-area band with the same labeller backends used for topics.
+
+    Bands are presented as the "topics" of a lightweight model. The evidence is
+    built only from child labels, child top terms and (additional) example titles;
+    no abstract text and no title-in-place-of-abstract substitution.
+    """
+    info_rows = []
+    band_terms = {}
+    samples = []
+    assignments = []
+    for band in bands:
+        band_id = int(band["band_id"])
+        children = [int(t) for t in band["child_topic_ids"]]
+        weights = {t: max(int(band.get("child_doc_counts", {}).get(t, 1)), 1) for t in children}
+        scores = {}
+        for t in children:
+            for term, weight in topic_terms.get(t, []):
+                scores[term] = scores.get(term, 0.0) + float(weight or 0) * weights[t]
+        band_terms[band_id] = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+        info_rows.append({
+            "Topic": band_id,
+            "Name": f"{band_id}_{'_'.join(term for term, _ in band_terms[band_id][:4])}",
+            "Count": int(band["doc_count"]),
+        })
+        largest = sorted(children, key=lambda t: (-weights[t], t))[:5]
+        child_labels = [topic_labels.get(t, f"Topic {t}") for t in children]
+        titles = []
+        for t in largest:
+            titles.extend((titles_by_topic.get(t) or [])[:2])
+        samples.append(
+            "Subtopics: " + "; ".join(child_labels) + "\nExample titles: " + "; ".join(titles)
+        )
+        assignments.append(band_id)
+
+    model = ExistingTopicModel(band_terms, ExistingTopicInfo(info_rows))
+    generated = generate_labels(model, samples, assignments, reporter) or {}
+
+    labels = {}
+    used = set()
+    for band in bands:
+        band_id = int(band["band_id"])
+        children = [int(t) for t in band["child_topic_ids"]]
+        child_keys = {normalize_label_key(topic_labels.get(t, "")) for t in children}
+        label = clean_generated_label(generated.get(band_id))
+        if not label_is_usable(label, used):
+            counts = band.get("child_doc_counts", {})
+            largest = min(children, key=lambda t: (-int(counts.get(t, 0)), t))
+            base = clean_generated_label(topic_labels.get(largest)) or f"Topic {largest}"
+            label = f"{base} and related topics"
+            if normalize_label_key(label) in child_keys or normalize_label_key(label) in used:
+                label = f"{label} (band {band_id})"
+        used.add(normalize_label_key(label))
+        labels[band_id] = label
+    return labels
+
+
 def parse_top_terms(value):
     try:
         parsed = json.loads(value or "[]")
@@ -1677,6 +1739,7 @@ def main():
 
         doc_ids = []
         abstracts = []
+        doc_titles = []  # extra evidence for band naming only; never a substitute for an abstract
         for row in rows_res.rows:
             try:
                 meta = json.loads(row["metadata_json"])
@@ -1688,6 +1751,7 @@ def main():
                 continue
             doc_ids.append(row["doc_id"])
             abstracts.append(abstract)
+            doc_titles.append(str(meta.get("title") or "").strip())
 
         print(f"Extracted {len(abstracts)} non-empty abstracts (skipped {len(rows_res.rows) - len(abstracts)})")
         if reporter:
@@ -1883,32 +1947,22 @@ def main():
             new_outliers = sum(1 for t in topics if t == -1)
             print(f"  Outliers reduced: {outlier_count} -> {new_outliers}")
 
-        # Compute hierarchical topic structure from topic embeddings
+        # Compute the topic hierarchy from meaning: Ward on mean-centred, L2-normalised
+        # topic centroids of the cached document embeddings (outliers excluded).
         import numpy as np
-        from sklearn.metrics.pairwise import cosine_similarity
-        from scipy.cluster.hierarchy import linkage
-        from scipy.spatial.distance import squareform
 
-        print("\nComputing topic hierarchy (ward linkage on topic embeddings)...")
+        print("\nComputing topic hierarchy (ward linkage on document-embedding centroids)...")
         all_topic_info = topic_model.get_topic_info()
-        all_topic_ids = sorted(all_topic_info[all_topic_info["Topic"] != -1]["Topic"].tolist())
-        embeddings_raw = topic_model.topic_embeddings_
+        all_topic_ids = sorted(int(t) for t in all_topic_info[all_topic_info["Topic"] != -1]["Topic"].tolist())
+        topic_doc_counts = {}
+        for t in topics:
+            if int(t) != -1:
+                topic_doc_counts[int(t)] = topic_doc_counts.get(int(t), 0) + 1
 
-        # BERTopic keeps an extra embedding row for the outlier topic (-1) even after
-        # outlier reduction removes it from topic_info. Detect this by comparing the
-        # embedding count to the number of non-outlier topics.
-        if embeddings_raw.shape[0] == len(all_topic_ids) + 1:
-            hierarchy_embeddings = embeddings_raw[1:]  # skip ghost outlier row
-        else:
-            hierarchy_embeddings = embeddings_raw
-
+        linkage_matrix = None
         if len(all_topic_ids) >= 2:
-            dist_matrix = 1 - cosine_similarity(hierarchy_embeddings)
-            np.fill_diagonal(dist_matrix, 0)
-            condensed = squareform(dist_matrix, checks=False)
-            linkage_matrix = linkage(condensed, method='ward', optimal_ordering=True)
-
-            # Store in topic_hierarchy_meta table
+            centroids = topic_centroids(embeddings_matrix, topics, all_topic_ids)
+            linkage_matrix = centroid_linkage(centroids)
             leaf_topic_ids_json = json.dumps(all_topic_ids)
             linkage_json = json.dumps(linkage_matrix.tolist())
             print(f"  Linkage matrix: {len(linkage_matrix)} merge steps for {len(all_topic_ids)} topics")
@@ -2006,11 +2060,43 @@ def main():
             )
             print(f"  Saved topic hierarchy ({len(all_topic_ids)} leaves, {len(linkage_matrix)} merges)")
 
+        # Research-area bands: cut the hierarchy, name the bands, stage them with the topics
+        if linkage_matrix is not None:
+            k_min, k_max = resolve_band_range()
+            heights = [float(row[2]) for row in linkage_matrix]
+            k = choose_band_count(heights, len(all_topic_ids), k_min, k_max)
+            bands = cut_bands(linkage_matrix, all_topic_ids, topic_doc_counts, k)
+            n = len(all_topic_ids)
+            if 1 <= k < n:
+                gap = (heights[n - k] - heights[n - k - 1]) / heights[n - k - 1] if heights[n - k - 1] > 0 else float("inf")
+                print(f"  Band cut: k={k} (range {k_min}-{k_max}), gap={gap:.3f}, bands={len(bands)}")
+            else:
+                print(f"  Band cut: k={k} (range {k_min}-{k_max}), bands={len(bands)}")
+            for band in bands:
+                band["child_doc_counts"] = {t: topic_doc_counts.get(t, 0) for t in band["child_topic_ids"]}
+            titles_by_topic = {}
+            for title, t in zip(doc_titles, topics):
+                if title and int(t) != -1:
+                    bucket = titles_by_topic.setdefault(int(t), [])
+                    if title not in bucket:
+                        bucket.append(title)
+            band_topic_terms = {t: (topic_model.get_topic(t) or []) for t in all_topic_ids}
+            band_labels = generate_band_labels(bands, topic_labels, band_topic_terms, titles_by_topic, reporter)
+            band_rows = [
+                [b["band_id"], band_labels[b["band_id"]], json.dumps(b["child_topic_ids"]), b["doc_count"], now]
+                for b in bands
+            ]
+            write_rows(
+                client,
+                "INSERT OR REPLACE INTO topic_bands_next (band_id, label, child_topic_ids, doc_count, created_at) VALUES (?, ?, ?, ?, ?)",
+                band_rows,
+            )
+            print(f"  Saved {len(band_rows)} research-area bands")
+
         # Release what the 2-D UMAP fit and the rest of the run no longer need
         # (still needed: topic_model, topic_info, topic_labels, topics, doc_ids, abstracts, embeddings_matrix)
         probs = doc_topic_rows = topic_rows = label_candidates = claude_labels = None
-        embeddings_raw = hierarchy_embeddings = None
-        dist_matrix = condensed = linkage_matrix = linkage_json = None
+        linkage_matrix = linkage_json = band_rows = None
         gc.collect()
 
         # Extract 2D UMAP projection for scatter plot visualization

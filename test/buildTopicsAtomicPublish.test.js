@@ -19,6 +19,7 @@ client.execute("INSERT INTO topics VALUES (1, 'old', '[]', 1, 'm', 't')")
 client.execute("INSERT INTO document_topics VALUES ('d_old', 1, 0.5)")
 client.execute("INSERT INTO document_topic_coords VALUES ('d_old', 0.1, 0.2)")
 client.execute("INSERT INTO topic_hierarchy_meta VALUES (1, '[1]', '[]', 't')")
+client.execute("INSERT INTO topic_bands VALUES (0, 'Old band', '[1]', 1, 't')")
 def stage():
     bt.prepare_staging_topic_tables(client)
     bt.write_rows(client, "INSERT OR REPLACE INTO topics_next (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -167,4 +168,32 @@ print(json.dumps({"after_fail": after_fail, "after_ok": gen()}))
 `);
   assert.equal(r.after_fail, null);
   assert.equal(r.after_ok, 'gen-2');
+});
+
+test('topic_bands is staged and swapped with topics', () => {
+  const r = runPython(`
+stage()
+bt.write_rows(client, "INSERT OR REPLACE INTO topic_bands_next (band_id, label, child_topic_ids, doc_count, created_at) VALUES (?, ?, ?, ?, ?)",
+    [[0, 'New band', '[7,8]', 3, 't2']])
+bt.publish_staged_topics(client, 't2')
+rows = client.execute("SELECT label, child_topic_ids, doc_count FROM topic_bands").rows
+print(json.dumps({"rows": [[x["label"], x["child_topic_ids"], x["doc_count"]] for x in rows], "tables": tables()}))
+`);
+  assert.deepEqual(r.rows, [['New band', '[7,8]', 3]]);
+  assert.ok(r.tables.every((t) => !t.endsWith('_next')), r.tables.join());
+});
+
+test('a failed swap leaves the old topic_bands rows', () => {
+  const r = runPython(`
+stage()
+bt.write_rows(client, "INSERT OR REPLACE INTO topic_bands_next (band_id, label, child_topic_ids, doc_count, created_at) VALUES (?, ?, ?, ?, ?)",
+    [[0, 'New band', '[7,8]', 3, 't2']])
+client.execute("DROP TABLE document_topic_coords_next")
+try:
+    bt.publish_staged_topics(client, 't2')
+except Exception:
+    pass
+print(json.dumps({"labels": [x["label"] for x in client.execute("SELECT label FROM topic_bands").rows]}))
+`);
+  assert.deepEqual(r.labels, ['Old band']);
 });
