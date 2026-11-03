@@ -13,6 +13,10 @@ import { bandsServerEnv, ADMIN_PASSWORD, BAND_TOPICS } from './bands-env.mjs';
 const PORT = 4175;
 const URL_BASE = `http://127.0.0.1:${PORT}`;
 const PYTHON = existsSync('.venv/bin/python') ? '.venv/bin/python' : 'python3';
+// CI runs stdlib-only python3; --bands-only needs numpy/scipy for the linkage.
+const hasScipy = (() => {
+  try { execFileSync(PYTHON, ['-c', 'import numpy, scipy'], { stdio: 'ignore' }); return true; } catch { return false; }
+})();
 
 let dataDir;
 let dbPath;
@@ -72,6 +76,7 @@ async function waitForHealth(tries = 60) {
 test.describe.configure({ mode: 'serial' });
 
 test.describe('research-area bands end to end', () => {
+  test.skip(!hasScipy, 'numpy/scipy not installed');
   test.use({ baseURL: URL_BASE });
 
   test.beforeAll(async () => {
@@ -108,11 +113,13 @@ test.describe('research-area bands end to end', () => {
 
   test.afterAll(async () => {
     if (server) {
-      const exited = new Promise((r) => server.once('exit', r));
-      server.kill('SIGTERM');
-      const t = setTimeout(() => server.kill('SIGKILL'), 5000);
-      await exited;
-      clearTimeout(t);
+      if (server.exitCode === null && server.signalCode === null) {
+        const exited = new Promise((r) => server.once('exit', r));
+        server.kill('SIGTERM');
+        const t = setTimeout(() => server.kill('SIGKILL'), 5000);
+        await exited;
+        clearTimeout(t);
+      }
     }
     if (dataDir) rmSync(dataDir, { recursive: true, force: true });
   });
@@ -179,6 +186,7 @@ test.describe('research-area bands end to end', () => {
 
   test.describe('POST /api/admin/topics/bands/rebuild', () => {
     let csrf;
+    let adminCtx;
     const post = (request, p) => request.post(p, { headers: { 'x-csrf-token': csrf }, data: {} });
 
     test.beforeAll(async ({ playwright }) => {
@@ -187,9 +195,9 @@ test.describe('research-area bands end to end', () => {
       expect(res.status()).toBe(200);
       csrf = (await res.json()).csrfToken;
       test.info().annotations.push({ type: 'login', description: 'ok' });
-      globalThis.__bandsAdminCtx = ctx;
+      adminCtx = ctx;
     });
-    test.afterAll(async () => { await globalThis.__bandsAdminCtx?.dispose(); delete globalThis.__bandsAdminCtx; });
+    test.afterAll(async () => { await adminCtx?.dispose(); });
 
     test('rejects anonymous callers', async ({ request }) => {
       expect((await request.post('/api/admin/topics/bands/rebuild', { data: {} })).status()).toBe(401);
@@ -198,7 +206,7 @@ test.describe('research-area bands end to end', () => {
     test('409 while a bertopic job is running', async () => {
       setJob('bertopic', 'running');
       try {
-        const res = await post(globalThis.__bandsAdminCtx, '/api/admin/topics/bands/rebuild');
+        const res = await post(adminCtx, '/api/admin/topics/bands/rebuild');
         expect(res.status()).toBe(409);
         expect(await res.json()).toMatchObject({ runningType: 'bertopic' });
       } finally { setJob('bertopic', 'none'); }
@@ -207,7 +215,7 @@ test.describe('research-area bands end to end', () => {
     test('409 while a topic_labels job is running', async () => {
       setJob('topic_labels', 'running');
       try {
-        const res = await post(globalThis.__bandsAdminCtx, '/api/admin/topics/bands/rebuild');
+        const res = await post(adminCtx, '/api/admin/topics/bands/rebuild');
         expect(res.status()).toBe(409);
         expect(await res.json()).toMatchObject({ runningType: 'topic_labels' });
       } finally { setJob('topic_labels', 'none'); }
@@ -216,13 +224,13 @@ test.describe('research-area bands end to end', () => {
     test('202 alreadyRunning when a topic_bands job is running; labels/regenerate then 409', async () => {
       setJob('topic_bands', 'running');
       try {
-        const res = await post(globalThis.__bandsAdminCtx, '/api/admin/topics/bands/rebuild');
+        const res = await post(adminCtx, '/api/admin/topics/bands/rebuild');
         expect(res.status()).toBe(202);
         const body = await res.json();
         expect(body).toMatchObject({ ok: true, alreadyRunning: true });
         expect(body.jobId).toBeGreaterThan(0);
 
-        const labels = await post(globalThis.__bandsAdminCtx, '/api/admin/topics/labels/regenerate');
+        const labels = await post(adminCtx, '/api/admin/topics/labels/regenerate');
         expect(labels.status()).toBe(409);
         expect(await labels.json()).toMatchObject({ bandsRunning: true, jobId: body.jobId });
       } finally { setJob('topic_bands', 'none'); }

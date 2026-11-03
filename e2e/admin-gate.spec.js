@@ -68,11 +68,13 @@ test.describe('admin network gate: ADMIN_ALLOWED_NETWORKS set to a non-matching 
 
   test.afterAll(async () => {
     if (!server) return;
-    const exited = new Promise((r) => server.once('exit', r));
-    server.kill('SIGTERM');
-    const t = setTimeout(() => server.kill('SIGKILL'), 5000);
-    await exited;
-    clearTimeout(t);
+    if (server.exitCode === null && server.signalCode === null) {
+      const exited = new Promise((r) => server.once('exit', r));
+      server.kill('SIGTERM');
+      const t = setTimeout(() => server.kill('SIGKILL'), 5000);
+      await exited;
+      clearTimeout(t);
+    }
   });
 
   test('API: auth and admin are 404, health is 200', async ({ request }) => {

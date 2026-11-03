@@ -263,8 +263,9 @@ test.describe('Rate limiter', () => {
   // start-server.mjs) so the 120/min per-IP limit does not throttle unrelated
   // tests. This proves the limiter itself is still live: one fixed address
   // exceeding the limit gets a 429. (/api/health is mounted before the limiter.)
-  test('more than 120 anonymous /api requests from one IP get 429', async ({ request }) => {
-    const headers = { 'x-forwarded-for': '192.0.2.50' };
+  test('more than 120 anonymous /api requests from one IP get 429', async ({ request }, testInfo) => {
+    // Unique per attempt so a CI retry inside the 60s window starts with a fresh bucket.
+    const headers = { 'x-forwarded-for': `192.0.2.${50 + testInfo.retry}` };
     const statuses = [];
     for (let i = 0; i < 125; i += 1) {
       statuses.push((await request.get('/api/citations/top', { headers })).status());
@@ -272,7 +273,7 @@ test.describe('Rate limiter', () => {
     expect(statuses.slice(0, 120).every((c) => c !== 429), 'first 120 pass').toBe(true);
     expect(statuses.slice(120)).toContain(429);
     // A different client address is unaffected.
-    const other = await request.get('/api/citations/top', { headers: { 'x-forwarded-for': '192.0.2.51' } });
+    const other = await request.get('/api/citations/top', { headers: { 'x-forwarded-for': `192.0.2.${150 + testInfo.retry}` } });
     expect(other.status()).not.toBe(429);
   });
 });
