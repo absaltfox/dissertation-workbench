@@ -242,6 +242,7 @@ Use `.env.development.example` and `.env.production.example` as the canonical te
 - `CACHE_TTL_MS`: in-memory metrics cache TTL, default `600000`.
 - `TRUST_PROXY`: set `1` behind Fly/reverse proxies.
 - `SESSION_COOKIE_SECURE`: defaults to `1` in production and `0` otherwise.
+- `ADMIN_ALLOWED_NETWORKS`: optional comma-separated IPv4/IPv6 addresses or CIDR ranges (e.g. `203.0.113.5, 10.0.0.0/8`). When set, `/api/auth/*` and `/api/admin/*` return `404` to clients outside the list and the Admin tab is hidden; `/api/internal/*` (worker callbacks) is never gated. Unset or empty allows everyone. An invalid entry fails startup. Requires `TRUST_PROXY=1` behind a proxy so the real client IP is seen. In production set it as a Fly secret, not in `fly.toml`.
 - `REQUIRE_ADMIN_MFA`: defaults to `1` in production and `0` otherwise.
 - `ADMIN_BOOTSTRAP_PASSWORD`: required in production to create the first `admin` user.
 - `API_KEY_ENCRYPTION_KEY`: required in production for stored API keys.

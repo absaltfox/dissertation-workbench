@@ -196,6 +196,12 @@ export function createAuthRouter({ getClientIp }) {
     res.status(200).json({ ok: true });
   });
 
+  // Quiet reachability probe for the frontend: 200 here (behind the network
+  // gate) vs 404 when this client may not see admin. Avoids a 401 console error.
+  router.get('/available', (_req, res) => {
+    res.json({ ok: true });
+  });
+
   router.get('/session', (req, res) => {
     const user = authenticate(req);
     if (!user) {
