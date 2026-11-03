@@ -26,11 +26,7 @@ test.describe('Part A: manuscripts UI', () => {
     await expect(page.locator('#documentsTable tr.doc-row').first()).toBeVisible();
   });
 
-  // PRODUCT BUG: buildWordCloud() (src/nlp.js) tokenises rec.subjects, and
-  // src/metrics.js substitutes the "(Unspecified)" placeholder for empty
-  // subjects, so "unspecified" is served in /api/metrics wordCloud and rendered.
-  // The d909f54 fix only patched documentThemeTerms(), not buildWordCloud().
-  test.fail('"unspecified" is never a word-cloud term (doc with no subjects is seeded)', async ({ page, request }) => {
+  test('"unspecified" is never a word-cloud term (doc with no subjects is seeded)', async ({ page, request }) => {
     // The placeholder reaches records as "(Unspecified)"; make sure the seed exercises it.
     const res = await request.get('/api/metrics');
     expect(res.ok()).toBe(true);

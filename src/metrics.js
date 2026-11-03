@@ -13,7 +13,8 @@ import {
 import {
   toArray, flattenText, extractYear, parsePageCount, buildWordCloud,
   buildMethodologyStats, extractNgrams, detectMethodologies,
-  isLowSignalConceptTerm, documentThemeTerms, COOCCURRENCE_BLOCKLIST, UNSPECIFIED_SUBJECT
+  isLowSignalConceptTerm, documentThemeTerms, COOCCURRENCE_BLOCKLIST, UNSPECIFIED_SUBJECT,
+  subjectsText
 } from './nlp.js';
 import { fetchPage, extractHits, resolveIndexName, collectCandidateUrls } from './api.js';
 import { enrichDocumentsWithFileAnalysis } from './pdf.js';
@@ -139,7 +140,7 @@ export function normalizeRecord(doc, dict = null) {
 
   const methodologies = accessRestricted
     ? []
-    : detectMethodologies([title, analyticalDescription, subjects.join(' ')].join(' '));
+    : detectMethodologies([title, analyticalDescription, subjectsText(subjects)].join(' '));
   const conceptTerms = accessRestricted
     ? []
     : docConceptTerms({ title, abstract: analyticalDescription, subjects }, 12, dict);
@@ -388,7 +389,7 @@ function docConceptTerms(rec, limit = 12, dict = null) {
   // (e.g. "coordinators/directors" → "coordinators directors" bigram).
   const bodySegments = [
     ...(rec.abstract || '').split(/[/,]/),  // "/" and "," both act as phrase boundaries
-    ...(rec.subjects || []).join('/')        // "/" join keeps each subject as its own segment
+    ...subjectsText(rec.subjects, '/')      // "/" join keeps each subject as its own segment
       .split('/')
   ].map((s) => s.trim()).filter(Boolean);
   for (const seg of bodySegments) {
@@ -833,7 +834,7 @@ export function enrichDocumentSignals(records = []) {
       rec.conceptTerms = docConceptTerms(rec, 12, conceptDict);
     }
     if (!rec.methodologies.length) {
-      rec.methodologies = detectMethodologies([rec.title, rec.abstract, rec.subjects.join(' ')].join(' '));
+      rec.methodologies = detectMethodologies([rec.title, rec.abstract, subjectsText(rec.subjects)].join(' '));
     }
     if (!rec.themes.length) {
       rec.themes = documentThemeTerms(rec, 12);
