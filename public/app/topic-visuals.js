@@ -1,4 +1,4 @@
-import { BAND_PALETTE } from './palette.js';
+import { BAND_PALETTE, FLOW_FILL_OPACITY } from './palette.js';
 import {
   dom,
   ensureD3Library,
@@ -923,6 +923,7 @@ function renderTopicSankey() {
   const pad = { t: 30, r: 30, b: 40, l: 30 };
   const colWidth = (width - pad.l - pad.r) / Math.max(periods.length - 1, 1);
 
+  // Colours wrap after 15 bands (BAND_PALETTE.length).
   const colorForIdx = i => BAND_PALETTE[i % BAND_PALETTE.length];
 
   const periodTotals = periods.map((_, pi) => topicPeriods.reduce((s, t) => s + t.counts[pi], 0));
@@ -979,7 +980,7 @@ function renderTopicSankey() {
       Z
     `)
     .attr('fill', d => colorForIdx(d.topicIdx))
-    .attr('fill-opacity', 0.55)
+    .attr('fill-opacity', FLOW_FILL_OPACITY)
     .attr('stroke', d => colorForIdx(d.topicIdx))
     .attr('stroke-opacity', 0.3)
     .attr('stroke-width', 0.5)
@@ -989,13 +990,13 @@ function renderTopicSankey() {
     d3.select(this)
       .transition()
       .duration(100)
-      .attr('fill-opacity', 0.85);
+      .attr('fill-opacity', 1);
   })
   .on('mouseout', function() {
     d3.select(this)
       .transition()
       .duration(100)
-      .attr('fill-opacity', 0.55);
+      .attr('fill-opacity', FLOW_FILL_OPACITY);
   });
 
   svg.append('g')
@@ -1018,7 +1019,7 @@ function renderTopicSankey() {
     .append('span')
     .attr('class', 'scatter-legend-item')
     .html((t, i) => `
-      <span class="scatter-legend-swatch" style="background:${colorForIdx(i)}"></span>
+      <span class="scatter-legend-swatch" style="background:${colorForIdx(i)};opacity:${FLOW_FILL_OPACITY}"></span>
       ${escapeHtml(topicDisplayLabel(t.label))}
     `);
 }
