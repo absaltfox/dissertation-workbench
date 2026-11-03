@@ -9,7 +9,7 @@ import {
 import {
   applyCitationCountsToDocuments, applyCommitteeMembersToDocuments,
   applyStoredFileMetricsToDocuments, getDocumentCacheStats, getDocumentServingAnalytics, getDocumentServingSummary,
-  getSetting, loadServingSnapshot, saveServingSnapshot, getTopicByYearCounts, hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics, loadTopicHierarchy,
+  getTopicsCacheVersion, loadServingSnapshot, saveServingSnapshot, getTopicByYearCounts, hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics, loadTopicHierarchy,
   queryCachedDocumentPage, queryCitationDocumentPage, queryConceptTermsByDoc, queryPeoplePage, queryPersonDetailPage,
   queryRelatedDocuments, queryVisualizationDocuments
 } from '../db.js';
@@ -429,8 +429,16 @@ export function resetTopicsGenerationMemo(cache) {
   topicsGenerationState.delete(cache);
 }
 
+// For a topics/bands write made by this instance: drop the cache and forget
+// the memo, so the next sync re-baselines instead of seeing our own version
+// bump as a foreign change and rebuilding a second time.
+export function clearCacheAfterLocalTopicsWrite(cache) {
+  cache.clear();
+  resetTopicsGenerationMemo(cache);
+}
+
 export async function syncTopicsGeneration(cache, {
-  read = () => getSetting('topics_generation'), now = Date.now,
+  read = () => getTopicsCacheVersion(), now = Date.now,
 } = {}) {
   let state = topicsGenerationState.get(cache);
   if (!state) {
@@ -476,7 +484,7 @@ export async function seedSliceFromSnapshot(cache, key) {
     if (cache.get(key)) return false;
     const snapshot = await loadServingSnapshot(VISUALIZATIONS_SNAPSHOT_KEY);
     if (!snapshot || snapshot.payload?.cacheKey !== key) return false;
-    const generation = await getSetting('topics_generation');
+    const generation = await getTopicsCacheVersion();
     if (generation == null || snapshot.generation !== generation) return false;
     const timestamp = Date.parse(snapshot.updatedAt);
     cache.set(key, { timestamp: Number.isFinite(timestamp) ? timestamp : 0, payload: snapshot.payload.data });
@@ -501,7 +509,7 @@ async function saveVisualizationsSnapshot(key, generation, payload) {
 async function buildAndSaveSnapshot(key, build) {
   let generation = null;
   try {
-    generation = await getSetting('topics_generation');
+    generation = await getTopicsCacheVersion();
   } catch {
     // Without a generation the snapshot is simply not saved.
   }

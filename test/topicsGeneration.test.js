@@ -10,6 +10,7 @@ import path from 'node:path';
 
 let syncTopicsGeneration;
 let resetTopicsGenerationMemo;
+let clearCacheAfterLocalTopicsWrite;
 let TOPICS_GENERATION_MEMO_MS;
 
 test.before(async () => {
@@ -17,7 +18,7 @@ test.before(async () => {
   process.env.APP_DATA_DIR = dir;
   process.env.SQLITE_PATH = path.join(dir, 'metrics.sqlite');
   delete process.env.TURSO_DATABASE_URL;
-  ({ syncTopicsGeneration, resetTopicsGenerationMemo, TOPICS_GENERATION_MEMO_MS } = await import('../src/routes/metricsRoutes.js'));
+  ({ syncTopicsGeneration, resetTopicsGenerationMemo, clearCacheAfterLocalTopicsWrite, TOPICS_GENERATION_MEMO_MS } = await import('../src/routes/metricsRoutes.js'));
 });
 
 function fakeCache() {
@@ -88,4 +89,23 @@ test('the default reader reads the topics_generation setting from the database',
   await syncTopicsGeneration(cache, { now: () => 1 + TOPICS_GENERATION_MEMO_MS + 1 });
   assert.equal(cache.clears, 1);
   await db.closeDb();
+});
+
+test('a local topics/bands write clears once and does not trigger a second clear on the next memo check', async () => {
+  const cache = fakeCache();
+  let version = 'g|v1';
+  let clock = 20_000_000;
+  const opts = { read: async () => version, now: () => clock };
+  await syncTopicsGeneration(cache, opts);
+  version = 'g|v2'; // this instance wrote the new version
+  clearCacheAfterLocalTopicsWrite(cache);
+  assert.equal(cache.clears, 1);
+  await syncTopicsGeneration(cache, opts);
+  clock += TOPICS_GENERATION_MEMO_MS + 1;
+  await syncTopicsGeneration(cache, opts);
+  assert.equal(cache.clears, 1);
+  version = 'g|v3'; // a foreign change is still noticed
+  clock += TOPICS_GENERATION_MEMO_MS + 1;
+  await syncTopicsGeneration(cache, opts);
+  assert.equal(cache.clears, 2);
 });

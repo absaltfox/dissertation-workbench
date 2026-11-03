@@ -1649,8 +1649,14 @@ def generate_band_labels(bands, topic_labels, topic_terms, titles_by_topic, repo
             counts = band.get("child_doc_counts", {})
             largest = min(children, key=lambda t: (-int(counts.get(t, 0)), t))
             base = clean_generated_label(topic_labels.get(largest)) or f"Topic {largest}"
-            label = f"{base} and related topics"
-            if normalize_label_key(label) in child_keys or normalize_label_key(label) in used:
+            if len(children) == 1:
+                # No related topics exist: the band is just its single child.
+                label = base
+                collides = normalize_label_key(label) in used
+            else:
+                label = f"{base} and related topics"
+                collides = normalize_label_key(label) in child_keys or normalize_label_key(label) in used
+            if collides:
                 label = f"{label} (band {band_id})"
         used.add(normalize_label_key(label))
         labels[band_id] = label

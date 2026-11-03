@@ -49,6 +49,7 @@ const topicDendrogramContainerEl = document.getElementById('topicDendrogramConta
 const topicSankeyPanelEl = document.getElementById('topicSankeyPanel');
 const topicSankeyChartEl = document.getElementById('topicSankeyChart');
 const topicSankeyLegendEl = document.getElementById('topicSankeyLegend');
+const topicSankeyTooltipEl = document.getElementById('topicSankeyTooltip');
 const methTopicBubblePanelEl = document.getElementById('methTopicBubblePanel');
 const methTopicBubbleChartEl = document.getElementById('methTopicBubbleChart');
 const methTopicBubbleTooltipEl = document.getElementById('methTopicBubbleTooltip');
@@ -801,6 +802,7 @@ const dom = {
   topicSankeyPanelEl,
   topicSankeyChartEl,
   topicSankeyLegendEl,
+  topicSankeyTooltipEl,
   methTopicBubblePanelEl,
   methTopicBubbleChartEl,
   methTopicBubbleTooltipEl,

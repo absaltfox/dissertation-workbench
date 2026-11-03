@@ -74,7 +74,27 @@ test.describe('Document Explorer', () => {
   test('Escape closes the detail modal', async ({ page }) => {
     await page.locator(`#documentsTable tr[data-doc-id="${FIXTURE_DOCS[0].id}"] .doc-title-cell`).click();
     await expect(page.locator('#docModalOverlay')).toBeVisible();
+    // Wait for the detail to finish loading: openRecord() re-opens the modal when
+    // the load completes (see the test.fail test below).
+    await expect(page.locator('#docModalTitle')).toContainText(FIXTURE_DOCS[0].title);
     await page.keyboard.press('Escape');
+    await expect(page.locator('#docModalOverlay')).toBeHidden();
+  });
+
+  // PRODUCT BUG: openRecord() (public/app/documents.js) opens the modal, awaits the
+  // detail fetch, then calls renderDetails() -> openDesktopModal(), which sets
+  // overlay.hidden = false again. Closing the modal (Escape or the X) while the
+  // detail is still loading is undone when the fetch resolves.
+  test.fail('closing the modal while details are loading keeps it closed', async ({ page }) => {
+    let release;
+    const gate = new Promise((r) => { release = r; });
+    await page.route('**/api/workbench/documents/*', async (route) => { await gate; await route.continue(); });
+    await page.locator(`#documentsTable tr[data-doc-id="${FIXTURE_DOCS[0].id}"] .doc-title-cell`).click();
+    await expect(page.locator('#docModalOverlay')).toBeVisible();
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#docModalOverlay')).toBeHidden();
+    release();
+    await page.waitForTimeout(500);
     await expect(page.locator('#docModalOverlay')).toBeHidden();
   });
 

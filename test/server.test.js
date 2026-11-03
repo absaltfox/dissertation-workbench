@@ -9,7 +9,7 @@ import { createSession, destroySession, getSessionCsrfToken } from '../src/auth.
 import { getConceptPipelineStatus } from '../src/conceptsPipeline.js';
 import { CITATION_SCAN_NIGHTLY_ENABLED } from '../src/config.js';
 import {
-  closeDb, createAdminJob, finishAdminJob, hashAdminJobToken, hasRunningAdminJob, saveCitations,
+  closeDb, getDb, getSetting, setSetting, createAdminJob, finishAdminJob, hashAdminJobToken, hasRunningAdminJob, saveCitations,
   countPendingCitationScans, saveCitationExtractionState,
   saveCommitteeMembers, saveDocumentMetadata, saveFileMetric, saveImportRule
 } from '../src/db.js';
@@ -776,6 +776,77 @@ test('admin cannot delete their own account', async () => {
 
     assert.equal(res.body.error, 'Cannot delete your own admin account');
   } finally {
+    destroySession(token);
+  }
+});
+
+test('admin research-area band routes list, rename, reset, validate, and require CSRF', async () => {
+  const client = await getDb();
+  const now = new Date().toISOString();
+  await client.execute({ sql: "DELETE FROM topic_bands", args: [] });
+  await client.execute({ sql: "DELETE FROM topic_band_label_overrides", args: [] });
+  await client.execute({ sql: "DELETE FROM topics WHERE topic_id IN (9101, 9102, 9103)", args: [] });
+  for (const [id, label, count] of [[9101, 'Alpha topic', 4], [9102, 'Beta topic', 7], [9103, 'Gamma topic', 2]]) {
+    await client.execute({
+      sql: "INSERT INTO topics (topic_id, label, top_terms, doc_count, model_name, created_at) VALUES (?, ?, '[]', ?, 'test', ?)",
+      args: [id, label, count, now],
+    });
+  }
+  await client.execute({
+    sql: "INSERT INTO topic_bands (band_id, label, child_topic_ids, doc_count, created_at) VALUES (0, 'Auto Zero', '[9102,9101]', 11, ?), (1, 'Auto One', '[9103]', 2, ?)",
+    args: [now, now],
+  });
+  // Overrides match on the current topics generation; a fresh DB has none.
+  const priorGeneration = await getSetting('topics_generation');
+  await setSetting('topics_generation', 'test-gen');
+  const token = createSession('admin');
+  const cookie = `session=${token}`;
+  const csrf = getSessionCsrfToken(token);
+  const api = (method, url) => request(app)[method](url).set('Cookie', cookie).set('x-csrf-token', csrf);
+  try {
+    const list = await api('get', '/api/admin/topics/bands').expect(200);
+    assert.equal(list.body.bands.length, 2);
+    assert.ok('generation' in list.body);
+    const b0 = list.body.bands.find((b) => b.bandId === 0);
+    assert.equal(b0.label, 'Auto Zero');
+    assert.equal(b0.hasOverride, false);
+    assert.equal(b0.docCount, 11);
+    assert.deepEqual(b0.children, [
+      { topicId: 9102, label: 'Beta topic', docCount: 7 },
+      { topicId: 9101, label: 'Alpha topic', docCount: 4 },
+    ]);
+
+    await api('patch', '/api/admin/topics/bands/0/label').send({ label: '' }).expect(400);
+    await api('patch', '/api/admin/topics/bands/0/label').send({ label: 'x'.repeat(121) }).expect(400);
+    await api('patch', '/api/admin/topics/bands/77/label').send({ label: 'Nope' }).expect(404);
+    await request(app).patch('/api/admin/topics/bands/0/label').set('Cookie', cookie)
+      .send({ label: 'No csrf' }).expect(403);
+
+    await api('patch', '/api/admin/topics/bands/abc/label').send({ label: 'Nope' }).expect(400);
+    await api('patch', '/api/admin/topics/bands/0/label').send({ label: 123 }).expect(400);
+    await api('patch', '/api/admin/topics/bands/0/label').send({}).expect(400);
+    await api('delete', '/api/admin/topics/bands/abc/label/override').expect(400);
+    await client.execute({ sql: "DELETE FROM settings WHERE key = 'topics_generation'", args: [] });
+    const noGen = await api('patch', '/api/admin/topics/bands/0/label').send({ label: 'Renamed' }).expect(409);
+    assert.equal(noGen.body.error, 'Rebuild topics before renaming research areas.');
+    await setSetting('topics_generation', 'test-gen');
+
+    await api('patch', '/api/admin/topics/bands/0/label').send({ label: '  Renamed  ' }).expect(200);
+    let after = (await api('get', '/api/admin/topics/bands').expect(200)).body.bands.find((b) => b.bandId === 0);
+    assert.equal(after.hasOverride, true);
+    assert.equal(after.label, 'Renamed');
+    assert.equal(after.autoLabel, 'Auto Zero');
+
+    await api('delete', '/api/admin/topics/bands/0/label/override').expect(200);
+    after = (await api('get', '/api/admin/topics/bands').expect(200)).body.bands.find((b) => b.bandId === 0);
+    assert.equal(after.hasOverride, false);
+    assert.equal(after.label, after.autoLabel);
+  } finally {
+    await client.execute({ sql: "DELETE FROM topic_bands", args: [] });
+    await client.execute({ sql: "DELETE FROM topic_band_label_overrides", args: [] });
+    await client.execute({ sql: "DELETE FROM topics WHERE topic_id IN (9101, 9102, 9103)", args: [] });
+    if (priorGeneration == null) await client.execute({ sql: "DELETE FROM settings WHERE key = 'topics_generation'", args: [] });
+    else await setSetting('topics_generation', priorGeneration);
     destroySession(token);
   }
 });

@@ -10,7 +10,7 @@ import { dedupeSupervisorNames, normalizePersonName, stripMiddleInitials, superv
 import { encryptMfaSecret, decryptMfaSecret } from './secretCrypto.js';
 import { jaroWinkler } from './fuzzyMatch.js';
 import { documentThemeTerms, COOCCURRENCE_BLOCKLIST } from './nlp.js';
-import { buildParentClusters, buildTopicsByYearFromCounts } from './topicHierarchy.js';
+import { resolveTopicGrouping, buildTopicsByYearFromCounts } from './topicHierarchy.js';
 import { normalizeImportRule } from './importRules.js';
 import {
   ACTIVE_ANALYTICS_ACCESS_SQL, CONTENT_RETRY_ACCESS_SQL, deriveAccessState,
@@ -620,6 +620,33 @@ async function ensureSchema(client) {
       leaf_topic_ids  TEXT NOT NULL,
       linkage_json    TEXT NOT NULL,
       created_at      TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS topic_bands (
+      band_id          INTEGER PRIMARY KEY,
+      label            TEXT NOT NULL,
+      child_topic_ids  TEXT NOT NULL,
+      doc_count        INTEGER NOT NULL,
+      created_at       TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS topic_band_label_overrides (
+      band_id          INTEGER PRIMARY KEY,
+      label            TEXT NOT NULL,
+      child_topic_ids  TEXT NOT NULL,
+      generation       TEXT,
+      created_at       TEXT NOT NULL,
+      updated_at       TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS topic_band_label_overrides_archive (
+      band_id          INTEGER NOT NULL,
+      label            TEXT NOT NULL,
+      child_topic_ids  TEXT NOT NULL,
+      generation       TEXT,
+      created_at       TEXT NOT NULL,
+      updated_at       TEXT NOT NULL,
+      archived_at      TEXT NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS document_embeddings (
@@ -2267,8 +2294,8 @@ async function computeMethodologyTopicMatrixSql(filters, qualifier, topics) {
   };
 }
 
-async function computeTopicDataByYearSql(filters, qualifier, topics, hierarchy) {
-  const parentInfo = hierarchy ? buildParentClusters(hierarchy, topics) : null;
+async function computeTopicDataByYearSql(filters, qualifier, topics, hierarchy, bands = null) {
+  const parentInfo = resolveTopicGrouping(hierarchy, topics, bands);
   const rows = await all(`
     SELECT dt.topic_id AS topic_id, d.year AS year, COUNT(*) AS count
     FROM documents d
@@ -2281,7 +2308,7 @@ async function computeTopicDataByYearSql(filters, qualifier, topics, hierarchy) 
     topicId: Number(row.topic_id), year: Number(row.year), count: Number(row.count || 0),
   }));
   return parentInfo
-    ? buildTopicsByYearFromCounts(parentInfo.parentClusters, countRows, parentInfo.leafToParent)
+    ? buildTopicsByYearFromCounts(parentInfo.parentClusters, countRows, parentInfo.leafToParent, parentInfo.limit)
     : buildTopicsByYearFromCounts(topics, countRows);
 }
 
@@ -2295,8 +2322,8 @@ export async function getTopicByYearCounts({ syncKey = null, filters: requestedF
   const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
   const topics = await loadTopics();
-  const hierarchy = await loadTopicHierarchy();
-  return computeTopicDataByYearSql(filters, qualifier, topics, hierarchy);
+  const [hierarchy, bands] = await Promise.all([loadTopicHierarchy(), loadTopicBands()]);
+  return computeTopicDataByYearSql(filters, qualifier, topics, hierarchy, bands);
 }
 
 // The legacy json_each `term.key < 10` cutoff (used below for "first 10
@@ -2429,12 +2456,13 @@ export async function getDocumentServingAnalytics({ syncKey = null, filters: req
   let topicData = null;
   if (topicsExist) {
     const topics = await loadTopics();
-    const [matrix, hierarchy] = await Promise.all([
+    const [matrix, hierarchy, bands] = await Promise.all([
       computeMethodologyTopicMatrixSql(filters, qualifier, topics),
       loadTopicHierarchy(),
+      loadTopicBands(),
     ]);
     methodologyTopicMatrix = matrix;
-    const byYear = await computeTopicDataByYearSql(filters, qualifier, topics, hierarchy);
+    const byYear = await computeTopicDataByYearSql(filters, qualifier, topics, hierarchy, bands);
     topicData = { topics, byYear };
   }
 
@@ -6385,6 +6413,112 @@ export async function loadTopicHierarchy() {
       linkage: JSON.parse(row.linkage_json),
     };
   } catch { return null; }
+}
+
+function parseChildIds(text) {
+  try {
+    const ids = JSON.parse(text);
+    return Array.isArray(ids) ? ids.map(Number) : [];
+  } catch { return []; }
+}
+
+// Persisted research-area bands (written by the Python worker). One round
+// trip: bands LEFT JOIN the override for the current generation. Null when the
+// table is missing or empty; any other failure propagates so a transient error
+// is never cached as a "no bands" fallback.
+export async function loadTopicBands() {
+  let rows;
+  try {
+    rows = await all(`
+      SELECT b.band_id, b.label, b.child_topic_ids, b.doc_count,
+             o.label AS o_label, o.child_topic_ids AS o_children
+      FROM topic_bands b
+      LEFT JOIN topic_band_label_overrides o
+        ON o.band_id = b.band_id
+       AND o.generation = (SELECT value FROM settings WHERE key = 'topics_generation')
+      ORDER BY b.band_id
+    `);
+  } catch (error) {
+    if (/no such table/i.test(error?.message || '')) return null;
+    throw error;
+  }
+  if (!rows.length) return null;
+  return rows.map((row) => {
+    const children = parseChildIds(row.child_topic_ids);
+    const hasOverride = row.o_label != null
+      && JSON.stringify(parseChildIds(row.o_children)) === JSON.stringify(children);
+    return {
+      bandId: Number(row.band_id),
+      label: hasOverride ? row.o_label : row.label,
+      autoLabel: row.label,
+      docCount: Number(row.doc_count || 0),
+      children,
+      hasOverride,
+    };
+  });
+}
+
+// Copies the band's override into the archive when it no longer applies (a
+// different generation, or the band's topics changed) so a rebuild never loses
+// a manual name. Returns the existing row and whether it was the active one.
+async function archiveStaleBandOverride(bandId, band, generation) {
+  const existing = await get('SELECT * FROM topic_band_label_overrides WHERE band_id = ?', [Number(bandId)]);
+  if (!existing) return { existing: null, active: false };
+  const active = existing.generation === generation
+    && JSON.stringify(parseChildIds(existing.child_topic_ids)) === JSON.stringify(parseChildIds(band?.child_topic_ids));
+  if (!active) {
+    await run(`
+      INSERT INTO topic_band_label_overrides_archive
+        (band_id, label, child_topic_ids, generation, created_at, updated_at, archived_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `, [existing.band_id, existing.label, existing.child_topic_ids, existing.generation,
+      existing.created_at, existing.updated_at, new Date().toISOString()]);
+  }
+  return { existing, active };
+}
+
+export async function updateTopicBandManualLabel(bandId, label) {
+  const normalized = String(label || '').trim();
+  if (!normalized) return null;
+  const band = await get('SELECT band_id, child_topic_ids FROM topic_bands WHERE band_id = ?', [Number(bandId)]);
+  if (!band) return null;
+  const now = new Date().toISOString();
+  const generation = await getSetting('topics_generation');
+  await archiveStaleBandOverride(bandId, band, generation);
+  await run(`
+    INSERT INTO topic_band_label_overrides (band_id, label, child_topic_ids, generation, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(band_id) DO UPDATE SET
+      label = excluded.label,
+      child_topic_ids = excluded.child_topic_ids,
+      generation = excluded.generation,
+      updated_at = excluded.updated_at
+  `, [Number(bandId), normalized, band.child_topic_ids, generation, now, now]);
+  await setSetting('topic_bands_version', now);
+  return { bandId: Number(bandId), label: normalized };
+}
+
+export async function deleteTopicBandLabelOverride(bandId) {
+  const band = await get('SELECT band_id, child_topic_ids FROM topic_bands WHERE band_id = ?', [Number(bandId)]);
+  const generation = await getSetting('topics_generation');
+  const { existing, active } = await archiveStaleBandOverride(bandId, band, generation);
+  if (!existing) return false;
+  await run('DELETE FROM topic_band_label_overrides WHERE band_id = ?', [Number(bandId)]);
+  // Only an active override affected the displayed label.
+  if (active) await setSetting('topic_bands_version', new Date().toISOString());
+  return true;
+}
+
+// Cache key for anything derived from topics or bands. Null while no topics
+// generation exists.
+export async function getTopicsCacheVersion() {
+  const rows = await all(
+    "SELECT key, value FROM settings WHERE key IN ('topics_generation','topic_bands_version')",
+  );
+  const byKey = new Map(rows.map((row) => [row.key, row.value]));
+  const generation = byKey.get('topics_generation');
+  const bandsVersion = byKey.get('topic_bands_version');
+  return generation == null ? null : `${generation}|${bandsVersion ?? ''}`;
 }
 
 export async function logCacheStats() {

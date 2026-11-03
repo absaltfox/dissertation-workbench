@@ -8,7 +8,7 @@ import {
   applyCitationCountsToDocuments, applyCommitteeMembersToDocuments,
   applyStoredFileMetricsToDocuments, ensureStorage, getDb, saveRunMetrics,
   hasTopics, loadTopics, loadDocumentTopics, loadDocumentTopicCoords,
-  loadTopicHierarchy, getCitationCooccurrence
+  loadTopicHierarchy, loadTopicBands, getCitationCooccurrence
 } from './db.js';
 import {
   toArray, flattenText, extractYear, parsePageCount, buildWordCloud,
@@ -20,7 +20,7 @@ import { fetchPage, extractHits, resolveIndexName, collectCandidateUrls } from '
 import { enrichDocumentsWithFileAnalysis } from './pdf.js';
 import { dedupeSupervisorNames } from './supervisors.js';
 import { canonicalizeDomainText } from './domainDictionary.js';
-import { buildParentClusters, buildTopicsByYear } from './topicHierarchy.js';
+import { resolveTopicGrouping, buildTopicsByYear } from './topicHierarchy.js';
 import {
   deriveAccessState, isAccessRestricted, isAnalyticallyEligible, isEmbargoPlaceholder,
 } from './accessStatus.js';
@@ -789,12 +789,12 @@ function buildMethodologyTopicMatrix(records, topics) {
 // slim projection documents (already topic-assigned and access-filtered in
 // SQL) and builds only the panels the slice returns. A non-null byYear (full
 // corpus from SQL) wins over one derived from the supplied documents.
-export function buildTopicVisualizations(documents, { topics, hierarchy = null, byYear = null } = {}) {
+export function buildTopicVisualizations(documents, { topics, hierarchy = null, byYear = null, bands = null } = {}) {
   let resolvedByYear = byYear;
   if (!resolvedByYear) {
-    const parentInfo = hierarchy ? buildParentClusters(hierarchy, topics) : null;
+    const parentInfo = resolveTopicGrouping(hierarchy, topics, bands);
     resolvedByYear = parentInfo
-      ? buildTopicsByYear(parentInfo.parentClusters, documents, parentInfo.leafToParent)
+      ? buildTopicsByYear(parentInfo.parentClusters, documents, parentInfo.leafToParent, parentInfo.limit)
       : buildTopicsByYear(topics, documents);
   }
   return {
@@ -954,12 +954,12 @@ export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjec
         doc.umapY = coord.y;
       }
     }
-    const hierarchy = await loadTopicHierarchy();
-    const parentInfo = hierarchy ? buildParentClusters(hierarchy, topics) : null;
+    const [hierarchy, bands] = await Promise.all([loadTopicHierarchy(), loadTopicBands()]);
+    const parentInfo = resolveTopicGrouping(hierarchy, topics, bands);
     topicData = {
       topics,
       byYear: parentInfo
-        ? buildTopicsByYear(parentInfo.parentClusters, normalizedRecords, parentInfo.leafToParent)
+        ? buildTopicsByYear(parentInfo.parentClusters, normalizedRecords, parentInfo.leafToParent, parentInfo.limit)
         : buildTopicsByYear(topics, normalizedRecords),
       hierarchy,
     };

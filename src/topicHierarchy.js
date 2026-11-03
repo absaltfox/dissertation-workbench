@@ -68,6 +68,21 @@ export function buildParentClusters(hierarchy, topics, targetK = 10) {
   return { parentClusters, leafToParent };
 }
 
+// Persisted bands win; otherwise the hierarchy's top-10 parent clusters;
+// otherwise null (ungrouped topics).
+export function resolveTopicGrouping(hierarchy, topics, bands) {
+  if (bands?.length) {
+    const parentClusters = bands.map((b) => ({
+      parentId: b.bandId, topicId: b.bandId, label: b.label, docCount: b.docCount, children: b.children,
+    }));
+    const leafToParent = new Map();
+    for (const p of parentClusters) for (const tid of p.children) leafToParent.set(tid, p.parentId);
+    return { parentClusters, leafToParent, limit: parentClusters.length };
+  }
+  if (!hierarchy) return null;
+  return { ...buildParentClusters(hierarchy, topics), limit: 10 };
+}
+
 // Count-row-based aggregation: takes pre-aggregated {topicId, year, count}
 // rows (as a bounded SQL GROUP BY would produce) instead of a per-document
 // array, and buckets them by resolved parent-cluster id. buildTopicsByYear
@@ -76,7 +91,7 @@ export function buildParentClusters(hierarchy, topics, targetK = 10) {
 // (db.js, at any corpus size) and the JS path (metrics.js, ≤5000-document
 // samples) share one aggregation implementation and cannot silently drift
 // apart.
-export function buildTopicsByYearFromCounts(topics, rows, leafToParent) {
+export function buildTopicsByYearFromCounts(topics, rows, leafToParent, limit = 10) {
   const yearCounts = new Map(); // resolvedTopicId -> Map<year, count>
 
   for (const row of rows) {
@@ -89,7 +104,7 @@ export function buildTopicsByYearFromCounts(topics, rows, leafToParent) {
 
   return topics
     .filter((t) => t.topicId !== -1)
-    .slice(0, 10)
+    .slice(0, limit)
     .map((topic) => {
       const ym = yearCounts.get(topic.topicId) || new Map();
       const data = Array.from(ym.entries())
@@ -99,11 +114,11 @@ export function buildTopicsByYearFromCounts(topics, rows, leafToParent) {
     });
 }
 
-export function buildTopicsByYear(topics, documents, leafToParent) {
+export function buildTopicsByYear(topics, documents, leafToParent, limit = 10) {
   const rows = [];
   for (const doc of documents) {
     if (doc.topicId == null || !doc.year) continue;
     rows.push({ topicId: doc.topicId, year: doc.year, count: 1 });
   }
-  return buildTopicsByYearFromCounts(topics, rows, leafToParent);
+  return buildTopicsByYearFromCounts(topics, rows, leafToParent, limit);
 }

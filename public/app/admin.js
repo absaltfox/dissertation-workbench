@@ -186,6 +186,8 @@ function initAdmin() {
   runCitationScanBtn?.addEventListener('click', handleRunCitationScan);
   runBertopicBtn?.addEventListener('click', handleRunBertopic);
   refreshTopicLabelsBtn?.addEventListener('click', loadTopicLabels);
+  document.getElementById('refreshResearchAreasBtn')?.addEventListener('click', () => loadResearchAreas());
+  document.getElementById('rebuildResearchAreasBtn')?.addEventListener('click', handleRebuildResearchAreas);
   regenerateTopicLabelsBtn?.addEventListener('click', () => handleRegenerateTopicLabels());
   publishPassingTopicLabelsBtn?.addEventListener('click', handlePublishPassingTopicLabels);
   topicLabelFilterEl?.addEventListener('change', renderTopicLabels);
@@ -203,7 +205,7 @@ function activateAdminTab(tabName, options = {}) {
   const targetTab = normalizeAdminTab(tabName);
   setActiveAdminTabShell(targetTab, options);
   if (targetTab === 'jobs') loadJobs();
-  if (targetTab === 'labels') loadTopicLabels();
+  if (targetTab === 'labels') { loadResearchAreas(); loadTopicLabels(); }
   return true;
 }
 
@@ -276,7 +278,7 @@ function showAdminContent({ activeTab = getActiveAdminTab() } = {}) {
   const targetTab = normalizeAdminTab(activeTab);
   setActiveAdminTabShell(targetTab, { updateUrl: false });
   loadAdminData();
-  if (targetTab === 'labels') loadTopicLabels();
+  if (targetTab === 'labels') { loadResearchAreas(); loadTopicLabels(); }
 }
 
 function showMfaChallenge() {
@@ -1403,6 +1405,151 @@ function renderJobs(data = {}) {
         </tr>
       `).join('')
       : '<tr><td colspan="6">No import or PDF sync runs have run yet.</td></tr>';
+  }
+}
+
+// Band names feed Topic Evolution, which is cached per filter set in the
+// browser; drop those caches so the next Analytics view refetches the names.
+function clearWorkbenchViewCaches() {
+  state.tabData.visualizationsByFilterKey = new Map();
+  state.tabData.analyticsByFilterKey = new Map();
+}
+
+function setResearchAreasStatus(message) {
+  const el = document.getElementById('researchAreasStatus');
+  if (el) el.textContent = message;
+  setStatus(message);
+}
+
+async function loadResearchAreas({ focusBandId = null } = {}) {
+  const listEl = document.getElementById('researchAreasList');
+  if (!listEl) return;
+  listEl.innerHTML = '<p class="meta">Loading research areas...</p>';
+  try {
+    const res = await fetch('/api/admin/topics/bands');
+    if (!res.ok) {
+      listEl.innerHTML = '<p class="meta">Research areas could not be loaded.</p>';
+      return;
+    }
+    state.researchAreas = await res.json();
+    renderResearchAreas();
+    if (focusBandId != null) listEl.querySelector(`[data-band-input="${CSS.escape(String(focusBandId))}"]`)?.focus();
+  } catch {
+    listEl.innerHTML = '<p class="meta">Research areas could not be loaded.</p>';
+  }
+}
+
+function renderResearchAreas() {
+  const listEl = document.getElementById('researchAreasList');
+  if (!listEl) return;
+  const bands = state.researchAreas?.bands || [];
+  if (!bands.length) {
+    listEl.innerHTML = '<p class="meta">No research areas yet. Use Rebuild Research Areas to create them.</p>';
+    return;
+  }
+  listEl.innerHTML = bands.map((band) => `
+    <article class="research-area-row">
+      <div class="research-area-main">
+        <div class="research-area-head">
+          <strong>${escapeHtml(band.label)}</strong>
+          <span class="meta">${formatNum(band.docCount)} papers</span>
+          ${band.hasOverride ? `<span class="topic-label-status warning">Manual (auto: ${escapeHtml(band.autoLabel)})</span>` : ''}
+        </div>
+        <p class="meta research-area-children">${band.children.map((c) => `${escapeHtml(c.label)} (${formatNum(c.docCount)})`).join(' · ')}</p>
+      </div>
+      <div class="research-area-edit">
+        <input type="text" maxlength="120" value="${escapeHtml(band.label)}" aria-label="Name for research area ${band.bandId + 1}" data-band-input="${band.bandId}" />
+        <button type="button" class="btn btn-sm" data-save-band="${band.bandId}" aria-label="Save name for ${escapeHtml(band.label)}">Save</button>
+        ${band.hasOverride ? `<button type="button" class="btn ghost btn-sm" data-reset-band="${band.bandId}" aria-label="Reset name for ${escapeHtml(band.label)} to automatic">Reset to automatic</button>` : ''}
+      </div>
+    </article>
+  `).join('');
+  for (const input of listEl.querySelectorAll('[data-band-input]')) {
+    input.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' || event.isComposing) return;
+      event.preventDefault();
+      saveResearchAreaName(input.dataset.bandInput, input.value);
+    });
+  }
+  for (const btn of listEl.querySelectorAll('[data-save-band]')) {
+    btn.addEventListener('click', () => {
+      const input = listEl.querySelector(`[data-band-input="${CSS.escape(btn.dataset.saveBand)}"]`);
+      saveResearchAreaName(btn.dataset.saveBand, input?.value || '');
+    });
+  }
+  for (const btn of listEl.querySelectorAll('[data-reset-band]')) {
+    btn.addEventListener('click', () => resetResearchAreaName(btn.dataset.resetBand));
+  }
+}
+
+async function saveResearchAreaName(bandId, label) {
+  const trimmed = String(label || '').trim();
+  if (!trimmed) {
+    alert('A name is required.');
+    return;
+  }
+  try {
+    const res = await fetch(`/api/admin/topics/bands/${encodeURIComponent(bandId)}/label`, {
+      method: 'PATCH',
+      headers: jsonHeaders(),
+      body: JSON.stringify({ label: trimmed }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert(data.error || 'Name could not be saved.');
+      return;
+    }
+    clearWorkbenchViewCaches();
+    setResearchAreasStatus('Research area renamed.');
+    await loadResearchAreas({ focusBandId: bandId });
+  } catch {
+    alert('Connection error');
+  }
+}
+
+async function resetResearchAreaName(bandId) {
+  try {
+    const res = await fetch(`/api/admin/topics/bands/${encodeURIComponent(bandId)}/label/override`, {
+      method: 'DELETE',
+      headers: csrfHeaders(),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      alert(data.error || 'Name could not be reset.');
+      return;
+    }
+    clearWorkbenchViewCaches();
+    setResearchAreasStatus('Research area name reset to automatic.');
+    await loadResearchAreas({ focusBandId: bandId });
+  } catch {
+    alert('Connection error');
+  }
+}
+
+async function handleRebuildResearchAreas() {
+  if (!confirm('Rebuild research areas now? Manual names are kept for areas whose topics are unchanged; changed areas get fresh automatic names (old names are archived).')) return;
+  const button = document.getElementById('rebuildResearchAreasBtn');
+  if (button) button.disabled = true;
+  try {
+    const res = await fetch('/api/admin/topics/bands/rebuild', {
+      method: 'POST',
+      headers: jsonHeaders(),
+      body: JSON.stringify({}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      alert(data.error || 'Research area rebuild failed to start.');
+      return;
+    }
+    clearWorkbenchViewCaches();
+    setStatus(data.alreadyRunning
+      ? 'A research-area rebuild is already running. Follow it in Admin > Jobs.'
+      : 'Research-area rebuild started. Follow it in Admin > Jobs.');
+    await loadJobs();
+  } catch {
+    alert('Connection error');
+  } finally {
+    if (button) button.disabled = false;
   }
 }
 
