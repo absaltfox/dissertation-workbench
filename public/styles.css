@@ -1009,6 +1009,7 @@ body.phone-screen-open {
 }
 
 .scatter-legend-item.dimmed { opacity: 0.3; }
+.scatter-legend-item.is-active { color: var(--ink); font-weight: 600; text-decoration: underline; }
 
 .scatter-legend-swatch {
   width: 10px;

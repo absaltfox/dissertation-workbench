@@ -43,6 +43,7 @@ const {
   topicDendrogramTooltipEl,
   topicSankeyChartEl,
   topicSankeyLegendEl,
+  topicSankeyTooltipEl,
   topicSankeyPanelEl,
 } = dom;
 
@@ -88,6 +89,13 @@ function topicDisplayLabel(label) {
   // BERTopic labels are "0_word1_word2_word3" — strip the ID prefix and join
   const cleaned = label.replace(/^-?\d+_/, '').replace(/_/g, ' ');
   return cleaned || label;
+}
+
+// Research-area names are shown verbatim. Only a raw BERTopic id label
+// ("3_word_word", no spaces; the topic-cluster fallback) is cleaned up.
+function seriesDisplayLabel(label) {
+  const text = String(label ?? '');
+  return /^-?\d+(_[^\s_]+)+$/.test(text) ? topicDisplayLabel(text) : text;
 }
 
 function wrapLabel(text, maxChars) {
@@ -957,6 +965,8 @@ function renderTopicSankey() {
         e,
         topicIdx: ti,
         label: topicPeriods[ti].label,
+        periodStart: periods[pi].label,
+        periodEnd: periods[pi + 1].label,
         countStart: topicPeriods[ti].counts[pi],
         countEnd: topicPeriods[ti].counts[pi + 1]
       });
@@ -984,19 +994,45 @@ function renderTopicSankey() {
     .attr('stroke', d => colorForIdx(d.topicIdx))
     .attr('stroke-opacity', 0.3)
     .attr('stroke-width', 0.5)
+    .attr('role', 'img')
+    .attr('aria-label', d => `${seriesDisplayLabel(d.label)}: ${d.countStart} manuscript(s) in ${d.periodStart}, ${d.countEnd} in ${d.periodEnd}`)
     .style('cursor', 'pointer');
 
-  paths.on('mouseover', function() {
+  // Colour alone cannot identify 15 areas, so each flow also names itself on
+  // hover (tooltip) and highlights its legend item.
+  const tooltip = d3.select(topicSankeyTooltipEl);
+  const setLegendActive = (idx, on) => {
+    d3.select(topicSankeyLegendEl).selectAll('.scatter-legend-item')
+      .classed('is-active', (_, i) => on && i === idx);
+  };
+  const placeTooltip = (event) => {
+    const rect = topicSankeyTooltipEl.parentElement.getBoundingClientRect();
+    tooltip.style('left', (event.clientX - rect.left + 15) + 'px')
+      .style('top', (event.clientY - rect.top - 10) + 'px');
+  };
+
+  paths.on('mouseover', function(event, d) {
     d3.select(this)
       .transition()
       .duration(100)
       .attr('fill-opacity', 1);
+    setLegendActive(d.topicIdx, true);
+    tooltip.html(`<strong>${escapeHtml(seriesDisplayLabel(d.label))}</strong>
+      <div class="tooltip-meta">${d.countStart} manuscript(s) in ${escapeHtml(d.periodStart)}</div>
+      <div class="tooltip-meta">${d.countEnd} manuscript(s) in ${escapeHtml(d.periodEnd)}</div>`)
+      .style('display', 'block');
+    placeTooltip(event);
   })
-  .on('mouseout', function() {
+  .on('mousemove', function(event) {
+    placeTooltip(event);
+  })
+  .on('mouseout', function(_, d) {
     d3.select(this)
       .transition()
       .duration(100)
       .attr('fill-opacity', FLOW_FILL_OPACITY);
+    setLegendActive(d.topicIdx, false);
+    tooltip.style('display', 'none');
   });
 
   svg.append('g')
@@ -1020,8 +1056,17 @@ function renderTopicSankey() {
     .attr('class', 'scatter-legend-item')
     .html((t, i) => `
       <span class="scatter-legend-swatch" style="background:${colorForIdx(i)};opacity:${FLOW_FILL_OPACITY}"></span>
-      ${escapeHtml(topicDisplayLabel(t.label))}
-    `);
+      ${escapeHtml(seriesDisplayLabel(t.label))}
+    `)
+    .on('mouseover', (_, t) => {
+      const idx = topicPeriods.indexOf(t);
+      setLegendActive(idx, true);
+      paths.attr('fill-opacity', d => (d.topicIdx === idx ? 1 : FLOW_FILL_OPACITY));
+    })
+    .on('mouseout', () => {
+      setLegendActive(-1, false);
+      paths.attr('fill-opacity', FLOW_FILL_OPACITY);
+    });
 }
 
 function renderMethTopicBubble() {

@@ -143,6 +143,20 @@ test.describe('research-area bands: chart and admin panel', () => {
     expect(flowOpacity).toBe('0.85');
   });
 
+  test('hovering a flow names its band and highlights the legend item', async ({ page }) => {
+    await openEvolution(page);
+    const flow = page.locator('#topicSankeyChart path[fill]').first();
+    await flow.hover();
+    const tooltip = page.locator('#topicSankeyTooltip');
+    await expect(tooltip).toBeVisible();
+    const name = await tooltip.locator('strong').textContent();
+    expect(AUTO_NAMES).toContain(name);
+    await expect(tooltip).toContainText('manuscript(s) in');
+    await expect(page.locator('#topicSankeyLegend .scatter-legend-item.is-active')).toHaveText(name);
+    await page.mouse.move(0, 0);
+    await expect(tooltip).toBeHidden();
+  });
+
   test.describe('admin Research Areas panel', () => {
     test.use({ allowedConsoleErrors: SESSION_401 });
 
@@ -169,6 +183,31 @@ test.describe('research-area bands: chart and admin panel', () => {
       expect(labels).toContain('Renamed Research Area');
       expect(labels).not.toContain(autoName(0));
       expect(labels).toHaveLength(BAND_COUNT);
+    });
+
+    test('a rename shows in Topic Evolution without a page reload, and Enter saves', async ({ page }) => {
+      await adminLogin(page);
+      await openEvolution(page); // warms the browser's visualizations cache
+      expect(await legendLabels(page)).toContain(autoName(2));
+      await gotoHash(page, '#/admin');
+      await page.locator('.admin-tab-btn[data-admin-tab="labels"]').click();
+      await expect(page.locator('#researchAreasList [data-band-input]')).toHaveCount(BAND_COUNT);
+      await page.locator('[data-band-input="2"]').fill('Live Renamed Area');
+      await page.locator('[data-band-input="2"]').press('Enter');
+      await expect(page.locator('[data-reset-band="2"]')).toBeVisible();
+      await expect(page.locator('[data-band-input="2"]')).toBeFocused();
+      await expect(page.locator('[data-save-band="2"]')).toHaveAttribute('aria-label', 'Save name for Live Renamed Area');
+      await openEvolution(page);
+      await expect.poll(() => legendLabels(page)).toContain('Live Renamed Area');
+      expect(await legendLabels(page)).not.toContain(autoName(2));
+
+      await gotoHash(page, '#/admin');
+      await page.locator('.admin-tab-btn[data-admin-tab="labels"]').click();
+      await page.locator('[data-reset-band="2"]').click();
+      await expect(page.locator('[data-reset-band="2"]')).toHaveCount(0);
+      await expect(page.locator('[data-band-input="2"]')).toBeFocused();
+      await openEvolution(page);
+      await expect.poll(() => legendLabels(page)).toContain(autoName(2));
     });
 
     test('Reset to automatic restores the auto name in the panel and the chart', async ({ page }) => {
@@ -212,9 +251,11 @@ test.describe('research-area bands: chart and admin panel', () => {
         return route.fulfill({ status: 202, contentType: 'application/json', body: JSON.stringify(body) });
       });
       await adminLogin(page);
+      page.once('dialog', (d) => d.accept());
       await page.locator('#rebuildResearchAreasBtn').click();
       await expect(page.locator('#statusText')).toHaveText('Research-area rebuild started. Follow it in Admin > Jobs.');
       await expect(page.locator('#rebuildResearchAreasBtn')).toBeEnabled();
+      page.once('dialog', (d) => d.accept());
       await page.locator('#rebuildResearchAreasBtn').click();
       await expect(page.locator('#statusText')).toHaveText('A research-area rebuild is already running. Follow it in Admin > Jobs.');
       expect(posts).toEqual(['POST', 'POST']);

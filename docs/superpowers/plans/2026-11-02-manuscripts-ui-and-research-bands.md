@@ -295,16 +295,18 @@ Copy changes beyond the mechanical rename (exact text):
 No code. Each step starts only after the owner says go.
 
 - [ ] **Step 1: Whole-branch verification.** `npm test`, `npx eslint .` and `npx playwright test` all pass. Open a PR to `main`.
-- [ ] **Step 2: Push the worker image** (bands code runs on worker/labeler machines). Follow memory `fly-worker-image-deploy`: push `worker-latest`, retag `labeler-latest`, and confirm both tag digests moved.
+- [ ] **Step 2 (bands a): Push the worker image.** Task 11b changed the one-child fallback in `scripts/build-topics.py`, so the image shipped with PR #66 is stale. Follow memory `fly-worker-image-deploy`:
+  - Push under a unique label (not `worker-latest`) and verify the new manifest digest through the registry API.
+  - Point `worker-latest` and `labeler-latest` at that manifest, then verify both tag digests equal the new one.
 - [ ] **Step 3: Set the admin allow-list secret:** `fly secrets set ADMIN_ALLOWED_NETWORKS=<owner-home-ip> --stage`, so it applies with the deploy in Step 4.
-- [ ] **Step 4: `fly deploy`.** Verify from the owner's network: the Admin tab is present. Then verify from elsewhere, e.g. `curl -s -o /dev/null -w '%{http_code}' https://dissertation-workbench.fly.dev/api/auth/session` from a non-home host, which should print `404`. `/api/health` is 200. Also:
+- [ ] **Step 4 (bands b): `fly deploy` the web app.** Verify Topic Evolution is unchanged: prod `topic_bands` is empty, so the chart falls back to the top-10 clusters. Expect one cold visualizations build per machine because the snapshot format changed. Verify from the owner's network: the Admin tab is present. Then verify from elsewhere, e.g. `curl -s -o /dev/null -w '%{http_code}' https://dissertation-workbench.fly.dev/api/auth/session` from a non-home host, which should print `404`. `/api/health` is 200. Also:
   - Check that the `ip` in the request log lines is the real client address, not a Fly proxy address.
   - From outside the allowed network, try to spoof the header: `curl -s -o /dev/null -w '%{http_code}' -H 'X-Forwarded-For: <owner-home-ip>' https://dissertation-workbench.fly.dev/api/auth/available`. Expect `404`.
   - Watch for 429s on public routes right after the deploy. Too few trusted hops would collapse every visitor into one rate-limit bucket. If that happens, set `TRUST_PROXY=2` or revert the deploy.
   - Possible follow-up: read the client address from Fly's `Fly-Client-IP` header instead of counting proxy hops.
 - [ ] **Step 5: Admin › Operations › Recompute Stored Themes.** When it finishes, `curl -s https://dissertation-workbench.fly.dev/api/metrics | python3 -c "import json,sys;print([w for w in json.load(sys.stdin)['wordCloud'] if 'unspec' in w['term']])"` prints `[]`.
-- [ ] **Step 6 (optional): Admin › Topic Labels › Rebuild Research Areas (API-only).** Without Tasks 9–11 this job only writes the `topic_bands` table and the hierarchy. Topic Evolution still shows the top-10 clusters named after their largest child, and there is no Rebuild button in the UI, so the band names are not user-visible until Task 9 ships. Recommendation: defer this step to the Task 9 rollout. If it is run now, trigger it through the API and check:
-  - the log reports k = 9 on today's topics (or the k the gap rule picks; record it);
-  - `topics_generation` is unchanged;
-  - the topic-label override count is still 104.
-- [ ] **Step 7:** Once the bands are user-visible (Task 9 shipped and Step 6 run), owner spot-checks band names and renames any that need it.
+- [ ] **Step 6 (bands c): Admin › Topic Labels › Rebuild Research Areas.** Confirm the dialog. Record k (the gap rule's pick; about 9 on today's topics), then check that `topics_generation` is unchanged and there are still 104 topic overrides. Use Refresh in the Research Areas panel when the job finishes in Admin › Jobs.
+- [ ] **Step 7 (bands d): Propagation.** Within about 30 s every web machine shows the bands in Analytics › Topic Evolution, and the chart legend matches the Research Areas panel in Admin.
+- [ ] **Step 8 (bands e): Owner spot-check.** The owner reviews the band names and renames any that need it. Renames show in the chart on the next Analytics view without a reload.
+
+Note: a later rebuild archives manual names (in `topic_band_label_overrides_archive`) for any area whose topics change; those areas get fresh automatic names.

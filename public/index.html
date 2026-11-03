@@ -261,6 +261,7 @@
             </p>
             <div id="topicSankeyContainer" style="position:relative">
               <svg id="topicSankeyChart" viewBox="0 0 940 500"></svg>
+              <div id="topicSankeyTooltip" class="scatter-tooltip" hidden></div>
             </div>
             <div id="topicSankeyLegend" class="scatter-legend"></div>
             <p class="meta" style="margin-top:0.75rem; font-size:0.82rem; opacity:0.7">
@@ -805,14 +806,15 @@
               <div class="section-heading-row">
                 <div>
                   <h2>Research Areas</h2>
-                  <p class="meta">Groups of topics shown in Topic Evolution. Rename an area, or reset it to its automatic name. Manual names are kept until the topics change.</p>
+                  <p class="meta">Groups of topics shown in Topic Evolution. Rename an area, or reset it to its automatic name. Manual names are kept until an area's topics change; changed areas get fresh automatic names (old names are archived). After a rebuild finishes in Admin &gt; Jobs, use Refresh to reload this list.</p>
                 </div>
                 <div class="row-actions">
                   <button type="button" id="refreshResearchAreasBtn" class="btn ghost btn-sm">Refresh</button>
                   <button type="button" id="rebuildResearchAreasBtn" class="btn btn-sm">Rebuild Research Areas</button>
                 </div>
               </div>
-              <div id="researchAreasList" class="research-area-list" aria-live="polite"></div>
+              <p id="researchAreasStatus" class="meta" role="status" aria-live="polite"></p>
+              <div id="researchAreasList" class="research-area-list"></div>
             </article>
             <article class="panel">
               <div class="section-heading-row">
