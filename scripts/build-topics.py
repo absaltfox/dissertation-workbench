@@ -167,6 +167,92 @@ def resolve_max_topics():
     return value
 
 
+DEFAULT_BANDS_MIN = 6
+DEFAULT_BANDS_MAX = 15
+
+
+def resolve_band_range():
+    """(min, max) research-area band count from TOPIC_BANDS_MIN/MAX; defaults (6, 15) if unset or min > max."""
+    lo = _positive_int_env("TOPIC_BANDS_MIN")
+    hi = _positive_int_env("TOPIC_BANDS_MAX")
+    lo = DEFAULT_BANDS_MIN if lo is None else lo
+    hi = DEFAULT_BANDS_MAX if hi is None else hi
+    if lo > hi:
+        print(f"Warning: TOPIC_BANDS_MIN={lo} exceeds TOPIC_BANDS_MAX={hi}; using defaults "
+              f"({DEFAULT_BANDS_MIN}, {DEFAULT_BANDS_MAX})", file=sys.stderr)
+        return DEFAULT_BANDS_MIN, DEFAULT_BANDS_MAX
+    return lo, hi
+
+
+def topic_centroids(embeddings, assignments, topic_ids):
+    """Unit-length topic centroids, rows aligned to topic_ids.
+
+    Embeddings are mean-centred over every assigned (non-outlier) row first, so the
+    shared corpus direction does not dominate the geometry.
+    """
+    import numpy as np
+    emb = np.asarray(embeddings, dtype=float)
+    labels = np.asarray(assignments)
+    assigned = labels != -1
+    if not assigned.any():
+        raise ValueError("no assigned documents to build topic centroids from")
+    centred = emb - emb[assigned].mean(axis=0)
+    rows = []
+    for topic_id in topic_ids:
+        mask = labels == topic_id
+        if not mask.any():
+            raise ValueError(f"topic {topic_id} has no documents")
+        rows.append(centred[mask].mean(axis=0))
+    centroids = np.vstack(rows)
+    norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return centroids / norms
+
+
+def centroid_linkage(centroids):
+    """Ward linkage over Euclidean distances between unit centroids."""
+    from scipy.cluster.hierarchy import linkage
+    return linkage(centroids, method="ward", metric="euclidean", optimal_ordering=True)
+
+
+def choose_band_count(heights, n, k_min, k_max):
+    """Pick the band count k whose cut has the largest relative merge-height gap.
+
+    `heights` are the n-1 ascending merge heights; gap(k) = (h[n-k] - h[n-k-1]) / h[n-k-1].
+    Ties go to the smaller k. Returns n when n <= k_min.
+    """
+    if n <= k_min:
+        return n
+    best_k, best_gap = None, -1.0
+    for k in range(k_min, min(k_max, n - 1) + 1):
+        upper, lower = heights[n - k], heights[n - k - 1]
+        numerator = upper - lower
+        if lower == 0:
+            if numerator <= 0:
+                continue
+            gap = float("inf")
+        else:
+            gap = numerator / lower
+        if gap > best_gap:
+            best_k, best_gap = k, gap
+    return k_min if best_k is None else best_k
+
+
+def cut_bands(linkage_matrix, topic_ids, doc_counts, k):
+    """Cut the hierarchy into k bands, numbered 0..k-1 by paper count desc (ties: smallest child id)."""
+    from scipy.cluster.hierarchy import fcluster
+    labels = fcluster(linkage_matrix, k, "maxclust")
+    groups = {}
+    for topic_id, label in zip(topic_ids, labels):
+        groups.setdefault(int(label), []).append(int(topic_id))
+    bands = [
+        {"child_topic_ids": sorted(ids), "doc_count": sum(doc_counts.get(t, 0) for t in ids)}
+        for ids in groups.values()
+    ]
+    bands.sort(key=lambda b: (-b["doc_count"], b["child_topic_ids"][0]))
+    return [{"band_id": i, **b} for i, b in enumerate(bands)]
+
+
 def refresh_topic_representation(topic_model, docs, topics, vectorizer_model):
     """Recompute topic representations while keeping the stop-word vectorizer.
 
