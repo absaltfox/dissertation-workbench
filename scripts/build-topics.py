@@ -167,6 +167,99 @@ def resolve_max_topics():
     return value
 
 
+DEFAULT_BANDS_MIN = 6
+DEFAULT_BANDS_MAX = 15
+
+
+def resolve_band_range():
+    """(min, max) research-area band count from TOPIC_BANDS_MIN/MAX; defaults (6, 15) if unset or min > max."""
+    lo = _positive_int_env("TOPIC_BANDS_MIN")
+    hi = _positive_int_env("TOPIC_BANDS_MAX")
+    lo = DEFAULT_BANDS_MIN if lo is None else lo
+    hi = DEFAULT_BANDS_MAX if hi is None else hi
+    lo = max(lo, 2)  # k=1 has no merge-height gap to score
+    if lo > hi:
+        print(f"Warning: TOPIC_BANDS_MIN={lo} exceeds TOPIC_BANDS_MAX={hi}; using defaults "
+              f"({DEFAULT_BANDS_MIN}, {DEFAULT_BANDS_MAX})", file=sys.stderr)
+        return DEFAULT_BANDS_MIN, DEFAULT_BANDS_MAX
+    return lo, hi
+
+
+def topic_centroids(embeddings, assignments, topic_ids):
+    """Unit-length topic centroids, rows aligned to topic_ids.
+
+    Embeddings are mean-centred over every assigned (non-outlier) row first, so the
+    shared corpus direction does not dominate the geometry.
+    """
+    import numpy as np
+    emb = np.asarray(embeddings, dtype=float)
+    labels = np.asarray(assignments)
+    assigned = labels != -1
+    if not assigned.any():
+        raise ValueError("no assigned documents to build topic centroids from")
+    centred = emb - emb[assigned].mean(axis=0)
+    rows = []
+    for topic_id in topic_ids:
+        mask = labels == topic_id
+        if not mask.any():
+            raise ValueError(f"topic {topic_id} has no documents")
+        rows.append(centred[mask].mean(axis=0))
+    centroids = np.vstack(rows)
+    norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return centroids / norms
+
+
+def centroid_linkage(centroids):
+    """Ward linkage over Euclidean distances between unit centroids."""
+    from scipy.cluster.hierarchy import linkage
+    return linkage(centroids, method="ward", metric="euclidean", optimal_ordering=True)
+
+
+def choose_band_count(heights, n, k_min, k_max):
+    """Pick the band count k whose cut has the largest relative merge-height gap.
+
+    `heights` are the n-1 ascending merge heights; gap(k) = (h[n-k] - h[n-k-1]) / h[n-k-1].
+    Ties go to the smaller k. Returns n when n <= k_min. k=1 cannot be scored, so
+    the search starts at max(k_min, 2).
+    """
+    k_min = max(k_min, 2)
+    if n <= k_min:
+        return n
+    best_k, best_gap = None, -1.0
+    for k in range(k_min, min(k_max, n - 1) + 1):
+        upper, lower = heights[n - k], heights[n - k - 1]
+        numerator = upper - lower
+        if lower == 0:
+            if numerator <= 0:
+                continue
+            gap = float("inf")
+        else:
+            gap = numerator / lower
+        if gap > best_gap:
+            best_k, best_gap = k, gap
+    return k_min if best_k is None else best_k
+
+
+def cut_bands(linkage_matrix, topic_ids, doc_counts, k):
+    """Cut the hierarchy into at most k bands, numbered 0..len-1 by paper count desc (ties: smallest child id).
+
+    fcluster(maxclust) may return fewer than k bands when merge heights tie (e.g. duplicate
+    centroids); ids stay contiguous, so callers must use len(result), not k.
+    """
+    from scipy.cluster.hierarchy import fcluster
+    labels = fcluster(linkage_matrix, k, "maxclust")
+    groups = {}
+    for topic_id, label in zip(topic_ids, labels):
+        groups.setdefault(int(label), []).append(int(topic_id))
+    bands = [
+        {"child_topic_ids": sorted(ids), "doc_count": sum(doc_counts.get(t, 0) for t in ids)}
+        for ids in groups.values()
+    ]
+    bands.sort(key=lambda b: (-b["doc_count"], b["child_topic_ids"][0]))
+    return [{"band_id": i, **b} for i, b in enumerate(bands)]
+
+
 def refresh_topic_representation(topic_model, docs, topics, vectorizer_model):
     """Recompute topic representations while keeping the stop-word vectorizer.
 
@@ -177,6 +270,26 @@ def refresh_topic_representation(topic_model, docs, topics, vectorizer_model):
 
 
 # DB connection and logging utilities
+def compute_bands(linkage_matrix, topic_ids, topic_doc_counts):
+    """Choose k, cut the hierarchy, and attach the transient `child_doc_counts` used for naming.
+
+    `child_doc_counts` is for generate_band_labels only; never store it.
+    """
+    k_min, k_max = resolve_band_range()
+    heights = [float(row[2]) for row in linkage_matrix]
+    n = len(topic_ids)
+    k = choose_band_count(heights, n, k_min, k_max)
+    bands = cut_bands(linkage_matrix, topic_ids, topic_doc_counts, k)
+    if 1 <= k < n:
+        gap = (heights[n - k] - heights[n - k - 1]) / heights[n - k - 1] if heights[n - k - 1] > 0 else float("inf")
+        print(f"  Band cut: k={k} (range {k_min}-{k_max}), gap={gap:.3f}, bands={len(bands)}")
+    else:
+        print(f"  Band cut: k={k} (range {k_min}-{k_max}), bands={len(bands)}")
+    for band in bands:
+        band["child_doc_counts"] = {t: topic_doc_counts.get(t, 0) for t in band["child_topic_ids"]}
+    return bands
+
+
 class SqliteClientWrapper:
     def __init__(self, db_path):
         self.conn = sqlite3.connect(db_path)
@@ -269,12 +382,17 @@ TOPIC_TABLE_SCHEMAS = {
     "document_topic_coords": (
         "doc_id TEXT PRIMARY KEY, umap_x REAL NOT NULL, umap_y REAL NOT NULL"
     ),
+    "topic_bands": (
+        "band_id INTEGER PRIMARY KEY, label TEXT NOT NULL, child_topic_ids TEXT NOT NULL, "
+        "doc_count INTEGER NOT NULL, created_at TEXT NOT NULL"
+    ),
 }
 TOPIC_TABLE_COLUMNS = {
     "topics": ["topic_id", "label", "top_terms", "doc_count", "model_name", "created_at"],
     "document_topics": ["doc_id", "topic_id", "probability"],
     "topic_hierarchy_meta": ["id", "leaf_topic_ids", "linkage_json", "created_at"],
     "document_topic_coords": ["doc_id", "umap_x", "umap_y"],
+    "topic_bands": ["band_id", "label", "child_topic_ids", "doc_count", "created_at"],
 }
 
 
@@ -320,6 +438,15 @@ def staging_swap_committed(client, now):
 
 
 TOPICS_GENERATION_KEY = "topics_generation"
+TOPIC_BANDS_VERSION_KEY = "topic_bands_version"
+
+
+def bands_version_statement(now):
+    return (
+        "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        [TOPIC_BANDS_VERSION_KEY, now, now],
+    )
 
 
 def publish_staged_topics(client, now):
@@ -349,6 +476,7 @@ def publish_staged_topics(client, now):
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
         [TOPICS_GENERATION_KEY, now, now],
     ))
+    statements.append(bands_version_statement(now))
     client.batch(statements)
 
 
@@ -678,6 +806,16 @@ def generate_labels(topic_model, abstracts, topic_assignments, reporter=None):
     return generate_local_labels(topic_model, abstracts, topic_assignments, reporter)
 
 
+def claude_complete_text(client, prompt, max_tokens):
+    """Low-level Claude call shared by topic and band labelling; returns the stripped text."""
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text.strip()
+
+
 def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key, reporter=None):
     """Use Claude to generate human-readable topic labels."""
     try:
@@ -743,12 +881,7 @@ def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key, r
     print(f"\nGenerating labels for {len(topic_ids_in_batch)} topics via Claude ({CLAUDE_MODEL})...")
 
     try:
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = response.content[0].text.strip()
+        text = claude_complete_text(client, prompt, 2048)
         # Parse JSON from response (handle markdown code blocks)
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
@@ -779,6 +912,26 @@ def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key, r
         return {}
 
     return labels
+
+
+def llama_cpp_complete(prompt, model_path, command, max_tokens=24):
+    """Low-level llama.cpp call shared by topic and band labelling; returns stdout."""
+    result = subprocess.run(
+        [
+            command,
+            "-m", model_path,
+            "-p", prompt,
+            "-n", str(max_tokens),
+            "--temp", "0.35",
+            "--top-p", "0.9",
+            "--no-display-prompt",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return result.stdout.strip()
 
 
 def generate_llama_cpp_labels(topic_model, abstracts, topic_assignments, reporter=None):
@@ -820,22 +973,8 @@ def generate_llama_cpp_labels(topic_model, abstracts, topic_assignments, reporte
             + "\nRules: return only one natural 3 to 6 word noun phrase. Do not list keywords. Label:"
         )
         try:
-            result = subprocess.run(
-                [
-                    command,
-                    "-m", model_path,
-                    "-p", prompt,
-                    "-n", "24",
-                    "--temp", "0.35",
-                    "--top-p", "0.9",
-                    "--no-display-prompt",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            response = clean_generated_label(result.stdout.strip())
+            stdout = llama_cpp_complete(prompt, model_path, command)
+            response = clean_generated_label(stdout)
         except Exception as exc:
             print(f"  Topic {topic_id} llama.cpp generation failed: {exc}")
             response = None
@@ -851,6 +990,52 @@ def generate_llama_cpp_labels(topic_model, abstracts, topic_assignments, reporte
     return labels
 
 
+def load_local_chat_model(model_name):
+    """Load the local transformers label model; returns (tokenizer, model) or None."""
+    print(f"\nLoading local label generation model: {model_name}...")
+    try:
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        import torch
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+
+        # Enforce single-threaded CPU execution for inference
+        torch.set_num_threads(1)
+    except Exception as e:
+        print(f"Failed to load local transformers model: {e}")
+        return None
+    return tokenizer, model
+
+
+def local_chat_complete(tokenizer, model, system, prompt, max_new_tokens=18, sample=False):
+    """Low-level local transformers call shared by topic and band labelling."""
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt},
+    ]
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    model_inputs = tokenizer([text], return_tensors="pt")
+    generate_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": tokenizer.eos_token_id,
+        "no_repeat_ngram_size": 2,
+    }
+    if sample:
+        generate_kwargs.update({"do_sample": True, "temperature": 0.7, "top_p": 0.9})
+    else:
+        generate_kwargs["do_sample"] = False
+    generated_ids = model.generate(
+        model_inputs.input_ids,
+        attention_mask=model_inputs.get("attention_mask"),
+        **generate_kwargs
+    )
+    generated_ids = [
+        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    ]
+    return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+
+
 def generate_local_labels(topic_model, abstracts, topic_assignments, reporter=None):
     """Use a local LLM (Qwen/Qwen2.5-0.5B-Instruct by default) to generate topic labels."""
     if os.environ.get("LOCAL_LABEL_BACKEND", "").strip().lower() == "llama_cpp":
@@ -859,19 +1044,10 @@ def generate_local_labels(topic_model, abstracts, topic_assignments, reporter=No
             return labels
 
     model_name = os.environ.get("LOCAL_LLM_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
-    print(f"\nLoading local label generation model: {model_name}...")
-    try:
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        import torch
-        
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(model_name)
-        
-        # Enforce single-threaded CPU execution for inference
-        torch.set_num_threads(1)
-    except Exception as e:
-        print(f"Failed to load local transformers model: {e}")
+    loaded = load_local_chat_model(model_name)
+    if loaded is None:
         return {}
+    tokenizer, model = loaded
 
     topic_info = topic_model.get_topic_info()
     labels = {}
@@ -946,38 +1122,11 @@ def generate_local_labels(topic_model, abstracts, topic_assignments, reporter=No
         label = None
         source = None
         for attempt, prompt in enumerate(prompts):
-            messages = [
-                {"role": "system", "content": "You are an academic librarian creating concise, human-readable research topic labels. Return only one natural noun phrase, with no quotes and no commentary."},
-                {"role": "user", "content": prompt}
-            ]
-
-            text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
+            response = local_chat_complete(
+                tokenizer, model,
+                "You are an academic librarian creating concise, human-readable research topic labels. Return only one natural noun phrase, with no quotes and no commentary.",
+                prompt, max_new_tokens=18, sample=attempt != 0,
             )
-            model_inputs = tokenizer([text], return_tensors="pt")
-
-            generate_kwargs = {
-                "max_new_tokens": 18,
-                "pad_token_id": tokenizer.eos_token_id,
-                "no_repeat_ngram_size": 2,
-            }
-            if attempt == 0:
-                generate_kwargs["do_sample"] = False
-            else:
-                generate_kwargs.update({"do_sample": True, "temperature": 0.7, "top_p": 0.9})
-
-            generated_ids = model.generate(
-                model_inputs.input_ids,
-                attention_mask=model_inputs.get("attention_mask"),
-                **generate_kwargs
-            )
-            generated_ids = [
-                output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-            ]
-
-            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
             response = clean_generated_label(response)
             if normalize_label_key(response) == normalize_label_key(keyword_fallback_label):
                 response = None
@@ -1383,6 +1532,131 @@ class ExistingTopicModel:
         return self.topic_info
 
 
+BAND_SYSTEM_PROMPT = (
+    "You are an academic librarian naming research-area groupings of dissertation topics. "
+    "Return only one short noun phrase, with no quotes and no commentary."
+)
+
+
+def interleave_child_items(per_child, limit):
+    """Round-robin across children so no single child dominates; de-duplicated, capped."""
+    out, seen = [], set()
+    depth = max((len(items) for items in per_child), default=0)
+    for i in range(depth):
+        for items in per_child:
+            if i < len(items) and items[i] not in seen:
+                seen.add(items[i])
+                out.append(items[i])
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def build_band_prompt(band, topic_labels, topic_terms, titles_by_topic):
+    """Prompt asking for one short name covering the WHOLE band. Lists every child
+    label untruncated; terms and titles are interleaved per child, no abstract text."""
+    children = sorted((int(t) for t in band["child_topic_ids"]),
+                      key=lambda t: (-int(band.get("child_doc_counts", {}).get(t, 0)), t))
+    child_labels = [topic_labels.get(t, f"Topic {t}") for t in children]
+    terms = interleave_child_items(
+        [[term for term, _ in sorted(topic_terms.get(t, []), key=lambda kv: -float(kv[1] or 0))] for t in children], 12)
+    titles = interleave_child_items([(titles_by_topic.get(t) or [])[:2] for t in children], 15)
+    return (
+        f"A research-area band groups {len(children)} related topics from UBC Education doctoral "
+        f"dissertations ({int(band['doc_count'])} dissertations in total). Every topic in the band:\n"
+        + "\n".join(f"- {label}" for label in child_labels)
+        + "\nKey terms, drawn evenly from each topic: " + ", ".join(terms)
+        + "\nExample dissertation titles:\n"
+        + "\n".join(f"- {title}" for title in titles)
+        + "\n\nWrite a short name (2 to 6 words) that covers the WHOLE band: a cross-department research "
+          "theme that fits all of the topics above, not just the largest or first one. Do not simply "
+          "copy one topic label. Respond with ONLY the name."
+    )
+
+
+def complete_band_names(prompts, reporter=None):
+    """Run band-name prompts through the configured backend (Claude, then llama.cpp,
+    then local transformers). Returns {band_id: raw text}; {} when no backend works."""
+    total = len(prompts)
+
+    def progress(done, status="running", detail=""):
+        if reporter:
+            reporter.report("generate_band_labels", "Naming Research Areas", status=status,
+                            detail=detail, counts={"processed": done, "total": total})
+
+    def run_all(call, what):
+        out = {}
+        for i, (band_id, prompt) in enumerate(prompts.items()):
+            progress(i, detail=f"Naming research area {i + 1}/{total} via {what}...")
+            try:
+                out[band_id] = call(prompt)
+            except Exception as exc:
+                print(f"  Band {band_id} {what} naming failed: {exc}")
+        progress(len(out), status="completed", detail=f"Named {len(out)} research areas via {what}.")
+        return out
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if api_key:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            print(f"\nNaming {total} research-area bands via Claude ({CLAUDE_MODEL})...")
+            out = run_all(lambda p: claude_complete_text(client, p, 64), "Claude")
+            if out:
+                return out
+        except ImportError:
+            print("\nanthropic package not installed — skipping Claude band naming")
+
+    if os.environ.get("LOCAL_LABEL_BACKEND", "").strip().lower() == "llama_cpp":
+        model_path = os.environ.get("LOCAL_LABEL_MODEL_PATH", "/app/models/qwen2.5-1.5b-instruct-q4.gguf")
+        command = os.environ.get("LLAMA_CPP_COMMAND", "llama-cli")
+        if os.path.exists(model_path):
+            out = run_all(lambda p: llama_cpp_complete(p, model_path, command, 24), "llama.cpp")
+            if out:
+                return out
+        else:
+            print(f"llama.cpp model not found at {model_path}; falling back to transformers")
+
+    loaded = load_local_chat_model(os.environ.get("LOCAL_LLM_MODEL", "Qwen/Qwen2.5-0.5B-Instruct"))
+    if loaded is None:
+        return {}
+    tokenizer, model = loaded
+    out = run_all(lambda p: local_chat_complete(tokenizer, model, BAND_SYSTEM_PROMPT, p, 18), "local model")
+    del model
+    del tokenizer
+    return out
+
+
+def generate_band_labels(bands, topic_labels, topic_terms, titles_by_topic, reporter=None):
+    """Name each research-area band with a short name covering the whole band.
+
+    Evidence is every child label, interleaved child top terms and example titles;
+    no abstract text. Uses its own prompt (not the per-topic labeller)."""
+    prompts = {
+        int(b["band_id"]): build_band_prompt(b, topic_labels, topic_terms, titles_by_topic)
+        for b in bands
+    }
+    generated = complete_band_names(prompts, reporter) or {}
+
+    labels = {}
+    used = set()
+    for band in bands:
+        band_id = int(band["band_id"])
+        children = [int(t) for t in band["child_topic_ids"]]
+        child_keys = {normalize_label_key(topic_labels.get(t, "")) for t in children}
+        label = clean_generated_label(generated.get(band_id))
+        if not label_is_usable(label, used):
+            counts = band.get("child_doc_counts", {})
+            largest = min(children, key=lambda t: (-int(counts.get(t, 0)), t))
+            base = clean_generated_label(topic_labels.get(largest)) or f"Topic {largest}"
+            label = f"{base} and related topics"
+            if normalize_label_key(label) in child_keys or normalize_label_key(label) in used:
+                label = f"{label} (band {band_id})"
+        used.add(normalize_label_key(label))
+        labels[band_id] = label
+    return labels
+
+
 def parse_top_terms(value):
     try:
         parsed = json.loads(value or "[]")
@@ -1475,6 +1749,143 @@ def run_label_only(client, topic_id=None, reporter=None):
         client.execute("UPDATE topics SET label = ? WHERE topic_id = ?", [label, tid])
     mark_auto_selected_candidates(client, candidates, labels, overrides)
     print(f"Regenerated labels for {len(selected_topic_ids)} topics.")
+    if topic_id is None:
+        try:
+            refresh_band_labels(client, labels, topic_terms, titles_by_topic, topic_rows, reporter)
+        except Exception as ex:
+            raise RuntimeError(
+                f"Topic labels were saved, but research-area band names were not refreshed: {ex}"
+            ) from ex
+
+
+def refresh_band_labels(client, new_topic_labels, topic_terms, titles_by_topic, topic_rows, reporter=None):
+    """Rename existing bands from the refreshed topic labels; membership is never changed."""
+    client.execute(
+        "CREATE TABLE IF NOT EXISTS topic_bands (" + TOPIC_TABLE_SCHEMAS["topic_bands"] + ")"
+    )
+    band_rows = client.execute(
+        "SELECT band_id, child_topic_ids, doc_count FROM topic_bands ORDER BY band_id"
+    ).rows
+    if not band_rows:
+        return
+    topic_labels = {int(r["topic_id"]): r["label"] for r in topic_rows}
+    topic_labels.update({int(t): l for t, l in new_topic_labels.items() if int(t) != -1})
+    topic_counts = {int(r["topic_id"]): int(r["doc_count"] or 0) for r in topic_rows}
+    bands = []
+    for r in band_rows:
+        children = [int(t) for t in json.loads(r["child_topic_ids"])]
+        bands.append({
+            "band_id": int(r["band_id"]),
+            "child_topic_ids": children,
+            "doc_count": int(r["doc_count"]),
+            "child_doc_counts": {t: topic_counts.get(t, 0) for t in children},
+        })
+    band_labels = generate_band_labels(bands, topic_labels, topic_terms, titles_by_topic, reporter)
+    now = datetime.now(timezone.utc).isoformat()
+    client.batch(
+        [("UPDATE topic_bands SET label = ? WHERE band_id = ?", [label, bid]) for bid, label in band_labels.items()]
+        + [bands_version_statement(now)]
+    )
+    print(f"Regenerated names for {len(bands)} research-area bands.")
+
+
+def read_topics_generation(client):
+    rows = client.execute("SELECT value FROM settings WHERE key = 'topics_generation'").rows
+    return rows[0]["value"] if rows else None
+
+
+def run_bands_only(client, reporter=None):
+    """Rebuild the hierarchy and research-area bands for the CURRENT topics generation.
+
+    Reads document_topics and cached embeddings only; never touches topics,
+    document_topics, topic_label_overrides or topics_generation. All live writes
+    happen in one batch, so a failure leaves the previous rows in place.
+    """
+    import numpy as np
+    ensure_live_topic_tables(client)
+    client.execute(
+        "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT NOT NULL)"
+    )
+    generation_at_start = read_topics_generation(client)
+    if reporter:
+        reporter.report("build_bands", "Building Research Areas", status="running",
+                        detail="Loading topic assignments and cached embeddings...")
+    topic_rows = client.execute("SELECT topic_id, label, top_terms FROM topics WHERE topic_id != -1").rows
+    topic_labels = {int(r["topic_id"]): r["label"] for r in topic_rows}
+    topic_terms = {int(r["topic_id"]): parse_top_terms(r["top_terms"]) for r in topic_rows}
+    assign_rows = client.execute(
+        "SELECT doc_id, topic_id FROM document_topics WHERE topic_id != -1 ORDER BY doc_id"
+    ).rows
+    doc_ids = [r["doc_id"] for r in assign_rows]
+    doc_topic = [int(r["topic_id"]) for r in assign_rows]
+    topic_ids = sorted(set(doc_topic))
+    if len(topic_ids) < 2:
+        raise ValueError("Need at least 2 topics with assigned documents to build research areas")
+    matrix, filled, _dim = load_cached_embeddings(client, doc_ids)
+    if matrix is None or not filled.any():
+        raise ValueError("No cached embeddings found for assigned documents")
+    missing = int((~filled).sum())
+    if missing:
+        print(f"  Dropping {missing} of {len(doc_ids)} assigned documents with no cached embedding")
+    keep = np.nonzero(filled)[0]
+    kept_ids = [doc_ids[i] for i in keep]
+    kept_topics = [doc_topic[i] for i in keep]
+    centroids = topic_centroids(matrix[keep], kept_topics, topic_ids)  # raises if a topic lost all vectors
+    linkage_matrix = centroid_linkage(centroids)
+
+    doc_counts = {}
+    for t in doc_topic:  # paper count = all non-outlier assignments, not just embedded ones
+        doc_counts[t] = doc_counts.get(t, 0) + 1
+    bands = compute_bands(linkage_matrix, topic_ids, doc_counts)
+
+    titles_by_topic = {}
+    meta_rows = client.execute("""
+        SELECT dt.topic_id, d.metadata_json
+        FROM document_topics dt
+        JOIN documents d ON d.doc_id = dt.doc_id
+        WHERE dt.topic_id != -1
+          AND COALESCE(json_extract(d.metadata_json, '$.accessStatus'), 'unknown')
+                NOT IN ('embargoed', 'verification_due')
+        ORDER BY dt.topic_id, dt.probability DESC
+    """).rows
+    for r in meta_rows:
+        try:
+            title = str(json.loads(r["metadata_json"] or "{}").get("title") or "").strip()
+        except Exception:
+            continue
+        if title:
+            bucket = titles_by_topic.setdefault(int(r["topic_id"]), [])
+            if title not in bucket:
+                bucket.append(title)
+    band_labels = generate_band_labels(bands, topic_labels, topic_terms, titles_by_topic, reporter)
+
+    now = datetime.now(timezone.utc).isoformat()
+    statements = [
+        ("DELETE FROM topic_hierarchy_meta", []),
+        ("INSERT INTO topic_hierarchy_meta (id, leaf_topic_ids, linkage_json, created_at) VALUES (1, ?, ?, ?)",
+         [json.dumps(topic_ids), json.dumps(linkage_matrix.tolist()), now]),
+        ("DELETE FROM topic_bands", []),
+    ]
+    for b in bands:
+        statements.append((
+            "INSERT INTO topic_bands (band_id, label, child_topic_ids, doc_count, created_at) VALUES (?, ?, ?, ?, ?)",
+            [b["band_id"], band_labels[b["band_id"]], json.dumps(b["child_topic_ids"]), b["doc_count"], now],
+        ))
+    statements.append(bands_version_statement(now))
+    # A full rebuild swaps topics (and bumps topics_generation) while this job
+    # runs; bands computed from the old topics must not be written over them.
+    generation_now = read_topics_generation(client)
+    if generation_now != generation_at_start:
+        raise RuntimeError(
+            f"topics_generation changed during the bands-only run ({generation_at_start!r} -> "
+            f"{generation_now!r}); nothing was written. Re-run after the topic rebuild finishes."
+        )
+    client.batch(statements)
+    print(f"Saved {len(bands)} research-area bands over {len(topic_ids)} topics.")
+    if reporter:
+        reporter.report("build_bands", "Building Research Areas", status="completed",
+                        detail=f"Built {len(bands)} research-area bands.", next_task="Completed")
+    return {"bands": len(bands), "leaves": len(topic_ids)}
 
 
 import threading
@@ -1519,6 +1930,7 @@ def finish_job(client, job_id, execution_id, status, error=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--labels-only", action="store_true")
+    parser.add_argument("--bands-only", action="store_true")
     parser.add_argument("--topic-id", type=int)
     args = parser.parse_args()
 
@@ -1546,6 +1958,16 @@ def main():
         reporter = ProgressReporter(client, job_id, execution_id)
 
     try:
+        if args.bands_only:
+            run_bands_only(client, reporter=reporter)
+            if job_id:
+                finish_job(client, job_id, execution_id, "completed")
+            if db_logger:
+                db_logger.flush()
+            client.close()
+            print("Done.")
+            return
+
         if args.labels_only:
             if reporter:
                 reporter.report(
@@ -1584,6 +2006,7 @@ def main():
 
         doc_ids = []
         abstracts = []
+        doc_titles = []  # extra evidence for band naming only; never a substitute for an abstract
         for row in rows_res.rows:
             try:
                 meta = json.loads(row["metadata_json"])
@@ -1595,6 +2018,7 @@ def main():
                 continue
             doc_ids.append(row["doc_id"])
             abstracts.append(abstract)
+            doc_titles.append(str(meta.get("title") or "").strip())
 
         print(f"Extracted {len(abstracts)} non-empty abstracts (skipped {len(rows_res.rows) - len(abstracts)})")
         if reporter:
@@ -1790,32 +2214,22 @@ def main():
             new_outliers = sum(1 for t in topics if t == -1)
             print(f"  Outliers reduced: {outlier_count} -> {new_outliers}")
 
-        # Compute hierarchical topic structure from topic embeddings
+        # Compute the topic hierarchy from meaning: Ward on mean-centred, L2-normalised
+        # topic centroids of the cached document embeddings (outliers excluded).
         import numpy as np
-        from sklearn.metrics.pairwise import cosine_similarity
-        from scipy.cluster.hierarchy import linkage
-        from scipy.spatial.distance import squareform
 
-        print("\nComputing topic hierarchy (ward linkage on topic embeddings)...")
+        print("\nComputing topic hierarchy (ward linkage on document-embedding centroids)...")
         all_topic_info = topic_model.get_topic_info()
-        all_topic_ids = sorted(all_topic_info[all_topic_info["Topic"] != -1]["Topic"].tolist())
-        embeddings_raw = topic_model.topic_embeddings_
+        all_topic_ids = sorted(int(t) for t in all_topic_info[all_topic_info["Topic"] != -1]["Topic"].tolist())
+        topic_doc_counts = {}
+        for t in topics:
+            if int(t) != -1:
+                topic_doc_counts[int(t)] = topic_doc_counts.get(int(t), 0) + 1
 
-        # BERTopic keeps an extra embedding row for the outlier topic (-1) even after
-        # outlier reduction removes it from topic_info. Detect this by comparing the
-        # embedding count to the number of non-outlier topics.
-        if embeddings_raw.shape[0] == len(all_topic_ids) + 1:
-            hierarchy_embeddings = embeddings_raw[1:]  # skip ghost outlier row
-        else:
-            hierarchy_embeddings = embeddings_raw
-
+        linkage_matrix = None
         if len(all_topic_ids) >= 2:
-            dist_matrix = 1 - cosine_similarity(hierarchy_embeddings)
-            np.fill_diagonal(dist_matrix, 0)
-            condensed = squareform(dist_matrix, checks=False)
-            linkage_matrix = linkage(condensed, method='ward', optimal_ordering=True)
-
-            # Store in topic_hierarchy_meta table
+            centroids = topic_centroids(embeddings_matrix, topics, all_topic_ids)
+            linkage_matrix = centroid_linkage(centroids)
             leaf_topic_ids_json = json.dumps(all_topic_ids)
             linkage_json = json.dumps(linkage_matrix.tolist())
             print(f"  Linkage matrix: {len(linkage_matrix)} merge steps for {len(all_topic_ids)} topics")
@@ -1913,11 +2327,32 @@ def main():
             )
             print(f"  Saved topic hierarchy ({len(all_topic_ids)} leaves, {len(linkage_matrix)} merges)")
 
+        # Research-area bands: cut the hierarchy, name the bands, stage them with the topics
+        if linkage_matrix is not None:
+            bands = compute_bands(linkage_matrix, all_topic_ids, topic_doc_counts)
+            titles_by_topic = {}
+            for title, t in zip(doc_titles, topics):
+                if title and int(t) != -1:
+                    bucket = titles_by_topic.setdefault(int(t), [])
+                    if title not in bucket:
+                        bucket.append(title)
+            band_topic_terms = {t: (topic_model.get_topic(t) or []) for t in all_topic_ids}
+            band_labels = generate_band_labels(bands, topic_labels, band_topic_terms, titles_by_topic, reporter)
+            band_rows = [
+                [b["band_id"], band_labels[b["band_id"]], json.dumps(b["child_topic_ids"]), b["doc_count"], now]
+                for b in bands
+            ]
+            write_rows(
+                client,
+                "INSERT OR REPLACE INTO topic_bands_next (band_id, label, child_topic_ids, doc_count, created_at) VALUES (?, ?, ?, ?, ?)",
+                band_rows,
+            )
+            print(f"  Saved {len(band_rows)} research-area bands")
+
         # Release what the 2-D UMAP fit and the rest of the run no longer need
         # (still needed: topic_model, topic_info, topic_labels, topics, doc_ids, abstracts, embeddings_matrix)
         probs = doc_topic_rows = topic_rows = label_candidates = claude_labels = None
-        embeddings_raw = hierarchy_embeddings = None
-        dist_matrix = condensed = linkage_matrix = linkage_json = None
+        linkage_matrix = linkage_json = band_rows = None
         gc.collect()
 
         # Extract 2D UMAP projection for scatter plot visualization
@@ -1985,7 +2420,7 @@ def main():
             
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
-        if not args.labels_only:
+        if not (args.labels_only or args.bands_only):
             drop_staging_topic_tables(client)
         if reporter:
             reporter.report(

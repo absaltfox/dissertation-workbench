@@ -43,7 +43,7 @@ export async function runThemeRecomputeAdminJob(job) {
   await appendAdminJobLog(job.id, 'Starting stored theme recompute.\n');
   await updateProgress({
     phase: 'load_documents',
-    currentTask: 'Loading stored dissertation metadata',
+    currentTask: 'Loading stored manuscript metadata',
     tasks: [
       {
         key: 'load_documents',

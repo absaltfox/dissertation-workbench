@@ -194,10 +194,7 @@ test('workbench analytics above the detailed-corpus threshold returns real SQL-b
   assert.equal(response.body.source.aggregateSource, 'database');
   assert.equal(response.body.source.detailedAnalyticsRecordLimit, 5000);
 
-  const { supervisorNgramMatrix, conceptTimeline, methodologyConceptMatrix, methodologyTopicMatrix, topicData, termCooccurrence } = response.body;
-
-  assert.ok(supervisorNgramMatrix.supervisors.length > 0, 'supervisorNgramMatrix must have real supervisors, not an empty stub');
-  assert.ok(supervisorNgramMatrix.matrix.some((row) => row.some((cell) => cell > 0)), 'supervisorNgramMatrix must have real nonzero cells');
+  const { conceptTimeline, methodologyConceptMatrix, methodologyTopicMatrix, topicData, termCooccurrence } = response.body;
 
   assert.ok(conceptTimeline.length > 0, 'conceptTimeline must have real concepts, not an empty stub');
   assert.ok(conceptTimeline[0].data.length > 0);

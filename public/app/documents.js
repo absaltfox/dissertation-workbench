@@ -137,18 +137,6 @@ function docsForCooccurrence(termA, termB) {
   });
 }
 
-function docsForSupervisorConcept(supervisor, concept) {
-  const sup = String(supervisor || '').toLowerCase();
-  const conceptNorm = String(concept || '').toLowerCase();
-  const docs = getFilteredDocs();
-  return docs.filter((doc) => {
-    const hasSup = (doc.supervisors || []).some((s) => String(s || '').toLowerCase() === sup);
-    if (!hasSup) return false;
-    const terms = new Set((doc.conceptTerms || []).map((t) => String(t || '').toLowerCase()));
-    return terms.has(conceptNorm);
-  });
-}
-
 function openMatchesModal(title, matches) {
   const list = matches || [];
   const body = list.length
@@ -166,18 +154,18 @@ function openMatchesModal(title, matches) {
           .join('')}
       </div>
     `
-    : '<p class="meta">No matching dissertations found in the current result set.</p>';
+    : '<p class="meta">No matching manuscripts found in the current result set.</p>';
 
   const bodyHtml = `
     <div class="meta">
       <p><strong>${escapeHtml(title)}</strong></p>
-      <p>${formatNum(list.length)} dissertation(s)</p>
+      <p>${formatNum(list.length)} manuscript(s)</p>
     </div>
     ${body}
   `;
   openResponsivePanel({
     title,
-    eyebrow: `${formatNum(list.length)} dissertation(s)`,
+    eyebrow: `${formatNum(list.length)} manuscript(s)`,
     bodyHtml,
     onMount: attachRelatedItemHandlers,
   });
@@ -554,7 +542,6 @@ export {
   docsForCooccurrence,
   docsForConceptTerm,
   docsForMethodology,
-  docsForSupervisorConcept,
   docsForTheme,
   docsForTopic,
   getFilteredDocs,

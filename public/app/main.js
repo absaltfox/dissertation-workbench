@@ -155,7 +155,14 @@ function scheduleAnalyticsWarmup() {
   }, 350);
 }
 
+let adminUnavailable = false;
+
 async function activateTab(tabName, { updateUrl = true, resetToken = '' } = {}) {
+  if (tabName === 'admin' && adminUnavailable) {
+    window.history.replaceState(null, '', '#/documents');
+    tabName = 'records';
+    updateUrl = false;
+  }
   setActiveTab(tabName, { updateUrl });
 
   if (tabName === 'citations' && state.payload) {
@@ -420,8 +427,28 @@ configureData({
   },
 });
 
+// The server answers 404 on /api/auth/* (including /available, a quiet 200 probe
+// that avoids the 401 console error from /session) when this client is outside
+// ADMIN_ALLOWED_NETWORKS. 401/200 (or a network error) leave the tab alone.
+async function hideAdminIfUnavailable() {
+  try {
+    const res = await fetch('/api/auth/available');
+    if (res.status !== 404) return;
+  } catch {
+    return;
+  }
+  adminUnavailable = true;
+  for (let i = tabButtons.length - 1; i >= 0; i -= 1) {
+    if (tabButtons[i].dataset.tab === 'admin') tabButtons.splice(i, 1)[0].remove();
+  }
+  const { tab } = parseRouteFromHash();
+  if (tab === 'admin' || /^#\/?admin(\/|$|\?)/i.test(window.location.hash)) {
+    window.history.replaceState(null, '', '#/documents');
+  }
+}
+
 bindFirstScreenEvents();
-applyRouteFromHash();
+hideAdminIfUnavailable().then(applyRouteFromHash);
 loadData();
 setInterval(async () => {
   if (state.user && document.querySelector('#admin-jobs.active')) {

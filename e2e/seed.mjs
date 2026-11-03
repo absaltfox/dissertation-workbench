@@ -35,7 +35,9 @@ export async function seedFixtureCorpus() {
       affiliation: ['University of British Columbia'],
       supervisors: doc.supervisors,
       abstract: `Fixture abstract for ${doc.title}.`,
-      subjects: [doc.program],
+      // e2e-doc-5 has no subject headings: the API/normalizer substitutes an
+      // "(Unspecified)" placeholder that must never become a word-cloud term.
+      subjects: doc.id === 'e2e-doc-5' ? [] : [doc.program],
       conceptTerms: doc.conceptTerms,
       methodologies: doc.methodologies,
     }, { syncKey: null });

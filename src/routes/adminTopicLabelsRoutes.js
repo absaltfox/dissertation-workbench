@@ -30,6 +30,15 @@ export function createAdminTopicLabelsRouter({ clearMetricsCache }) {
       });
       return;
     }
+    const bandsRunningId = await hasRunningAdminJob('topic_bands');
+    if (bandsRunningId) {
+      res.status(409).json({
+        error: 'A research-area rebuild is running; wait for it to finish before regenerating labels.',
+        bandsRunning: true,
+        jobId: bandsRunningId,
+      });
+      return;
+    }
     const topicId = req.body?.topicId != null ? Number(req.body.topicId) : null;
     if (topicId != null && !Number.isInteger(topicId)) {
       res.status(400).json({ error: 'Invalid topic id.' });
@@ -40,6 +49,37 @@ export function createAdminTopicLabelsRouter({ clearMetricsCache }) {
       label: topicId == null ? 'Regenerate Topic Labels' : `Regenerate Topic ${topicId} Label`,
       params: { topicId },
     });
+    res.status(202).json({ ok: true, started: true, ...result });
+  }));
+
+  router.post('/topics/bands/rebuild', asyncHandler(async (_req, res) => {
+    const runningId = await hasRunningAdminJob('topic_bands');
+    if (runningId) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: runningId });
+      return;
+    }
+    // Both jobs write band rows, and a bertopic run replaces the topics they sit on.
+    for (const [type, name] of [['bertopic', 'A BERTopic rebuild'], ['topic_labels', 'A topic label job']]) {
+      const otherId = await hasRunningAdminJob(type);
+      if (otherId) {
+        res.status(409).json({
+          error: `${name} is running; wait for it to finish before rebuilding research areas.`,
+          jobId: otherId,
+          runningType: type,
+        });
+        return;
+      }
+    }
+    const result = await createAndStartAdminWorkerJob({
+      type: 'topic_bands',
+      label: 'Rebuild Research Areas',
+      params: {},
+      singleInstance: true,
+    });
+    if (result.alreadyRunning) {
+      res.status(202).json({ ok: true, alreadyRunning: true, jobId: result.jobId });
+      return;
+    }
     res.status(202).json({ ok: true, started: true, ...result });
   }));
 

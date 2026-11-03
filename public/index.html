@@ -19,10 +19,10 @@
           <h1>Dissertation Workbench</h1>
           <span class="beta-tag">Beta</span>
         </div>
-        <p class="subtitle">View research, explore related themes, and discover patterns across the EdD and PhD (EDST) dissertation corpus from 1966 to present at UBC.</p>
+        <p class="subtitle">View research, explore related themes, and discover patterns across UBC's theses and dissertations from 1919 onward. Note that theses and dissertations continue to be indexed, and the catalogue here is not a complete representation of those held by cIRcle, made available through Open Collections.</p>
         <div class="hero-context" aria-label="Workbench context">
           <p>The Dissertation Workbench extracts and enriches metadata from UBC Open Collections, offering new ways to consider connections between people, research, and topics.</p>
-          <p>Some metadata is calculated, including word and page counts. Themes and concepts come from n-gram analysis; topics are generated from dissertation abstracts using BERTopic. The workbench remains a work in progress, and some edge-case errors remain.</p>
+          <p>Some metadata is calculated, including word and page counts. Themes and concepts come from n-gram analysis; topics are generated from manuscript abstracts using BERTopic. The workbench remains a work in progress, and some edge-case errors remain.</p>
         </div>
         <p id="refreshRule" class="refresh-rule"></p>
       </header>
@@ -46,7 +46,7 @@
       <div id="facetFilterBar" class="facet-filter-bar reveal" hidden>
         <button id="facetToggle" class="facet-toggle" type="button" aria-expanded="false" aria-controls="facetFilterContent">
           <span>Filters</span>
-          <span id="facetToggleSummary" class="facet-toggle-summary">All dissertations</span>
+          <span id="facetToggleSummary" class="facet-toggle-summary">All manuscripts</span>
         </button>
         <div id="facetFilterContent" class="facet-filter-content">
           <div class="facet-filter-controls">
@@ -149,7 +149,7 @@
             </article>
 
             <article class="panel">
-              <h2>Dissertations by Year</h2>
+              <h2>Manuscripts by Year</h2>
               <div id="dissertationsByYearChart" class="chart-container" style="position:relative; width:100%; height:320px;"><canvas></canvas></div>
             </article>
 
@@ -159,7 +159,7 @@
             </article>
 
             <article class="panel">
-              <h2>Dissertation Length Trend (Median Pages by Year)</h2>
+              <h2>Manuscript Length Trend (Median Pages by Year)</h2>
               <div id="pageTrendChart" class="chart-container" style="position:relative; width:100%; height:320px;"><canvas></canvas></div>
             </article>
 
@@ -197,11 +197,6 @@
           <div id="cooccurrenceBars" class="bars"></div>
         </article>
 
-        <article class="panel">
-          <h2>Supervisor &ndash; Concept Heatmap</h2>
-          <div id="supervisorHeatmap" class="table-wrap"></div>
-        </article>
-
         <article class="panel" id="supervisorTopicPanel" hidden>
           <h2>Supervisor &ndash; Topic Heatmap</h2>
           <div id="supervisorTopicHeatmap" class="table-wrap"></div>
@@ -214,7 +209,7 @@
 
         <article class="panel" id="topicDistPanel" hidden>
           <h2>Topic Distribution</h2>
-          <p id="topicModelMeta" class="meta" style="margin-bottom:0.5rem">Topics discovered by BERTopic clustering of dissertation abstracts.</p>
+          <p id="topicModelMeta" class="meta" style="margin-bottom:0.5rem">Topics discovered by BERTopic clustering of manuscript abstracts.</p>
           <div id="topicBars" class="bars"></div>
         </article>
 
@@ -235,9 +230,9 @@
           <article class="panel" id="topicClusterPanel" hidden>
             <h2>Topic Clusters</h2>
             <p class="meta" style="margin-bottom:0.5rem">
-              Each dot is a dissertation, projected into two dimensions with UMAP and
+              Each dot is a manuscript, projected into two dimensions with UMAP and
               colored by BERTopic cluster assignment. Nearby points are useful for exploration,
-              but screen distance is not a precise similarity measure. Click a dot to view the dissertation.
+              but screen distance is not a precise similarity measure. Click a dot to view the manuscript.
             </p>
             <div id="topicClusterContainer" style="position:relative">
               <canvas id="topicClusterChart" width="940" height="600" role="img"
@@ -250,7 +245,7 @@
             <h2>Topic Hierarchy</h2>
             <p class="meta" style="margin-bottom:0.5rem">
               Topics clustered by shared terminology. Closer branches indicate
-              more similar research themes. Node size reflects dissertation count.
+              more similar research themes. Node size reflects manuscript count.
             </p>
             <div id="topicDendrogramContainer" style="position:relative">
               <svg id="topicDendrogramChart" viewBox="0 0 940 600"></svg>
@@ -262,7 +257,7 @@
             <h2>Topic Evolution</h2>
             <p class="meta" style="margin-bottom:0.5rem">
               How topic prevalence shifts across time periods. Band width shows
-              the number of dissertations in each topic per period.
+              the number of manuscripts in each topic per period.
             </p>
             <div id="topicSankeyContainer" style="position:relative">
               <svg id="topicSankeyChart" viewBox="0 0 940 500"></svg>
@@ -278,7 +273,7 @@
           <article class="panel" id="methTopicBubblePanel" hidden>
             <h2>Methodology &times; Topic</h2>
             <p class="meta" style="margin-bottom:0.5rem">
-              Bubble size shows how many dissertations use each methodology within
+              Bubble size shows how many manuscripts use each methodology within
               each topic cluster.
             </p>
             <div id="methTopicBubbleContainer" style="position:relative">
@@ -299,9 +294,9 @@
         <div class="citations-explorer">
           <div class="citations-list-col">
             <article class="panel">
-              <h2>Dissertations</h2>
+              <h2>Manuscripts</h2>
               <input id="citationDocFilter" class="doc-filter" type="search"
-                     placeholder="Filter dissertations..." />
+                     placeholder="Filter manuscripts..." />
               <div class="table-wrap">
                 <table class="citation-docs-table">
                   <thead>
@@ -332,7 +327,7 @@
         <div id="citation-foundational" class="citation-tab-section">
         <article class="panel">
           <h2>Foundational Works</h2>
-          <p class="meta" style="margin-bottom:0.5rem">Citations appearing across the most dissertations in this corpus.</p>
+          <p class="meta" style="margin-bottom:0.5rem">Citations appearing across the most manuscripts in this corpus.</p>
           <div id="foundationalWorksList" class="foundational-works-list"></div>
         </article>
         </div>
@@ -358,6 +353,7 @@
                   </select>
                 </div>
               </div>
+              <p id="peopleProvenanceNotice" class="meta people-provenance-notice">Connections between people and theses and dissertations have been reconstructed from statements in the documents themselves. Where authoritative metadata exists indicating the dissertation or thesis supervisor, that metadata takes precedence here. However, supervisor metadata is only available from 2018 onward in UBCV manuscripts, based on sampling.</p>
               <div class="table-wrap" style="max-height:78vh">
                 <table>
                   <thead>
@@ -387,7 +383,7 @@
         <div class="about-grid">
           <article class="about-card">
             <h3>Discovery &amp; Connections</h3>
-            <p>UBC Open Collections offers an entry point into the university's graduate-level scholarship. Dissertation Intelligence Workbench interacts with Open Collections through its public APIs, and enriches and links dissertation metadata in ways that may support researchers and graduate students with discovery &mdash; in terms of thematic and conceptual connections, methodologies, and even supervisor interests.</p>
+            <p>UBC Open Collections offers an entry point into the university's graduate-level scholarship. Dissertation Workbench interacts with Open Collections through its public APIs, and enriches and links thesis and dissertation metadata in ways that may support researchers and graduate students with discovery &mdash; in terms of thematic and conceptual connections, methodologies, and even supervisor interests.</p>
           </article>
           <article class="about-card">
             <h3>Metadata as Narrative</h3>
@@ -395,7 +391,7 @@
           </article>
           <article class="about-card">
             <h3>Current Scope</h3>
-            <p>Currently, the tool's dataset is limited to Education Studies (Faculty of Education) Doctor of Education dissertations. The intention is to slowly expand the dataset to include other dissertations, by subject, in Open Collections.</p>
+            <p>The workbench covers UBC theses and dissertations from 1919 onward, drawn from cIRcle through Open Collections. Indexing is ongoing, so the catalogue here is not yet a complete representation of the collection.</p>
           </article>
         </div>
       </section>

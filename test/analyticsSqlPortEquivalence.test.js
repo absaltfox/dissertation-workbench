@@ -4,8 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-// #15: JS-vs-SQL cross-check for the two corrected ports (topicData.byYear,
-// supervisorNgramMatrix) on an identical fixture, proving behavioral
+// #15: JS-vs-SQL cross-check for the corrected topicData.byYear port on an identical fixture, proving behavioral
 // equivalence rather than assuming it. Both ports are exercised through
 // their real production entry points: the JS side via
 // buildMetricsPayloadFromRecords (the same function the below-threshold
@@ -87,9 +86,9 @@ test.before(async () => {
 
   // Task 6a: one extra doc with 12 conceptTerms (docConceptTerms can emit up
   // to 12 in production — see src/metrics.js), exercising the
-  // `term.key < 10` ordinal cutoff that computeSupervisorNgramMatrixSql's
-  // legacy json_each form applies. document_terms has no stored array
-  // position, so the projected branch reconstructs it via ROW_NUMBER()
+  // `term.key < 10` ordinal cutoff that the legacy json_each form of the
+  // concept SQL ports (e.g. computeMethodologyConceptMatrixSql) applies.
+  // document_terms has no stored array position, so the projected branch reconstructs it via ROW_NUMBER()
   // OVER (PARTITION BY doc_id ORDER BY rowid).
   //
   // Positions 0-9 reuse the fixture's 8 existing high-count concept names
@@ -167,35 +166,11 @@ async function computeJsPath() {
   return payload;
 }
 
-test('#15 cross-check: supervisorNgramMatrix — SQL port matches the JS path on an identical fixture, including committee-only (non-metadata-source) supervisors', async () => {
-  const jsPayload = await computeJsPath();
+test('analytics payload has no supervisorNgramMatrix', async () => {
   const sqlPayload = await getDocumentServingAnalytics({ syncKey: SYNC_KEY });
-
-  const jsMatrix = jsPayload.supervisorNgramMatrix;
-  const sqlMatrix = sqlPayload.supervisorNgramMatrix;
-
-  assert.deepEqual([...jsMatrix.supervisors].sort(), [...sqlMatrix.supervisors].sort());
-  // The committee-only supervisor pool must actually be present in both —
-  // proving the fix isn't accidentally passing by omission (e.g. a
-  // source='metadata'-only filter would silently drop this entire pool).
-  const committeeSupervisorsInSql = sqlMatrix.supervisors.filter((name) => name.startsWith('Committee Supervisor'));
-  assert.ok(committeeSupervisorsInSql.length > 0, 'committee-sourced supervisors must appear in the SQL port');
-  assert.deepEqual([...jsMatrix.ngrams].sort(), [...sqlMatrix.ngrams].sort());
-
-  // Compare the matrix cell-by-cell after aligning both sides' row/column
-  // order (ranking ties are avoided by fixture design, so alignment via
-  // sorted labels is sufficient — no ordering ambiguity to paper over).
-  const jsSupIndex = new Map(jsMatrix.supervisors.map((name, i) => [name, i]));
-  const sqlSupIndex = new Map(sqlMatrix.supervisors.map((name, i) => [name, i]));
-  const jsNgIndex = new Map(jsMatrix.ngrams.map((name, i) => [name, i]));
-  const sqlNgIndex = new Map(sqlMatrix.ngrams.map((name, i) => [name, i]));
-  for (const name of jsMatrix.supervisors) {
-    for (const ngram of jsMatrix.ngrams) {
-      const jsValue = jsMatrix.matrix[jsSupIndex.get(name)][jsNgIndex.get(ngram)];
-      const sqlValue = sqlMatrix.matrix[sqlSupIndex.get(name)][sqlNgIndex.get(ngram)];
-      assert.equal(sqlValue, jsValue, `mismatch at supervisor="${name}" ngram="${ngram}": js=${jsValue} sql=${sqlValue}`);
-    }
-  }
+  const jsPayload = await computeJsPath();
+  assert.equal('supervisorNgramMatrix' in sqlPayload, false);
+  assert.equal('supervisorNgramMatrix' in jsPayload, false);
 });
 
 test('#15 cross-check: topicData.byYear — SQL port resolves to parent-cluster id via the same buildParentClusters algorithm as the JS path', async () => {
@@ -238,7 +213,7 @@ test('#15 cross-check: topicData.byYear — SQL port resolves to parent-cluster 
   );
 });
 
-test('Task 6a: conceptTimeline + supervisorNgramMatrix — document_terms projection equals legacy json_each', async () => {
+test('Task 6a: conceptTimeline — document_terms projection equals legacy json_each', async () => {
   const { __setDocumentTermsReadyForTesting } = await import('../src/db.js');
   try {
     __setDocumentTermsReadyForTesting(false);
@@ -253,15 +228,8 @@ test('Task 6a: conceptTimeline + supervisorNgramMatrix — document_terms projec
       legacy.conceptTimeline.some((row) => row.data.length > 0 && row.totalDocs > 0),
       'conceptTimeline must have at least one concept with year data'
     );
-    assert.ok(legacy.supervisorNgramMatrix.supervisors.length > 0, 'supervisorNgramMatrix.supervisors must be non-empty');
-    assert.ok(legacy.supervisorNgramMatrix.ngrams.length > 0, 'supervisorNgramMatrix.ngrams must be non-empty');
-    assert.ok(
-      legacy.supervisorNgramMatrix.matrix.some((row) => row.some((v) => v > 0)),
-      'supervisorNgramMatrix.matrix must contain at least one nonzero cell'
-    );
 
     assert.deepEqual(projected.conceptTimeline, legacy.conceptTimeline);
-    assert.deepEqual(projected.supervisorNgramMatrix, legacy.supervisorNgramMatrix);
   } finally {
     __setDocumentTermsReadyForTesting(false);
   }
@@ -297,15 +265,15 @@ test('Task 6b: methodologyConceptMatrix + methodologyTopicMatrix — document_te
   }
 });
 
-test('Task 6a/6b fix (round 1 review + Task 6b reuse): supervisorNgramMatrix + methodologyConceptMatrix — legacy distinct-first-10 selection matches the document_terms projection when a document has a duplicate conceptTerm inside its first 10 raw array positions', async () => {
+test('Task 6a/6b fix (round 1 review + Task 6b reuse): methodologyConceptMatrix — legacy distinct-first-10 selection matches the document_terms projection when a document has a duplicate conceptTerm inside its first 10 raw array positions', async () => {
   // Isolated in its own syncKey/doc, deliberately NOT added to the shared
-  // 222-doc SYNC_KEY corpus: the JS reference path (buildSupervisorNgramMatrix
-  // -> docConceptTerms -> rec.conceptTerms.slice(0, 10)) truncates by RAW
+  // 222-doc SYNC_KEY corpus: the JS reference path (the metrics.js
+  // methodology/concept matrix builders -> docConceptTerms -> rec.conceptTerms.slice(0, 10)) truncates by RAW
   // array position with no dedup, so on a document with a duplicate in its
   // first 10 positions it would disagree with the (correct, post-fix)
   // distinct-based SQL truncation used by both branches here. That's a
   // separate, pre-existing JS-vs-SQL semantic gap outside this task's scope
-  // (computeSupervisorNgramMatrixSql's two *SQL* branches, not the JS port);
+  // (the SQL ports' two *SQL* branches, not the JS port);
   // keeping this fixture off SYNC_KEY avoids corrupting the unrelated #15
   // JS-vs-SQL cross-check above with that unrelated gap.
   const dupSyncKey = 'sql-port-dup-boundary';
@@ -348,13 +316,6 @@ test('Task 6a/6b fix (round 1 review + Task 6b reuse): supervisorNgramMatrix + m
     setDupReady(true);
     const projected = await getDocumentServingAnalytics({ syncKey: dupSyncKey });
 
-    assert.ok(legacy.supervisorNgramMatrix.supervisors.length > 0, 'supervisors must be non-empty');
-    assert.ok(legacy.supervisorNgramMatrix.ngrams.length > 0, 'ngrams must be non-empty');
-    assert.ok(
-      legacy.supervisorNgramMatrix.matrix.some((row) => row.some((v) => v > 0)),
-      'matrix must contain at least one nonzero cell'
-    );
-
     // The fix's load-bearing assertions: this is the exact scenario the
     // round-1 review flagged as a hole. Before the fix, legacy's raw
     // term.key < 10 would have excluded 'filler b' here while the
@@ -362,10 +323,8 @@ test('Task 6a/6b fix (round 1 review + Task 6b reuse): supervisorNgramMatrix + m
     // diverging. Confirm the (now-fixed) legacy branch agrees with
     // production's distinct-term intent, and that the boundary control
     // term stays excluded on both sides.
-    assert.ok(legacy.supervisorNgramMatrix.ngrams.includes('filler b'), "'filler b' (10th distinct term) must be selected under distinct-based first-10 counting");
-    assert.ok(!legacy.supervisorNgramMatrix.ngrams.includes('boundary x'), "'boundary x' (11th distinct term) must remain excluded");
-
-    assert.deepEqual(projected.supervisorNgramMatrix, legacy.supervisorNgramMatrix);
+    assert.ok(legacy.methodologyConceptMatrix.concepts.includes('filler b'), "'filler b' (10th distinct term) must be selected under distinct-based first-10 counting");
+    assert.ok(!legacy.methodologyConceptMatrix.concepts.includes('boundary x'), "'boundary x' (11th distinct term) must remain excluded");
 
     // Task 6b reuses this exact fixture (same doc, same duplicate-in-first-10
     // boundary) to prove computeMethodologyConceptMatrixSql's topConcepts

@@ -20,7 +20,6 @@ const pageTrendChartEl = document.getElementById('pageTrendChart');
 const ngramCloudEl = document.getElementById('ngramCloud');
 const methodologyBarsEl = document.getElementById('methodologyBars');
 const cooccurrenceBarsEl = document.getElementById('cooccurrenceBars');
-const supervisorHeatmapEl = document.getElementById('supervisorHeatmap');
 const conceptTimelineChartEl = document.getElementById('conceptTimelineChart');
 const conceptTimelineLegendEl = document.getElementById('conceptTimelineLegend');
 const methodologyConceptHeatmapEl = document.getElementById('methodologyConceptHeatmap');
@@ -545,7 +544,7 @@ function setRefreshRuleFromPayload() {
   refreshRuleEl.classList.remove('error');
   refreshRuleEl.innerHTML = [
     `Last refreshed ${escapeHtml(formatRefreshDate(state.payload?.generatedAt))}`,
-    `${formatNum(documentTotal)} dissertations`,
+    `${formatNum(documentTotal)} manuscripts`,
     `${formatNum(supervisorTotal)} supervisors`
   ].map((part) => `<span>${part}</span>`).join('<span class="dot" aria-hidden="true"></span>');
 }
@@ -777,7 +776,6 @@ const dom = {
   ngramCloudEl,
   methodologyBarsEl,
   cooccurrenceBarsEl,
-  supervisorHeatmapEl,
   conceptTimelineChartEl,
   conceptTimelineLegendEl,
   methodologyConceptHeatmapEl,

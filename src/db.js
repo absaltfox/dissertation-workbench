@@ -2005,8 +2005,10 @@ async function aggregateNumericSeries({ filters, valueSql, reliabilitySql }) {
   return rows.map((row) => ({ year: Number(row.year), ...numericStats(row) }));
 }
 
-// #15: SQL ports of five of the six panels that previously went silently
-// empty above DETAILED_ANALYTICS_RECORD_LIMIT. Each mirrors a JS aggregator
+// #15: SQL ports of four of the five panels that previously went silently
+// empty above DETAILED_ANALYTICS_RECORD_LIMIT (conceptTimeline,
+// methodologyConceptMatrix, methodologyTopicMatrix, topicData.byYear; the
+// supervisor n-gram matrix has since been removed entirely). Each mirrors a JS aggregator
 // in metrics.js closely enough to be behaviorally equivalent on real
 // ingested data (docConceptTerms() short-circuits to the stored
 // `conceptTerms` array for every real document, so a direct
@@ -2297,26 +2299,6 @@ export async function getTopicByYearCounts({ syncKey = null, filters: requestedF
   return computeTopicDataByYearSql(filters, qualifier, topics, hierarchy);
 }
 
-// #15 supervisorNgramMatrix filter decision (per the plan's review
-// correction): role IN ('Supervisor', 'Co-Supervisor') regardless of
-// `source`, DISTINCT person_key. The JS path's `rec.supervisors` (what
-// buildSupervisorNgramMatrix in metrics.js actually counts) is populated by
-// applyCommitteeMembersToDocuments, which merges committee-derived
-// Supervisor/Co-Supervisor names into `rec.supervisors` alongside
-// metadata-sourced ones — those committee rows land in document_people with
-// source values other than 'metadata' ('api', 'pdf_fallback', 'committee').
-// A `source = 'metadata'`-only filter would silently undercount. DISTINCT is
-// required because the same person can have both a metadata row and a
-// committee row for the same document (differing `source`), which would
-// otherwise double-count that document for that person.
-//
-// Known simplification: a person's display name is taken as MIN(p.name)
-// across their rows, which is a deterministic but arbitrary tiebreak when
-// different sources spell the same person's name differently. The JS path's
-// name string is whichever source added them to `rec.supervisors` first.
-// This does not affect *who* is counted or their doc counts, only which
-// spelling variant is displayed when sources disagree — disclosed here
-// rather than silently assumed correct.
 // The legacy json_each `term.key < 10` cutoff (used below for "first 10
 // conceptTerms") counts RAW array positions, including duplicate values. The
 // document_terms projection it's being compared against is deduped on write
@@ -2348,116 +2330,6 @@ const LEGACY_CONCEPT_FIRST10_DISTINCT_SQL = `
     )
   )
 `;
-
-async function computeSupervisorNgramMatrixSql(filters, qualifier, topN = 12, topM = 10) {
-  const supervisorFilters = filters.where
-    ? `${filters.where} AND p.role IN ('Supervisor', 'Co-Supervisor')`
-    : `WHERE p.role IN ('Supervisor', 'Co-Supervisor')`;
-  const topSupervisors = await all(`
-    SELECT p.person_key AS person_key, MIN(p.name) AS name, COUNT(DISTINCT p.doc_id) AS count
-    FROM document_people p
-    JOIN documents d ON d.doc_id = p.doc_id
-    ${supervisorFilters}
-    GROUP BY p.person_key
-    ORDER BY count DESC, name ASC
-    LIMIT ?
-  `, [...filters.args, topN]);
-  if (!topSupervisors.length) return { supervisors: [], ngrams: [], conceptIds: [], matrix: [] };
-
-  // term.key < 10 in the legacy json_each form restricts candidates to the
-  // first 10 conceptTerms in metadata_json array order (docConceptTerms can
-  // emit up to 12 — see src/metrics.js). document_terms has no stored
-  // ordinal, so the projected branch reconstructs that same array-order
-  // position via ROW_NUMBER() PARTITION BY doc_id ORDER BY rowid: rows for
-  // a given doc are (re)inserted in metadata_json array order by
-  // metadataTermsStatements (full DELETE+INSERT per write, never a partial
-  // update), so rowid order within a doc_id reproduces array order exactly.
-  // ord <= 10 (1-based) is therefore equivalent to key < 10 (0-based).
-  const topNgrams = isDocumentTermsReady()
-    ? await all(`
-        SELECT term.term AS concept, COUNT(DISTINCT d.doc_id) AS count
-        FROM documents d
-        JOIN (
-          SELECT doc_id, term, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY rowid) AS ord
-          FROM document_terms WHERE kind = 'concept'
-        ) term ON term.doc_id = d.doc_id
-        ${filters.where}
-        ${qualifier} term.ord <= 10
-          AND EXISTS (
-            SELECT 1 FROM document_people p
-            WHERE p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
-          )
-        GROUP BY concept
-        ORDER BY count DESC, concept ASC
-        LIMIT ?
-      `, [...filters.args, topM])
-    : await all(`
-        SELECT term.value AS concept, COUNT(DISTINCT d.doc_id) AS count
-        FROM documents d
-        JOIN ${LEGACY_CONCEPT_FIRST10_DISTINCT_SQL} term ON term.doc_id = d.doc_id
-        ${filters.where}
-        ${qualifier} term.rnk <= 10
-          AND EXISTS (
-            SELECT 1 FROM document_people p
-            WHERE p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
-          )
-        GROUP BY concept
-        ORDER BY count DESC, concept ASC
-        LIMIT ?
-      `, [...filters.args, topM]);
-  if (!topNgrams.length) {
-    return {
-      supervisors: topSupervisors.map((r) => r.name),
-      ngrams: [], conceptIds: [], matrix: [],
-    };
-  }
-
-  const supKeyList = topSupervisors.map((r) => r.person_key);
-  const ngramList = topNgrams.map((r) => r.concept);
-  const cellRows = isDocumentTermsReady()
-    ? await all(`
-        SELECT p.person_key AS person_key, term.term AS concept, COUNT(DISTINCT d.doc_id) AS count
-        FROM documents d
-        JOIN document_people p ON p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
-        JOIN (
-          SELECT doc_id, term, ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY rowid) AS ord
-          FROM document_terms WHERE kind = 'concept'
-        ) term ON term.doc_id = d.doc_id
-        ${filters.where}
-        ${qualifier} term.ord <= 10
-          AND p.person_key IN (SELECT value FROM json_each(?))
-          AND term.term IN (SELECT value FROM json_each(?))
-        GROUP BY p.person_key, concept
-      `, [...filters.args, JSON.stringify(supKeyList), JSON.stringify(ngramList)])
-    : await all(`
-        SELECT p.person_key AS person_key, term.value AS concept, COUNT(DISTINCT d.doc_id) AS count
-        FROM documents d
-        JOIN document_people p ON p.doc_id = d.doc_id AND p.role IN ('Supervisor', 'Co-Supervisor')
-        JOIN ${LEGACY_CONCEPT_FIRST10_DISTINCT_SQL} term ON term.doc_id = d.doc_id
-        ${filters.where}
-        ${qualifier} term.rnk <= 10
-          AND p.person_key IN (SELECT value FROM json_each(?))
-          AND term.value IN (SELECT value FROM json_each(?))
-        GROUP BY p.person_key, concept
-      `, [...filters.args, JSON.stringify(supKeyList), JSON.stringify(ngramList)]);
-
-  const supIndex = new Map(supKeyList.map((key, i) => [key, i]));
-  const ngramIndex = new Map(ngramList.map((label, i) => [label, i]));
-  const matrix = supKeyList.map(() => ngramList.map(() => 0));
-  for (const row of cellRows) {
-    const si = supIndex.get(row.person_key);
-    const ni = ngramIndex.get(row.concept);
-    if (si == null || ni == null) continue;
-    matrix[si][ni] = Number(row.count || 0);
-  }
-
-  return {
-    supervisors: topSupervisors.map((r) => r.name),
-    ngrams: ngramList,
-    conceptIds: ngramList.map((label) => `c:${label.replace(/\s+/g, '_')}`),
-    matrix,
-  };
-}
 
 // Builds the SQL for the themes/conceptTerms/methodologies frequency
 // aggregates used by getDocumentServingAnalytics. When document_terms is
@@ -2549,25 +2421,22 @@ export async function getDocumentServingAnalytics({ syncKey = null, filters: req
     conceptTimeline, methodologyConceptMatrix, topicsExist,
   ] = analyticsRows;
 
-  // supervisorNgramMatrix, methodologyTopicMatrix, and topicData all need
-  // topics/hierarchy state that isn't known until hasTopics() resolves, so
-  // they run in a second, smaller wave rather than the main Promise.all
-  // above (which itself still runs everything independent of topic state
+  // methodologyTopicMatrix and topicData need topics/hierarchy state that
+  // isn't known until hasTopics() resolves, so they run after the main
+  // Promise.all above (which runs everything independent of topic state
   // concurrently, per #24's original layout).
-  const [supervisorNgramMatrix, methodologyTopicMatrixAndTopicData] = await Promise.all([
-    computeSupervisorNgramMatrixSql(filters, qualifier),
-    (async () => {
-      if (!topicsExist) return { methodologyTopicMatrix: { methodologies: [], topics: [], matrix: [] }, topicData: null };
-      const topics = await loadTopics();
-      const [methodologyTopicMatrix, hierarchy] = await Promise.all([
-        computeMethodologyTopicMatrixSql(filters, qualifier, topics),
-        loadTopicHierarchy(),
-      ]);
-      const byYear = await computeTopicDataByYearSql(filters, qualifier, topics, hierarchy);
-      return { methodologyTopicMatrix, topicData: { topics, byYear } };
-    })(),
-  ]);
-  const { methodologyTopicMatrix, topicData } = methodologyTopicMatrixAndTopicData;
+  let methodologyTopicMatrix = { methodologies: [], topics: [], matrix: [] };
+  let topicData = null;
+  if (topicsExist) {
+    const topics = await loadTopics();
+    const [matrix, hierarchy] = await Promise.all([
+      computeMethodologyTopicMatrixSql(filters, qualifier, topics),
+      loadTopicHierarchy(),
+    ]);
+    methodologyTopicMatrix = matrix;
+    const byYear = await computeTopicDataByYearSql(filters, qualifier, topics, hierarchy);
+    topicData = { topics, byYear };
+  }
 
   const wordStats = {
     count: Number(overall?.word_count || 0),
@@ -2626,12 +2495,11 @@ export async function getDocumentServingAnalytics({ syncKey = null, filters: req
     wordCloud: themes.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
     ngramCloud: concepts.map((row) => ({ term: row.term, count: Number(row.count || 0) })),
     methodologies: methodologies.map((row) => ({ methodology: row.term, count: Number(row.count || 0) })),
-    // #15: five of six panels are now real SQL-backed aggregates, computed
+    // #15: four of the five panels are real SQL-backed aggregates, computed
     // above next to the other bounded aggregates in this function.
     // termCooccurrence has no SQL port (see the comment above this
     // function) — it stays null here; the caller (metricsRoutes.js) is
     // responsible for filling it with a bounded, disclosed-sample answer.
-    supervisorNgramMatrix,
     termCooccurrence: null,
     conceptTimeline,
     methodologyConceptMatrix,

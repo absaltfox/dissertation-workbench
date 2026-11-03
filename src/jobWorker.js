@@ -78,7 +78,7 @@ async function main() {
   });
 
   let run;
-  if (claimed.type === 'bertopic' || claimed.type === 'topic_labels' || claimed.type === 'concept_rebuild') {
+  if (claimed.type === 'bertopic' || claimed.type === 'topic_labels' || claimed.type === 'topic_bands' || claimed.type === 'concept_rebuild') {
     const { spawn } = await import('node:child_process');
     const path = await import('node:path');
     const { fileURLToPath } = await import('node:url');
@@ -90,6 +90,8 @@ async function main() {
     const conceptScriptPath = path.join(__dirname, '..', 'scripts', 'build-concepts.py');
     const args = claimed.type === 'concept_rebuild'
       ? [conceptScriptPath]
+      : claimed.type === 'topic_bands'
+      ? [scriptPath, '--bands-only']
       : claimed.type === 'topic_labels'
       ? [scriptPath, '--labels-only', ...(claimed.params?.topicId != null ? ['--topic-id', String(claimed.params.topicId)] : [])]
       : [scriptPath];

@@ -97,7 +97,8 @@ export function buildFlyWorkerMachinePayload({
   image, jobId, token, executionId = '', timeoutMs = ADMIN_WORKER_TIMEOUT_MS, jobType = null
 }) {
   const isBertopic = jobType === 'bertopic';
-  const isTopicLabels = jobType === 'topic_labels';
+  const isTopicBands = jobType === 'topic_bands';
+  const isTopicLabels = jobType === 'topic_labels' || isTopicBands;
   const isConceptRebuild = jobType === 'concept_rebuild';
   const bertopicWorkerImage = process.env.BERTOPIC_WORKER_IMAGE || BERTOPIC_WORKER_IMAGE;
   const labelerWorkerImage = process.env.LABELER_WORKER_IMAGE || LABELER_WORKER_IMAGE || bertopicWorkerImage;
@@ -114,7 +115,9 @@ export function buildFlyWorkerMachinePayload({
       : 'WORKER_IMAGE';
     throw new Error(`${variable} is required for Fly ${jobType} workers.`);
   }
-  const execCmd = isTopicLabels
+  const execCmd = isTopicBands
+    ? ['python3', 'scripts/build-topics.py', '--bands-only']
+    : isTopicLabels
     ? ['python3', 'scripts/build-topics.py', '--labels-only']
     : isConceptRebuild
     ? ['python3', 'scripts/build-concepts.py']

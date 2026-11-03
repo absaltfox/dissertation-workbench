@@ -14,7 +14,6 @@ import {
   docsForCooccurrence,
   docsForConceptTerm,
   docsForMethodology,
-  docsForSupervisorConcept,
   docsForTheme,
   docsForTopic,
   getFilteredDocs,
@@ -35,7 +34,6 @@ const {
   pageTrendChartEl,
   pagesByYearChartEl,
   subjectBarsEl,
-  supervisorHeatmapEl,
   supervisorTopicHeatmapEl,
   supervisorTopicPanelEl,
   themeResultsEl,
@@ -118,7 +116,6 @@ function renderAnalytics() {
   renderNgramCloud();
   renderMethodologies();
   renderCooccurrence();
-  renderSupervisorHeatmap();
   renderConceptTimeline();
   renderTopicDistribution();
   renderTopicTimeline();
@@ -148,7 +145,7 @@ function renderKpis() {
     : null;
 
   const cards = [
-    { label: 'Dissertations', value: formatNum(metrics.recordCount) },
+    { label: 'Manuscripts', value: formatNum(metrics.recordCount) },
     {
       label: 'Pages',
       value: `${formatNum(metrics.overallPageCount.min)}\u2013${formatNum(metrics.overallPageCount.max)}`,
@@ -249,7 +246,7 @@ function renderDissertationsByYear() {
     data: {
       labels: rows.map((d) => d.year),
       datasets: [{
-        label: 'Dissertations',
+        label: 'Manuscripts',
         data: rows.map((d) => d.count || 0),
         backgroundColor: '#1b808c',
         borderRadius: 4
@@ -342,23 +339,23 @@ function renderWordCloud() {
     });
   }
 
-  themeResultsEl.innerHTML = '<p>Select a theme to view tagged dissertations.</p>';
+  themeResultsEl.innerHTML = '<p>Select a theme to view tagged manuscripts.</p>';
 }
 
 function renderThemeResults() {
   if (!state.selectedTheme) {
-    themeResultsEl.innerHTML = '<p>Select a theme to view tagged dissertations.</p>';
+    themeResultsEl.innerHTML = '<p>Select a theme to view tagged manuscripts.</p>';
     return;
   }
 
   const matches = docsForTheme(state.selectedTheme);
   if (!matches.length) {
-    themeResultsEl.innerHTML = `<p>No dissertations tagged with <strong>${escapeHtml(state.selectedTheme)}</strong>.</p>`;
+    themeResultsEl.innerHTML = `<p>No manuscripts tagged with <strong>${escapeHtml(state.selectedTheme)}</strong>.</p>`;
     return;
   }
 
   themeResultsEl.innerHTML = `
-    <p><strong>${escapeHtml(state.selectedTheme)}</strong> &middot; ${formatNum(matches.length)} dissertation(s)</p>
+    <p><strong>${escapeHtml(state.selectedTheme)}</strong> &middot; ${formatNum(matches.length)} manuscript(s)</p>
     <div class="related-list">
       ${matches
         .map(
@@ -575,7 +572,7 @@ function renderCooccurrence() {
         <div class="bar-row">
           <span class="bar-label" title="${escapeHtml(label)}">${escapeHtml(label)}</span>
           <div class="bar-track"><div class="bar-fill" style="width:${widthPct}%"></div></div>
-          <button class="bar-value" title="${entry.count} dissertations${escapeHtml(liftStr)}" data-co-term-a="${escapeHtml(entry.termA)}" data-co-term-b="${escapeHtml(entry.termB)}">${formatNum(entry.count)}</button>
+          <button class="bar-value" title="${entry.count} manuscripts${escapeHtml(liftStr)}" data-co-term-a="${escapeHtml(entry.termA)}" data-co-term-b="${escapeHtml(entry.termB)}">${formatNum(entry.count)}</button>
         </div>
       `;
     })
@@ -586,62 +583,6 @@ function renderCooccurrence() {
       const termA = node.getAttribute('data-co-term-a');
       const termB = node.getAttribute('data-co-term-b');
       openMatchesModal(`Co-occurrence: ${termA} + ${termB}`, docsForCooccurrence(termA, termB));
-    });
-  }
-}
-
-function renderSupervisorHeatmap() {
-  const analytics = getAnalytics();
-  const data = analytics?.supervisorNgramMatrix;
-  if (!data || !data.supervisors.length || !data.ngrams.length) {
-    const reason = data === null ? notComputedReason(analytics?.source) : null;
-    const message = reason || 'No supervisor-term data available.';
-    supervisorHeatmapEl.innerHTML = `<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">${escapeHtml(message)}</p>`;
-    return;
-  }
-
-  const maxVal = Math.max(...data.matrix.flat(), 1);
-
-  const headerCells = data.ngrams
-    .map((s) => heatmapHeaderCell(s))
-    .join('');
-
-  const bodyRows = data.supervisors
-    .map((sup, si) => {
-      const cells = data.ngrams
-        .map((concept, nj) => {
-          const val = data.matrix[si][nj];
-          const lightness = val > 0 ? 95 - Math.round((val / maxVal) * 65) : 97;
-          const textColor = lightness < 55 ? '#fff' : 'var(--ink)';
-          const content = val > 0
-            ? `<button class="heatmap-cell-btn" data-heatmap-sup="${escapeHtml(sup)}" data-heatmap-concept="${escapeHtml(concept)}" style="color:${textColor}">${val}</button>`
-            : '';
-          return `<td class="heatmap-cell" style="background:hsl(190 58% ${lightness}%);color:${textColor}">${content}</td>`;
-        })
-        .join('');
-      return `<tr><td class="heatmap-label" title="${escapeHtml(sup)}"><button class="supervisor-link" data-supervisor-name="${escapeHtml(sup)}">${escapeHtml(sup)}</button></td>${cells}</tr>`;
-    })
-    .join('');
-
-  supervisorHeatmapEl.innerHTML = `
-    <table class="heatmap-table">
-      <thead><tr><th></th>${headerCells}</tr></thead>
-      <tbody>${bodyRows}</tbody>
-    </table>
-  `;
-
-  for (const node of supervisorHeatmapEl.querySelectorAll('[data-heatmap-sup][data-heatmap-concept]')) {
-    node.addEventListener('click', () => {
-      const sup = node.getAttribute('data-heatmap-sup');
-      const concept = node.getAttribute('data-heatmap-concept');
-      openMatchesModal(`Supervisor + Concept: ${sup} + ${concept}`, docsForSupervisorConcept(sup, concept));
-    });
-  }
-
-  for (const btn of supervisorHeatmapEl.querySelectorAll('.supervisor-link[data-supervisor-name]')) {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      analyticsIntegrations.openSupervisorProfile(btn.dataset.supervisorName);
     });
   }
 }
@@ -750,7 +691,7 @@ function renderTopicDistribution() {
     const detail = [modelName, createdAt ? `run ${new Date(createdAt).toLocaleDateString()}` : '']
       .filter(Boolean)
       .join('; ');
-    topicModelMetaEl.textContent = `Topics discovered by BERTopic clustering of dissertation abstracts${detail ? ` (${detail})` : ''}.`;
+    topicModelMetaEl.textContent = `Topics discovered by BERTopic clustering of manuscript abstracts${detail ? ` (${detail})` : ''}.`;
   }
 
   const regular = td.topics.filter((t) => t.topicId !== -1);
@@ -1032,7 +973,6 @@ export {
   renderPageTrend,
   renderPagesByYear,
   renderSubjectBars,
-  renderSupervisorHeatmap,
   renderSupervisorTopicHeatmap,
   renderThemeResults,
   renderTopicDistribution,

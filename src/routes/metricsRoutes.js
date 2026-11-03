@@ -277,7 +277,6 @@ function analyticsSlice(payload) {
     wordCloud: payload.wordCloud,
     ngramCloud: payload.ngramCloud,
     methodologies: payload.methodologies,
-    supervisorNgramMatrix: payload.supervisorNgramMatrix,
     termCooccurrence: payload.termCooccurrence,
     conceptTimeline: payload.conceptTimeline,
     methodologyConceptMatrix: payload.methodologyConceptMatrix,

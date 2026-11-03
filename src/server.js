@@ -5,7 +5,7 @@ import {
   PORT, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT, EXPOSE_ERROR_DETAILS,
   DEFAULT_TERM, DEFAULT_SOURCE, TRUST_PROXY, WORKBENCH_CACHE_REFRESH_MS,
   CITATION_SCAN_NIGHTLY_ENABLED, CITATION_SCAN_NIGHTLY_HOUR_LOCAL, CONCEPT_REBUILD_NIGHTLY_ENABLED,
-  validateRuntimeSecrets
+  validateRuntimeSecrets, ADMIN_ALLOWED_NETWORKS
 } from './config.js';
 import {
   checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb,
@@ -25,6 +25,7 @@ import {
 import { getConfiguredApiKey } from './secrets.js';
 import { getTrustedClientIp } from './requestSecurity.js';
 import { applyCompression, applySecurityHeaders } from './middleware/http.js';
+import { createAdminNetworkGate } from './middleware/adminNetwork.js';
 import { requireAdmin, requireCsrf } from './middleware/adminAuth.js';
 import { createPublicRateLimit } from './middleware/rateLimit.js';
 import { createAuthRouter } from './routes/authRoutes.js';
@@ -134,6 +135,11 @@ app.use((req, _res, next) => {
 // Mount them before the global 64 KB parser so the router's authenticated,
 // route-specific raw body limits handle these requests instead.
 app.use('/api/internal', createInternalWorkerRouter());
+// Gate login and admin surfaces by network before any body parsing or CSRF
+// handling so outside clients see a uniform 404. Express matches these
+// prefixes case-insensitively and ignores trailing slashes. /api/internal
+// (worker callbacks) is deliberately never gated.
+app.use(['/api/auth', '/api/admin'], createAdminNetworkGate({ blockList: ADMIN_ALLOWED_NETWORKS, getClientIp }));
 app.use(express.json({ limit: '64kb' }));
 app.use(requireCsrf);
 

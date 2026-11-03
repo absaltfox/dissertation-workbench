@@ -477,7 +477,7 @@ function renderTopicDendrogram() {
     const terms = (t.topTerms || []).slice(0, 5).map(p => Array.isArray(p) ? p[0] : p).join(', ');
 
     tooltip.html(`<strong>${escapeHtml(label)}</strong>
-      <div class="tooltip-meta">${t.docCount} dissertation(s)</div>
+      <div class="tooltip-meta">${t.docCount} manuscript(s)</div>
       <div class="tooltip-meta" style="margin-top:2px">Top terms: ${escapeHtml(terms)}</div>`)
       .style('display', 'block');
 
@@ -597,7 +597,7 @@ function renderSupervisorNetwork() {
       .map(e => e.source.id === d.id ? e.target.id : e.source.id).slice(0, 5);
     
     tooltip.html(`<div class="tooltip-title">${escapeHtml(d.id)}</div>
-       <div class="tooltip-meta">${d.docCount} dissertation(s)${connected.length ? '<br>Connected: ' + connected.map(c => escapeHtml(c)).join(', ') : ''}</div>`)
+       <div class="tooltip-meta">${d.docCount} manuscript(s)${connected.length ? '<br>Connected: ' + connected.map(c => escapeHtml(c)).join(', ') : ''}</div>`)
       .style('display', 'block');
 
     const rect = supervisorNetworkContainerEl.getBoundingClientRect();
@@ -719,7 +719,7 @@ function renderCitationNetwork() {
 
   nodeGroups.on('mouseover', function(event, d) {
     tooltip.html(`<div class="tooltip-title">${escapeHtml(d.label)}</div>
-       <div class="tooltip-meta">Cited in ${d.freq} dissertation(s)</div>`)
+       <div class="tooltip-meta">Cited in ${d.freq} manuscript(s)</div>`)
       .style('display', 'block');
 
     const rect = citationNetworkContainerEl.getBoundingClientRect();
@@ -1130,7 +1130,7 @@ function renderMethTopicBubble() {
 
   bubbleGroups.on('mouseover', function(event, d) {
     tooltip.html(`<div class="tooltip-title">${escapeHtml(d.meth)}</div>
-       <div class="tooltip-meta">${escapeHtml(topicDisplayLabel(d.topic?.label || ''))} \u00B7 ${d.val} dissertation(s)</div>`)
+       <div class="tooltip-meta">${escapeHtml(topicDisplayLabel(d.topic?.label || ''))} \u00B7 ${d.val} manuscript(s)</div>`)
       .style('display', 'block');
 
     const rect = methTopicBubbleContainerEl.getBoundingClientRect();

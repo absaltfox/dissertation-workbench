@@ -321,18 +321,30 @@ export function topTfidfTermsFromText(text, documentFrequency, documentCount, li
     .map(({ term }) => term);
 }
 
+export const UNSPECIFIED_SUBJECT = '(Unspecified)';
+
+// Subject text for analysis: the placeholder is never a term, so it is dropped
+// before subjects are joined. Accepts an array or a single string.
+export function subjectsText(subjects, separator = ' ') {
+  const list = Array.isArray(subjects) ? subjects : [subjects];
+  return list
+    .filter((s) => s != null && s !== '' && s !== UNSPECIFIED_SUBJECT)
+    .join(separator);
+}
+
 const THEME_LOW_SIGNAL_TOKENS = new Set([
   'abstract', 'academic', 'approach', 'based', 'chapter', 'chapters', 'current',
   'data', 'findings', 'framework', 'method', 'methods', 'methodology',
   'participant', 'participants', 'purpose', 'result', 'results', 'student',
-  'students', 'using'
+  'students', 'unspecified', 'using'
 ]);
 
 export function documentThemeTerms(doc, limit = 12) {
+  const subjectString = subjectsText(doc?.subjects);
   const text = [
     doc?.title,
     doc?.abstract,
-    Array.isArray(doc?.subjects) ? doc.subjects.join(' ') : doc?.subjects,
+    subjectString,
     doc?.program,
     doc?.degree,
   ].join(' ');
@@ -341,9 +353,7 @@ export function documentThemeTerms(doc, limit = 12) {
     .filter(([term]) => !THEME_LOW_SIGNAL_TOKENS.has(term))
     .map(([term, count]) => {
       const titleText = String(doc?.title || '').toLowerCase();
-      const subjectText = Array.isArray(doc?.subjects)
-        ? doc.subjects.join(' ').toLowerCase()
-        : String(doc?.subjects || '').toLowerCase();
+      const subjectText = subjectString.toLowerCase();
       const titleBonus = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(titleText) ? 2 : 0;
       const subjectBonus = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(subjectText) ? 1 : 0;
       return { term, score: count + titleBonus + subjectBonus, count };
@@ -354,7 +364,7 @@ export function documentThemeTerms(doc, limit = 12) {
 }
 
 export function buildWordCloud(records, maxTerms = 70) {
-  const textForRecord = (rec) => [rec.title, rec.abstract, rec.subjects.join(' '), rec.program, rec.degree].join(' ');
+  const textForRecord = (rec) => [rec.title, rec.abstract, subjectsText(rec.subjects), rec.program, rec.degree].join(' ');
   const df = buildDocumentFrequency(records, textForRecord);
   const scores = new Map();
   for (const rec of records) {
@@ -397,7 +407,7 @@ export function extractNgrams(text, n) {
 export function buildNgramCloud(records, maxTerms = 60) {
   const counts = new Map();
   for (const rec of records) {
-    const text = [rec.title, rec.abstract, rec.subjects.join(' ')].join(' ');
+    const text = [rec.title, rec.abstract, subjectsText(rec.subjects)].join(' ');
     const allDocCounts = new Map();
     for (const n of [2, 3, 4]) {
       for (const ngram of extractNgrams(text, n)) {
@@ -523,7 +533,7 @@ export function detectMethodologies(text) {
 export function buildMethodologyStats(records) {
   const counts = new Map();
   for (const rec of records) {
-    const text = [rec.title, rec.abstract, rec.subjects.join(' ')].join(' ');
+    const text = [rec.title, rec.abstract, subjectsText(rec.subjects)].join(' ');
     for (const label of detectMethodologies(text)) {
       counts.set(label, (counts.get(label) || 0) + 1);
     }

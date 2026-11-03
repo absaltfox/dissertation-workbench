@@ -211,6 +211,55 @@ test('bertopic start is single-flight and blocks topic label regeneration while 
   }
 });
 
+test('bands rebuild route returns 409 while bertopic or topic_labels runs; labels regenerate 409s while bands runs', async () => {
+  const token = createSession('admin');
+  const csrf = getSessionCsrfToken(token);
+  const post = (url) => request(app).post(url)
+    .set('Cookie', `session=${token}`).set('x-csrf-token', csrf).send({});
+  try {
+    for (const type of ['bertopic', 'topic_labels']) {
+      const id = await createAdminJob({ type, label: `Existing ${type}`, params: {}, runnerType: 'local' });
+      try {
+        const res = await post('/api/admin/topics/bands/rebuild').expect(409);
+        assert.equal(res.body.jobId, id);
+      } finally {
+        await finishAdminJob(id, { status: 'completed', runnerState: 'completed' });
+      }
+    }
+    const bandsId = await createAdminJob({ type: 'topic_bands', label: 'Existing bands', params: {}, runnerType: 'local' });
+    try {
+      const res = await post('/api/admin/topics/bands/rebuild').expect(202);
+      assert.equal(res.body.alreadyRunning, true);
+      assert.equal(res.body.jobId, bandsId);
+      const labels = await post('/api/admin/topics/labels/regenerate').expect(409);
+      assert.equal(labels.body.jobId, bandsId);
+    } finally {
+      await finishAdminJob(bandsId, { status: 'completed', runnerState: 'completed' });
+    }
+  } finally {
+    destroySession(token);
+  }
+});
+
+test('bertopic start returns 409 while a topic_bands job is running', async () => {
+  const bandsId = await createAdminJob({ type: 'topic_bands', label: 'Existing bands', params: {}, runnerType: 'local' });
+  const token = createSession('admin');
+  try {
+    const csrf = getSessionCsrfToken(token);
+    const res = await request(app)
+      .post('/api/admin/jobs/bertopic')
+      .set('Cookie', `session=${token}`).set('x-csrf-token', csrf)
+      .send({})
+      .expect(409);
+    assert.equal(res.body.jobId, bandsId);
+    assert.equal(res.body.runningType, 'topic_bands');
+    assert.match(res.body.error, /research-area rebuild is running/);
+  } finally {
+    await finishAdminJob(bandsId, { status: 'completed', runnerState: 'completed' });
+    destroySession(token);
+  }
+});
+
 test('citation scan preview counts pending documents and honors retryFailures without starting a job', async () => {
   const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const degree = `Scan Route ${suffix}`;

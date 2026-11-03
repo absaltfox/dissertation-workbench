@@ -98,8 +98,8 @@ function renderCitationDocs() {
   const headerEl = citationDocsTableEl.closest('.panel')?.querySelector('h2');
   if (headerEl) {
     headerEl.textContent = pager.total
-      ? `Dissertations (${formatNum(pager.withCitations || 0)} with parsed citations, ${formatNum(pager.total)} total)`
-      : 'Dissertations';
+      ? `Manuscripts (${formatNum(pager.withCitations || 0)} with parsed citations, ${formatNum(pager.total)} total)`
+      : 'Manuscripts';
   }
 
   const rows = docs
@@ -118,11 +118,11 @@ function renderCitationDocs() {
     })
     .join('');
   const footer = pager.loading
-    ? '<tr class="document-page-status"><td colspan="4">Loading dissertations...</td></tr>'
+    ? '<tr class="document-page-status"><td colspan="4">Loading manuscripts...</td></tr>'
     : (!docs.length
-      ? '<tr class="document-page-status"><td colspan="4">No matching dissertations found.</td></tr>'
+      ? '<tr class="document-page-status"><td colspan="4">No matching manuscripts found.</td></tr>'
       : (!pager.done && pager.total
-        ? `<tr class="document-page-status"><td colspan="4">Showing ${formatNum(docs.length)} of ${formatNum(pager.total)} dissertations</td></tr>`
+        ? `<tr class="document-page-status"><td colspan="4">Showing ${formatNum(docs.length)} of ${formatNum(pager.total)} manuscripts</td></tr>`
         : ''));
 
   citationDocsTableEl.innerHTML = rows + footer;
@@ -369,19 +369,19 @@ async function showCitingDissertations(citationId, citationText, totalDocs = nul
             </div>
           `).join('')}
         </div>`
-      : '<p class="meta">No dissertations found for this citation.</p>';
+      : '<p class="meta">No manuscripts found for this citation.</p>';
 
     const bodyHtml = `
       <div class="meta">
         <p><strong>Citation:</strong> ${escapeHtml(shortText)}</p>
-        <p><strong>Linked dissertations:</strong> ${formatNum(linkedCount)}</p>
-        <p>${formatNum(docs.length)} dissertation(s) loaded from index</p>
+        <p><strong>Linked manuscripts:</strong> ${formatNum(linkedCount)}</p>
+        <p>${formatNum(docs.length)} manuscript(s) loaded from index</p>
       </div>
       ${list}
     `;
 
     openResponsivePanel({
-      title: 'Linked Dissertations',
+      title: 'Linked Manuscripts',
       eyebrow: `${formatNum(linkedCount)} linked`,
       bodyHtml,
       onMount: (root) => {
@@ -481,7 +481,7 @@ async function loadFoundationalWorks() {
 
 function renderFoundationalWorks(works) {
   if (!works.length) {
-    foundationalWorksListEl.innerHTML = '<p class="meta">No works cited across multiple dissertations yet.</p>';
+    foundationalWorksListEl.innerHTML = '<p class="meta">No works cited across multiple manuscripts yet.</p>';
     return;
   }
 

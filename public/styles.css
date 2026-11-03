@@ -3098,3 +3098,10 @@ svg[viewBox] {
   .kpis { gap: 0.3rem; }
   .panel { padding: 0.7rem; }
 }
+
+.people-provenance-notice {
+  margin-top: 0.6rem;
+  font-size: 0.88rem;
+  line-height: 1.5;
+  color: var(--ink-soft);
+}

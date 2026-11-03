@@ -11,7 +11,10 @@ primary_region = "sjc"
   SQLITE_PATH = "/data/metrics.sqlite"
   PDF_CACHE_DIR = "/data/pdf-cache"
   FULL_TEXT_CACHE_DIR = "/data/full-text-cache"
-  TRUST_PROXY = "1"
+  TRUST_PROXY = "2"  # Fly: edge + host proxy = 2 hops
+  # Restrict login/admin to specific networks. Set the real value as a secret
+  # (fly secrets set ADMIN_ALLOWED_NETWORKS=...), never in this file. Example:
+  # ADMIN_ALLOWED_NETWORKS = "203.0.113.5, 198.51.100.0/24"
   SESSION_COOKIE_SECURE = "1"
   DOWNLOAD_FILES = "0"
   DISABLE_CONTENT_RETRIEVAL = "0"
