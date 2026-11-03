@@ -20,7 +20,6 @@ const pageTrendChartEl = document.getElementById('pageTrendChart');
 const ngramCloudEl = document.getElementById('ngramCloud');
 const methodologyBarsEl = document.getElementById('methodologyBars');
 const cooccurrenceBarsEl = document.getElementById('cooccurrenceBars');
-const supervisorHeatmapEl = document.getElementById('supervisorHeatmap');
 const conceptTimelineChartEl = document.getElementById('conceptTimelineChart');
 const conceptTimelineLegendEl = document.getElementById('conceptTimelineLegend');
 const methodologyConceptHeatmapEl = document.getElementById('methodologyConceptHeatmap');
@@ -777,7 +776,6 @@ const dom = {
   ngramCloudEl,
   methodologyBarsEl,
   cooccurrenceBarsEl,
-  supervisorHeatmapEl,
   conceptTimelineChartEl,
   conceptTimelineLegendEl,
   methodologyConceptHeatmapEl,

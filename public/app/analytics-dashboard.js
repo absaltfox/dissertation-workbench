@@ -14,7 +14,6 @@ import {
   docsForCooccurrence,
   docsForConceptTerm,
   docsForMethodology,
-  docsForSupervisorConcept,
   docsForTheme,
   docsForTopic,
   getFilteredDocs,
@@ -35,7 +34,6 @@ const {
   pageTrendChartEl,
   pagesByYearChartEl,
   subjectBarsEl,
-  supervisorHeatmapEl,
   supervisorTopicHeatmapEl,
   supervisorTopicPanelEl,
   themeResultsEl,
@@ -118,7 +116,6 @@ function renderAnalytics() {
   renderNgramCloud();
   renderMethodologies();
   renderCooccurrence();
-  renderSupervisorHeatmap();
   renderConceptTimeline();
   renderTopicDistribution();
   renderTopicTimeline();
@@ -590,62 +587,6 @@ function renderCooccurrence() {
   }
 }
 
-function renderSupervisorHeatmap() {
-  const analytics = getAnalytics();
-  const data = analytics?.supervisorNgramMatrix;
-  if (!data || !data.supervisors.length || !data.ngrams.length) {
-    const reason = data === null ? notComputedReason(analytics?.source) : null;
-    const message = reason || 'No supervisor-term data available.';
-    supervisorHeatmapEl.innerHTML = `<p style="color:var(--ink-soft);font-family:var(--sans);font-size:0.85rem">${escapeHtml(message)}</p>`;
-    return;
-  }
-
-  const maxVal = Math.max(...data.matrix.flat(), 1);
-
-  const headerCells = data.ngrams
-    .map((s) => heatmapHeaderCell(s))
-    .join('');
-
-  const bodyRows = data.supervisors
-    .map((sup, si) => {
-      const cells = data.ngrams
-        .map((concept, nj) => {
-          const val = data.matrix[si][nj];
-          const lightness = val > 0 ? 95 - Math.round((val / maxVal) * 65) : 97;
-          const textColor = lightness < 55 ? '#fff' : 'var(--ink)';
-          const content = val > 0
-            ? `<button class="heatmap-cell-btn" data-heatmap-sup="${escapeHtml(sup)}" data-heatmap-concept="${escapeHtml(concept)}" style="color:${textColor}">${val}</button>`
-            : '';
-          return `<td class="heatmap-cell" style="background:hsl(190 58% ${lightness}%);color:${textColor}">${content}</td>`;
-        })
-        .join('');
-      return `<tr><td class="heatmap-label" title="${escapeHtml(sup)}"><button class="supervisor-link" data-supervisor-name="${escapeHtml(sup)}">${escapeHtml(sup)}</button></td>${cells}</tr>`;
-    })
-    .join('');
-
-  supervisorHeatmapEl.innerHTML = `
-    <table class="heatmap-table">
-      <thead><tr><th></th>${headerCells}</tr></thead>
-      <tbody>${bodyRows}</tbody>
-    </table>
-  `;
-
-  for (const node of supervisorHeatmapEl.querySelectorAll('[data-heatmap-sup][data-heatmap-concept]')) {
-    node.addEventListener('click', () => {
-      const sup = node.getAttribute('data-heatmap-sup');
-      const concept = node.getAttribute('data-heatmap-concept');
-      openMatchesModal(`Supervisor + Concept: ${sup} + ${concept}`, docsForSupervisorConcept(sup, concept));
-    });
-  }
-
-  for (const btn of supervisorHeatmapEl.querySelectorAll('.supervisor-link[data-supervisor-name]')) {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      analyticsIntegrations.openSupervisorProfile(btn.dataset.supervisorName);
-    });
-  }
-}
-
 let conceptTimelineChartInstance = null;
 
 function renderConceptTimeline() {
@@ -1032,7 +973,6 @@ export {
   renderPageTrend,
   renderPagesByYear,
   renderSubjectBars,
-  renderSupervisorHeatmap,
   renderSupervisorTopicHeatmap,
   renderThemeResults,
   renderTopicDistribution,

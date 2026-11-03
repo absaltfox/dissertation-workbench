@@ -137,18 +137,6 @@ function docsForCooccurrence(termA, termB) {
   });
 }
 
-function docsForSupervisorConcept(supervisor, concept) {
-  const sup = String(supervisor || '').toLowerCase();
-  const conceptNorm = String(concept || '').toLowerCase();
-  const docs = getFilteredDocs();
-  return docs.filter((doc) => {
-    const hasSup = (doc.supervisors || []).some((s) => String(s || '').toLowerCase() === sup);
-    if (!hasSup) return false;
-    const terms = new Set((doc.conceptTerms || []).map((t) => String(t || '').toLowerCase()));
-    return terms.has(conceptNorm);
-  });
-}
-
 function openMatchesModal(title, matches) {
   const list = matches || [];
   const body = list.length
@@ -554,7 +542,6 @@ export {
   docsForCooccurrence,
   docsForConceptTerm,
   docsForMethodology,
-  docsForSupervisorConcept,
   docsForTheme,
   docsForTopic,
   getFilteredDocs,

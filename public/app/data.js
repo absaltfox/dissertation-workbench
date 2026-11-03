@@ -150,15 +150,13 @@ function buildAnalytics(docs) {
   const pairMap         = new Map();
   const termCountMap    = new Map();
   const conceptDocMap   = new Map();
-  const supCountMap     = new Map();
-  const supConceptMap   = new Map();
   const mcCountMap      = new Map();
   const conceptYearMap  = new Map();
 
   for (const doc of docs) {
     const { year, pages,
       themes = [], conceptTerms = [],
-      methodologies: meths = [], supervisors: sups = [] } = doc;
+      methodologies: meths = [] } = doc;
     const reliableWords = hasReliableWordCount(doc);
     const reliablePages = hasReliablePageCount(doc);
     const weightedWordCount = reliableWords ? activeWordCount(doc) : null;
@@ -195,13 +193,6 @@ function buildAnalytics(docs) {
     // Track document frequency for ALL concept terms (used after the loop to
     // filter pairs to multi-doc concepts only).
     for (const t of new Set(conceptTerms)) termCountMap.set(t, (termCountMap.get(t) || 0) + 1);
-
-    for (const sup of sups) {
-      supCountMap.set(sup, (supCountMap.get(sup) || 0) + 1);
-      if (!supConceptMap.has(sup)) supConceptMap.set(sup, new Map());
-      const sm = supConceptMap.get(sup);
-      for (const t of conceptTerms) sm.set(t, (sm.get(t) || 0) + 1);
-    }
 
     for (const m of meths) {
       for (const t of conceptTerms) {
@@ -288,14 +279,6 @@ function buildAnalytics(docs) {
     .filter(Boolean)
     .sort((a, b) => b.lift - a.lift || b.count - a.count)
     .slice(0, 20);
-
-  const topSups = Array.from(supCountMap.entries()).sort((a, b) => b[1] - a[1]).slice(0, 12).map(([s]) => s);
-  const top10Ngrams = ngramCloud.slice(0, 10).map(w => w.term);
-  const supervisorNgramMatrix = {
-    supervisors: topSups,
-    ngrams: top10Ngrams,
-    matrix: topSups.map(sup => top10Ngrams.map(concept => supConceptMap.get(sup)?.get(concept) || 0))
-  };
 
   const top8Concepts = ngramCloud.slice(0, 8).map(w => w.term);
   const conceptTimeline = top8Concepts
@@ -401,7 +384,7 @@ function buildAnalytics(docs) {
     };
   }
 
-  return { metrics, wordCloud, ngramCloud, methodologies, supervisorNgramMatrix, termCooccurrence, conceptTimeline, methodologyConceptMatrix, supervisorNetwork, citationCooccurrence, methodologyTopicMatrix, topicData };
+  return { metrics, wordCloud, ngramCloud, methodologies, termCooccurrence, conceptTimeline, methodologyConceptMatrix, supervisorNetwork, citationCooccurrence, methodologyTopicMatrix, topicData };
 }
 
 function getAnalytics() {

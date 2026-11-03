@@ -434,69 +434,6 @@ function buildConceptCloud(records, maxTerms = 60) {
     .map(([term, count]) => ({ term, count }));
 }
 
-function buildSupervisorNgramMatrix(records, topN = 12, topM = 10) {
-  const dict = loadConceptDictionary();
-  const supervisorCounts = new Map();
-  const docConceptCache = new Map();
-  // Only count concepts from records that have supervisors for better signal
-  const supNgramCounts = new Map();
-
-  for (const rec of records) {
-    const terms = docConceptTerms(rec, 10, dict);
-    const concepts = terms.map((label) => `c:${label.replace(/\s+/g, '_')}`);
-    docConceptCache.set(rec.id, { concepts, labels: terms });
-    const hasSup = rec.supervisors.length > 0;
-    for (const sup of rec.supervisors) {
-      supervisorCounts.set(sup, (supervisorCounts.get(sup) || 0) + 1);
-    }
-    if (hasSup) {
-      for (const ng of concepts) {
-        supNgramCounts.set(ng, (supNgramCounts.get(ng) || 0) + 1);
-      }
-    }
-  }
-
-  const topSupervisors = Array.from(supervisorCounts.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, topN)
-    .map(([name]) => name);
-  const topNgrams = Array.from(supNgramCounts.entries())
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, topM)
-    .map(([conceptId]) => conceptId);
-
-  const supSet = new Set(topSupervisors);
-  const ngSet = new Set(topNgrams);
-
-  const matrix = topSupervisors.map(() => topNgrams.map(() => 0));
-  for (const rec of records) {
-    const recSups = rec.supervisors.filter((s) => supSet.has(s));
-    if (!recSups.length) continue;
-    const recNgrams = (docConceptCache.get(rec.id)?.concepts || []).filter((ng) => ngSet.has(ng));
-    for (const sup of recSups) {
-      const si = topSupervisors.indexOf(sup);
-      for (const ng of recNgrams) {
-        const nj = topNgrams.indexOf(ng);
-        matrix[si][nj] += 1;
-      }
-    }
-  }
-
-  const conceptIdToLabel = new Map();
-  for (const { concepts, labels } of docConceptCache.values()) {
-    for (let k = 0; k < concepts.length; k++) {
-      conceptIdToLabel.set(concepts[k], labels[k]);
-    }
-  }
-
-  return {
-    supervisors: topSupervisors,
-    ngrams: topNgrams.map((id) => conceptIdToLabel.get(id) || id),
-    conceptIds: topNgrams,
-    matrix
-  };
-}
-
 // #26: the floor below was a bare `2`, tuned by inspection for the corpus
 // size at the time (~400 documents) and never revisited as the corpus grew.
 // A fixed floor stops trimming low-signal pairs as N grows, so the
@@ -1045,7 +982,6 @@ export async function buildMetricsPayloadFromRecords(records, sourceMeta, subjec
     wordCloud: buildWordCloud(normalizedRecords),
     ngramCloud: buildConceptCloud(normalizedRecords),
     methodologies: buildMethodologyStats(normalizedRecords),
-    supervisorNgramMatrix: buildSupervisorNgramMatrix(normalizedRecords),
     termCooccurrence: buildTermCooccurrence(normalizedRecords),
     conceptTimeline: buildConceptTimeline(normalizedRecords),
     methodologyConceptMatrix: buildMethodologyConceptMatrix(normalizedRecords),

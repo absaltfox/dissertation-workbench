@@ -102,7 +102,7 @@ try {
     // order for the document_terms-backed analytics queries once the table
     // has grown past a few thousand rows: a derived table built from a
     // ROW_NUMBER() window over document_terms (used by
-    // computeMethodologyConceptMatrixSql / computeSupervisorNgramMatrixSql)
+    // computeMethodologyConceptMatrixSql)
     // gets scanned per outer row instead of via its automatic covering
     // index, turning a sub-100ms query into one that takes tens of seconds
     // (observed: ~41s at 20k docs, ~457s at 56k docs, confirmed via EXPLAIN

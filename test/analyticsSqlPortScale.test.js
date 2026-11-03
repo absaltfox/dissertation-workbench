@@ -4,8 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
-// #15 scale test: the five SQL-ported panels (supervisorNgramMatrix,
-// conceptTimeline, methodologyConceptMatrix, methodologyTopicMatrix,
+// #15 scale test: the four SQL-ported panels (conceptTimeline, methodologyConceptMatrix, methodologyTopicMatrix,
 // topicData) must return real data promptly at a corpus size well beyond
 // DETAILED_ANALYTICS_RECORD_LIMIT (5,000) — proving the SQL port, not just
 // the below-threshold JS path, is what serves a corpus this large. 20,000
@@ -89,9 +88,6 @@ test('#15 scale: SQL-ported panels return real data at 4x the detailed-analytics
   const elapsedMs = Date.now() - t0;
 
   assert.equal(analytics.metrics.recordCount, TOTAL_DOCUMENTS);
-
-  assert.ok(analytics.supervisorNgramMatrix.supervisors.length > 0);
-  assert.ok(analytics.supervisorNgramMatrix.matrix.some((row) => row.some((cell) => cell > 0)));
 
   assert.ok(analytics.conceptTimeline.length > 0);
   assert.ok(analytics.conceptTimeline.some((series) => series.data.length > 0));
