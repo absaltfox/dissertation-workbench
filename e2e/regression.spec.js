@@ -149,7 +149,8 @@ test.describe('Person Explorer', () => {
     for (const n of ['Jane Supervisor', 'Alex Supervisor', 'Morgan Supervisor']) {
       await expect(page.locator('#personTable')).toContainText(n);
     }
-    await expect(page.locator('#personCount')).not.toBeEmpty();
+    await expect(page.locator('#personTable tr.doc-row')).toHaveCount(3);
+    await expect(page.locator('#personCount')).toContainText('3');
   });
 
   test('filter narrows the list', async ({ page }) => {
@@ -157,20 +158,19 @@ test.describe('Person Explorer', () => {
     await expect(page.locator('#personTable tr.doc-row')).toHaveCount(1);
     await expect(page.locator('#personTable')).toContainText('Alex Supervisor');
     await page.locator('#personFilter').fill('');
-    await expect(page.locator('#personTable tr.doc-row')).not.toHaveCount(1);
+    await expect(page.locator('#personTable tr.doc-row')).toHaveCount(3);
   });
 
-  test('role select can be changed and filters to examiners', async ({ page }) => {
+  test('role select filters to examiners', async ({ page }) => {
     const select = page.locator('#personRoleFilter');
     const values = await select.locator('option').evaluateAll((os) => os.map((o) => o.value));
-    expect(values.length).toBeGreaterThan(1);
-    const examiner = values.find((v) => /examiner/i.test(v));
-    if (examiner) {
-      await select.selectOption(examiner);
-      await expect(page.locator('#personTable tr.doc-row').first()).toBeVisible();
-      await expect(page.locator('#personTable')).toContainText('Jane Supervisor');
-    }
+    const examiner = 'University Examiner';
+    expect(values, 'role filter offers the examiner option').toContain(examiner);
+    await select.selectOption(examiner);
+    await expect(page.locator('#personTable tr.doc-row')).toHaveCount(1);
+    await expect(page.locator('#personTable')).toContainText('Jane Supervisor');
     await select.selectOption(values[0]);
+    await expect(page.locator('#personTable tr.doc-row')).toHaveCount(3);
   });
 
   test('opening a person shows their manuscripts', async ({ page }) => {
@@ -255,5 +255,24 @@ test.describe('About, routing, mobile', () => {
     await tab(page, 'people').click();
     await expect(page.locator('#tab-people')).toBeVisible();
     await expect(page.locator('#peopleProvenanceNotice')).toBeVisible();
+  });
+});
+
+test.describe('Rate limiter', () => {
+  // The suite gives every test its own X-Forwarded-For (TRUST_PROXY=1 in
+  // start-server.mjs) so the 120/min per-IP limit does not throttle unrelated
+  // tests. This proves the limiter itself is still live: one fixed address
+  // exceeding the limit gets a 429. (/api/health is mounted before the limiter.)
+  test('more than 120 anonymous /api requests from one IP get 429', async ({ request }) => {
+    const headers = { 'x-forwarded-for': '192.0.2.50' };
+    const statuses = [];
+    for (let i = 0; i < 125; i += 1) {
+      statuses.push((await request.get('/api/citations/top', { headers })).status());
+    }
+    expect(statuses.slice(0, 120).every((c) => c !== 429), 'first 120 pass').toBe(true);
+    expect(statuses.slice(120)).toContain(429);
+    // A different client address is unaffected.
+    const other = await request.get('/api/citations/top', { headers: { 'x-forwarded-for': '192.0.2.51' } });
+    expect(other.status()).not.toBe(429);
   });
 });

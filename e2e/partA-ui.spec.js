@@ -1,19 +1,6 @@
 /* global window, document */ // used inside page.evaluate() callbacks
-import { readFileSync } from 'node:fs';
 import { test, expect } from './fixtures.js';
-
-const CONSTRAINTS = new URL(
-  '../.superpowers/sdd/2026-11-02-manuscripts-ui-and-research-bands/global-constraints.md',
-  import.meta.url,
-);
-const constraintText = readFileSync(CONSTRAINTS, 'utf8');
-const exact = (label) => {
-  const m = constraintText.match(new RegExp(`${label}, exact: \`([^\`]+)\``));
-  if (!m) throw new Error(`constraint "${label}" not found`);
-  return m[1];
-};
-const HERO = exact('Hero subtitle');
-const NOTICE = exact('Person Explorer notice');
+import { HERO_SUBTITLE as HERO, PEOPLE_PROVENANCE_NOTICE as NOTICE } from './copy-fixtures.mjs';
 
 async function openTab(page, tab) {
   await page.locator(`.tab-btn[data-tab="${tab}"]`).click();
@@ -49,13 +36,10 @@ test.describe('Part A: manuscripts UI', () => {
     // Methodology-Concept matrix still has its panel and renders content.
     await expect(page.getByRole('heading', { name: /Methodology . Concept Matrix/ })).toBeVisible();
     await expect(page.locator('#methodologyConceptHeatmap')).not.toBeEmpty();
-    // Supervisor-Topic panel exists; it is only shown when enough data exists.
-    await expect(page.locator('#supervisorTopicPanel')).toHaveCount(1);
-    const visible = await page.locator('#supervisorTopicPanel').isVisible();
-    if (visible) {
-      await expect(page.locator('#supervisorTopicHeatmap')).not.toBeEmpty();
-      await expect(page.locator('#supervisorTopicPanel h2')).toContainText(/Supervisor.*Topic/);
-    }
+    // Supervisor-Topic heatmap still renders (the fixtures have supervisors and topics).
+    await expect(page.locator('#supervisorTopicPanel')).toBeVisible();
+    await expect(page.locator('#supervisorTopicPanel h2')).toHaveText(/Supervisor.*Topic Heatmap/);
+    await expect(page.locator('#supervisorTopicHeatmap')).not.toBeEmpty();
   });
 
   test('visible copy says manuscripts, not dissertations', async ({ page }) => {
@@ -81,9 +65,9 @@ test.describe('Part A: manuscripts UI', () => {
       const chart = window.Chart?.getChart?.(canvas);
       return chart ? chart.data.datasets.map((d) => d.label) : null;
     });
-    if (labels) {
-      for (const l of labels) expect(String(l)).not.toMatch(/dissertation/i);
-    }
+    expect(labels, 'Chart.js instance reachable via window.Chart').not.toBeNull();
+    expect(labels.length).toBeGreaterThan(0);
+    for (const l of labels) expect(String(l)).not.toMatch(/dissertation/i);
 
     // Visible text anywhere: "dissertation" may only occur in the approved
     // owner-copy phrases (title/H1, "theses and dissertations", the notice).

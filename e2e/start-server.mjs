@@ -29,7 +29,8 @@ const serverEnv = isolatedServerEnv(process.env, {
   CONCEPT_REBUILD_NIGHTLY_ENABLED: '0',    // a run spanning 2:00 must not start a worker
   // The app rate-limits anonymous /api traffic to 120/min per IP, which the whole
   // suite exceeds from one loopback address. Trust one proxy hop so fixtures.js can
-  // give every test its own X-Forwarded-For client IP.
+  // give every test its own X-Forwarded-For client IP. This deliberately hides the
+  // limiter from most tests; regression.spec.js ("Rate limiter") proves it still works.
   TRUST_PROXY: '1',
   ADMIN_ALLOWED_NETWORKS: process.env.E2E_ADMIN_ALLOWED_NETWORKS || '',  // gate specs spawn a second server with this set
   PORT: process.env.E2E_PORT || '4173',
