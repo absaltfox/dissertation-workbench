@@ -365,6 +365,26 @@ test('topic label Fly worker payload uses labeler image and labels-only command'
   }
 });
 
+test('buildFlyWorkerMachinePayload runs --bands-only on the labeler image for topic_bands', () => {
+  const previousLabelerImage = process.env.LABELER_WORKER_IMAGE;
+  process.env.LABELER_WORKER_IMAGE = 'registry.fly.io/dissertation-workbench:labeler-latest';
+  try {
+    const payload = buildFlyWorkerMachinePayload({
+      image: 'registry.fly.io/dissertation-workbench:deployment-123',
+      jobId: 46,
+      token: 'secret-token',
+      timeoutMs: 12345,
+      jobType: 'topic_bands',
+    });
+    assert.equal(payload.config.image, 'registry.fly.io/dissertation-workbench:labeler-latest');
+    assert.deepEqual(payload.config.init.exec, ['python3', 'scripts/build-topics.py', '--bands-only']);
+    assert.equal(payload.config.guest.memory_mb >= 2048, true);
+  } finally {
+    if (previousLabelerImage === undefined) delete process.env.LABELER_WORKER_IMAGE;
+    else process.env.LABELER_WORKER_IMAGE = previousLabelerImage;
+  }
+});
+
 test('PatternRank concept rebuild Fly worker payload uses Python NLP worker', () => {
   const previousBertopicImage = process.env.BERTOPIC_WORKER_IMAGE;
   process.env.BERTOPIC_WORKER_IMAGE = 'registry.fly.io/dissertation-workbench:worker-latest';
