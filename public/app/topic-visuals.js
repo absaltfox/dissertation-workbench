@@ -1,3 +1,4 @@
+import { BAND_PALETTE } from './palette.js';
 import {
   dom,
   ensureD3Library,
@@ -922,8 +923,7 @@ function renderTopicSankey() {
   const pad = { t: 30, r: 30, b: 40, l: 30 };
   const colWidth = (width - pad.l - pad.r) / Math.max(periods.length - 1, 1);
 
-  const hueStep = 360 / Math.max(topicPeriods.length, 1);
-  const colorForIdx = i => `hsl(${Math.round(i * hueStep)}, 60%, 50%)`;
+  const colorForIdx = i => BAND_PALETTE[i % BAND_PALETTE.length];
 
   const periodTotals = periods.map((_, pi) => topicPeriods.reduce((s, t) => s + t.counts[pi], 0));
   const maxTotal = Math.max(...periodTotals, 1);
