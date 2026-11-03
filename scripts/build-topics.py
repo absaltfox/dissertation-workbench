@@ -806,6 +806,16 @@ def generate_labels(topic_model, abstracts, topic_assignments, reporter=None):
     return generate_local_labels(topic_model, abstracts, topic_assignments, reporter)
 
 
+def claude_complete_text(client, prompt, max_tokens):
+    """Low-level Claude call shared by topic and band labelling; returns the stripped text."""
+    response = client.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return response.content[0].text.strip()
+
+
 def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key, reporter=None):
     """Use Claude to generate human-readable topic labels."""
     try:
@@ -871,12 +881,7 @@ def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key, r
     print(f"\nGenerating labels for {len(topic_ids_in_batch)} topics via Claude ({CLAUDE_MODEL})...")
 
     try:
-        response = client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = response.content[0].text.strip()
+        text = claude_complete_text(client, prompt, 2048)
         # Parse JSON from response (handle markdown code blocks)
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
@@ -907,6 +912,26 @@ def generate_claude_labels(topic_model, abstracts, topic_assignments, api_key, r
         return {}
 
     return labels
+
+
+def llama_cpp_complete(prompt, model_path, command, max_tokens=24):
+    """Low-level llama.cpp call shared by topic and band labelling; returns stdout."""
+    result = subprocess.run(
+        [
+            command,
+            "-m", model_path,
+            "-p", prompt,
+            "-n", str(max_tokens),
+            "--temp", "0.35",
+            "--top-p", "0.9",
+            "--no-display-prompt",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    return result.stdout.strip()
 
 
 def generate_llama_cpp_labels(topic_model, abstracts, topic_assignments, reporter=None):
@@ -948,22 +973,8 @@ def generate_llama_cpp_labels(topic_model, abstracts, topic_assignments, reporte
             + "\nRules: return only one natural 3 to 6 word noun phrase. Do not list keywords. Label:"
         )
         try:
-            result = subprocess.run(
-                [
-                    command,
-                    "-m", model_path,
-                    "-p", prompt,
-                    "-n", "24",
-                    "--temp", "0.35",
-                    "--top-p", "0.9",
-                    "--no-display-prompt",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-            response = clean_generated_label(result.stdout.strip())
+            stdout = llama_cpp_complete(prompt, model_path, command)
+            response = clean_generated_label(stdout)
         except Exception as exc:
             print(f"  Topic {topic_id} llama.cpp generation failed: {exc}")
             response = None
@@ -979,6 +990,52 @@ def generate_llama_cpp_labels(topic_model, abstracts, topic_assignments, reporte
     return labels
 
 
+def load_local_chat_model(model_name):
+    """Load the local transformers label model; returns (tokenizer, model) or None."""
+    print(f"\nLoading local label generation model: {model_name}...")
+    try:
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        import torch
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+
+        # Enforce single-threaded CPU execution for inference
+        torch.set_num_threads(1)
+    except Exception as e:
+        print(f"Failed to load local transformers model: {e}")
+        return None
+    return tokenizer, model
+
+
+def local_chat_complete(tokenizer, model, system, prompt, max_new_tokens=18, sample=False):
+    """Low-level local transformers call shared by topic and band labelling."""
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt},
+    ]
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    model_inputs = tokenizer([text], return_tensors="pt")
+    generate_kwargs = {
+        "max_new_tokens": max_new_tokens,
+        "pad_token_id": tokenizer.eos_token_id,
+        "no_repeat_ngram_size": 2,
+    }
+    if sample:
+        generate_kwargs.update({"do_sample": True, "temperature": 0.7, "top_p": 0.9})
+    else:
+        generate_kwargs["do_sample"] = False
+    generated_ids = model.generate(
+        model_inputs.input_ids,
+        attention_mask=model_inputs.get("attention_mask"),
+        **generate_kwargs
+    )
+    generated_ids = [
+        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+    ]
+    return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+
+
 def generate_local_labels(topic_model, abstracts, topic_assignments, reporter=None):
     """Use a local LLM (Qwen/Qwen2.5-0.5B-Instruct by default) to generate topic labels."""
     if os.environ.get("LOCAL_LABEL_BACKEND", "").strip().lower() == "llama_cpp":
@@ -987,19 +1044,10 @@ def generate_local_labels(topic_model, abstracts, topic_assignments, reporter=No
             return labels
 
     model_name = os.environ.get("LOCAL_LLM_MODEL", "Qwen/Qwen2.5-0.5B-Instruct")
-    print(f"\nLoading local label generation model: {model_name}...")
-    try:
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        import torch
-        
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModelForCausalLM.from_pretrained(model_name)
-        
-        # Enforce single-threaded CPU execution for inference
-        torch.set_num_threads(1)
-    except Exception as e:
-        print(f"Failed to load local transformers model: {e}")
+    loaded = load_local_chat_model(model_name)
+    if loaded is None:
         return {}
+    tokenizer, model = loaded
 
     topic_info = topic_model.get_topic_info()
     labels = {}
@@ -1074,38 +1122,11 @@ def generate_local_labels(topic_model, abstracts, topic_assignments, reporter=No
         label = None
         source = None
         for attempt, prompt in enumerate(prompts):
-            messages = [
-                {"role": "system", "content": "You are an academic librarian creating concise, human-readable research topic labels. Return only one natural noun phrase, with no quotes and no commentary."},
-                {"role": "user", "content": prompt}
-            ]
-
-            text = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
+            response = local_chat_complete(
+                tokenizer, model,
+                "You are an academic librarian creating concise, human-readable research topic labels. Return only one natural noun phrase, with no quotes and no commentary.",
+                prompt, max_new_tokens=18, sample=attempt != 0,
             )
-            model_inputs = tokenizer([text], return_tensors="pt")
-
-            generate_kwargs = {
-                "max_new_tokens": 18,
-                "pad_token_id": tokenizer.eos_token_id,
-                "no_repeat_ngram_size": 2,
-            }
-            if attempt == 0:
-                generate_kwargs["do_sample"] = False
-            else:
-                generate_kwargs.update({"do_sample": True, "temperature": 0.7, "top_p": 0.9})
-
-            generated_ids = model.generate(
-                model_inputs.input_ids,
-                attention_mask=model_inputs.get("attention_mask"),
-                **generate_kwargs
-            )
-            generated_ids = [
-                output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-            ]
-
-            response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
             response = clean_generated_label(response)
             if normalize_label_key(response) == normalize_label_key(keyword_fallback_label):
                 response = None
@@ -1511,43 +1532,111 @@ class ExistingTopicModel:
         return self.topic_info
 
 
+BAND_SYSTEM_PROMPT = (
+    "You are an academic librarian naming research-area groupings of dissertation topics. "
+    "Return only one short noun phrase, with no quotes and no commentary."
+)
+
+
+def interleave_child_items(per_child, limit):
+    """Round-robin across children so no single child dominates; de-duplicated, capped."""
+    out, seen = [], set()
+    depth = max((len(items) for items in per_child), default=0)
+    for i in range(depth):
+        for items in per_child:
+            if i < len(items) and items[i] not in seen:
+                seen.add(items[i])
+                out.append(items[i])
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def build_band_prompt(band, topic_labels, topic_terms, titles_by_topic):
+    """Prompt asking for one short name covering the WHOLE band. Lists every child
+    label untruncated; terms and titles are interleaved per child, no abstract text."""
+    children = sorted((int(t) for t in band["child_topic_ids"]),
+                      key=lambda t: (-int(band.get("child_doc_counts", {}).get(t, 0)), t))
+    child_labels = [topic_labels.get(t, f"Topic {t}") for t in children]
+    terms = interleave_child_items(
+        [[term for term, _ in sorted(topic_terms.get(t, []), key=lambda kv: -float(kv[1] or 0))] for t in children], 12)
+    titles = interleave_child_items([(titles_by_topic.get(t) or [])[:2] for t in children], 15)
+    return (
+        f"A research-area band groups {len(children)} related topics from UBC Education doctoral "
+        f"dissertations ({int(band['doc_count'])} dissertations in total). Every topic in the band:\n"
+        + "\n".join(f"- {label}" for label in child_labels)
+        + "\nKey terms, drawn evenly from each topic: " + ", ".join(terms)
+        + "\nExample dissertation titles:\n"
+        + "\n".join(f"- {title}" for title in titles)
+        + "\n\nWrite a short name (2 to 6 words) that covers the WHOLE band: a cross-department research "
+          "theme that fits all of the topics above, not just the largest or first one. Do not simply "
+          "copy one topic label. Respond with ONLY the name."
+    )
+
+
+def complete_band_names(prompts, reporter=None):
+    """Run band-name prompts through the configured backend (Claude, then llama.cpp,
+    then local transformers). Returns {band_id: raw text}; {} when no backend works."""
+    total = len(prompts)
+
+    def progress(done, status="running", detail=""):
+        if reporter:
+            reporter.report("generate_band_labels", "Naming Research Areas", status=status,
+                            detail=detail, counts={"processed": done, "total": total})
+
+    def run_all(call, what):
+        out = {}
+        for i, (band_id, prompt) in enumerate(prompts.items()):
+            progress(i, detail=f"Naming research area {i + 1}/{total} via {what}...")
+            try:
+                out[band_id] = call(prompt)
+            except Exception as exc:
+                print(f"  Band {band_id} {what} naming failed: {exc}")
+        progress(len(out), status="completed", detail=f"Named {len(out)} research areas via {what}.")
+        return out
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if api_key:
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            print(f"\nNaming {total} research-area bands via Claude ({CLAUDE_MODEL})...")
+            out = run_all(lambda p: claude_complete_text(client, p, 64), "Claude")
+            if out:
+                return out
+        except ImportError:
+            print("\nanthropic package not installed — skipping Claude band naming")
+
+    if os.environ.get("LOCAL_LABEL_BACKEND", "").strip().lower() == "llama_cpp":
+        model_path = os.environ.get("LOCAL_LABEL_MODEL_PATH", "/app/models/qwen2.5-1.5b-instruct-q4.gguf")
+        command = os.environ.get("LLAMA_CPP_COMMAND", "llama-cli")
+        if os.path.exists(model_path):
+            out = run_all(lambda p: llama_cpp_complete(p, model_path, command, 24), "llama.cpp")
+            if out:
+                return out
+        else:
+            print(f"llama.cpp model not found at {model_path}; falling back to transformers")
+
+    loaded = load_local_chat_model(os.environ.get("LOCAL_LLM_MODEL", "Qwen/Qwen2.5-0.5B-Instruct"))
+    if loaded is None:
+        return {}
+    tokenizer, model = loaded
+    out = run_all(lambda p: local_chat_complete(tokenizer, model, BAND_SYSTEM_PROMPT, p, 18), "local model")
+    del model
+    del tokenizer
+    return out
+
+
 def generate_band_labels(bands, topic_labels, topic_terms, titles_by_topic, reporter=None):
-    """Name each research-area band with the same labeller backends used for topics.
+    """Name each research-area band with a short name covering the whole band.
 
-    Bands are presented as the "topics" of a lightweight model. The evidence is
-    built only from child labels, child top terms and (additional) example titles;
-    no abstract text and no title-in-place-of-abstract substitution.
-    """
-    info_rows = []
-    band_terms = {}
-    samples = []
-    assignments = []
-    for band in bands:
-        band_id = int(band["band_id"])
-        children = [int(t) for t in band["child_topic_ids"]]
-        weights = {t: max(int(band.get("child_doc_counts", {}).get(t, 1)), 1) for t in children}
-        scores = {}
-        for t in children:
-            for term, weight in topic_terms.get(t, []):
-                scores[term] = scores.get(term, 0.0) + float(weight or 0) * weights[t]
-        band_terms[band_id] = sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
-        info_rows.append({
-            "Topic": band_id,
-            "Name": f"{band_id}_{'_'.join(term for term, _ in band_terms[band_id][:4])}",
-            "Count": int(band["doc_count"]),
-        })
-        largest = sorted(children, key=lambda t: (-weights[t], t))[:5]
-        child_labels = [topic_labels.get(t, f"Topic {t}") for t in children]
-        titles = []
-        for t in largest:
-            titles.extend((titles_by_topic.get(t) or [])[:2])
-        samples.append(
-            "Subtopics: " + "; ".join(child_labels) + "\nExample titles: " + "; ".join(titles)
-        )
-        assignments.append(band_id)
-
-    model = ExistingTopicModel(band_terms, ExistingTopicInfo(info_rows))
-    generated = generate_labels(model, samples, assignments, reporter) or {}
+    Evidence is every child label, interleaved child top terms and example titles;
+    no abstract text. Uses its own prompt (not the per-topic labeller)."""
+    prompts = {
+        int(b["band_id"]): build_band_prompt(b, topic_labels, topic_terms, titles_by_topic)
+        for b in bands
+    }
+    generated = complete_band_names(prompts, reporter) or {}
 
     labels = {}
     used = set()

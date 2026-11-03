@@ -145,30 +145,43 @@ titles = {1: ["T one"], 2: ["T two", "T three", "T four"]}
 
 test('generate_band_labels falls back to a whole-band name', () => {
   const r = runPython(`${BAND_SETUP}
-bt.generate_labels = lambda *a, **k: {}
+bt.complete_band_names = lambda *a, **k: {}
 print(json.dumps(bt.generate_band_labels(bands, labels, terms, titles)))`);
   assert.deepEqual(r, { 0: 'Fish Physiology and related topics' });
 });
 
-test('generate_band_labels passes band evidence to the labeller', () => {
-  const r = runPython(`${BAND_SETUP}
+const BIG_BAND_SETUP = `
+ids = list(range(1, 12))
+bands = [{"band_id": 0, "child_topic_ids": ids, "doc_count": 500,
+          "child_doc_counts": {t: (400 if t == 1 else 10) for t in ids}}]
+labels = {t: f"Child Label Number {t} With A Fairly Long Descriptive Name" for t in ids}
+terms = {t: [(f"term{t}a", 0.9), (f"term{t}b", 0.5)] for t in ids}
+titles = {t: [f"Dissertation title {t}x", f"Dissertation title {t}y"] for t in ids}
+`;
+
+test('generate_band_labels prompts with every child label, titles and a whole-band ask', () => {
+  const r = runPython(`${BIG_BAND_SETUP}
 seen = {}
-def fake(model, abstracts, assignments, reporter=None):
-    seen["abstracts"] = abstracts
-    seen["assignments"] = assignments
-    seen["terms"] = model.get_topic(0)
-    seen["info"] = [dict(r) for _, r in model.get_topic_info().iterrows()]
-    return {0: "Aquatic Animal Biology"}
-bt.generate_labels = fake
+def fake(prompts, reporter=None):
+    seen["prompts"] = prompts
+    return {0: "Teaching and Learning Contexts"}
+bt.complete_band_names = fake
+def boom(*a, **k):
+    raise AssertionError("per-topic labeller must not be used for bands")
+bt.generate_labels = boom
 out = bt.generate_band_labels(bands, labels, terms, titles)
-print(json.dumps({"out": out, **seen}))`);
-  assert.equal(r.out['0'], 'Aquatic Animal Biology');
-  assert.equal(r.abstracts.length, 1);
-  assert.ok(r.abstracts[0].includes('Gill Function') && r.abstracts[0].includes('Fish Physiology'));
-  assert.ok(r.abstracts[0].includes('T two') && r.abstracts[0].includes('T three') && !r.abstracts[0].includes('T four'));
-  assert.deepEqual(r.assignments, [0]);
-  assert.equal(r.terms[0][0], 'fish');
-  assert.equal(r.info[0].Count, 30);
+print(json.dumps({"out": out, "prompts": {str(k): v for k, v in seen["prompts"].items()}}))`);
+  assert.equal(r.out['0'], 'Teaching and Learning Contexts');
+  const prompt = r.prompts['0'];
+  for (let t = 1; t <= 11; t++) assert.ok(prompt.includes(`Child Label Number ${t} With A Fairly Long Descriptive Name`), `label ${t}`);
+  assert.ok(prompt.includes('Dissertation title 1x'));
+  assert.match(prompt, /\(2 to 6 words\) that covers the WHOLE band/);
+  assert.match(prompt, /cross-department research theme/);
+  assert.doesNotMatch(prompt, /abstract/i);
+  assert.doesNotMatch(prompt, /Sample/);
+  // the 400-paper child must not crowd out the others: terms come from several children
+  const termChildren = new Set([...prompt.matchAll(/term(\d+)a/g)].map((m) => m[1]));
+  assert.ok(termChildren.size >= 8, `terms drawn from ${termChildren.size} children`);
 });
 
 test('the full-rebuild hierarchy no longer uses topic_embeddings_', () => {
@@ -209,6 +222,7 @@ def snap():
     return {n: [tuple(r) for r in client.execute(f"SELECT * FROM {n} ORDER BY 1, 2").rows]
             for n in ("topics", "document_topics", "topic_label_overrides", "settings")}
 bt.generate_labels = lambda model, abstracts, assignments, reporter=None: {}
+bt.complete_band_names = lambda *a, **k: {}
 os.environ["TOPIC_BANDS_MIN"] = "2"
 os.environ["TOPIC_BANDS_MAX"] = "3"
 `;
