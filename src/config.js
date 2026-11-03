@@ -1,6 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { parseAllowedNetworks } from './middleware/adminNetwork.js';
+import { parseTrustProxy } from './requestSecurity.js';
 import './env.js';
 
 export const IS_PRODUCTION = process.env.NODE_ENV === 'production';
@@ -58,7 +59,7 @@ export const DOWNLOAD_TIMEOUT_MS = 30_000; // 30 seconds
 // Comma-separated IPs/CIDRs allowed to reach /api/auth and /api/admin. Unset = everyone.
 // Parsed at load so a typo throws at startup rather than silently allowing all.
 export const ADMIN_ALLOWED_NETWORKS = parseAllowedNetworks(process.env.ADMIN_ALLOWED_NETWORKS);
-export const TRUST_PROXY = /^(1|true|yes)$/i.test(process.env.TRUST_PROXY || '');
+export const TRUST_PROXY = parseTrustProxy(process.env.TRUST_PROXY);
 export const PDF_ALLOWED_HOSTS = (process.env.PDF_ALLOWED_HOSTS || 'open.library.ubc.ca,oc-index.library.ubc.ca,circle.library.ubc.ca')
   .split(',')
   .map((host) => host.trim().toLowerCase())

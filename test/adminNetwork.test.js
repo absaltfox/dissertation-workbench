@@ -16,14 +16,14 @@ test('single IP and CIDR', () => {
   const list = parseAllowedNetworks('203.0.113.5, 10.0.0.0/8');
   assert.equal(isAllowedAdminIp(list, '203.0.113.5'), true);
   assert.equal(isAllowedAdminIp(list, '10.2.3.4'), true);
-  assert.equal(isAllowedAdminIp(list, '173.180.169.84'), false);
+  assert.equal(isAllowedAdminIp(list, '203.0.113.6'), false);
   assert.equal(isAllowedAdminIp(list, ''), false);
 });
 
 test('IPv4-mapped IPv6 client', () => {
   const list = parseAllowedNetworks('203.0.113.5, 10.0.0.0/8');
   assert.equal(isAllowedAdminIp(list, '::ffff:203.0.113.5'), true);
-  assert.equal(isAllowedAdminIp(list, '::ffff:173.180.169.84'), false);
+  assert.equal(isAllowedAdminIp(list, '::ffff:203.0.113.6'), false);
 });
 
 test('IPv6 entry', () => {
@@ -108,4 +108,35 @@ test('invalid ADMIN_ALLOWED_NETWORKS fails startup', () => {
   });
   assert.notEqual(res.status, 0);
   assert.match(res.stderr, /Invalid ADMIN_ALLOWED_NETWORKS entry: oops/);
+});
+
+test('TRUST_PROXY parses to a hop count, never a bare true', async () => {
+  const { parseTrustProxy } = await import('../src/requestSecurity.js');
+  for (const v of ['1', 'true', 'TRUE', 'Yes']) assert.equal(parseTrustProxy(v), 1, v);
+  assert.equal(parseTrustProxy('2'), 2);
+  for (const v of [undefined, '', '0', 'false', 'nope', '-1']) assert.equal(parseTrustProxy(v), false, String(v));
+});
+
+const XFF_SCRIPT = SCRIPT.replace('request(app)[method](p)', 'request(app)[method](p).set("X-Forwarded-For", process.env.PROBE_XFF)');
+
+test('X-Forwarded-For cannot spoof the allow-list with TRUST_PROXY=1', () => {
+  const run = (xff) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'admin-net-'));
+    try {
+      const res = spawnSync(process.execPath, ['--input-type=module', '-e', XFF_SCRIPT], {
+        cwd: path.resolve(import.meta.dirname, '..'),
+        env: {
+          PATH: process.env.PATH, NODE_ENV: 'development', SQLITE_PATH: path.join(dir, 'm.sqlite'),
+          APP_DATA_DIR: dir, TRUST_PROXY: '1', ADMIN_ALLOWED_NETWORKS: '203.0.113.9',
+          PROBE_XFF: xff, PROBE_PATHS: JSON.stringify([['get', '/api/auth/session']]),
+        },
+        encoding: 'utf8', timeout: 60_000,
+      });
+      const line = res.stdout.split('\n').find((l) => l.startsWith('RESULT'));
+      assert.ok(line, res.stderr);
+      return JSON.parse(line.slice(6))['get /api/auth/session'];
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  };
+  assert.equal(run('203.0.113.9, 198.51.100.77'), 404);
+  assert.equal(run('198.51.100.77, 203.0.113.9'), 401);
 });

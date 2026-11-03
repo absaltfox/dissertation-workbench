@@ -28,7 +28,7 @@
 
 ## Review Focus
 
-- **Client IP forms:** behind Fly, `req.ip` may arrive as `::ffff:<owner-home-ip>` (IPv4-mapped IPv6) when the allow-list holds `<owner-home-ip>`. Expected: allowed. Pinned in Task 4.
+- **Client IP forms:** behind Fly, `req.ip` may arrive as `::ffff:203.0.113.5` (IPv4-mapped IPv6) when the allow-list holds `203.0.113.5`. Expected: allowed. Pinned in Task 4.
 - **A worker callback from outside the allow-list:** `/api/internal/*` must keep working, or every Fly job hangs. Pinned in Task 4.
 - **Bands-only job re-cuts within one generation:** a manual band name saved for band 2 must not attach to a different set of topics after the job re-cuts. Expected: an override applies only when its generation AND its `child_topic_ids` match the band. Pinned in Task 9.
 - **Degenerate trees:** fewer leaf topics than `TOPIC_BANDS_MIN`, or a zero merge height. Expected: no crash, no division by zero. Each topic is its own band when n ≤ min; a zero denominator scores `inf` when the numerator is > 0, and is skipped when both are 0. Pinned in Task 5.
@@ -116,8 +116,8 @@ Copy changes beyond the mechanical rename (exact text):
 
 - [ ] **Step 1: Write the failing tests:**
   - `unset or blank allows everyone` — `parseAllowedNetworks(undefined)` and `('  ')` → `null`; `isAllowedAdminIp(null, '8.8.8.8') === true`.
-  - `single IP and CIDR` — list `'<owner-home-ip>, 10.0.0.0/8'`: allows `<owner-home-ip>`, `10.2.3.4`; rejects `173.180.169.84`.
-  - `IPv4-mapped IPv6 client` — the same list allows `'::ffff:<owner-home-ip>'`.
+  - `single IP and CIDR` — list `'203.0.113.5, 10.0.0.0/8'`: allows `203.0.113.5`, `10.2.3.4`; rejects `203.0.113.6`.
+  - `IPv4-mapped IPv6 client` — the same list allows `'::ffff:203.0.113.5'`.
   - `IPv6 entry` — `'2001:db8::/32'` allows `2001:db8::1`.
   - `bad entry throws` — `'not-an-ip'` throws with the entry in the message.
   - Server integration, following the existing server test helpers in `test/server.test.js` with `ADMIN_ALLOWED_NETWORKS='203.0.113.9'` and the test client on loopback: `GET /api/auth/session` → 404; `GET /api/admin/topics/labels` → 404; `POST /api/internal/...` (an existing internal route used in `test/adminWorker.test.js`) is not 404 from the gate; `GET /api/health` → 200. With the variable unset, `GET /api/auth/session` → 401.

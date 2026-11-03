@@ -155,7 +155,14 @@ function scheduleAnalyticsWarmup() {
   }, 350);
 }
 
+let adminUnavailable = false;
+
 async function activateTab(tabName, { updateUrl = true, resetToken = '' } = {}) {
+  if (tabName === 'admin' && adminUnavailable) {
+    window.history.replaceState(null, '', '#/documents');
+    tabName = 'records';
+    updateUrl = false;
+  }
   setActiveTab(tabName, { updateUrl });
 
   if (tabName === 'citations' && state.payload) {
@@ -430,7 +437,10 @@ async function hideAdminIfUnavailable() {
   } catch {
     return;
   }
-  for (const btn of tabButtons.filter((b) => b.dataset.tab === 'admin')) btn.remove();
+  adminUnavailable = true;
+  for (let i = tabButtons.length - 1; i >= 0; i -= 1) {
+    if (tabButtons[i].dataset.tab === 'admin') tabButtons.splice(i, 1)[0].remove();
+  }
   const { tab } = parseRouteFromHash();
   if (tab === 'admin' || /^#\/?admin(\/|$|\?)/i.test(window.location.hash)) {
     window.history.replaceState(null, '', '#/documents');
