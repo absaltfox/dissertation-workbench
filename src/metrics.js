@@ -13,7 +13,7 @@ import {
 import {
   toArray, flattenText, extractYear, parsePageCount, buildWordCloud,
   buildMethodologyStats, extractNgrams, detectMethodologies,
-  isLowSignalConceptTerm, documentThemeTerms, COOCCURRENCE_BLOCKLIST
+  isLowSignalConceptTerm, documentThemeTerms, COOCCURRENCE_BLOCKLIST, UNSPECIFIED_SUBJECT
 } from './nlp.js';
 import { fetchPage, extractHits, resolveIndexName, collectCandidateUrls } from './api.js';
 import { enrichDocumentsWithFileAnalysis } from './pdf.js';
@@ -168,7 +168,7 @@ export function normalizeRecord(doc, dict = null) {
       : (extentPages ? 'metadata_extent' : 'estimated_from_metadata_words'),
     abstract: analyticalDescription,
     rawAbstract: access.isEmbargoPlaceholder ? description : undefined,
-    subjects: subjects.length ? subjects : ['(Unspecified)'],
+    subjects: subjects.length ? subjects : [UNSPECIFIED_SUBJECT],
     wordCount: accessRestricted ? null : metadataWords,
     wordCountSource: accessRestricted ? null : 'metadata_text',
     charCount: accessRestricted ? null : cleaned.length,
@@ -870,7 +870,7 @@ function normalizeStoredRecordShape(rec) {
   rec.supervisors = toArray(rec.supervisors);
   rec.affiliation = toArray(rec.affiliation);
   rec.subjects = toArray(rec.subjects);
-  if (!rec.subjects.length) rec.subjects = ['(Unspecified)'];
+  if (!rec.subjects.length) rec.subjects = [UNSPECIFIED_SUBJECT];
   rec.themes = toArray(rec.themes);
   rec.methodologies = toArray(rec.methodologies);
   rec.conceptTerms = toArray(rec.conceptTerms);

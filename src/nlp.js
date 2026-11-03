@@ -321,18 +321,23 @@ export function topTfidfTermsFromText(text, documentFrequency, documentCount, li
     .map(({ term }) => term);
 }
 
+export const UNSPECIFIED_SUBJECT = '(Unspecified)';
+
 const THEME_LOW_SIGNAL_TOKENS = new Set([
   'abstract', 'academic', 'approach', 'based', 'chapter', 'chapters', 'current',
   'data', 'findings', 'framework', 'method', 'methods', 'methodology',
   'participant', 'participants', 'purpose', 'result', 'results', 'student',
-  'students', 'using'
+  'students', 'unspecified', 'using'
 ]);
 
 export function documentThemeTerms(doc, limit = 12) {
+  const subjectList = (Array.isArray(doc?.subjects) ? doc.subjects : [doc?.subjects])
+    .filter((s) => s != null && s !== '' && s !== UNSPECIFIED_SUBJECT);
+  const subjectString = subjectList.join(' ');
   const text = [
     doc?.title,
     doc?.abstract,
-    Array.isArray(doc?.subjects) ? doc.subjects.join(' ') : doc?.subjects,
+    subjectString,
     doc?.program,
     doc?.degree,
   ].join(' ');
@@ -341,9 +346,7 @@ export function documentThemeTerms(doc, limit = 12) {
     .filter(([term]) => !THEME_LOW_SIGNAL_TOKENS.has(term))
     .map(([term, count]) => {
       const titleText = String(doc?.title || '').toLowerCase();
-      const subjectText = Array.isArray(doc?.subjects)
-        ? doc.subjects.join(' ').toLowerCase()
-        : String(doc?.subjects || '').toLowerCase();
+      const subjectText = subjectString.toLowerCase();
       const titleBonus = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(titleText) ? 2 : 0;
       const subjectBonus = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(subjectText) ? 1 : 0;
       return { term, score: count + titleBonus + subjectBonus, count };
