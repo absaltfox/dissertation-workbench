@@ -271,3 +271,25 @@ print(json.dumps({"rows": rows, "rows2": rows2, "v1": v1, "v2": v2}))`);
   assert.deepEqual(r.rows2, r.rows);
   assert.equal(r.v1, r.v2);
 });
+
+test('bands-only rolls back a batch that fails partway through', { skip: skipScipy }, () => {
+  const r = runPython(`SKIP_TOPIC = None
+${BANDS_DB_SETUP}
+client.execute("INSERT INTO topic_bands VALUES (0, 'Old', '[1]', 1, 'old')")
+client.execute("INSERT INTO topic_hierarchy_meta VALUES (1, '[1]', '[]', 'old')")
+client.execute("INSERT INTO settings VALUES ('topic_bands_version', 'oldv', 'old')")
+bt.generate_band_labels = lambda bands, *a, **k: {b["band_id"]: (None if b["band_id"] == 1 else "Named") for b in bands}
+try:
+    bt.run_bands_only(client)
+    err = None
+except Exception as e:
+    err = str(e)
+bands = [tuple(r) for r in client.execute("SELECT * FROM topic_bands").rows]
+meta = [tuple(r) for r in client.execute("SELECT * FROM topic_hierarchy_meta").rows]
+v = client.execute("SELECT value FROM settings WHERE key = 'topic_bands_version'").rows[0]["value"]
+print(json.dumps({"err": err, "bands": bands, "meta": meta, "v": v}))`);
+  assert.ok(r.err && /NOT NULL/.test(r.err), r.err);
+  assert.deepEqual(r.bands, [[0, 'Old', '[1]', 1, 'old']]);
+  assert.deepEqual(r.meta, [[1, '[1]', '[]', 'old']]);
+  assert.equal(r.v, 'oldv');
+});

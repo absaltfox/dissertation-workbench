@@ -1661,7 +1661,12 @@ def run_label_only(client, topic_id=None, reporter=None):
     mark_auto_selected_candidates(client, candidates, labels, overrides)
     print(f"Regenerated labels for {len(selected_topic_ids)} topics.")
     if topic_id is None:
-        refresh_band_labels(client, labels, topic_terms, titles_by_topic, topic_rows, reporter)
+        try:
+            refresh_band_labels(client, labels, topic_terms, titles_by_topic, topic_rows, reporter)
+        except Exception as ex:
+            raise RuntimeError(
+                f"Topic labels were saved, but research-area band names were not refreshed: {ex}"
+            ) from ex
 
 
 def refresh_band_labels(client, new_topic_labels, topic_terms, titles_by_topic, topic_rows, reporter=None):
