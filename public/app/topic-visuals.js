@@ -41,6 +41,7 @@ const {
   topicDendrogramContainerEl,
   topicDendrogramPanelEl,
   topicDendrogramTooltipEl,
+  topicDendrogramMatchSummaryEl,
   topicSankeyChartEl,
   topicSankeyLegendEl,
   topicSankeyTooltipEl,
@@ -407,6 +408,12 @@ function renderTopicDendrogram() {
   }
   const rootNode = nodes[nodes.length - 1];
 
+  // Under a filter the server sends per-topic match counts; the tree keeps its
+  // shape and mutes topics (and branches) with no matching manuscripts.
+  const filtered = td.matchCounts != null;
+  const matchOf = (topicId) => td.matchCounts?.[String(topicId)] ?? 0;
+  const isEmptyLeaf = (d) => filtered && matchOf(d.data.topic.topicId) === 0;
+
   const width = 940, height = Math.max(400, N * 32 + 60);
   const pad = { t: 30, r: 220, b: 30, l: 40 };
   const plotW = width - pad.l - pad.r;
@@ -421,6 +428,7 @@ function renderTopicDendrogram() {
   const clusterLayout = d3.cluster()
     .size([plotH, plotW]);
   clusterLayout(root);
+  root.sum(d => (d.leaf && d.topic ? (filtered ? matchOf(d.topic.topicId) : 1) : 0));
 
   const dMax = root.data.distance || 1;
   root.each(node => {
@@ -439,40 +447,57 @@ function renderTopicDendrogram() {
       L ${d.parent.y} ${d.x}
       L ${d.parent.y} ${d.parent.x}
     `)
+    .attr('class', d => (filtered && d.value === 0 ? 'tree-link tree-link--empty' : 'tree-link'))
     .attr('fill', 'none')
     .attr('stroke', '#7c8a97')
-    .attr('stroke-width', 1.5);
+    .attr('stroke-width', 1.5)
+    .attr('stroke-opacity', d => (filtered && d.value === 0 ? 0.25 : 1));
 
   const leaves = root.leaves();
   const hueStep = 360 / Math.max(leaves.length, 1);
-  const docCounts = leaves.map(l => l.data.topic.docCount);
-  const minDoc = d3.min(docCounts);
-  const maxDoc = d3.max(docCounts);
   const rMin = 5, rMax = 12;
+  const sizeOf = (topic) => (filtered ? matchOf(topic.topicId) : topic.docCount);
+  const sizes = leaves.filter(l => !isEmptyLeaf(l)).map(l => sizeOf(l.data.topic));
+  const minDoc = d3.min(sizes);
+  const maxDoc = d3.max(sizes);
+  // No matches, or one size only: a linear scale would divide by zero.
+  const rScale = (sizes.length && minDoc !== maxDoc)
+    ? d3.scaleLinear().domain([minDoc, maxDoc]).range([rMin, rMax])
+    : () => (rMin + rMax) / 2;
+  const radiusOf = (d) => (isEmptyLeaf(d) ? rMin : rScale(sizeOf(d.data.topic)));
 
-  const rScale = d3.scaleLinear()
-    .domain([minDoc, maxDoc])
-    .range([rMin, rMax]);
+  if (topicDendrogramMatchSummaryEl) {
+    const matched = filtered ? leaves.filter(l => !isEmptyLeaf(l)).length : 0;
+    topicDendrogramMatchSummaryEl.textContent = filtered
+      ? `Topics with matching manuscripts: ${matched} of ${leaves.length}`
+      : '';
+    topicDendrogramMatchSummaryEl.hidden = !filtered;
+  }
 
   const leafGroups = svg.append('g')
     .selectAll('g')
     .data(leaves)
     .enter()
     .append('g')
+    .attr('class', d => (isEmptyLeaf(d) ? 'tree-leaf tree-leaf--empty' : 'tree-leaf'))
+    .attr('data-topic-id', d => d.data.topic.topicId)
     .attr('transform', d => `translate(${d.y},${d.x})`)
-    .style('cursor', 'pointer');
+    .style('cursor', d => (isEmptyLeaf(d) ? 'default' : 'pointer'));
 
   leafGroups.append('circle')
-    .attr('r', d => rScale(d.data.topic.docCount))
-    .attr('fill', (d, i) => `hsl(${Math.round(i * hueStep)}, 65%, 50%)`)
-    .attr('stroke', '#fff')
-    .attr('stroke-width', 1.5);
+    .attr('r', radiusOf)
+    .attr('fill', (d, i) => (isEmptyLeaf(d) ? 'none' : `hsl(${Math.round(i * hueStep)}, 65%, 50%)`))
+    .attr('stroke', d => (isEmptyLeaf(d) ? '#7c8a97' : '#fff'))
+    .attr('stroke-width', 1.5)
+    // A hollow circle is otherwise hoverable only on its outline.
+    .attr('pointer-events', 'all');
 
   leafGroups.append('text')
-    .attr('x', d => rScale(d.data.topic.docCount) + 6)
+    .attr('x', d => radiusOf(d) + 6)
     .attr('dy', '0.35em')
     .attr('font-size', '11')
     .attr('fill', 'var(--fg)')
+    .attr('opacity', d => (isEmptyLeaf(d) ? 0.45 : 1))
     .text(d => {
       const label = topicDisplayLabel(d.data.topic.label);
       return label.length > 28 ? label.slice(0, 26) + '\u2026' : label;
@@ -485,8 +510,13 @@ function renderTopicDendrogram() {
     const label = topicDisplayLabel(t.label);
     const terms = (t.topTerms || []).slice(0, 5).map(p => Array.isArray(p) ? p[0] : p).join(', ');
 
+    const countText = !filtered
+      ? `${t.docCount} manuscript(s)`
+      : isEmptyLeaf(d)
+        ? 'No manuscripts match the current filters'
+        : `${matchOf(t.topicId)} of ${t.docCount} manuscripts match the current filters`;
     tooltip.html(`<strong>${escapeHtml(label)}</strong>
-      <div class="tooltip-meta">${t.docCount} manuscript(s)</div>
+      <div class="tooltip-meta">${countText}</div>
       <div class="tooltip-meta" style="margin-top:2px">Top terms: ${escapeHtml(terms)}</div>`)
       .style('display', 'block');
 
@@ -497,7 +527,7 @@ function renderTopicDendrogram() {
     d3.select(this).select('circle')
       .transition()
       .duration(100)
-      .attr('r', rScale(t.docCount) + 4);
+      .attr('r', radiusOf(d) + 4);
   })
   .on('mousemove', function(event) {
     const rect = topicDendrogramContainerEl.getBoundingClientRect();
@@ -509,9 +539,10 @@ function renderTopicDendrogram() {
     d3.select(this).select('circle')
       .transition()
       .duration(100)
-      .attr('r', rScale(d.data.topic.docCount));
+      .attr('r', radiusOf(d));
   })
   .on('click', function(event, d) {
+    if (isEmptyLeaf(d)) return;
     const label = topicDisplayLabel(d.data.topic.label);
     const topicId = d.data.topic.topicId;
     openMatchesModal(`Topic: ${label}`, (state.visualizationDocuments || []).filter((doc) => doc.topicId === topicId));

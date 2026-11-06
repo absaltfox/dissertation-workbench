@@ -2326,6 +2326,29 @@ export async function getTopicByYearCounts({ syncKey = null, filters: requestedF
   return computeTopicDataByYearSql(filters, qualifier, topics, hierarchy, bands);
 }
 
+/**
+ * Manuscripts matching the active filters, per topic, keyed by topic id.
+ * Each manuscript counts toward its best topic only, the same rule
+ * queryVisualizationDocuments uses, so a topic's count equals its clicked list.
+ * Topics with no matches are omitted.
+ */
+export async function getTopicMatchCounts({ syncKey = null, filters: requestedFilters = {} } = {}) {
+  if (!await hasTopics()) return null;
+  const f = analyticalDocumentFilters({ syncKey, ...requestedFilters });
+  const rows = await all(`
+    SELECT bt.topic_id AS topic_id, COUNT(*) AS count
+    FROM documents d
+    JOIN (
+      SELECT doc_id, topic_id,
+             ROW_NUMBER() OVER (PARTITION BY doc_id ORDER BY probability DESC, topic_id ASC) AS rn
+      FROM document_topics
+    ) bt ON bt.doc_id = d.doc_id AND bt.rn = 1
+    ${f.where}
+    GROUP BY bt.topic_id
+  `, f.args);
+  return Object.fromEntries(rows.map((row) => [String(row.topic_id), Number(row.count || 0)]));
+}
+
 // The legacy json_each `term.key < 10` cutoff (used below for "first 10
 // conceptTerms") counts RAW array positions, including duplicate values. The
 // document_terms projection it's being compared against is deduped on write

@@ -9,7 +9,7 @@ import {
 import {
   applyCitationCountsToDocuments, applyCommitteeMembersToDocuments,
   applyStoredFileMetricsToDocuments, getDocumentCacheStats, getDocumentServingAnalytics, getDocumentServingSummary,
-  getTopicsCacheVersion, loadServingSnapshot, saveServingSnapshot, getTopicByYearCounts, hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics, loadTopicHierarchy,
+  getTopicsCacheVersion, loadServingSnapshot, saveServingSnapshot, getTopicByYearCounts, getTopicMatchCounts, hasTopics, isDocumentTermsReady, listCachedDocuments, loadDocumentMetadata, loadDocumentTopics, loadTopics, loadTopicHierarchy,
   queryCachedDocumentPage, queryCitationDocumentPage, queryConceptTermsByDoc, queryPeoplePage, queryPersonDetailPage,
   queryRelatedDocuments, queryVisualizationDocuments
 } from '../db.js';
@@ -626,12 +626,16 @@ export async function buildWorkbenchVisualizationsPayload(params, filters, loadS
   const documentCache = await documentCacheForParams(params, loadSyncModule);
   const result = await queryVisualizationDocuments({ syncKey: documentCache.syncKey, filters });
   const documents = Number.isFinite(documentLimit) ? result.documents.slice(0, documentLimit) : result.documents;
-  const [topics, hierarchy, byYear] = await Promise.all([
+  // Match counts exist only under a filter, so the unfiltered payload (and
+  // its snapshot) keeps its shape.
+  const [topics, hierarchy, byYear, matchCounts] = await Promise.all([
     loadTopics(),
     loadTopicHierarchy(),
     getTopicByYearCounts({ syncKey: documentCache.syncKey, filters }),
+    isUnfiltered(filters) ? null : getTopicMatchCounts({ syncKey: documentCache.syncKey, filters }),
   ]);
   const aggregates = buildTopicVisualizations(documents, { topics, hierarchy, byYear });
+  if (matchCounts) aggregates.topicData.matchCounts = matchCounts;
   const docIds = documents.map((doc) => doc.id).filter(Boolean);
   const citationCooccurrence = await buildCitationCooccurrenceNetwork(docIds);
   return visualizationSlice({

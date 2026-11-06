@@ -45,6 +45,7 @@ const topicClusterContainerEl = document.getElementById('topicClusterContainer')
 const topicDendrogramPanelEl = document.getElementById('topicDendrogramPanel');
 const topicDendrogramChartEl = document.getElementById('topicDendrogramChart');
 const topicDendrogramTooltipEl = document.getElementById('topicDendrogramTooltip');
+const topicDendrogramMatchSummaryEl = document.getElementById('topicDendrogramMatchSummary');
 const topicDendrogramContainerEl = document.getElementById('topicDendrogramContainer');
 const topicSankeyPanelEl = document.getElementById('topicSankeyPanel');
 const topicSankeyChartEl = document.getElementById('topicSankeyChart');
@@ -798,6 +799,7 @@ const dom = {
   topicDendrogramPanelEl,
   topicDendrogramChartEl,
   topicDendrogramTooltipEl,
+  topicDendrogramMatchSummaryEl,
   topicDendrogramContainerEl,
   topicSankeyPanelEl,
   topicSankeyChartEl,
