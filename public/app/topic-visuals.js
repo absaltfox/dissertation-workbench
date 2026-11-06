@@ -488,7 +488,9 @@ function renderTopicDendrogram() {
     .attr('r', radiusOf)
     .attr('fill', (d, i) => (isEmptyLeaf(d) ? 'none' : `hsl(${Math.round(i * hueStep)}, 65%, 50%)`))
     .attr('stroke', d => (isEmptyLeaf(d) ? '#7c8a97' : '#fff'))
-    .attr('stroke-width', 1.5);
+    .attr('stroke-width', 1.5)
+    // A hollow circle is otherwise hoverable only on its outline.
+    .attr('pointer-events', 'all');
 
   leafGroups.append('text')
     .attr('x', d => radiusOf(d) + 6)
