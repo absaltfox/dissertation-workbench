@@ -6121,18 +6121,24 @@ export async function getCitationCooccurrence(limit = 100, docIds = null) {
   `, args);
 }
 
+// Aggregate the narrow covering index first, then join citations for the rows
+// that survive. COUNT(*) equals COUNT(DISTINCT doc_id) because
+// (doc_id, citation_id) is the table's primary key.
 export async function getTopCitedWorks(limit = 50) {
   return all(`
-    SELECT c.id, c.citation_text,
-      COUNT(DISTINCT dc.doc_id) AS doc_count,
+    WITH counts AS MATERIALIZED (
+      SELECT citation_id, COUNT(*) AS doc_count
+      FROM document_citations
+      GROUP BY citation_id
+      HAVING doc_count > 1
+    )
+    SELECT c.id, c.citation_text, k.doc_count,
       cl.hits AS catalogue_hits,
       cl.bib_id AS catalogue_bib_id
-    FROM citations c
-    JOIN document_citations dc ON dc.citation_id = c.id
+    FROM counts k
+    JOIN citations c ON c.id = k.citation_id
     LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
-    GROUP BY c.id
-    HAVING doc_count > 1
-    ORDER BY doc_count DESC, c.citation_text
+    ORDER BY k.doc_count DESC, c.citation_text
     LIMIT ?
   `, [limit]);
 }
