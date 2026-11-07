@@ -190,6 +190,8 @@ test('getCatalogueLookupStats().pending matches countPendingLookups() and listPe
   await client.execute({ sql: 'DELETE FROM citations WHERE id = ?', args: [strayId] });
   await client.execute('PRAGMA foreign_keys=ON');
 
+  // getCatalogueLookupStats() memoizes the pending count for the admin poll.
+  db.clearCatalogueLookupStatsCache();
   const [statsPending, countPending, listPending] = await Promise.all([
     db.getCatalogueLookupStats().then((s) => s.pending),
     db.countPendingLookups(),
@@ -249,6 +251,7 @@ test('the pre-fix table-total arithmetic would have disagreed with the real pred
 
   const realPendingAfter = await db.countPendingLookups();
   const oldArithmeticAfter = await tableTotals();
+  db.clearCatalogueLookupStatsCache();
   const fixedStatsAfter = (await db.getCatalogueLookupStats()).pending;
 
   assert.equal(realPendingAfter, realPendingBefore,

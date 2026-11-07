@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { logger } from './logger.js';
-import { listPendingLookups, saveCatalogueLookup } from './db.js';
+import { clearCatalogueLookupStatsCache, listPendingLookups, saveCatalogueLookup } from './db.js';
 import { buildPqfQuery } from './catalogueQuery.js';
 import {
   CATALOGUE_LOOKUP_BATCH_SIZE,
@@ -542,7 +542,17 @@ export async function lookupCitationBatch(citationTexts, {
  * Processes in pages of `pageSize` to bound memory and provide progress logging.
  * Returns summary stats { processed, found, notFound, skipped }.
  */
-export async function runPendingCatalogueLookups({
+export async function runPendingCatalogueLookups(options = {}) {
+  try {
+    return await runPendingCatalogueLookupsPages(options);
+  } finally {
+    // The admin stats memoize the pending count; a run (even an aborted one)
+    // changes it, so the next poll must recompute.
+    clearCatalogueLookupStatsCache();
+  }
+}
+
+async function runPendingCatalogueLookupsPages({
   pageSize = 200,
   scope = null,
   signal,

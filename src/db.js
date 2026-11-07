@@ -5919,6 +5919,30 @@ export async function getCitationForSummon(citationId) {
   `, [citationId]);
 }
 
+// The unscoped pending count scans every citation (about 1.6M rows read on prod)
+// and the admin page polls getCatalogueLookupStats() every 5 s while a job runs,
+// so it is memoized. The five table counts stay live (about 39k rows). The
+// memo holds the in-flight promise so concurrent polls share one query.
+const CATALOGUE_PENDING_TTL_MS = 2 * 60 * 1000;
+let cataloguePendingMemo = null;
+
+export function clearCatalogueLookupStatsCache() {
+  cataloguePendingMemo = null;
+}
+
+function memoizedPendingLookupCount() {
+  const now = Date.now();
+  if (cataloguePendingMemo && now - cataloguePendingMemo.at < CATALOGUE_PENDING_TTL_MS) {
+    return cataloguePendingMemo.promise;
+  }
+  const promise = countPendingLookups();
+  const memo = { at: now, promise };
+  cataloguePendingMemo = memo;
+  // A failed count must not be served for the rest of the TTL.
+  promise.catch(() => { if (cataloguePendingMemo === memo) cataloguePendingMemo = null; });
+  return promise;
+}
+
 export async function getCatalogueLookupStats() {
   const [row, pending] = await Promise.all([
     get(`
@@ -5933,7 +5957,7 @@ export async function getCatalogueLookupStats() {
     // dashboard number can never disagree with the pager/resolution-job's own count.
     // See #30 (M-09): the previous arithmetic here double-counted/under-counted once
     // citations and catalogue_lookups rows could be deleted independently of each other.
-    countPendingLookups(),
+    memoizedPendingLookupCount(),
   ]);
   return {
     total: Number(row?.total || 0),
