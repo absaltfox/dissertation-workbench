@@ -58,7 +58,7 @@ export async function getDb() {
     // idempotent, so retry the complete startup pass on SQLITE_BUSY instead of
     // letting a transient schema-read lock prevent a singleton claimant from
     // reaching its durable lease.
-    schemaReady = ensureSchemaWithRetry(db);
+    schemaReady = ensureSchemaWithRetry(db).then(() => initCitationCountsReadiness(db));
   }
   await schemaReady;
   return db;
@@ -69,6 +69,7 @@ export async function closeDb() {
     await db.close();
     db = undefined;
     schemaReady = undefined;
+    citationCountsReady = false;
   }
 }
 
@@ -893,6 +894,7 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_kind_termlower ON document_terms(kind, lower(term))');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_doc ON document_terms(doc_id, kind)');
 
+  await ensureCitationCountSummaries(client);
   await backfillCitationMatchKeys(client);
   await backfillDocumentAccessStatus(client);
 
@@ -1240,6 +1242,122 @@ function metadataTermsStatements(doc, _now = new Date().toISOString()) {
     }
   }
   return statements;
+}
+
+// --- Citation count summaries ---
+//
+// citation_doc_counts (citation -> number of linking documents) and
+// document_citation_counts (document -> number of citations) replace the
+// full-table "GROUP BY" aggregates over document_citations that the Citations
+// tab, Foundational Works and the co-occurrence panel used to run. They are kept
+// correct by triggers, not by application code, because document_citations has
+// several writers (saveCitations, replaceDocumentCitationLinks, the embargo
+// cleanup, clearAllCitations, the maintenance scripts, and an older app version
+// still running during a deploy). SQLite semantics match those writers: an
+// upsert that takes the DO UPDATE branch fires no INSERT trigger, so a re-link
+// does not double count, and an INSERT OR IGNORE that ignores a row fires
+// nothing. A plain INSERT OR REPLACE on document_citations would bypass the
+// delete trigger (recursive_triggers is off); nothing does that, and
+// reconcileCitationCounts() detects it if something ever does.
+const CITATION_COUNT_TRIGGER_INSERT = 'trg_document_citations_count_ins';
+const CITATION_COUNT_TRIGGER_DELETE = 'trg_document_citations_count_del';
+
+const CITATION_COUNT_REBUILD_STATEMENTS = [
+  'DELETE FROM citation_doc_counts',
+  `INSERT INTO citation_doc_counts (citation_id, doc_count)
+     SELECT citation_id, COUNT(*) FROM document_citations GROUP BY citation_id`,
+  'DELETE FROM document_citation_counts',
+  `INSERT INTO document_citation_counts (doc_id, citation_count)
+     SELECT doc_id, COUNT(*) FROM document_citations GROUP BY doc_id`,
+];
+
+const CITATION_COUNT_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS citation_doc_counts (
+     citation_id INTEGER PRIMARY KEY,
+     doc_count INTEGER NOT NULL
+   )`,
+  // About 2% of citations are shared by two or more documents; the partial index
+  // lets Foundational Works and the co-occurrence panel read only those.
+  `CREATE INDEX IF NOT EXISTS idx_citation_doc_counts_shared
+     ON citation_doc_counts(doc_count DESC, citation_id) WHERE doc_count >= 2`,
+  `CREATE TABLE IF NOT EXISTS document_citation_counts (
+     doc_id TEXT PRIMARY KEY,
+     citation_count INTEGER NOT NULL
+   )`,
+  `DROP TRIGGER IF EXISTS ${CITATION_COUNT_TRIGGER_INSERT}`,
+  `DROP TRIGGER IF EXISTS ${CITATION_COUNT_TRIGGER_DELETE}`,
+  `CREATE TRIGGER ${CITATION_COUNT_TRIGGER_INSERT} AFTER INSERT ON document_citations BEGIN
+     INSERT INTO citation_doc_counts (citation_id, doc_count) VALUES (NEW.citation_id, 1)
+       ON CONFLICT(citation_id) DO UPDATE SET doc_count = doc_count + 1;
+     INSERT INTO document_citation_counts (doc_id, citation_count) VALUES (NEW.doc_id, 1)
+       ON CONFLICT(doc_id) DO UPDATE SET citation_count = citation_count + 1;
+   END`,
+  // Rows that reach zero are removed so the tables never accumulate dead rows.
+  `CREATE TRIGGER ${CITATION_COUNT_TRIGGER_DELETE} AFTER DELETE ON document_citations BEGIN
+     UPDATE citation_doc_counts SET doc_count = doc_count - 1 WHERE citation_id = OLD.citation_id;
+     DELETE FROM citation_doc_counts WHERE citation_id = OLD.citation_id AND doc_count <= 0;
+     UPDATE document_citation_counts SET citation_count = citation_count - 1 WHERE doc_id = OLD.doc_id;
+     DELETE FROM document_citation_counts WHERE doc_id = OLD.doc_id AND citation_count <= 0;
+   END`,
+];
+
+const CITATION_COUNT_OBJECTS_SQL = `
+  SELECT COUNT(*) AS n FROM sqlite_master
+  WHERE (type = 'trigger' AND name IN ('${CITATION_COUNT_TRIGGER_INSERT}', '${CITATION_COUNT_TRIGGER_DELETE}'))
+     OR (type = 'table' AND name IN ('citation_doc_counts', 'document_citation_counts'))`;
+
+// One sqlite_master read on every later boot. When anything is missing, tables,
+// triggers and the backfill go in ONE write batch (one transaction), so a
+// concurrent writer can never land between the backfill and the triggers.
+async function ensureCitationCountSummaries(client) {
+  const present = await client.execute(CITATION_COUNT_OBJECTS_SQL);
+  if (Number(present.rows[0]?.n || 0) === 4) return false;
+  await client.batch([
+    ...CITATION_COUNT_SCHEMA_STATEMENTS,
+    ...CITATION_COUNT_REBUILD_STATEMENTS,
+  ], 'write');
+  return true;
+}
+
+let citationCountsReady = false;
+export function isCitationCountsReady() { return citationCountsReady; }
+export function __setCitationCountsReadyForTesting(value) { citationCountsReady = Boolean(value); }
+
+// Ready means the summary tables and both triggers exist, so the tables track
+// every write. Readers use them only then and otherwise run the live SQL.
+export async function initCitationCountsReadiness(client = null) {
+  const target = client || await getDb();
+  const result = await target.execute(CITATION_COUNT_OBJECTS_SQL);
+  citationCountsReady = Number(result.rows[0]?.n || 0) === 4;
+  return citationCountsReady;
+}
+
+// Compares both summary tables with a fresh GROUP BY recount (about 590k rows
+// read on prod, so maintenance/admin use only). Counts mismatched, missing and
+// orphaned summary rows. repair: true rebuilds both tables atomically.
+export async function reconcileCitationCounts({ repair = false } = {}) {
+  const client = await getDb();
+  const result = await client.execute(`
+    SELECT
+      (SELECT COUNT(*) FROM (
+         SELECT citation_id, COUNT(*) AS n FROM document_citations GROUP BY citation_id
+       ) t LEFT JOIN citation_doc_counts k USING (citation_id) WHERE k.doc_count IS NOT t.n)
+      + (SELECT COUNT(*) FROM citation_doc_counts k
+           WHERE NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.citation_id = k.citation_id)) AS citation_drift,
+      (SELECT COUNT(*) FROM (
+         SELECT doc_id, COUNT(*) AS n FROM document_citations GROUP BY doc_id
+       ) t LEFT JOIN document_citation_counts k USING (doc_id) WHERE k.citation_count IS NOT t.n)
+      + (SELECT COUNT(*) FROM document_citation_counts k
+           WHERE NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = k.doc_id)) AS doc_drift
+  `);
+  const drift = {
+    citationDrift: Number(result.rows[0]?.citation_drift || 0),
+    docDrift: Number(result.rows[0]?.doc_drift || 0),
+  };
+  if (!repair) return drift;
+  const drifted = drift.citationDrift + drift.docDrift > 0;
+  if (drifted) await client.batch(CITATION_COUNT_REBUILD_STATEMENTS, 'write');
+  return { ...drift, repaired: drifted };
 }
 
 let documentTermsReady = false;
