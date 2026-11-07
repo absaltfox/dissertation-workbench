@@ -1859,6 +1859,15 @@ function analyticalDocumentFilters(options = {}) {
   };
 }
 
+// The derived per-document count used by the citationCount sorts, which must see
+// every filtered row's count before LIMIT. With the summary tables ready it is a
+// plain table; otherwise it aggregates every link.
+function citationCountJoinSource() {
+  return isCitationCountsReady()
+    ? 'document_citation_counts'
+    : '(SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id)';
+}
+
 const DOCUMENT_PAGE_SORTS = {
   title: 'lower(COALESCE(d.title, \'\'))',
   author: 'lower(COALESCE(d.author, \'\'))',
@@ -1893,11 +1902,7 @@ export async function queryCachedDocumentPage({
            fm.word_count_comparison_json
     FROM documents d
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
-    ${needsCitationSortJoin ? `LEFT JOIN (
-      SELECT doc_id, COUNT(*) AS citation_count
-      FROM document_citations
-      GROUP BY doc_id
-    ) dc ON dc.doc_id = d.doc_id` : ''}
+    ${needsCitationSortJoin ? `LEFT JOIN ${citationCountJoinSource()} dc ON dc.doc_id = d.doc_id` : ''}
     ${queryFilters.where}
     ORDER BY ${sortExpression} ${direction}, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
     LIMIT ? OFFSET ?
@@ -2090,8 +2095,7 @@ export async function queryCitationDocumentPage({
     ? 'COALESCE(dc.citation_count, 0)'
     : '(SELECT COUNT(*) FROM document_citations x WHERE x.doc_id = d.doc_id)';
   const countJoin = sortsOnCount
-    ? `LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
-      ON dc.doc_id = d.doc_id`
+    ? `LEFT JOIN ${citationCountJoinSource()} dc ON dc.doc_id = d.doc_id`
     : '';
   const rows = await all(`
     SELECT d.doc_id, d.title, d.author, d.year, ${countSource} AS citation_count
@@ -2985,7 +2989,11 @@ export async function applyCitationCountsToDocuments(documents = []) {
   // chunk loop): on remote Turso the corpus-wide /api/metrics caller used to cost
   // up to 15 round trips here.
   const countsByDocId = new Map();
-  const rows = await all(`
+  const rows = await all(isCitationCountsReady() ? `
+    SELECT doc_id, citation_count
+    FROM document_citation_counts
+    WHERE doc_id IN (SELECT value FROM json_each(?))
+  ` : `
     SELECT doc_id, COUNT(*) AS citation_count
     FROM document_citations
     WHERE doc_id IN (SELECT value FROM json_each(?))
@@ -6213,11 +6221,24 @@ export async function getCitationCooccurrence(limit = 100, docIds = null) {
   if (bounded) args.push(JSON.stringify(docIds));
   args.push(limit);
 
+  // A citation reaches cnt >= 2 inside any bound only if two or more documents
+  // cite it corpus-wide, so with the summary tables ready only the links of
+  // those citations are read, driven from the partial index. CROSS JOIN fixes
+  // the join order and the unary + stops doc_id IN (...) from becoming a probe
+  // driver. Same rows as the live form; reads about 40k rows whatever the bound.
+  const scopedSql = isCitationCountsReady()
+    ? `SELECT dc.doc_id, dc.citation_id
+      FROM citation_doc_counts cc
+      CROSS JOIN document_citations dc ON dc.citation_id = cc.citation_id
+      WHERE cc.doc_count >= 2
+      ${bounded ? 'AND +dc.doc_id IN (SELECT value FROM json_each(?))' : ''}`
+    : `SELECT dc.doc_id, dc.citation_id
+      FROM document_citations dc
+      ${bounded ? 'WHERE dc.doc_id IN (SELECT value FROM json_each(?))' : ''}`;
+
   return all(`
     WITH scoped AS MATERIALIZED (
-      SELECT dc.doc_id, dc.citation_id
-      FROM document_citations dc
-      ${bounded ? 'WHERE dc.doc_id IN (SELECT value FROM json_each(?))' : ''}
+      ${scopedSql}
     ),
     top_citations AS MATERIALIZED (
       SELECT citation_id, COUNT(*) AS cnt
@@ -6251,10 +6272,24 @@ export async function getCitationCooccurrence(limit = 100, docIds = null) {
   `, args);
 }
 
-// Aggregate the narrow covering index first, then join citations for the rows
-// that survive. COUNT(*) equals COUNT(DISTINCT doc_id) because
-// (doc_id, citation_id) is the table's primary key.
+// With the summary tables ready this reads the ~2% of citations shared by two or
+// more documents from a partial index; otherwise it aggregates the narrow
+// covering index first and joins citations for the rows that survive (COUNT(*)
+// equals COUNT(DISTINCT doc_id) because (doc_id, citation_id) is the primary key).
 export async function getTopCitedWorks(limit = 50) {
+  if (isCitationCountsReady()) {
+    return all(`
+      SELECT c.id, c.citation_text, k.doc_count,
+        cl.hits AS catalogue_hits,
+        cl.bib_id AS catalogue_bib_id
+      FROM citation_doc_counts k
+      JOIN citations c ON c.id = k.citation_id
+      LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
+      WHERE k.doc_count >= 2
+      ORDER BY k.doc_count DESC, c.citation_text
+      LIMIT ?
+    `, [limit]);
+  }
   return all(`
     WITH counts AS MATERIALIZED (
       SELECT citation_id, COUNT(*) AS doc_count

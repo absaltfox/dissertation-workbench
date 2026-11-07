@@ -172,17 +172,23 @@ test('co-occurrence equals the old SQL when the top-50 cut-off has no ties (unbo
       sql: ORIGINAL_SQL(!!ids),
       args: ids ? [JSON.stringify(ids), JSON.stringify(ids), 100000] : [100000],
     })).rows;
-    const fresh = await db.getCitationCooccurrence(100000, ids);
     assert.ok(old.length > 100, 'fixture must exercise a rich network');
-    assert.deepEqual(byEdge(fresh), byEdge(old));
+    // Both the live-aggregate fallback and the summary-table path.
+    for (const ready of [false, true]) {
+      db.__setCitationCountsReadyForTesting(ready);
+      assert.deepEqual(byEdge(await db.getCitationCooccurrence(100000, ids)), byEdge(old), `ready=${ready}`);
+    }
   }
 });
 
 test('co-occurrence equals the brute-force reference, including LIMIT order', async () => {
   const docs = await seedDistinctCounts();
   const bound = docs.slice(10, 90);
-  for (const [ids, limit] of [[null, 100], [bound, 100], [bound, 17], [null, 1]]) {
-    assert.deepEqual(plain(await db.getCitationCooccurrence(limit, ids)), await reference(limit, ids));
+  for (const ready of [false, true]) {
+    db.__setCitationCountsReadyForTesting(ready);
+    for (const [ids, limit] of [[null, 100], [bound, 100], [bound, 17], [null, 1]]) {
+      assert.deepEqual(plain(await db.getCitationCooccurrence(limit, ids)), await reference(limit, ids), `ready=${ready}`);
+    }
   }
 });
 
@@ -191,6 +197,10 @@ test('top-50 tie-break is citation_id ascending and stable across runs', async (
   const ids = await insertCitations(80); // every citation shared by the same 2 docs: 80-way tie at cnt 2
   await insertLinks(ids.flatMap((id) => [['tie-a', id], ['tie-b', id]]));
   const first = await db.getCitationCooccurrence(100000, ['tie-a', 'tie-b']);
+  db.__setCitationCountsReadyForTesting(false);
+  const live = await db.getCitationCooccurrence(100000, ['tie-a', 'tie-b']);
+  db.__setCitationCountsReadyForTesting(true);
+  assert.deepEqual(plain(live), plain(first));
   const second = await db.getCitationCooccurrence(100000, ['tie-a', 'tie-b']);
   assert.deepEqual(plain(first), plain(second));
   const nodeIds = new Set(first.flatMap((r) => [r.id1, r.id2]));
@@ -211,6 +221,8 @@ test('empty docIds returns an empty network without touching the corpus', async 
   const metrics = await import('../src/metrics.js');
   assert.deepEqual(await metrics.buildCitationCooccurrenceNetwork([]), { nodes: [], edges: [] });
 });
+
+test.afterEach(() => db.__setCitationCountsReadyForTesting(true));
 
 test('null docIds still means the whole corpus', async () => {
   await seedDistinctCounts();

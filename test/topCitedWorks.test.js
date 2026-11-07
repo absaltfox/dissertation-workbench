@@ -104,7 +104,9 @@ test('getTopCitedWorks reflects a re-extraction that drops a link', async () => 
   assert.deepEqual(plain(works), expected);
 });
 
-test('getTopCitedWorks aggregates the narrow link index and never scans citations', async () => {
+test('the live fallback of getTopCitedWorks aggregates the narrow link index and never scans citations', async () => {
+  // The summary-table path has its own coverage in citationSummaryReaders.test.js.
+  db.__setCitationCountsReadyForTesting(false);
   const captured = [];
   const original = client.execute.bind(client);
   client.execute = (stmt, ...rest) => { captured.push(stmt); return original(stmt, ...rest); };
@@ -112,6 +114,7 @@ test('getTopCitedWorks aggregates the narrow link index and never scans citation
     await db.getTopCitedWorks(10);
   } finally {
     client.execute = original;
+    db.__setCitationCountsReadyForTesting(true);
   }
   const stmt = captured.find((s) => /document_citations/.test(s.sql));
   assert.ok(stmt, 'expected a document_citations statement');
