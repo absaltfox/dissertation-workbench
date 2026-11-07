@@ -1812,15 +1812,10 @@ export async function queryTopicDocumentPage({
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
            fm.word_count_comparison_json,
-           COALESCE(dc.citation_count, 0) AS citation_count
+           (SELECT COUNT(*) FROM document_citations x WHERE x.doc_id = d.doc_id) AS citation_count
     FROM documents d
     ${topicJoin}
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
-    LEFT JOIN (
-      SELECT doc_id, COUNT(*) AS citation_count
-      FROM document_citations
-      GROUP BY doc_id
-    ) dc ON dc.doc_id = d.doc_id
     ${queryFilters.where}
     ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
     LIMIT ? OFFSET ?
@@ -1963,19 +1958,27 @@ export async function queryCitationDocumentPage({
   const queryFilters = analyticalDocumentFilters({ syncKey, ...filters, q });
   const counts = await get(`
     SELECT COUNT(*) AS total,
-           SUM(CASE WHEN COALESCE(dc.citation_count, 0) > 0 THEN 1 ELSE 0 END) AS with_citations
+           SUM(EXISTS (SELECT 1 FROM document_citations x WHERE x.doc_id = d.doc_id)) AS with_citations
     FROM documents d
-    LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
-      ON dc.doc_id = d.doc_id
     ${queryFilters.where}
   `, queryFilters.args);
   const sortExpression = DOCUMENT_PAGE_SORTS[sortKey] || DOCUMENT_PAGE_SORTS.citationCount;
   const direction = sortDir === 'asc' ? 'ASC' : 'DESC';
+  // Only the citationCount sort (the default) has to see every filtered row's
+  // count before LIMIT; every other sort labels just its page through a
+  // correlated count instead of aggregating all links.
+  const sortsOnCount = !DOCUMENT_PAGE_SORTS[sortKey] || sortKey === 'citationCount';
+  const countSource = sortsOnCount
+    ? 'COALESCE(dc.citation_count, 0)'
+    : '(SELECT COUNT(*) FROM document_citations x WHERE x.doc_id = d.doc_id)';
+  const countJoin = sortsOnCount
+    ? `LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
+      ON dc.doc_id = d.doc_id`
+    : '';
   const rows = await all(`
-    SELECT d.doc_id, d.title, d.author, d.year, COALESCE(dc.citation_count, 0) AS citation_count
+    SELECT d.doc_id, d.title, d.author, d.year, ${countSource} AS citation_count
     FROM documents d
-    LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
-      ON dc.doc_id = d.doc_id
+    ${countJoin}
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
     ${queryFilters.where}
     ORDER BY ${sortExpression} ${direction}, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
@@ -2728,13 +2731,11 @@ export async function queryPersonDetailPage({
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
            fm.word_count_comparison_json,
-           COALESCE(dc.citation_count, 0) AS citation_count,
+           (SELECT COUNT(*) FROM document_citations x WHERE x.doc_id = d.doc_id) AS citation_count,
            dt.topic_id, dt.probability
     FROM person_docs pd
     JOIN documents d ON d.doc_id = pd.doc_id
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
-    LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
-      ON dc.doc_id = d.doc_id
     LEFT JOIN topic_assignment dt ON dt.doc_id = d.doc_id
     ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
     LIMIT ? OFFSET ?
