@@ -14,8 +14,6 @@ let tempDir;
 let db;
 let client;
 
-const plain = (rows) => rows.map((r) => ({ ...r }));
-
 test.before(async () => {
   tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'oc-cite-doc-counts-'));
   Object.assign(process.env, {
