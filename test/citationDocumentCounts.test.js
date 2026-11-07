@@ -156,3 +156,48 @@ test('topic document page citationCount equals a direct count and avoids the all
   }
   assert.deepEqual(fullScan(details), [], `topic page aggregates all links: ${details.join(' | ')}`);
 });
+
+test('countDocumentCitations equals the number of linked citations without reading their text', async () => {
+  const hash = (t) => `cnt-${t.toLowerCase().trim()}`;
+  // Two near-identical items merge into one citation; the link count is distinct citations.
+  await db.reextractDocumentCitations('cdc-count', [
+    'Smith, J. (2001). Alpha theory of things. City: Press.',
+    'Smith, J. (2001). Alpha theory of things. City: Press',
+    'Jones, K. (1999). Beta. City: Press.',
+  ], hash);
+  const loaded = await db.loadDocumentCitations('cdc-count');
+  assert.equal(await db.countDocumentCitations('cdc-count'), loaded.length);
+  assert.equal(await db.countDocumentCitations('cdc-missing'), 0);
+
+  const seen = [];
+  const original = client.execute.bind(client);
+  client.execute = (stmt, ...rest) => { seen.push(typeof stmt === 'string' ? stmt : stmt.sql); return original(stmt, ...rest); };
+  try {
+    await db.countDocumentCitations('cdc-count');
+  } finally {
+    client.execute = original;
+  }
+  assert.ok(!seen.some((sql) => /citation_text/.test(sql)));
+});
+
+test('applyCitationCountsToDocuments labels any number of documents in one statement', async () => {
+  const docs = Array.from({ length: 2500 }, (_, i) => ({ id: i < 40 ? `cdc-${String(i).padStart(3, '0')}` : `nodoc-${i}` }));
+  docs.push({ id: docs[3].id }); // duplicate ids stay labelled
+  const statements = [];
+  const original = client.execute.bind(client);
+  client.execute = (stmt, ...rest) => { statements.push(stmt); return original(stmt, ...rest); };
+  try {
+    await db.applyCitationCountsToDocuments(docs);
+  } finally {
+    client.execute = original;
+  }
+  assert.equal(statements.length, 1, 'one round trip regardless of the id count');
+  for (const d of docs.slice(0, 40)) {
+    const n = Number((await client.execute({ sql: 'SELECT COUNT(*) n FROM document_citations WHERE doc_id = ?', args: [d.id] })).rows[0].n);
+    assert.equal(d.citationCount, n, d.id);
+  }
+  assert.equal(docs[100].citationCount, 0);
+  assert.equal(docs.at(-1).citationCount, docs[3].citationCount);
+  const plan = (await client.execute({ sql: `EXPLAIN QUERY PLAN ${statements[0].sql}`, args: statements[0].args })).rows.map((r) => String(r.detail));
+  assert.ok(!plan.some((d) => /^SCAN document_citations/.test(d)), plan.join(' | '));
+});

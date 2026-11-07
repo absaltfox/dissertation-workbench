@@ -2863,19 +2863,17 @@ export async function applyCitationCountsToDocuments(documents = []) {
   const ids = Array.from(new Set(list.map((doc) => doc?.id).filter(Boolean)));
   if (!ids.length) return list;
 
+  // One statement for any number of ids (one JSON parameter, not a 999-placeholder
+  // chunk loop): on remote Turso the corpus-wide /api/metrics caller used to cost
+  // up to 15 round trips here.
   const countsByDocId = new Map();
-  const chunkSize = 999;
-  for (let i = 0; i < ids.length; i += chunkSize) {
-    const chunk = ids.slice(i, i + chunkSize);
-    const placeholders = chunk.map(() => '?').join(', ');
-    const rows = await all(`
-      SELECT doc_id, COUNT(*) AS citation_count
-      FROM document_citations
-      WHERE doc_id IN (${placeholders})
-      GROUP BY doc_id
-    `, chunk);
-    for (const row of rows) countsByDocId.set(row.doc_id, Number(row.citation_count || 0));
-  }
+  const rows = await all(`
+    SELECT doc_id, COUNT(*) AS citation_count
+    FROM document_citations
+    WHERE doc_id IN (SELECT value FROM json_each(?))
+    GROUP BY doc_id
+  `, [JSON.stringify(ids)]);
+  for (const row of rows) countsByDocId.set(row.doc_id, Number(row.citation_count || 0));
 
   for (const doc of list) {
     if (doc?.id) doc.citationCount = countsByDocId.get(doc.id) || 0;
@@ -5437,6 +5435,13 @@ export async function loadDocumentCitations(docId) {
     WHERE dc.doc_id = ?
     ORDER BY c.id
   `, [docId]);
+}
+
+// COUNT(*) equals loadDocumentCitations(docId).length (the links are unique per
+// (doc, citation)) without reading every citation_text.
+export async function countDocumentCitations(docId) {
+  const row = await get('SELECT COUNT(*) AS total FROM document_citations WHERE doc_id = ?', [docId]);
+  return Number(row?.total || 0);
 }
 
 export async function loadDocumentCitationsWithSharing(docId) {

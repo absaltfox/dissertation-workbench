@@ -11,7 +11,7 @@ import {
 } from './config.js';
 import {
   loadStoredFileMetric, saveFileMetric, saveDocumentMetadata, saveCommitteeMembers,
-  loadCommitteeMembers, reextractDocumentCitations, loadDocumentCitations, deleteCommitteeMembersByRoles
+  loadCommitteeMembers, reextractDocumentCitations, countDocumentCitations, deleteCommitteeMembersByRoles
 } from './db.js';
 import { logger } from './logger.js';
 import { dedupeSupervisorNames } from './supervisors.js';
@@ -2341,7 +2341,7 @@ export async function extractAndSaveParsedData(doc, fullText, pdfPath, {
         counts: { citations: citations.length },
       });
       await reextractDocumentCitations(doc.id, citations, normalizeCitation, { onProgress });
-      doc.citationCount = (await loadDocumentCitations(doc.id)).length;
+      doc.citationCount = await countDocumentCitations(doc.id);
     } catch (err) {
       logger.warn('Failed to extract citations from PDF', { docId: doc.id, error: err.message });
       if (strictCitationErrors) throw err;
@@ -2358,7 +2358,7 @@ export async function extractAndSaveParsedData(doc, fullText, pdfPath, {
 async function loadStoredParsedData(doc) {
   try {
     doc.committee = await loadCommitteeMembers(doc.id);
-    doc.citationCount = (await loadDocumentCitations(doc.id)).length;
+    doc.citationCount = await countDocumentCitations(doc.id);
     if ((!doc.supervisors || !doc.supervisors.length) && doc.committee.length) {
       const storedSupervisors = supervisorsFromCommittee(doc.committee);
       if (storedSupervisors.length) {
