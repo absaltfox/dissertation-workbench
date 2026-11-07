@@ -6068,56 +6068,62 @@ export async function countPendingLookups(options = {}) {
   return Number(row?.total || 0);
 }
 
-// #25: dc1/dc2's self-join has no bound on its own — both arms already use
-// covering indexes (dc1: idx_document_citations_citation_doc; dc2: the
-// implicit index behind PRIMARY KEY(doc_id, citation_id)), verified by
-// EXPLAIN QUERY PLAN, so this was never an indexing gap. The bottleneck is
-// the *cardinality* the join is asked to process: with no document-set bound
-// it processes every document that contains any of the top-50 citations
-// corpus-wide, which grows with total corpus size regardless of how bounded
-// the caller's own document sample already is. `docIds`, when supplied,
-// scopes both top_citations and the self-join to that bounded set via a
-// single JSON-array parameter (`WHERE doc_id IN (SELECT value FROM
-// json_each(?))`) rather than a giant literal IN list, which risks
-// exceeding libsql's parameter-count ceiling above a few hundred ids. Do not
-// add a new index here — the existing ones already cover this query; the fix
-// is bounding the input, not the lookup path.
+// Co-occurrence of the 50 most-cited citations inside a document set.
+//
+// `docIds` is the caller's bound, passed as a single JSON-array parameter
+// (`doc_id IN (SELECT value FROM json_each(?))`) rather than a giant literal IN
+// list, which risks exceeding libsql's parameter-count ceiling. null means the
+// whole corpus; an empty array means "no documents match" and yields no edges
+// without querying.
+//
+// The query reads the bound's links once (`scoped`), picks the top 50 from
+// them, and self-joins only those citations' links. The earlier shape joined
+// document_citations to itself first and fetched citations rows before the
+// top-50 filter, which cost 50 x |bound| index probes plus every co-cited pair
+// of every document holding a top citation. Both ORDER BYs carry id tie-breaks
+// so the top-50 cut-off and the LIMIT are deterministic.
 export async function getCitationCooccurrence(limit = 100, docIds = null) {
-  const hasBound = Array.isArray(docIds) && docIds.length > 0;
-  const boundJson = hasBound ? JSON.stringify(docIds) : null;
-  const topCitationsFilter = hasBound ? 'WHERE doc_id IN (SELECT value FROM json_each(?))' : '';
-  const selfJoinFilter = hasBound ? 'AND dc1.doc_id IN (SELECT value FROM json_each(?))' : '';
+  if (Array.isArray(docIds) && docIds.length === 0) return [];
+  const bounded = Array.isArray(docIds);
   const args = [];
-  if (hasBound) args.push(boundJson);
-  if (hasBound) args.push(boundJson);
+  if (bounded) args.push(JSON.stringify(docIds));
   args.push(limit);
 
   return all(`
-    WITH top_citations AS (
-      SELECT citation_id, COUNT(DISTINCT doc_id) AS cnt
-      FROM document_citations
-      ${topCitationsFilter}
+    WITH scoped AS MATERIALIZED (
+      SELECT dc.doc_id, dc.citation_id
+      FROM document_citations dc
+      ${bounded ? 'WHERE dc.doc_id IN (SELECT value FROM json_each(?))' : ''}
+    ),
+    top_citations AS MATERIALIZED (
+      SELECT citation_id, COUNT(*) AS cnt
+      FROM scoped
       GROUP BY citation_id
       HAVING cnt >= 2
-      ORDER BY cnt DESC
+      ORDER BY cnt DESC, citation_id ASC
       LIMIT 50
+    ),
+    top_links AS MATERIALIZED (
+      SELECT s.doc_id, s.citation_id, t.cnt
+      FROM scoped s
+      JOIN top_citations t ON t.citation_id = s.citation_id
+    ),
+    pairs AS MATERIALIZED (
+      SELECT a.citation_id AS id1, a.cnt AS freq1, b.citation_id AS id2, b.cnt AS freq2,
+             COUNT(*) AS shared
+      FROM top_links a
+      JOIN top_links b ON b.doc_id = a.doc_id AND a.citation_id < b.citation_id
+      GROUP BY a.citation_id, b.citation_id
+      HAVING shared >= 2
+      ORDER BY shared DESC, id1 ASC, id2 ASC
+      LIMIT ?
     )
-    SELECT
-      c1.id AS id1, substr(c1.citation_text, 1, 80) AS text1, tc1.cnt AS freq1,
-      c2.id AS id2, substr(c2.citation_text, 1, 80) AS text2, tc2.cnt AS freq2,
-      COUNT(DISTINCT dc1.doc_id) AS shared
-    FROM document_citations dc1
-    JOIN document_citations dc2
-      ON dc1.doc_id = dc2.doc_id AND dc1.citation_id < dc2.citation_id
-    JOIN citations c1 ON c1.id = dc1.citation_id
-    JOIN citations c2 ON c2.id = dc2.citation_id
-    JOIN top_citations tc1 ON tc1.citation_id = c1.id
-    JOIN top_citations tc2 ON tc2.citation_id = c2.id
-    WHERE 1 = 1 ${selfJoinFilter}
-    GROUP BY dc1.citation_id, dc2.citation_id
-    HAVING shared >= 2
-    ORDER BY shared DESC
-    LIMIT ?
+    SELECT p.id1, substr(c1.citation_text, 1, 80) AS text1, p.freq1,
+           p.id2, substr(c2.citation_text, 1, 80) AS text2, p.freq2, p.shared
+    FROM pairs p
+    JOIN citations c1 ON c1.id = p.id1
+    JOIN citations c2 ON c2.id = p.id2
+    ORDER BY p.shared DESC, p.id1 ASC, p.id2 ASC
   `, args);
 }
 
