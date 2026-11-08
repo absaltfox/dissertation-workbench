@@ -1349,13 +1349,20 @@ async function backfillCitationCountSummaries(client) {
   let state = await readCitationCountBackfillState(client);
   let chunks = 0;
   if (state.phase === 'citations') {
+    // Each bound is its own single MIN/MAX so SQLite answers it with one index
+    // seek; MIN and MAX in one SELECT scan the whole index (295k rows on prod).
+    // Prod ids start at 313,657, so starting below the lowest id would spend ~16
+    // empty chunks (one round trip each) before the first link.
     const bounds = await client.execute(`
-      SELECT MAX(hi) AS hi FROM (
-        SELECT MAX(citation_id) AS hi FROM document_citations
-        UNION ALL SELECT MAX(citation_id) FROM citation_doc_counts
-      )`);
-    const maxId = Number(bounds.rows[0]?.hi || 0);
-    let cursor = state.cursor == null ? -1 : Number(state.cursor);
+      SELECT (SELECT MIN(citation_id) FROM document_citations) AS dlo,
+             (SELECT MAX(citation_id) FROM document_citations) AS dhi,
+             (SELECT MIN(citation_id) FROM citation_doc_counts) AS clo,
+             (SELECT MAX(citation_id) FROM citation_doc_counts) AS chi`);
+    const b = bounds.rows[0] || {};
+    const lows = [b.dlo, b.clo].filter((v) => v != null).map(Number);
+    const maxId = Math.max(0, ...[b.dhi, b.chi].filter((v) => v != null).map(Number));
+    const startCursor = lows.length ? Math.min(...lows) - 1 : -1;
+    let cursor = state.cursor == null ? startCursor : Number(state.cursor);
     while (cursor < maxId) {
       const hi = Math.min(maxId, cursor + idSpan);
       const next = hi >= maxId ? { phase: 'documents', cursor: null } : { phase: 'citations', cursor: hi };

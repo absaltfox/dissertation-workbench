@@ -49,7 +49,8 @@ async function seedPreReleaseDatabase() {
   `);
   for (let d = 0; d < 12; d += 1) {
     const cites = [`Shared work (2001). Common ${d % 3}.`, `Everyone cites this (1999).`];
-    for (let k = 0; k < 4; k += 1) cites.push(`Doc ${d} own citation ${k} (20${10 + k}).`);
+    // Distinct leading text per citation so fuzzy matching never merges them.
+    for (let k = 0; k < 4; k += 1) cites.push(`${hash(`own-${d}-${k}`).slice(0, 10)} Doc ${d} own citation ${k} (20${10 + k}).`);
     await db.saveCitations(`bf-${String(d).padStart(2, '0')}`, cites, hash);
   }
 }
@@ -119,6 +120,26 @@ test('the backfill never aggregates the whole link table inside one write transa
   assert.equal(await db.initCitationCountsReadiness(client), true);
 });
 
+test('the citation phase starts at the lowest linked citation id, not at zero', async () => {
+  await seedPreReleaseDatabase();
+  // Push every id far above the chunk span, as on prod (ids start at 313,657).
+  await client.execute("UPDATE sqlite_sequence SET seq = seq + 1000 WHERE name = 'citations'");
+  await db.saveCitations('bf-high', ['High id one (2001).', 'High id two (2002).'], hash);
+  await client.execute("DELETE FROM document_citations WHERE doc_id <> 'bf-high'");
+  const [[minId]] = await rows('SELECT MIN(citation_id) FROM document_citations');
+  await client.execute("DELETE FROM serving_projection_state WHERE projection_key = 'citation_count_backfill'");
+  await client.execute(`INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+    VALUES ('citation_count_backfill', '{"phase":"citations","cursor":null}', 'x')`);
+  const rec = recordingClient(client);
+  await db.ensureSchemaWithRetry(rec.proxy);
+  await expectInSync('after high-id backfill');
+  const lowerBounds = rec.batches.flatMap((sqls, i) => sqls
+    .map((sql, j) => (/INTO citation_doc_counts[\s\S]*SELECT/.test(sql) ? Number(rec.argLog[i][j][0]) : null))
+    .filter((v) => v != null));
+  assert.ok(lowerBounds.length > 0);
+  assert.ok(Math.min(...lowerBounds) >= minId - 1, `first chunk lower bound ${Math.min(...lowerBounds)} vs min id ${minId}`);
+});
+
 test('a backfill chunk that times out does not fail the boot, leaves readers on live SQL, and resumes', async () => {
   await seedPreReleaseDatabase();
   const failing = recordingClient(client, { failOnBackfillBatch: 3 });
@@ -134,9 +155,13 @@ test('a backfill chunk that times out does not fail the boot, leaves readers on 
   await db.ensureSchemaWithRetry(resumed.proxy);
   assert.equal(await db.initCitationCountsReadiness(client), true);
   await expectInSync('after resumed backfill');
-  // No resumed chunk starts from the beginning (citation lower bound -1).
-  const restartedFromScratch = resumed.batches.some((sqls, i) => sqls.some((sql, j) => (
-    /INTO citation_doc_counts[\s\S]*SELECT/.test(sql) && Number(resumed.argLog[i][j][0]) === -1)));
+  // No resumed chunk repeats the first chunk of the interrupted run.
+  const citationLowerBounds = (rec) => rec.batches.flatMap((sqls, i) => sqls
+    .map((sql, j) => (/INTO citation_doc_counts[\s\S]*SELECT/.test(sql) ? Number(rec.argLog[i][j][0]) : null))
+    .filter((v) => v != null));
+  const [firstStart] = citationLowerBounds(failing);
+  assert.ok(Number.isFinite(firstStart));
+  const restartedFromScratch = citationLowerBounds(resumed).includes(firstStart);
   assert.equal(restartedFromScratch, false, 'resume continues from the stored cursor');
   assert.ok(resumed.backfillCount() > 0);
   const firstSql = resumed.batches.flat().join('\n');
