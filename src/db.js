@@ -2038,7 +2038,13 @@ export async function queryCachedDocumentPage({
   syncKey = null, filters = {}, q = '', sortKey = '', sortDir = 'asc', limit = 50, offset = 0,
 } = {}) {
   const queryFilters = documentServingFilters({ syncKey, ...filters, q });
-  const countRow = await get(`SELECT COUNT(*) AS total FROM documents d ${queryFilters.where}`, queryFilters.args);
+  // doc_id is a NOT NULL primary key, so COUNT(d.doc_id) equals COUNT(*), but an
+  // unfiltered COUNT(*) is free to pick the widest index (sync_key, 1,358 pages
+  // on prod) where COUNT(d.doc_id) reads the 67-page primary-key index.
+  const countRow = await get(
+    `SELECT ${queryFilters.where ? 'COUNT(*)' : 'COUNT(d.doc_id)'} AS total FROM documents d ${queryFilters.where}`,
+    queryFilters.args,
+  );
   const sortExpression = DOCUMENT_PAGE_SORTS[sortKey] || 'COALESCE(d.year, 0)';
   const direction = sortKey ? (sortDir === 'asc' ? 'ASC' : 'DESC') : 'DESC';
   // The whole-table citation aggregation below is only needed when the page is
@@ -2047,17 +2053,28 @@ export async function queryCachedDocumentPage({
   // case) skips it entirely and gets counts afterward, bounded to just this
   // page's doc_ids, via applyCitationCountsToDocuments.
   const needsCitationSortJoin = sortKey === 'citationCount';
+  // Ids first: the sort keys come from covered columns, so the sorter never
+  // carries each filtered row's metadata_json (about 3.6 KB, on its own page).
+  // doc_id is unique, so the key order is total and the outer ORDER BY repeats it
+  // exactly.
   const rows = await all(`
+    WITH page AS (
+      SELECT d.doc_id AS doc_id, ${sortExpression} AS k1, lower(COALESCE(d.title, '')) AS k2
+      FROM documents d
+      ${/\bfm\./.test(sortExpression) ? 'LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id' : ''}
+      ${needsCitationSortJoin ? `LEFT JOIN ${citationCountJoinSource()} dc ON dc.doc_id = d.doc_id` : ''}
+      ${queryFilters.where}
+      ORDER BY k1 ${direction}, k2 ASC, d.doc_id ASC
+      LIMIT ? OFFSET ?
+    )
     SELECT d.doc_id, d.metadata_json,
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
            fm.word_count_comparison_json
-    FROM documents d
+    FROM page p
+    JOIN documents d ON d.doc_id = p.doc_id
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
-    ${needsCitationSortJoin ? `LEFT JOIN ${citationCountJoinSource()} dc ON dc.doc_id = d.doc_id` : ''}
-    ${queryFilters.where}
-    ORDER BY ${sortExpression} ${direction}, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
-    LIMIT ? OFFSET ?
+    ORDER BY p.k1 ${direction}, p.k2 ASC, p.doc_id ASC
   `, [...queryFilters.args, Math.max(1, Number(limit) || 50), Math.max(0, Number(offset) || 0)]);
   const documents = rows.map((row) => {
     try {
@@ -2082,18 +2099,25 @@ export async function queryTopicDocumentPage({
     ${topicJoin}
     ${queryFilters.where}
   `, queryFilters.args);
+  // Ids first, as in queryCachedDocumentPage: only the page's rows read metadata_json.
   const rows = await all(`
+    WITH page AS (
+      SELECT d.doc_id AS doc_id, COALESCE(d.year, 0) AS k1, lower(COALESCE(d.title, '')) AS k2
+      FROM documents d
+      ${topicJoin}
+      ${queryFilters.where}
+      ORDER BY k1 DESC, k2 ASC, d.doc_id ASC
+      LIMIT ? OFFSET ?
+    )
     SELECT d.doc_id, d.metadata_json,
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
            fm.word_count_comparison_json,
            (SELECT COUNT(*) FROM document_citations x WHERE x.doc_id = d.doc_id) AS citation_count
-    FROM documents d
-    ${topicJoin}
+    FROM page p
+    JOIN documents d ON d.doc_id = p.doc_id
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
-    ${queryFilters.where}
-    ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
-    LIMIT ? OFFSET ?
+    ORDER BY p.k1 DESC, p.k2 ASC, p.doc_id ASC
   `, [...queryFilters.args, Math.max(1, Number(limit) || 5000), Math.max(0, Number(offset) || 0)]);
   const documents = rows.map((row) => {
     try {
