@@ -2559,7 +2559,7 @@ async function computeConceptTimelineSql(filters, qualifier, topN = 8) {
     ? await all(`
         SELECT term.term AS concept, COUNT(DISTINCT d.doc_id) AS total_docs
         FROM documents d
-        JOIN document_terms term ON term.doc_id = d.doc_id AND term.kind = 'concept'
+        CROSS JOIN document_terms term ON term.doc_id = d.doc_id AND term.kind = 'concept'
         ${filters.where}
         ${qualifier} term.term NOT IN (SELECT value FROM json_each(?))
         GROUP BY concept
@@ -2615,7 +2615,7 @@ async function computeMethodologyConceptMatrixSql(filters, qualifier, topM = 10,
     ? await all(`
         SELECT m.term AS methodology, COUNT(*) AS count
         FROM documents d
-        JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
+        CROSS JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
         ${filters.where}
         GROUP BY methodology
         ORDER BY count DESC, methodology ASC
@@ -2739,7 +2739,7 @@ async function computeMethodologyTopicMatrixSql(filters, qualifier, topics) {
     ? await all(`
         SELECT m.term AS methodology, COUNT(*) AS count
         FROM documents d
-        JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
+        CROSS JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
         ${filters.where}
         GROUP BY methodology
         ORDER BY count DESC, methodology ASC
@@ -2896,11 +2896,16 @@ const LEGACY_CONCEPT_FIRST10_DISTINCT_SQL = `
 // renaming to `methodology` where needed via the SELECT alias below.
 function termAggregateSql(kind, filters, qualifier, limitSql) {
   if (isDocumentTermsReady()) {
+    // CROSS JOIN pins documents (through its covering index) as the outer loop.
+    // These joins have no selective term predicate, and left to itself the planner
+    // drives from document_terms and probes documents once per term row. The same
+    // applies to the unfiltered rankings in the timeline and matrix builders; their
+    // short `term IN (json_each(?))` lookups stay term-first on purpose.
     return {
       sql: `
         SELECT dt.term AS term, COUNT(DISTINCT d.doc_id) AS count
         FROM documents d
-        JOIN document_terms dt ON dt.doc_id = d.doc_id AND dt.kind = ?
+        CROSS JOIN document_terms dt ON dt.doc_id = d.doc_id AND dt.kind = ?
         ${filters.where}
         GROUP BY dt.term
         ORDER BY count DESC, term ASC

@@ -188,3 +188,41 @@ test('the affiliation facet and summary are identical from the projection and fr
     if (syncKey !== 'no-such-scope') assert.ok(legacy.facets.affiliation.length >= 5, 'facet has the fixture affiliations');
   }
 });
+
+// --- Unselective term aggregates (R5) ---
+
+async function withDocumentTermsReady(value, fn) {
+  const before = db.isDocumentTermsReady();
+  db.__setDocumentTermsReadyForTesting(value);
+  try { return await fn(); } finally { db.__setDocumentTermsReadyForTesting(before); }
+}
+
+test('unselective term aggregates drive from documents (CROSS JOIN); short IN-list term filters keep the planner free', async () => {
+  const capture = captureStatements(client);
+  try {
+    await withDocumentTermsReady(true, () => db.getDocumentServingAnalytics({ filters: { degree: 'Master of Arts - MA' } }));
+  } finally { capture.restore(); }
+  const statements = capture.seen.filter((sql) => /document_terms/.test(sql) && /FROM documents d/.test(sql));
+  const crossJoined = statements.filter((sql) => /CROSS JOIN document_terms/.test(sql));
+  // Three frequency aggregates, the timeline's top concepts, and the methodology
+  // rankings of the two matrix builders. The matrix builder's windowed concept
+  // subquery is deliberately left alone: its plan already probes documents by
+  // doc_id through the covering index, and a CROSS JOIN only adds an automatic index.
+  assert.equal(crossJoined.length, 6, crossJoined.map((sql) => sql.replace(/\s+/g, ' ').slice(0, 120)).join('\n'));
+  for (const sql of statements.filter((s) => /IN \(SELECT value FROM json_each\(\?\)\)/.test(s) && /term\.term IN|m\.term IN/.test(s))) {
+    assert.doesNotMatch(sql, /CROSS JOIN/, 'a selective IN list must stay term-first');
+  }
+});
+
+test('analytics panels are identical from the document_terms projection and from json_each', async () => {
+  for (const { name, filters } of FILTER_CASES) {
+    const legacy = plain(await withDocumentTermsReady(false, () => db.getDocumentServingAnalytics({ filters })));
+    const projected = plain(await withDocumentTermsReady(true, () => db.getDocumentServingAnalytics({ filters })));
+    assert.deepEqual(projected, legacy, name);
+    if (name === 'none') {
+      assert.ok(projected.ngramCloud.length > 3 && projected.conceptTimeline.length > 3
+        && projected.methodologyConceptMatrix.matrix.length > 0 && projected.methodologyTopicMatrix.matrix.length > 0,
+      'every panel is exercised by the fixture');
+    }
+  }
+});
