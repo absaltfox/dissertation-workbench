@@ -58,7 +58,7 @@ export async function getDb() {
     // idempotent, so retry the complete startup pass on SQLITE_BUSY instead of
     // letting a transient schema-read lock prevent a singleton claimant from
     // reaching its durable lease.
-    schemaReady = ensureSchemaWithRetry(db);
+    schemaReady = ensureSchemaWithRetry(db).then(() => initCitationCountsReadiness(db));
   }
   await schemaReady;
   return db;
@@ -69,6 +69,7 @@ export async function closeDb() {
     await db.close();
     db = undefined;
     schemaReady = undefined;
+    citationCountsReady = false;
   }
 }
 
@@ -893,6 +894,7 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_kind_termlower ON document_terms(kind, lower(term))');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_doc ON document_terms(doc_id, kind)');
 
+  await ensureCitationCountSummaries(client);
   await backfillCitationMatchKeys(client);
   await backfillDocumentAccessStatus(client);
 
@@ -1240,6 +1242,274 @@ function metadataTermsStatements(doc, _now = new Date().toISOString()) {
     }
   }
   return statements;
+}
+
+// --- Citation count summaries ---
+//
+// citation_doc_counts (citation -> number of linking documents) and
+// document_citation_counts (document -> number of citations) replace the
+// full-table "GROUP BY" aggregates over document_citations that the Citations
+// tab, Foundational Works and the co-occurrence panel used to run. They are kept
+// correct by triggers, not by application code, because document_citations has
+// several writers (saveCitations, replaceDocumentCitationLinks, the embargo
+// cleanup, clearAllCitations, the maintenance scripts, and an older app version
+// still running during a deploy). SQLite semantics match those writers: an
+// upsert that takes the DO UPDATE branch fires no INSERT trigger, so a re-link
+// does not double count, and an INSERT OR IGNORE that ignores a row fires
+// nothing. A plain INSERT OR REPLACE on document_citations would bypass the
+// delete trigger (recursive_triggers is off); nothing does that, and
+// reconcileCitationCounts() detects it if something ever does.
+const CITATION_COUNT_TRIGGER_INSERT = 'trg_document_citations_count_ins';
+const CITATION_COUNT_TRIGGER_DELETE = 'trg_document_citations_count_del';
+
+const CITATION_COUNT_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS citation_doc_counts (
+     citation_id INTEGER PRIMARY KEY,
+     doc_count INTEGER NOT NULL
+   )`,
+  // About 2% of citations are shared by two or more documents; the partial index
+  // lets Foundational Works and the co-occurrence panel read only those.
+  `CREATE INDEX IF NOT EXISTS idx_citation_doc_counts_shared
+     ON citation_doc_counts(doc_count DESC, citation_id) WHERE doc_count >= 2`,
+  `CREATE TABLE IF NOT EXISTS document_citation_counts (
+     doc_id TEXT PRIMARY KEY,
+     citation_count INTEGER NOT NULL
+   )`,
+  `DROP TRIGGER IF EXISTS ${CITATION_COUNT_TRIGGER_INSERT}`,
+  `DROP TRIGGER IF EXISTS ${CITATION_COUNT_TRIGGER_DELETE}`,
+  `CREATE TRIGGER ${CITATION_COUNT_TRIGGER_INSERT} AFTER INSERT ON document_citations BEGIN
+     INSERT INTO citation_doc_counts (citation_id, doc_count) VALUES (NEW.citation_id, 1)
+       ON CONFLICT(citation_id) DO UPDATE SET doc_count = doc_count + 1;
+     INSERT INTO document_citation_counts (doc_id, citation_count) VALUES (NEW.doc_id, 1)
+       ON CONFLICT(doc_id) DO UPDATE SET citation_count = citation_count + 1;
+   END`,
+  // Rows that reach zero are removed so the tables never accumulate dead rows.
+  `CREATE TRIGGER ${CITATION_COUNT_TRIGGER_DELETE} AFTER DELETE ON document_citations BEGIN
+     UPDATE citation_doc_counts SET doc_count = doc_count - 1 WHERE citation_id = OLD.citation_id;
+     DELETE FROM citation_doc_counts WHERE citation_id = OLD.citation_id AND doc_count <= 0;
+     UPDATE document_citation_counts SET citation_count = citation_count - 1 WHERE doc_id = OLD.doc_id;
+     DELETE FROM document_citation_counts WHERE doc_id = OLD.doc_id AND citation_count <= 0;
+   END`,
+];
+
+const CITATION_COUNT_OBJECTS_SQL = `
+  SELECT COUNT(*) AS n FROM sqlite_master
+  WHERE (type = 'trigger' AND name IN ('${CITATION_COUNT_TRIGGER_INSERT}', '${CITATION_COUNT_TRIGGER_DELETE}'))
+     OR (type = 'table' AND name IN ('citation_doc_counts', 'document_citation_counts'))`;
+
+const CITATION_COUNT_BACKFILL_KEY = 'citation_count_backfill';
+
+// Bounds on the links one backfill transaction reads: a span of citation ids
+// (autoincrement; each id has a handful of links at most, about 1 on average on
+// prod) and a number of distinct documents (prod averages ~97 links per citing
+// document, max 3,152). Env overrides exist only so tests can force several
+// chunks on a tiny corpus.
+function citationCountBackfillLimits() {
+  return {
+    idSpan: Math.max(1, Number(process.env.CITATION_COUNT_BACKFILL_ID_SPAN) || 20000),
+    docChunk: Math.max(1, Number(process.env.CITATION_COUNT_BACKFILL_DOC_CHUNK) || 150),
+  };
+}
+
+async function readCitationCountBackfillState(client) {
+  const result = await client.execute({
+    sql: 'SELECT projection_value FROM serving_projection_state WHERE projection_key = ?',
+    args: [CITATION_COUNT_BACKFILL_KEY],
+  });
+  const raw = result.rows[0]?.projection_value;
+  if (raw === 'complete') return { phase: 'complete' };
+  try {
+    const parsed = JSON.parse(raw || 'null');
+    if (parsed && (parsed.phase === 'citations' || parsed.phase === 'documents')) return parsed;
+  } catch { /* fall through */ }
+  return { phase: 'citations', cursor: null };
+}
+
+function citationCountBackfillStateStatement(state, now = new Date().toISOString()) {
+  return {
+    sql: `INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(projection_key) DO UPDATE SET
+            projection_value = excluded.projection_value, updated_at = excluded.updated_at`,
+    args: [CITATION_COUNT_BACKFILL_KEY, state.phase === 'complete' ? 'complete' : JSON.stringify(state), now],
+  };
+}
+
+// Recounts both summary tables from document_citations in bounded key ranges.
+// On remote libSQL a write transaction running longer than about 5 s is aborted
+// (TRANSACTION_TIMEOUT) once another connection waits for the write lock, and a
+// cold whole-table GROUP BY alone took 6.2 s on prod, so no chunk aggregates more
+// than one range. The triggers exist before the first chunk, and each chunk
+// overwrites its range with an exact recount inside its own transaction, so a
+// write landing between chunks (on either side of the cursor) is never lost or
+// double counted. Progress is stored with each chunk, so an interrupted backfill
+// resumes where it stopped; the readers stay on the live SQL until 'complete'.
+async function backfillCitationCountSummaries(client) {
+  const { idSpan, docChunk } = citationCountBackfillLimits();
+  let state = await readCitationCountBackfillState(client);
+  let chunks = 0;
+  if (state.phase === 'citations') {
+    // Each bound is its own single MIN/MAX so SQLite answers it with one index
+    // seek; MIN and MAX in one SELECT scan the whole index (295k rows on prod).
+    // Prod ids start at 313,657, so starting below the lowest id would spend ~16
+    // empty chunks (one round trip each) before the first link.
+    const bounds = await client.execute(`
+      SELECT (SELECT MIN(citation_id) FROM document_citations) AS dlo,
+             (SELECT MAX(citation_id) FROM document_citations) AS dhi,
+             (SELECT MIN(citation_id) FROM citation_doc_counts) AS clo,
+             (SELECT MAX(citation_id) FROM citation_doc_counts) AS chi`);
+    const b = bounds.rows[0] || {};
+    const lows = [b.dlo, b.clo].filter((v) => v != null).map(Number);
+    const maxId = Math.max(0, ...[b.dhi, b.chi].filter((v) => v != null).map(Number));
+    const startCursor = lows.length ? Math.min(...lows) - 1 : -1;
+    let cursor = state.cursor == null ? startCursor : Number(state.cursor);
+    while (cursor < maxId) {
+      const hi = Math.min(maxId, cursor + idSpan);
+      const next = hi >= maxId ? { phase: 'documents', cursor: null } : { phase: 'citations', cursor: hi };
+      await client.batch([
+        {
+          sql: `DELETE FROM citation_doc_counts WHERE citation_id > ? AND citation_id <= ?
+                AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.citation_id = citation_doc_counts.citation_id)`,
+          args: [cursor, hi],
+        },
+        {
+          sql: `INSERT INTO citation_doc_counts (citation_id, doc_count)
+                SELECT citation_id, COUNT(*) FROM document_citations
+                WHERE citation_id > ? AND citation_id <= ? GROUP BY citation_id
+                ON CONFLICT(citation_id) DO UPDATE SET doc_count = excluded.doc_count`,
+          args: [cursor, hi],
+        },
+        citationCountBackfillStateStatement(next),
+      ], 'write');
+      chunks += 1;
+      cursor = hi;
+    }
+    state = { phase: 'documents', cursor: null };
+    // A resumed cursor already past the last id: record the phase change alone.
+    if (chunks === 0) await client.execute(citationCountBackfillStateStatement(state));
+  }
+  if (state.phase === 'documents') {
+    let cursor = state.cursor == null ? '' : String(state.cursor);
+    for (;;) {
+      const boundary = await client.execute({
+        sql: `SELECT MAX(doc_id) AS hi FROM (
+                SELECT DISTINCT doc_id FROM document_citations WHERE doc_id > ? ORDER BY doc_id LIMIT ?
+              )`,
+        args: [cursor, docChunk],
+      });
+      const hi = boundary.rows[0]?.hi == null ? null : String(boundary.rows[0].hi);
+      if (hi == null) {
+        // Past the last linked document: drop summary rows left above the cursor
+        // that no longer have links. The NOT EXISTS matters: a writer can link a
+        // new document after the boundary read, and its trigger-made row is exact.
+        await client.batch([
+          {
+            sql: `DELETE FROM document_citation_counts WHERE doc_id > ?
+                  AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = document_citation_counts.doc_id)`,
+            args: [cursor],
+          },
+          citationCountBackfillStateStatement({ phase: 'complete' }),
+        ], 'write');
+        chunks += 1;
+        break;
+      }
+      await client.batch([
+        {
+          sql: `DELETE FROM document_citation_counts WHERE doc_id > ? AND doc_id <= ?
+                AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = document_citation_counts.doc_id)`,
+          args: [cursor, hi],
+        },
+        {
+          sql: `INSERT INTO document_citation_counts (doc_id, citation_count)
+                SELECT doc_id, COUNT(*) FROM document_citations
+                WHERE doc_id > ? AND doc_id <= ? GROUP BY doc_id
+                ON CONFLICT(doc_id) DO UPDATE SET citation_count = excluded.citation_count`,
+          args: [cursor, hi],
+        },
+        citationCountBackfillStateStatement({ phase: 'documents', cursor: hi }),
+      ], 'write');
+      chunks += 1;
+      cursor = hi;
+    }
+  }
+  return chunks;
+}
+
+// One sqlite_master read and one state read on every later boot. When an object
+// is missing, the tables, index and triggers are created in one small DDL
+// transaction that also resets the backfill, then the chunked backfill runs. A
+// failed chunk is logged and does not fail the boot: the summaries stay unused
+// (live SQL) and the next boot resumes from the stored cursor.
+async function ensureCitationCountSummaries(client) {
+  const present = await client.execute(CITATION_COUNT_OBJECTS_SQL);
+  if (Number(present.rows[0]?.n || 0) !== 4) {
+    await client.batch([
+      ...CITATION_COUNT_SCHEMA_STATEMENTS,
+      citationCountBackfillStateStatement({ phase: 'citations', cursor: null }),
+    ], 'write');
+  } else {
+    // The partial index is not part of the presence check; keep it present.
+    await client.execute(CITATION_COUNT_SCHEMA_STATEMENTS[1]);
+  }
+  const state = await readCitationCountBackfillState(client);
+  if (state.phase === 'complete') return false;
+  try {
+    const chunks = await backfillCitationCountSummaries(client);
+    logger.info('Backfilled citation count summaries', { chunks });
+    return true;
+  } catch (error) {
+    logger.warn('Citation count backfill interrupted; readers stay on live SQL until it resumes', {
+      error: error?.message || String(error), code: error?.code,
+    });
+    return false;
+  }
+}
+
+let citationCountsReady = false;
+export function isCitationCountsReady() { return citationCountsReady; }
+export function __setCitationCountsReadyForTesting(value) { citationCountsReady = Boolean(value); }
+
+// Ready means the summary tables and both triggers exist (so the tables track
+// every write) and the backfill has completed. Readers use them only then and
+// otherwise run the live SQL.
+export async function initCitationCountsReadiness(client = null) {
+  const target = client || await getDb();
+  const result = await target.execute(CITATION_COUNT_OBJECTS_SQL);
+  citationCountsReady = Number(result.rows[0]?.n || 0) === 4
+    && (await readCitationCountBackfillState(target)).phase === 'complete';
+  return citationCountsReady;
+}
+
+// Compares both summary tables with a fresh GROUP BY recount (about 590k rows
+// read on prod, so maintenance/admin use only). Counts mismatched, missing and
+// orphaned summary rows. repair: true re-runs the chunked backfill (each chunk is
+// an exact recount of its range, so the tables are exact when it completes).
+export async function reconcileCitationCounts({ repair = false } = {}) {
+  const client = await getDb();
+  const result = await client.execute(`
+    SELECT
+      (SELECT COUNT(*) FROM (
+         SELECT citation_id, COUNT(*) AS n FROM document_citations GROUP BY citation_id
+       ) t LEFT JOIN citation_doc_counts k USING (citation_id) WHERE k.doc_count IS NOT t.n)
+      + (SELECT COUNT(*) FROM citation_doc_counts k
+           WHERE NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.citation_id = k.citation_id)) AS citation_drift,
+      (SELECT COUNT(*) FROM (
+         SELECT doc_id, COUNT(*) AS n FROM document_citations GROUP BY doc_id
+       ) t LEFT JOIN document_citation_counts k USING (doc_id) WHERE k.citation_count IS NOT t.n)
+      + (SELECT COUNT(*) FROM document_citation_counts k
+           WHERE NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = k.doc_id)) AS doc_drift
+  `);
+  const drift = {
+    citationDrift: Number(result.rows[0]?.citation_drift || 0),
+    docDrift: Number(result.rows[0]?.doc_drift || 0),
+  };
+  if (!repair) return drift;
+  const drifted = drift.citationDrift + drift.docDrift > 0;
+  if (drifted) {
+    await client.execute(citationCountBackfillStateStatement({ phase: 'citations', cursor: null }));
+    await backfillCitationCountSummaries(client);
+  }
+  return { ...drift, repaired: drifted };
 }
 
 let documentTermsReady = false;
@@ -1741,6 +2011,15 @@ function analyticalDocumentFilters(options = {}) {
   };
 }
 
+// The derived per-document count used by the citationCount sorts, which must see
+// every filtered row's count before LIMIT. With the summary tables ready it is a
+// plain table; otherwise it aggregates every link.
+function citationCountJoinSource() {
+  return isCitationCountsReady()
+    ? 'document_citation_counts'
+    : '(SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id)';
+}
+
 const DOCUMENT_PAGE_SORTS = {
   title: 'lower(COALESCE(d.title, \'\'))',
   author: 'lower(COALESCE(d.author, \'\'))',
@@ -1775,11 +2054,7 @@ export async function queryCachedDocumentPage({
            fm.word_count_comparison_json
     FROM documents d
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
-    ${needsCitationSortJoin ? `LEFT JOIN (
-      SELECT doc_id, COUNT(*) AS citation_count
-      FROM document_citations
-      GROUP BY doc_id
-    ) dc ON dc.doc_id = d.doc_id` : ''}
+    ${needsCitationSortJoin ? `LEFT JOIN ${citationCountJoinSource()} dc ON dc.doc_id = d.doc_id` : ''}
     ${queryFilters.where}
     ORDER BY ${sortExpression} ${direction}, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
     LIMIT ? OFFSET ?
@@ -1812,15 +2087,10 @@ export async function queryTopicDocumentPage({
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
            fm.word_count_comparison_json,
-           COALESCE(dc.citation_count, 0) AS citation_count
+           (SELECT COUNT(*) FROM document_citations x WHERE x.doc_id = d.doc_id) AS citation_count
     FROM documents d
     ${topicJoin}
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
-    LEFT JOIN (
-      SELECT doc_id, COUNT(*) AS citation_count
-      FROM document_citations
-      GROUP BY doc_id
-    ) dc ON dc.doc_id = d.doc_id
     ${queryFilters.where}
     ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
     LIMIT ? OFFSET ?
@@ -1963,19 +2233,26 @@ export async function queryCitationDocumentPage({
   const queryFilters = analyticalDocumentFilters({ syncKey, ...filters, q });
   const counts = await get(`
     SELECT COUNT(*) AS total,
-           SUM(CASE WHEN COALESCE(dc.citation_count, 0) > 0 THEN 1 ELSE 0 END) AS with_citations
+           SUM(EXISTS (SELECT 1 FROM document_citations x WHERE x.doc_id = d.doc_id)) AS with_citations
     FROM documents d
-    LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
-      ON dc.doc_id = d.doc_id
     ${queryFilters.where}
   `, queryFilters.args);
   const sortExpression = DOCUMENT_PAGE_SORTS[sortKey] || DOCUMENT_PAGE_SORTS.citationCount;
   const direction = sortDir === 'asc' ? 'ASC' : 'DESC';
+  // Only the citationCount sort (the default) has to see every filtered row's
+  // count before LIMIT; every other sort labels just its page through a
+  // correlated count instead of aggregating all links.
+  const sortsOnCount = !DOCUMENT_PAGE_SORTS[sortKey] || sortKey === 'citationCount';
+  const countSource = sortsOnCount
+    ? 'COALESCE(dc.citation_count, 0)'
+    : '(SELECT COUNT(*) FROM document_citations x WHERE x.doc_id = d.doc_id)';
+  const countJoin = sortsOnCount
+    ? `LEFT JOIN ${citationCountJoinSource()} dc ON dc.doc_id = d.doc_id`
+    : '';
   const rows = await all(`
-    SELECT d.doc_id, d.title, d.author, d.year, COALESCE(dc.citation_count, 0) AS citation_count
+    SELECT d.doc_id, d.title, d.author, d.year, ${countSource} AS citation_count
     FROM documents d
-    LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
-      ON dc.doc_id = d.doc_id
+    ${countJoin}
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
     ${queryFilters.where}
     ORDER BY ${sortExpression} ${direction}, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
@@ -2728,13 +3005,11 @@ export async function queryPersonDetailPage({
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
            fm.word_count_comparison_json,
-           COALESCE(dc.citation_count, 0) AS citation_count,
+           (SELECT COUNT(*) FROM document_citations x WHERE x.doc_id = d.doc_id) AS citation_count,
            dt.topic_id, dt.probability
     FROM person_docs pd
     JOIN documents d ON d.doc_id = pd.doc_id
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
-    LEFT JOIN (SELECT doc_id, COUNT(*) AS citation_count FROM document_citations GROUP BY doc_id) dc
-      ON dc.doc_id = d.doc_id
     LEFT JOIN topic_assignment dt ON dt.doc_id = d.doc_id
     ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
     LIMIT ? OFFSET ?
@@ -2862,19 +3137,21 @@ export async function applyCitationCountsToDocuments(documents = []) {
   const ids = Array.from(new Set(list.map((doc) => doc?.id).filter(Boolean)));
   if (!ids.length) return list;
 
+  // One statement for any number of ids (one JSON parameter, not a 999-placeholder
+  // chunk loop): on remote Turso the corpus-wide /api/metrics caller used to cost
+  // up to 15 round trips here.
   const countsByDocId = new Map();
-  const chunkSize = 999;
-  for (let i = 0; i < ids.length; i += chunkSize) {
-    const chunk = ids.slice(i, i + chunkSize);
-    const placeholders = chunk.map(() => '?').join(', ');
-    const rows = await all(`
-      SELECT doc_id, COUNT(*) AS citation_count
-      FROM document_citations
-      WHERE doc_id IN (${placeholders})
-      GROUP BY doc_id
-    `, chunk);
-    for (const row of rows) countsByDocId.set(row.doc_id, Number(row.citation_count || 0));
-  }
+  const rows = await all(isCitationCountsReady() ? `
+    SELECT doc_id, citation_count
+    FROM document_citation_counts
+    WHERE doc_id IN (SELECT value FROM json_each(?))
+  ` : `
+    SELECT doc_id, COUNT(*) AS citation_count
+    FROM document_citations
+    WHERE doc_id IN (SELECT value FROM json_each(?))
+    GROUP BY doc_id
+  `, [JSON.stringify(ids)]);
+  for (const row of rows) countsByDocId.set(row.doc_id, Number(row.citation_count || 0));
 
   for (const doc of list) {
     if (doc?.id) doc.citationCount = countsByDocId.get(doc.id) || 0;
@@ -5438,6 +5715,13 @@ export async function loadDocumentCitations(docId) {
   `, [docId]);
 }
 
+// COUNT(*) equals loadDocumentCitations(docId).length (the links are unique per
+// (doc, citation)) without reading every citation_text.
+export async function countDocumentCitations(docId) {
+  const row = await get('SELECT COUNT(*) AS total FROM document_citations WHERE doc_id = ?', [docId]);
+  return Number(row?.total || 0);
+}
+
 export async function loadDocumentCitationsWithSharing(docId) {
   return all(`
     WITH doc_cites AS (
@@ -5919,6 +6203,30 @@ export async function getCitationForSummon(citationId) {
   `, [citationId]);
 }
 
+// The unscoped pending count scans every citation (about 1.6M rows read on prod)
+// and the admin page polls getCatalogueLookupStats() every 5 s while a job runs,
+// so it is memoized. The five table counts stay live (about 39k rows). The
+// memo holds the in-flight promise so concurrent polls share one query.
+const CATALOGUE_PENDING_TTL_MS = 2 * 60 * 1000;
+let cataloguePendingMemo = null;
+
+export function clearCatalogueLookupStatsCache() {
+  cataloguePendingMemo = null;
+}
+
+function memoizedPendingLookupCount() {
+  const now = Date.now();
+  if (cataloguePendingMemo && now - cataloguePendingMemo.at < CATALOGUE_PENDING_TTL_MS) {
+    return cataloguePendingMemo.promise;
+  }
+  const promise = countPendingLookups();
+  const memo = { at: now, promise };
+  cataloguePendingMemo = memo;
+  // A failed count must not be served for the rest of the TTL.
+  promise.catch(() => { if (cataloguePendingMemo === memo) cataloguePendingMemo = null; });
+  return promise;
+}
+
 export async function getCatalogueLookupStats() {
   const [row, pending] = await Promise.all([
     get(`
@@ -5933,7 +6241,7 @@ export async function getCatalogueLookupStats() {
     // dashboard number can never disagree with the pager/resolution-job's own count.
     // See #30 (M-09): the previous arithmetic here double-counted/under-counted once
     // citations and catalogue_lookups rows could be deleted independently of each other.
-    countPendingLookups(),
+    memoizedPendingLookupCount(),
   ]);
   return {
     total: Number(row?.total || 0),
@@ -6044,71 +6352,110 @@ export async function countPendingLookups(options = {}) {
   return Number(row?.total || 0);
 }
 
-// #25: dc1/dc2's self-join has no bound on its own — both arms already use
-// covering indexes (dc1: idx_document_citations_citation_doc; dc2: the
-// implicit index behind PRIMARY KEY(doc_id, citation_id)), verified by
-// EXPLAIN QUERY PLAN, so this was never an indexing gap. The bottleneck is
-// the *cardinality* the join is asked to process: with no document-set bound
-// it processes every document that contains any of the top-50 citations
-// corpus-wide, which grows with total corpus size regardless of how bounded
-// the caller's own document sample already is. `docIds`, when supplied,
-// scopes both top_citations and the self-join to that bounded set via a
-// single JSON-array parameter (`WHERE doc_id IN (SELECT value FROM
-// json_each(?))`) rather than a giant literal IN list, which risks
-// exceeding libsql's parameter-count ceiling above a few hundred ids. Do not
-// add a new index here — the existing ones already cover this query; the fix
-// is bounding the input, not the lookup path.
+// Co-occurrence of the 50 most-cited citations inside a document set.
+//
+// `docIds` is the caller's bound, passed as a single JSON-array parameter
+// (`doc_id IN (SELECT value FROM json_each(?))`) rather than a giant literal IN
+// list, which risks exceeding libsql's parameter-count ceiling. null means the
+// whole corpus; an empty array means "no documents match" and yields no edges
+// without querying.
+//
+// The query reads the bound's links once (`scoped`), picks the top 50 from
+// them, and self-joins only those citations' links. The earlier shape joined
+// document_citations to itself first and fetched citations rows before the
+// top-50 filter, which cost 50 x |bound| index probes plus every co-cited pair
+// of every document holding a top citation. Both ORDER BYs carry id tie-breaks
+// so the top-50 cut-off and the LIMIT are deterministic.
 export async function getCitationCooccurrence(limit = 100, docIds = null) {
-  const hasBound = Array.isArray(docIds) && docIds.length > 0;
-  const boundJson = hasBound ? JSON.stringify(docIds) : null;
-  const topCitationsFilter = hasBound ? 'WHERE doc_id IN (SELECT value FROM json_each(?))' : '';
-  const selfJoinFilter = hasBound ? 'AND dc1.doc_id IN (SELECT value FROM json_each(?))' : '';
+  if (Array.isArray(docIds) && docIds.length === 0) return [];
+  const bounded = Array.isArray(docIds);
   const args = [];
-  if (hasBound) args.push(boundJson);
-  if (hasBound) args.push(boundJson);
+  if (bounded) args.push(JSON.stringify(docIds));
   args.push(limit);
 
+  // A citation reaches cnt >= 2 inside any bound only if two or more documents
+  // cite it corpus-wide, so with the summary tables ready only the links of
+  // those citations are read, driven from the partial index. CROSS JOIN fixes
+  // the join order and the unary + stops doc_id IN (...) from becoming a probe
+  // driver. Same rows as the live form; reads about 40k rows whatever the bound.
+  const scopedSql = isCitationCountsReady()
+    ? `SELECT dc.doc_id, dc.citation_id
+      FROM citation_doc_counts cc
+      CROSS JOIN document_citations dc ON dc.citation_id = cc.citation_id
+      WHERE cc.doc_count >= 2
+      ${bounded ? 'AND +dc.doc_id IN (SELECT value FROM json_each(?))' : ''}`
+    : `SELECT dc.doc_id, dc.citation_id
+      FROM document_citations dc
+      ${bounded ? 'WHERE dc.doc_id IN (SELECT value FROM json_each(?))' : ''}`;
+
   return all(`
-    WITH top_citations AS (
-      SELECT citation_id, COUNT(DISTINCT doc_id) AS cnt
-      FROM document_citations
-      ${topCitationsFilter}
+    WITH scoped AS MATERIALIZED (
+      ${scopedSql}
+    ),
+    top_citations AS MATERIALIZED (
+      SELECT citation_id, COUNT(*) AS cnt
+      FROM scoped
       GROUP BY citation_id
       HAVING cnt >= 2
-      ORDER BY cnt DESC
+      ORDER BY cnt DESC, citation_id ASC
       LIMIT 50
+    ),
+    top_links AS MATERIALIZED (
+      SELECT s.doc_id, s.citation_id, t.cnt
+      FROM scoped s
+      JOIN top_citations t ON t.citation_id = s.citation_id
+    ),
+    pairs AS MATERIALIZED (
+      SELECT a.citation_id AS id1, a.cnt AS freq1, b.citation_id AS id2, b.cnt AS freq2,
+             COUNT(*) AS shared
+      FROM top_links a
+      JOIN top_links b ON b.doc_id = a.doc_id AND a.citation_id < b.citation_id
+      GROUP BY a.citation_id, b.citation_id
+      HAVING shared >= 2
+      ORDER BY shared DESC, id1 ASC, id2 ASC
+      LIMIT ?
     )
-    SELECT
-      c1.id AS id1, substr(c1.citation_text, 1, 80) AS text1, tc1.cnt AS freq1,
-      c2.id AS id2, substr(c2.citation_text, 1, 80) AS text2, tc2.cnt AS freq2,
-      COUNT(DISTINCT dc1.doc_id) AS shared
-    FROM document_citations dc1
-    JOIN document_citations dc2
-      ON dc1.doc_id = dc2.doc_id AND dc1.citation_id < dc2.citation_id
-    JOIN citations c1 ON c1.id = dc1.citation_id
-    JOIN citations c2 ON c2.id = dc2.citation_id
-    JOIN top_citations tc1 ON tc1.citation_id = c1.id
-    JOIN top_citations tc2 ON tc2.citation_id = c2.id
-    WHERE 1 = 1 ${selfJoinFilter}
-    GROUP BY dc1.citation_id, dc2.citation_id
-    HAVING shared >= 2
-    ORDER BY shared DESC
-    LIMIT ?
+    SELECT p.id1, substr(c1.citation_text, 1, 80) AS text1, p.freq1,
+           p.id2, substr(c2.citation_text, 1, 80) AS text2, p.freq2, p.shared
+    FROM pairs p
+    JOIN citations c1 ON c1.id = p.id1
+    JOIN citations c2 ON c2.id = p.id2
+    ORDER BY p.shared DESC, p.id1 ASC, p.id2 ASC
   `, args);
 }
 
+// With the summary tables ready this reads the ~2% of citations shared by two or
+// more documents from a partial index; otherwise it aggregates the narrow
+// covering index first and joins citations for the rows that survive (COUNT(*)
+// equals COUNT(DISTINCT doc_id) because (doc_id, citation_id) is the primary key).
 export async function getTopCitedWorks(limit = 50) {
+  if (isCitationCountsReady()) {
+    return all(`
+      SELECT c.id, c.citation_text, k.doc_count,
+        cl.hits AS catalogue_hits,
+        cl.bib_id AS catalogue_bib_id
+      FROM citation_doc_counts k
+      JOIN citations c ON c.id = k.citation_id
+      LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
+      WHERE k.doc_count >= 2
+      ORDER BY k.doc_count DESC, c.citation_text
+      LIMIT ?
+    `, [limit]);
+  }
   return all(`
-    SELECT c.id, c.citation_text,
-      COUNT(DISTINCT dc.doc_id) AS doc_count,
+    WITH counts AS MATERIALIZED (
+      SELECT citation_id, COUNT(*) AS doc_count
+      FROM document_citations
+      GROUP BY citation_id
+      HAVING doc_count > 1
+    )
+    SELECT c.id, c.citation_text, k.doc_count,
       cl.hits AS catalogue_hits,
       cl.bib_id AS catalogue_bib_id
-    FROM citations c
-    JOIN document_citations dc ON dc.citation_id = c.id
+    FROM counts k
+    JOIN citations c ON c.id = k.citation_id
     LEFT JOIN catalogue_lookups cl ON cl.citation_id = c.id
-    GROUP BY c.id
-    HAVING doc_count > 1
-    ORDER BY doc_count DESC, c.citation_text
+    ORDER BY k.doc_count DESC, c.citation_text
     LIMIT ?
   `, [limit]);
 }
