@@ -1262,15 +1262,6 @@ function metadataTermsStatements(doc, _now = new Date().toISOString()) {
 const CITATION_COUNT_TRIGGER_INSERT = 'trg_document_citations_count_ins';
 const CITATION_COUNT_TRIGGER_DELETE = 'trg_document_citations_count_del';
 
-const CITATION_COUNT_REBUILD_STATEMENTS = [
-  'DELETE FROM citation_doc_counts',
-  `INSERT INTO citation_doc_counts (citation_id, doc_count)
-     SELECT citation_id, COUNT(*) FROM document_citations GROUP BY citation_id`,
-  'DELETE FROM document_citation_counts',
-  `INSERT INTO document_citation_counts (doc_id, citation_count)
-     SELECT doc_id, COUNT(*) FROM document_citations GROUP BY doc_id`,
-];
-
 const CITATION_COUNT_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS citation_doc_counts (
      citation_id INTEGER PRIMARY KEY,
@@ -1306,35 +1297,180 @@ const CITATION_COUNT_OBJECTS_SQL = `
   WHERE (type = 'trigger' AND name IN ('${CITATION_COUNT_TRIGGER_INSERT}', '${CITATION_COUNT_TRIGGER_DELETE}'))
      OR (type = 'table' AND name IN ('citation_doc_counts', 'document_citation_counts'))`;
 
-// One sqlite_master read on every later boot. When anything is missing, tables,
-// triggers and the backfill go in ONE write batch (one transaction), so a
-// concurrent writer can never land between the backfill and the triggers.
+const CITATION_COUNT_BACKFILL_KEY = 'citation_count_backfill';
+
+// Bounds on the links one backfill transaction reads: a span of citation ids
+// (autoincrement; each id has a handful of links at most, about 1 on average on
+// prod) and a number of distinct documents (prod averages ~97 links per citing
+// document, max 3,152). Env overrides exist only so tests can force several
+// chunks on a tiny corpus.
+function citationCountBackfillLimits() {
+  return {
+    idSpan: Math.max(1, Number(process.env.CITATION_COUNT_BACKFILL_ID_SPAN) || 20000),
+    docChunk: Math.max(1, Number(process.env.CITATION_COUNT_BACKFILL_DOC_CHUNK) || 150),
+  };
+}
+
+async function readCitationCountBackfillState(client) {
+  const result = await client.execute({
+    sql: 'SELECT projection_value FROM serving_projection_state WHERE projection_key = ?',
+    args: [CITATION_COUNT_BACKFILL_KEY],
+  });
+  const raw = result.rows[0]?.projection_value;
+  if (raw === 'complete') return { phase: 'complete' };
+  try {
+    const parsed = JSON.parse(raw || 'null');
+    if (parsed && (parsed.phase === 'citations' || parsed.phase === 'documents')) return parsed;
+  } catch { /* fall through */ }
+  return { phase: 'citations', cursor: null };
+}
+
+function citationCountBackfillStateStatement(state, now = new Date().toISOString()) {
+  return {
+    sql: `INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(projection_key) DO UPDATE SET
+            projection_value = excluded.projection_value, updated_at = excluded.updated_at`,
+    args: [CITATION_COUNT_BACKFILL_KEY, state.phase === 'complete' ? 'complete' : JSON.stringify(state), now],
+  };
+}
+
+// Recounts both summary tables from document_citations in bounded key ranges.
+// On remote libSQL a write transaction running longer than about 5 s is aborted
+// (TRANSACTION_TIMEOUT) once another connection waits for the write lock, and a
+// cold whole-table GROUP BY alone took 6.2 s on prod, so no chunk aggregates more
+// than one range. The triggers exist before the first chunk, and each chunk
+// overwrites its range with an exact recount inside its own transaction, so a
+// write landing between chunks (on either side of the cursor) is never lost or
+// double counted. Progress is stored with each chunk, so an interrupted backfill
+// resumes where it stopped; the readers stay on the live SQL until 'complete'.
+async function backfillCitationCountSummaries(client) {
+  const { idSpan, docChunk } = citationCountBackfillLimits();
+  let state = await readCitationCountBackfillState(client);
+  let chunks = 0;
+  if (state.phase === 'citations') {
+    const bounds = await client.execute(`
+      SELECT MAX(hi) AS hi FROM (
+        SELECT MAX(citation_id) AS hi FROM document_citations
+        UNION ALL SELECT MAX(citation_id) FROM citation_doc_counts
+      )`);
+    const maxId = Number(bounds.rows[0]?.hi || 0);
+    let cursor = state.cursor == null ? -1 : Number(state.cursor);
+    while (cursor < maxId) {
+      const hi = Math.min(maxId, cursor + idSpan);
+      const next = hi >= maxId ? { phase: 'documents', cursor: null } : { phase: 'citations', cursor: hi };
+      await client.batch([
+        {
+          sql: `DELETE FROM citation_doc_counts WHERE citation_id > ? AND citation_id <= ?
+                AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.citation_id = citation_doc_counts.citation_id)`,
+          args: [cursor, hi],
+        },
+        {
+          sql: `INSERT INTO citation_doc_counts (citation_id, doc_count)
+                SELECT citation_id, COUNT(*) FROM document_citations
+                WHERE citation_id > ? AND citation_id <= ? GROUP BY citation_id
+                ON CONFLICT(citation_id) DO UPDATE SET doc_count = excluded.doc_count`,
+          args: [cursor, hi],
+        },
+        citationCountBackfillStateStatement(next),
+      ], 'write');
+      chunks += 1;
+      cursor = hi;
+    }
+    state = { phase: 'documents', cursor: null };
+    // A resumed cursor already past the last id: record the phase change alone.
+    if (chunks === 0) await client.execute(citationCountBackfillStateStatement(state));
+  }
+  if (state.phase === 'documents') {
+    let cursor = state.cursor == null ? '' : String(state.cursor);
+    for (;;) {
+      const boundary = await client.execute({
+        sql: `SELECT MAX(doc_id) AS hi FROM (
+                SELECT DISTINCT doc_id FROM document_citations WHERE doc_id > ? ORDER BY doc_id LIMIT ?
+              )`,
+        args: [cursor, docChunk],
+      });
+      const hi = boundary.rows[0]?.hi == null ? null : String(boundary.rows[0].hi);
+      if (hi == null) {
+        // Past the last linked document: drop any summary rows left above the cursor.
+        await client.batch([
+          { sql: 'DELETE FROM document_citation_counts WHERE doc_id > ?', args: [cursor] },
+          citationCountBackfillStateStatement({ phase: 'complete' }),
+        ], 'write');
+        chunks += 1;
+        break;
+      }
+      await client.batch([
+        {
+          sql: `DELETE FROM document_citation_counts WHERE doc_id > ? AND doc_id <= ?
+                AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = document_citation_counts.doc_id)`,
+          args: [cursor, hi],
+        },
+        {
+          sql: `INSERT INTO document_citation_counts (doc_id, citation_count)
+                SELECT doc_id, COUNT(*) FROM document_citations
+                WHERE doc_id > ? AND doc_id <= ? GROUP BY doc_id
+                ON CONFLICT(doc_id) DO UPDATE SET citation_count = excluded.citation_count`,
+          args: [cursor, hi],
+        },
+        citationCountBackfillStateStatement({ phase: 'documents', cursor: hi }),
+      ], 'write');
+      chunks += 1;
+      cursor = hi;
+    }
+  }
+  return chunks;
+}
+
+// One sqlite_master read and one state read on every later boot. When an object
+// is missing, the tables, index and triggers are created in one small DDL
+// transaction that also resets the backfill, then the chunked backfill runs. A
+// failed chunk is logged and does not fail the boot: the summaries stay unused
+// (live SQL) and the next boot resumes from the stored cursor.
 async function ensureCitationCountSummaries(client) {
   const present = await client.execute(CITATION_COUNT_OBJECTS_SQL);
-  if (Number(present.rows[0]?.n || 0) === 4) return false;
-  await client.batch([
-    ...CITATION_COUNT_SCHEMA_STATEMENTS,
-    ...CITATION_COUNT_REBUILD_STATEMENTS,
-  ], 'write');
-  return true;
+  if (Number(present.rows[0]?.n || 0) !== 4) {
+    await client.batch([
+      ...CITATION_COUNT_SCHEMA_STATEMENTS,
+      citationCountBackfillStateStatement({ phase: 'citations', cursor: null }),
+    ], 'write');
+  } else {
+    // The partial index is not part of the presence check; keep it present.
+    await client.execute(CITATION_COUNT_SCHEMA_STATEMENTS[1]);
+  }
+  const state = await readCitationCountBackfillState(client);
+  if (state.phase === 'complete') return false;
+  try {
+    const chunks = await backfillCitationCountSummaries(client);
+    logger.info('Backfilled citation count summaries', { chunks });
+    return true;
+  } catch (error) {
+    logger.warn('Citation count backfill interrupted; readers stay on live SQL until it resumes', {
+      error: error?.message || String(error), code: error?.code,
+    });
+    return false;
+  }
 }
 
 let citationCountsReady = false;
 export function isCitationCountsReady() { return citationCountsReady; }
 export function __setCitationCountsReadyForTesting(value) { citationCountsReady = Boolean(value); }
 
-// Ready means the summary tables and both triggers exist, so the tables track
-// every write. Readers use them only then and otherwise run the live SQL.
+// Ready means the summary tables and both triggers exist (so the tables track
+// every write) and the backfill has completed. Readers use them only then and
+// otherwise run the live SQL.
 export async function initCitationCountsReadiness(client = null) {
   const target = client || await getDb();
   const result = await target.execute(CITATION_COUNT_OBJECTS_SQL);
-  citationCountsReady = Number(result.rows[0]?.n || 0) === 4;
+  citationCountsReady = Number(result.rows[0]?.n || 0) === 4
+    && (await readCitationCountBackfillState(target)).phase === 'complete';
   return citationCountsReady;
 }
 
 // Compares both summary tables with a fresh GROUP BY recount (about 590k rows
 // read on prod, so maintenance/admin use only). Counts mismatched, missing and
-// orphaned summary rows. repair: true rebuilds both tables atomically.
+// orphaned summary rows. repair: true re-runs the chunked backfill (each chunk is
+// an exact recount of its range, so the tables are exact when it completes).
 export async function reconcileCitationCounts({ repair = false } = {}) {
   const client = await getDb();
   const result = await client.execute(`
@@ -1356,7 +1492,10 @@ export async function reconcileCitationCounts({ repair = false } = {}) {
   };
   if (!repair) return drift;
   const drifted = drift.citationDrift + drift.docDrift > 0;
-  if (drifted) await client.batch(CITATION_COUNT_REBUILD_STATEMENTS, 'write');
+  if (drifted) {
+    await client.execute(citationCountBackfillStateStatement({ phase: 'citations', cursor: null }));
+    await backfillCitationCountSummaries(client);
+  }
   return { ...drift, repaired: drifted };
 }
 

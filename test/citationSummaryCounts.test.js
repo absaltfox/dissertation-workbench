@@ -134,7 +134,7 @@ test('summary counts are empty after clearAllCitations', async () => {
   assert.deepEqual(await rows('SELECT COUNT(*) FROM document_citation_counts'), [[0]]);
 });
 
-test('migration is idempotent and backfills atomically from links that predate the triggers', async () => {
+test('migration is idempotent and backfills from links that predate the triggers', async () => {
   await resetAll();
   // Simulate a database from before this release: links exist, summary objects do not.
   await client.executeMultiple(`
