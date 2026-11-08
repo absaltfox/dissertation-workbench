@@ -228,7 +228,8 @@ export async function tryExec(client, sql, {
 // documents-serving objects built inline in the schema pass; larger ones leave the
 // slow builds to the guarded background migration.
 export function documentsInlineMaxRows() {
-  return Math.max(0, Number(process.env.DOCUMENTS_INDEX_INLINE_MAX_ROWS) || 2000);
+  const configured = process.env.DOCUMENTS_INDEX_INLINE_MAX_ROWS;
+  return configured == null || configured === '' || !Number.isFinite(Number(configured)) ? 2000 : Math.max(0, Number(configured));
 }
 
 async function isSmallDocumentsTable(client) {
@@ -858,9 +859,6 @@ async function ensureSchema(client) {
   // person: 5,100 documents took that query from 70 ms to 126 s. The queue drives
   // off the doc_id primary key instead - see listDocumentsPendingEnrichment.
   await tryExec(client, 'DROP INDEX IF EXISTS idx_documents_sync_key_doc_id');
-  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
-  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree ON documents(degree)');
-  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_program ON documents(program)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_people_key ON document_people(person_key)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_people_role ON document_people(role)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_concept_partitions_priority ON concept_partitions(enabled, priority DESC, updated_at)');
@@ -900,9 +898,10 @@ async function ensureSchema(client) {
       AND content_checksum IS NOT NULL
       AND content_checksum <> ''
   `);
-  // scope_where() in build-concepts.py filters every automatic partition by
-  // degree plus a year range on each PatternRank run.
-  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree_year ON documents(degree, year)');
+  // The documents indexes on degree, program, year and (degree, year) are the
+  // covering idx_documents_cover_* set, built by runDocumentsIndexMigration (see
+  // the schema pass below). idx_documents_cover_degree keeps
+  // (degree, year) as its prefix for scope_where() in build-concepts.py.
 
   // document_terms projection table indexes for efficient term lookups
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_kind_term ON document_terms(kind, term)');
@@ -910,17 +909,13 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_doc ON document_terms(doc_id, kind)');
 
   await ensureDocumentAffiliations(client);
-  // A small table (every test and fresh database) backfills inline. On prod the
-  // chunked backfill runs from the background migration instead, so the boot pass
-  // never waits on it.
+  // A small table (every test and fresh database) gets the whole migration inline:
+  // the covering indexes, dropping the legacy ones, and the affiliation backfill.
+  // On a large one (prod) the pass stops at the cheap DDL above, and the web
+  // process runs the guarded background migration after boot, so a slow build or a
+  // TRANSACTION_TIMEOUT can never fail or delay startup. The migration never throws.
   if (await isSmallDocumentsTable(client)) {
-    try {
-      await backfillDocumentAffiliations(client);
-    } catch (error) {
-      logger.warn('Affiliation backfill interrupted; readers stay on json_each until it resumes', {
-        error: error?.message || String(error), code: error?.code,
-      });
-    }
+    await runDocumentsIndexMigration({ client, inline: true });
   }
   await ensureCitationCountSummaries(client);
   await backfillCitationMatchKeys(client);
@@ -1696,6 +1691,261 @@ export async function initAffiliationsReadiness(client = null) {
   affiliationsReady = Number(result.rows[0]?.n || 0) === 5
     && (await readAffiliationBackfillState(target)).complete;
   return affiliationsReady;
+}
+
+// --- Covering indexes on documents, and the migration that builds them ---
+//
+// Every column the serving queries read from `documents` (everything except
+// metadata_json, sync_key, source_json and access_status_reason) sits in each of
+// four indexes, so whichever one the planner picks for a filtered read is
+// index-only. On prod a document is one 4 KB page (metadata_json averages 3.6 KB
+// and the filter columns are stored after it), so a plan that touches the table
+// costs a cold page per row. They replace the narrow indexes on the same leading
+// columns, which the planner would otherwise keep choosing and then follow into
+// the table.
+
+// `stat` is the sqlite_stat1 row the planner needs for the new index. libSQL
+// rejects ANALYZE, and without these rows the planner probes doc_id through the
+// primary-key index and reads the table again. The leading numbers (rows per
+// leading key) are the figures prod's own statistics carried for the narrow
+// indexes they replace; the tail is 1 because the remaining columns make a key
+// unique. They are clamped to the table size.
+export const DOCUMENT_SERVING_INDEXES = [
+  { name: 'idx_documents_cover_doc', columns: ['doc_id', 'access_status', 'degree', 'program', 'year', 'title', 'author', 'synced_at', 'available_at'], stat: [1, 1, 1, 1, 1, 1, 1, 1, 1] },
+  { name: 'idx_documents_cover_degree', columns: ['degree', 'year', 'access_status', 'program', 'doc_id', 'title', 'author', 'synced_at', 'available_at'], stat: [1310, 27, 27, 4, 1, 1, 1, 1, 1] },
+  { name: 'idx_documents_cover_year', columns: ['year', 'access_status', 'degree', 'program', 'doc_id', 'title', 'author', 'synced_at', 'available_at'], stat: [134, 133, 17, 4, 1, 1, 1, 1, 1] },
+  { name: 'idx_documents_cover_program', columns: ['program', 'year', 'access_status', 'degree', 'doc_id', 'title', 'author', 'synced_at', 'available_at'], stat: [101, 17, 17, 4, 1, 1, 1, 1, 1] },
+];
+const LEGACY_DOCUMENT_INDEXES = ['idx_documents_degree', 'idx_documents_degree_year', 'idx_documents_program', 'idx_documents_year'];
+
+function documentServingIndexStatements(index, rowCount) {
+  const n = Math.max(1, Number(rowCount) || 1);
+  const stat = [n, ...index.stat.map((v) => Math.min(v, n))].join(' ');
+  return [
+    { sql: `CREATE INDEX IF NOT EXISTS ${index.name} ON documents(${index.columns.join(', ')})`, args: [] },
+    {
+      sql: "INSERT OR REPLACE INTO sqlite_stat1 (tbl, idx, stat) VALUES ('documents', ?, ?)",
+      args: [index.name, stat],
+    },
+  ];
+}
+
+// sqlite_stat1 exists only after the first ANALYZE. Prod has it; a fresh local
+// database does not, and cannot CREATE it (the name is reserved).
+async function ensureStatTable(client) {
+  const present = await client.execute("SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1'");
+  if (!present.rows.length) await client.execute('ANALYZE sqlite_master');
+}
+
+// Reads that make a cold table warm: every column the index build reads, including
+// the ones stored after metadata_json, so the build's scan hits cache instead of
+// walking each row's overflow chain from disk inside the write lock.
+const DOCUMENTS_PREWARM_SQL = 'SELECT COUNT(*) AS n, MAX(synced_at) AS s, COUNT(available_at) AS a, MAX(length(title)) AS t FROM documents';
+
+async function documentsMigrationStatus(client) {
+  const present = new Set((await client.execute(
+    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'documents'",
+  )).rows.map((row) => String(row.name)));
+  return {
+    missingIndexes: DOCUMENT_SERVING_INDEXES.filter((index) => !present.has(index.name)),
+    legacyIndexes: LEGACY_DOCUMENT_INDEXES.filter((name) => present.has(name)),
+    affiliationsComplete: (await readAffiliationBackfillState(client)).complete
+      && Number((await client.execute(AFFILIATION_OBJECTS_SQL)).rows[0]?.n || 0) === 5,
+  };
+}
+
+function isRetryableMigrationError(error) {
+  return error?.code === 'TRANSACTION_TIMEOUT'
+    || /transaction timed out/i.test(String(error?.message || ''))
+    || classifyDbError(error) === 'transient';
+}
+
+async function warmDocumentsTable(client, { now, warmBudgetMs, warmTries }) {
+  for (let attempt = 1; attempt <= warmTries; attempt += 1) {
+    const started = now();
+    await client.execute(DOCUMENTS_PREWARM_SQL);
+    const ms = now() - started;
+    if (ms < warmBudgetMs) return true;
+    logger.info('Documents table still cold; reading it again', { attempt, ms: Math.round(ms) });
+  }
+  return false;
+}
+
+// One index: warm the table, then CREATE INDEX plus its statistics row in a single
+// write batch (a failed batch rolls back whole, so nothing partial is left). A
+// timeout, lock or connection blip is retried after a backoff; anything else is
+// logged and left for the next run.
+async function buildDocumentServingIndex(client, index, {
+  inline, now, wait, warmBudgetMs, warmTries, buildAttempts, retryDelaysMs, onStep,
+}) {
+  if (!inline && !await warmDocumentsTable(client, { now, warmBudgetMs, warmTries })) {
+    logger.warn('Serving index build deferred: the documents table is not warm', { index: index.name });
+    return 'deferred';
+  }
+  for (let attempt = 1; attempt <= buildAttempts; attempt += 1) {
+    const started = Date.now();
+    try {
+      await ensureStatTable(client);
+      const total = await client.execute('SELECT COUNT(doc_id) AS n FROM documents');
+      await client.batch(documentServingIndexStatements(index, total.rows[0]?.n), 'write');
+      const ms = Date.now() - started;
+      logger.info('Serving index built', { index: index.name, ms });
+      onStep?.({ step: 'build', index: index.name, ms, attempt });
+      return 'built';
+    } catch (error) {
+      logger.warn('Serving index build failed; rolled back', {
+        index: index.name, attempt, buildAttempts, ms: Date.now() - started,
+        error: error?.message || String(error), code: error?.code,
+      });
+      if (!isRetryableMigrationError(error) || attempt >= buildAttempts) return 'failed';
+      await wait(retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)]);
+    }
+  }
+  return 'failed';
+}
+
+/**
+ * Builds the covering indexes (each with its planner statistics), drops the legacy
+ * indexes once all four exist, and backfills document_affiliations in chunks. Safe
+ * to call at any time and any number of times: every step is idempotent and a step
+ * that fails or defers is logged and picked up by the next run. Never throws.
+ *
+ * `inline` is the schema pass for a small table: no prewarm, no retries.
+ */
+export async function runDocumentsIndexMigration({
+  client,
+  inline = false,
+  onStep = null,
+  wait = defaultRetryWait,
+  now = () => performance.now(),
+  warmBudgetMs = 1500,
+  warmTries = 3,
+  buildAttempts = inline ? 1 : 3,
+  retryDelaysMs = [30_000, 120_000],
+} = {}) {
+  const result = {
+    indexes: Object.fromEntries(DOCUMENT_SERVING_INDEXES.map((index) => [index.name, 'pending'])),
+    legacyDropped: false, affiliations: 'pending', complete: false,
+  };
+  const options = { inline, now, wait, warmBudgetMs, warmTries, buildAttempts, retryDelaysMs, onStep };
+  try {
+    const status = await documentsMigrationStatus(client);
+    for (const index of DOCUMENT_SERVING_INDEXES) result.indexes[index.name] = 'present';
+    for (const index of status.missingIndexes) result.indexes[index.name] = 'pending';
+    result.legacyDropped = status.legacyIndexes.length === 0;
+    result.affiliations = status.affiliationsComplete ? 'complete' : 'pending';
+
+    for (const index of status.missingIndexes) {
+      result.indexes[index.name] = await buildDocumentServingIndex(client, index, options);
+      if (result.indexes[index.name] !== 'built') break;
+    }
+    const allIndexes = Object.values(result.indexes).every((state) => state === 'present' || state === 'built');
+    if (allIndexes && status.legacyIndexes.length) {
+      try {
+        const started = Date.now();
+        await client.batch(status.legacyIndexes.map((name) => `DROP INDEX IF EXISTS ${name}`), 'write');
+        result.legacyDropped = true;
+        logger.info('Dropped legacy documents indexes', { indexes: status.legacyIndexes, ms: Date.now() - started });
+        onStep?.({ step: 'drop-legacy', ms: Date.now() - started });
+      } catch (error) {
+        logger.warn('Dropping legacy documents indexes failed; retried on the next run', {
+          error: error?.message || String(error), code: error?.code,
+        });
+      }
+    }
+
+    if (!status.affiliationsComplete) {
+      const started = Date.now();
+      try {
+        await ensureDocumentAffiliations(client);
+        const chunks = await backfillDocumentAffiliations(client);
+        await initAffiliationsReadiness(client);
+        result.affiliations = 'complete';
+        logger.info('Affiliation backfill complete', { chunks, ms: Date.now() - started });
+        onStep?.({ step: 'affiliation-backfill', ms: Date.now() - started, chunks });
+      } catch (error) {
+        result.affiliations = 'interrupted';
+        logger.warn('Affiliation backfill interrupted; readers stay on json_each until it resumes', {
+          error: error?.message || String(error), code: error?.code,
+        });
+      }
+    }
+    result.complete = allIndexes && result.legacyDropped && result.affiliations === 'complete';
+  } catch (error) {
+    logger.warn('Documents index migration failed; retried on the next run', {
+      error: error?.message || String(error), code: error?.code,
+    });
+  }
+  return result;
+}
+
+// Writer-heavy jobs that the build's write lock would contend with.
+const DOCUMENTS_MIGRATION_BLOCKING_JOBS = [
+  'document_sync', 'import_rules_sync', 'concept_rebuild', 'theme_recompute', 'reparse_all',
+  'reparse_citations', 'reparse_committee', 'citation_scan', 'catalogue_lookup', 'bertopic',
+  'topic_bands', 'topic_labels',
+];
+
+let documentsMigrationInflight = null;
+
+/**
+ * The web process's entry point: single-flight, skips (does not queue) while a
+ * writer-heavy admin job runs, and does nothing but one catalogue read once the
+ * migration is complete. Returns the run's result; never throws.
+ */
+export function ensureDocumentServingIndexes(options = {}) {
+  if (documentsMigrationInflight) return documentsMigrationInflight;
+  documentsMigrationInflight = (async () => {
+    try {
+      const client = await getDb();
+      const status = await documentsMigrationStatus(client);
+      if (!status.missingIndexes.length && !status.legacyIndexes.length && status.affiliationsComplete) {
+        await initAffiliationsReadiness(client);
+        return { complete: true, indexes: {}, legacyDropped: true, affiliations: 'complete' };
+      }
+      for (const type of DOCUMENTS_MIGRATION_BLOCKING_JOBS) {
+        if (await hasRunningAdminJob(type)) {
+          logger.info('Documents index migration deferred while an admin job runs', { jobType: type });
+          return { complete: false, deferred: 'admin_job', jobType: type };
+        }
+      }
+      return await runDocumentsIndexMigration({ client, ...options });
+    } catch (error) {
+      logger.warn('Documents index migration could not start; retried later', { error: error?.message || String(error) });
+      return { complete: false, error: error?.message || String(error) };
+    } finally {
+      documentsMigrationInflight = null;
+    }
+  })();
+  return documentsMigrationInflight;
+}
+
+/**
+ * Runs ensureDocumentServingIndexes once `delayMs` after it is called (so it never
+ * competes with startup work), then again every `retryMs` while it reports
+ * incomplete, at most `maxRuns` times in this process. Timers are unref'd. Returns
+ * a function that cancels any pending run.
+ */
+export function scheduleDocumentServingIndexes({
+  delayMs = 60_000, retryMs = 30 * 60_000, maxRuns = 6, run = ensureDocumentServingIndexes,
+} = {}) {
+  let timer = null;
+  let stopped = false;
+  let runs = 0;
+  const arm = (ms) => {
+    if (stopped) return;
+    timer = setTimeout(async () => {
+      runs += 1;
+      let result = null;
+      try { result = await run(); } catch (error) {
+        logger.warn('Documents index migration run failed', { error: error?.message || String(error) });
+      }
+      if (!result?.complete && runs < maxRuns) arm(retryMs);
+    }, ms);
+    timer.unref?.();
+  };
+  arm(delayMs);
+  return () => { stopped = true; clearTimeout(timer); };
 }
 
 let documentTermsReady = false;

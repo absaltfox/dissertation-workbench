@@ -4,12 +4,14 @@ import { fileURLToPath } from 'node:url';
 import {
   PORT, PUBLIC_MAX_RECORDS, PUBLIC_SCAN_LIMIT, EXPOSE_ERROR_DETAILS,
   DEFAULT_TERM, DEFAULT_SOURCE, TRUST_PROXY, WORKBENCH_CACHE_REFRESH_MS,
+  DOCUMENTS_INDEX_MIGRATION_DELAY_MS, DOCUMENTS_INDEX_MIGRATION_RETRY_MS,
   CITATION_SCAN_NIGHTLY_ENABLED, CITATION_SCAN_NIGHTLY_HOUR_LOCAL, CONCEPT_REBUILD_NIGHTLY_ENABLED,
   validateRuntimeSecrets, ADMIN_ALLOWED_NETWORKS
 } from './config.js';
 import {
   checkCacheIntegrity, ensureStorage, getDb, logCacheStats, closeDb,
-  initDocumentTermsReadiness, isDocumentTermsReady, runDocumentTermsBackfillOnce
+  initDocumentTermsReadiness, isDocumentTermsReady, runDocumentTermsBackfillOnce,
+  scheduleDocumentServingIndexes
 } from './db.js';
 import { ensureDefaultAdmin } from './auth.js';
 import { createBoundedCache } from './boundedCache.js';
@@ -52,6 +54,7 @@ let stopDailyConceptScheduler = null;
 let stopDailyCitationScanScheduler = null;
 let stopWorkbenchCacheWarmup = null;
 let stopAdminJobFollowupDispatcher = null;
+let stopDocumentsIndexMigration = null;
 const DAILY_CONCEPT_REBUILD_HOUR_LOCAL = 2;
 const ADMIN_JOB_FOLLOWUP_INTERVAL_MS = 5_000;
 
@@ -261,6 +264,12 @@ export async function start() {
     }))
     .catch((e) => logger.warn('document_terms backfill failed; using json_each fallback', { error: e.message }));
 
+  // The covering indexes on documents are built in the background, never in the
+  // boot path: a cold build can hold the write lock past Turso's transaction limit.
+  stopDocumentsIndexMigration = scheduleDocumentServingIndexes({
+    delayMs: DOCUMENTS_INDEX_MIGRATION_DELAY_MS, retryMs: DOCUMENTS_INDEX_MIGRATION_RETRY_MS,
+  });
+
   const workbenchCacheWarmupTimer = setInterval(() => {
     warmWorkbenchCache('scheduled').catch((e) => {
       logger.warn('Workbench landing cache warmup failed', { trigger: 'scheduled', error: e.message });
@@ -311,6 +320,10 @@ export async function start() {
     if (stopWorkbenchCacheWarmup) {
       stopWorkbenchCacheWarmup();
       stopWorkbenchCacheWarmup = null;
+    }
+    if (stopDocumentsIndexMigration) {
+      stopDocumentsIndexMigration();
+      stopDocumentsIndexMigration = null;
     }
     if (stopAdminJobFollowupDispatcher) {
       stopAdminJobFollowupDispatcher();
