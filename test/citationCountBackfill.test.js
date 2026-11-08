@@ -56,7 +56,7 @@ async function seedPreReleaseDatabase() {
 }
 
 // Records every write batch and can fail or interleave writes at chosen points.
-function recordingClient(target, { failOnBackfillBatch = null, beforeBackfillBatch = null } = {}) {
+function recordingClient(target, { failOnBackfillBatch = null, beforeBackfillBatch = null, beforeAnyBatch = null } = {}) {
   const batches = [];
   const argLog = [];
   let backfillBatches = 0;
@@ -67,6 +67,7 @@ function recordingClient(target, { failOnBackfillBatch = null, beforeBackfillBat
         return async (stmts, mode) => {
           batches.push(stmts.map((s) => (typeof s === 'string' ? s : s.sql)));
           argLog.push(stmts.map((s) => (typeof s === 'string' ? [] : s.args || [])));
+          if (beforeAnyBatch) await beforeAnyBatch(stmts.map((s) => (typeof s === 'string' ? s : s.sql)));
           if (isBackfill(stmts)) {
             backfillBatches += 1;
             if (beforeBackfillBatch) await beforeBackfillBatch(backfillBatches);
@@ -181,6 +182,23 @@ test('links written and deleted between backfill chunks are counted exactly', as
   await db.ensureSchemaWithRetry(rec.proxy);
   await expectInSync('after interleaved writes');
   assert.deepEqual(await db.reconcileCitationCounts(), { citationDrift: 0, docDrift: 0 });
+});
+
+test('a document first linked after the last backfill boundary keeps its count', async () => {
+  await seedPreReleaseDatabase();
+  let injected = false;
+  const rec = recordingClient(client, {
+    // The window between the final boundary read (no documents left above the
+    // cursor) and the closing batch: a writer links a brand-new document there.
+    beforeAnyBatch: async (sqls) => {
+      if (injected || !sqls.some((sql) => /DELETE FROM document_citation_counts WHERE doc_id > \?/.test(sql) && !/doc_id <= \?/.test(sql))) return;
+      injected = true;
+      await db.saveCitations('zzz-late-doc', ['Everyone cites this (1999).'], hash);
+    },
+  });
+  await db.ensureSchemaWithRetry(rec.proxy);
+  assert.equal(injected, true, 'the closing batch was reached');
+  await expectInSync('after a link in the closing window');
 });
 
 test('readiness requires the completed backfill marker, not only the objects', async () => {

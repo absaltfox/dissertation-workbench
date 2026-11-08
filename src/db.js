@@ -1399,9 +1399,15 @@ async function backfillCitationCountSummaries(client) {
       });
       const hi = boundary.rows[0]?.hi == null ? null : String(boundary.rows[0].hi);
       if (hi == null) {
-        // Past the last linked document: drop any summary rows left above the cursor.
+        // Past the last linked document: drop summary rows left above the cursor
+        // that no longer have links. The NOT EXISTS matters: a writer can link a
+        // new document after the boundary read, and its trigger-made row is exact.
         await client.batch([
-          { sql: 'DELETE FROM document_citation_counts WHERE doc_id > ?', args: [cursor] },
+          {
+            sql: `DELETE FROM document_citation_counts WHERE doc_id > ?
+                  AND NOT EXISTS (SELECT 1 FROM document_citations dc WHERE dc.doc_id = document_citation_counts.doc_id)`,
+            args: [cursor],
+          },
           citationCountBackfillStateStatement({ phase: 'complete' }),
         ], 'write');
         chunks += 1;
