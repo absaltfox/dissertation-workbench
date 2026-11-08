@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { FILTER_CASES, seedServingCorpus } from './fixtures/documentsServingCorpus.js';
+import { CORPUS_SYNC_KEY, FILTER_CASES, seedServingCorpus } from './fixtures/documentsServingCorpus.js';
 import { referenceDocumentPage, referenceFilters, REFERENCE_PAGE_SORTS } from './fixtures/documentsServingReference.js';
 
 // M-8: filtered `documents` reads. Every rewritten reader must return exactly the
@@ -113,5 +113,78 @@ test('topic document page: ids-first rewrite returns the single-query rows, in o
       if (name === 'none') assert.ok(actual.total > 50, 'the fixture has topic-assigned documents');
       assert.deepEqual(actual.documents.map((d) => d.id), expected.rows.map((r) => r.doc_id), `${name} ${limit}/${offset}`);
     }
+  }
+});
+
+// --- Affiliation projection readers (R1, R2) ---
+
+// Every reader that takes the shared filters, run for one filter case.
+const FILTERED_READERS = {
+  'Documents page': (filters) => db.queryCachedDocumentPage({ filters, sortKey: 'year', sortDir: 'desc', limit: 500 }),
+  'Documents page (q)': (filters) => db.queryCachedDocumentPage({ filters, q: 'thesis', limit: 500 }),
+  'topic document page': (filters) => db.queryTopicDocumentPage({ filters, limit: 500 }),
+  'visualization documents': (filters) => db.queryVisualizationDocuments({ filters }),
+  'topic match counts': (filters) => db.getTopicMatchCounts({ filters }),
+  'topic by year': (filters) => db.getTopicByYearCounts({ filters }),
+  'analytics': (filters) => db.getDocumentServingAnalytics({ filters }),
+  'citation documents': (filters) => db.queryCitationDocumentPage({ filters, limit: 500 }),
+  'people page': (filters) => db.queryPeoplePage({ filters, limit: 500 }),
+};
+
+async function withAffiliationsReady(value, fn) {
+  const before = db.isAffiliationsReady();
+  db.__setAffiliationsReadyForTesting(value);
+  try { return await fn(); } finally { db.__setAffiliationsReadyForTesting(before); }
+}
+
+const plain = (value) => JSON.parse(JSON.stringify(value));
+
+test('the affiliation filter reads the projection only once it is ready', async () => {
+  const run = (ready) => withAffiliationsReady(ready, async () => {
+    const capture = captureStatements(client);
+    try { await db.queryCachedDocumentPage({ filters: { affiliation: 'UBC' }, limit: 5 }); } finally { capture.restore(); }
+    return capture.seen.join('\n');
+  });
+  const legacy = await run(false);
+  assert.match(legacy, /json_each\(d\.metadata_json, '\$\.affiliation'\)/);
+  assert.doesNotMatch(legacy, /document_affiliations/);
+  const projected = await run(true);
+  assert.match(projected, /d\.doc_id IN \(SELECT a\.doc_id FROM document_affiliations a WHERE a\.value_norm IN/);
+  assert.doesNotMatch(projected, /json_each\(d\.metadata_json, '\$\.affiliation'\)/);
+});
+
+test('the affiliation facet reads the projection only once it is ready, with and without a syncKey', async () => {
+  for (const syncKey of [null, CORPUS_SYNC_KEY]) {
+    const run = (ready) => withAffiliationsReady(ready, async () => {
+      const capture = captureStatements(client);
+      try { await db.getDocumentServingSummary({ syncKey }); } finally { capture.restore(); }
+      return capture.seen.join('\n');
+    });
+    assert.doesNotMatch(await run(false), /document_affiliations/);
+    const projected = await run(true);
+    assert.match(projected, /FROM document_affiliations a/);
+    assert.doesNotMatch(projected, /json_each\(d\.metadata_json, '\$\.affiliation'\)/);
+  }
+});
+
+test('every filtered reader returns identical results from the projection and from json_each', async () => {
+  let nonEmptyAffiliation = 0;
+  for (const { name, filters } of FILTER_CASES) {
+    for (const [reader, read] of Object.entries(FILTERED_READERS)) {
+      const legacy = plain(await withAffiliationsReady(false, () => read(filters)));
+      const projected = plain(await withAffiliationsReady(true, () => read(filters)));
+      assert.deepEqual(projected, legacy, `${reader} / ${name}`);
+      if (reader === 'Documents page' && filters.affiliation && legacy.total > 0) nonEmptyAffiliation += 1;
+    }
+  }
+  assert.ok(nonEmptyAffiliation >= 5, 'the fixture must exercise affiliation filters that match documents');
+});
+
+test('the affiliation facet and summary are identical from the projection and from json_each', async () => {
+  for (const syncKey of [null, CORPUS_SYNC_KEY, 'no-such-scope']) {
+    const legacy = plain(await withAffiliationsReady(false, () => db.getDocumentServingSummary({ syncKey })));
+    const projected = plain(await withAffiliationsReady(true, () => db.getDocumentServingSummary({ syncKey })));
+    assert.deepEqual(projected, legacy, `syncKey ${syncKey}`);
+    if (syncKey !== 'no-such-scope') assert.ok(legacy.facets.affiliation.length >= 5, 'facet has the fixture affiliations');
   }
 });

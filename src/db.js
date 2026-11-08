@@ -58,7 +58,9 @@ export async function getDb() {
     // idempotent, so retry the complete startup pass on SQLITE_BUSY instead of
     // letting a transient schema-read lock prevent a singleton claimant from
     // reaching its durable lease.
-    schemaReady = ensureSchemaWithRetry(db).then(() => initCitationCountsReadiness(db));
+    schemaReady = ensureSchemaWithRetry(db)
+      .then(() => initCitationCountsReadiness(db))
+      .then(() => initAffiliationsReadiness(db));
   }
   await schemaReady;
   return db;
@@ -70,6 +72,7 @@ export async function closeDb() {
     db = undefined;
     schemaReady = undefined;
     citationCountsReady = false;
+    affiliationsReady = false;
   }
 }
 
@@ -219,6 +222,18 @@ export async function tryExec(client, sql, {
     }
     throw error;
   }
+}
+
+// Tables under this many documents (every test and fresh database) get the
+// documents-serving objects built inline in the schema pass; larger ones leave the
+// slow builds to the guarded background migration.
+export function documentsInlineMaxRows() {
+  return Math.max(0, Number(process.env.DOCUMENTS_INDEX_INLINE_MAX_ROWS) || 2000);
+}
+
+async function isSmallDocumentsTable(client) {
+  const result = await client.execute('SELECT COUNT(doc_id) AS n FROM documents');
+  return Number(result.rows[0]?.n || 0) < documentsInlineMaxRows();
 }
 
 export async function addColumnIfMissing(client, table, column, definition) {
@@ -894,6 +909,19 @@ async function ensureSchema(client) {
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_kind_termlower ON document_terms(kind, lower(term))');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_doc ON document_terms(doc_id, kind)');
 
+  await ensureDocumentAffiliations(client);
+  // A small table (every test and fresh database) backfills inline. On prod the
+  // chunked backfill runs from the background migration instead, so the boot pass
+  // never waits on it.
+  if (await isSmallDocumentsTable(client)) {
+    try {
+      await backfillDocumentAffiliations(client);
+    } catch (error) {
+      logger.warn('Affiliation backfill interrupted; readers stay on json_each until it resumes', {
+        error: error?.message || String(error), code: error?.code,
+      });
+    }
+  }
   await ensureCitationCountSummaries(client);
   await backfillCitationMatchKeys(client);
   await backfillDocumentAccessStatus(client);
@@ -1512,6 +1540,164 @@ export async function reconcileCitationCounts({ repair = false } = {}) {
   return { ...drift, repaired: drifted };
 }
 
+// --- document_affiliations projection ---
+//
+// `$.affiliation` of every document, one row per distinct trimmed value, so the
+// affiliation filter and facet stop parsing each document's ~3.6 KB metadata_json
+// (the same expressions as before: trim(CAST(value AS TEXT)), compared as
+// lower(...)). The triggers derive the rows from the stored NEW.metadata_json, so
+// they cover every writer. json_valid() guards keep a malformed metadata_json from
+// failing a document write (the old read queries raised on such a row instead).
+// The update trigger fires only when `$.affiliation` itself changes.
+const AFFILIATION_BACKFILL_KEY = 'document_affiliations_backfill';
+// Distinct, non-NULL values only, and a plain INSERT: an `INSERT OR IGNORE` inside
+// a trigger body is overridden by the conflict policy of the statement that fired
+// it, and the document upsert (ON CONFLICT DO UPDATE) aborts on a duplicate key.
+const AFFILIATION_PROJECTION_SELECT = (docIdExpr, metadataExpr, { from = '', where = '' } = {}) => `
+    SELECT DISTINCT t.doc_id, t.value, lower(t.value)
+    FROM (
+      SELECT ${docIdExpr} AS doc_id, trim(CAST(a.value AS TEXT)) AS value
+      FROM ${from}json_each(CASE WHEN json_valid(${metadataExpr}) THEN ${metadataExpr} END, '$.affiliation') a
+      ${where}
+    ) t
+    WHERE t.value IS NOT NULL`;
+
+const AFFILIATION_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS document_affiliations (
+     doc_id     TEXT NOT NULL,
+     value      TEXT NOT NULL,
+     value_norm TEXT NOT NULL,
+     PRIMARY KEY (doc_id, value)
+   ) WITHOUT ROWID`,
+  'CREATE INDEX IF NOT EXISTS idx_document_affiliations_norm ON document_affiliations(value_norm, doc_id)',
+  `CREATE TRIGGER IF NOT EXISTS trg_documents_affiliations_ins AFTER INSERT ON documents BEGIN
+     INSERT INTO document_affiliations (doc_id, value, value_norm)
+     ${AFFILIATION_PROJECTION_SELECT('NEW.doc_id', 'NEW.metadata_json')};
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_documents_affiliations_upd AFTER UPDATE OF metadata_json ON documents
+   WHEN json_extract(CASE WHEN json_valid(OLD.metadata_json) THEN OLD.metadata_json END, '$.affiliation')
+     IS NOT json_extract(CASE WHEN json_valid(NEW.metadata_json) THEN NEW.metadata_json END, '$.affiliation')
+   BEGIN
+     DELETE FROM document_affiliations WHERE doc_id = NEW.doc_id;
+     INSERT INTO document_affiliations (doc_id, value, value_norm)
+     ${AFFILIATION_PROJECTION_SELECT('NEW.doc_id', 'NEW.metadata_json')};
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_documents_affiliations_del AFTER DELETE ON documents BEGIN
+     DELETE FROM document_affiliations WHERE doc_id = OLD.doc_id;
+   END`,
+];
+
+const AFFILIATION_OBJECTS_SQL = `
+  SELECT COUNT(*) AS n FROM sqlite_master
+  WHERE (type = 'trigger' AND name IN ('trg_documents_affiliations_ins', 'trg_documents_affiliations_upd', 'trg_documents_affiliations_del'))
+     OR (type = 'table' AND name = 'document_affiliations')
+     OR (type = 'index' AND name = 'idx_document_affiliations_norm')`;
+
+function affiliationBackfillChunk() {
+  return Math.max(1, Number(process.env.DOCUMENT_AFFILIATIONS_BACKFILL_CHUNK) || 500);
+}
+
+async function readAffiliationBackfillState(client) {
+  const result = await client.execute({
+    sql: 'SELECT projection_value FROM serving_projection_state WHERE projection_key = ?',
+    args: [AFFILIATION_BACKFILL_KEY],
+  });
+  const raw = result.rows[0]?.projection_value;
+  if (raw === 'complete') return { complete: true };
+  try {
+    const parsed = JSON.parse(raw || 'null');
+    if (parsed && typeof parsed.cursor === 'string') return { complete: false, cursor: parsed.cursor };
+  } catch { /* fall through */ }
+  return { complete: false, cursor: '' };
+}
+
+function affiliationBackfillStateStatement(state, now = new Date().toISOString()) {
+  return {
+    sql: `INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(projection_key) DO UPDATE SET
+            projection_value = excluded.projection_value, updated_at = excluded.updated_at`,
+    args: [AFFILIATION_BACKFILL_KEY, state.complete ? 'complete' : JSON.stringify({ cursor: state.cursor ?? '' }), now],
+  };
+}
+
+// Creates the table, its index and the three triggers (cheap DDL on an empty
+// table) in one transaction that also resets the backfill, but only when
+// something is missing, so a repaired trigger set is always re-verified.
+export async function ensureDocumentAffiliations(client) {
+  const present = await client.execute(AFFILIATION_OBJECTS_SQL);
+  if (Number(present.rows[0]?.n || 0) === 5) return false;
+  await client.batch([
+    ...AFFILIATION_SCHEMA_STATEMENTS,
+    affiliationBackfillStateStatement({ complete: false, cursor: '' }),
+  ], 'write');
+  return true;
+}
+
+// Rebuilds the projection in doc_id keyset chunks. A chunk is an exact recount of
+// its range in one small write transaction (on remote libSQL a write over about
+// 5 s is aborted once another connection waits), so a write landing between chunks,
+// on either side of the cursor, is never lost: the triggers are live before the
+// first chunk and each chunk overwrites its range. The cursor is stored with each
+// chunk, so an interrupted backfill resumes where it stopped. Returns the chunk
+// count; throws on a failed chunk (callers log it and retry later).
+export async function backfillDocumentAffiliations(client) {
+  const size = affiliationBackfillChunk();
+  const state = await readAffiliationBackfillState(client);
+  if (state.complete) return 0;
+  let cursor = state.cursor;
+  let chunks = 0;
+  for (;;) {
+    const boundary = await client.execute({
+      sql: `SELECT MAX(doc_id) AS hi FROM (SELECT doc_id FROM documents WHERE doc_id > ? ORDER BY doc_id LIMIT ?)`,
+      args: [cursor, size],
+    });
+    const hi = boundary.rows[0]?.hi == null ? null : String(boundary.rows[0].hi);
+    if (hi == null) {
+      // Past the last document: drop rows above the cursor whose document is gone.
+      // The NOT EXISTS matters: a document inserted after the boundary read has
+      // exact trigger-made rows.
+      await client.batch([
+        {
+          sql: `DELETE FROM document_affiliations WHERE doc_id > ?
+                AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.doc_id = document_affiliations.doc_id)`,
+          args: [cursor],
+        },
+        affiliationBackfillStateStatement({ complete: true }),
+      ], 'write');
+      chunks += 1;
+      return chunks;
+    }
+    await client.batch([
+      { sql: 'DELETE FROM document_affiliations WHERE doc_id > ? AND doc_id <= ?', args: [cursor, hi] },
+      {
+        sql: `INSERT INTO document_affiliations (doc_id, value, value_norm)
+              ${AFFILIATION_PROJECTION_SELECT('d.doc_id', 'd.metadata_json', {
+    from: 'documents d, ', where: 'WHERE d.doc_id > ? AND d.doc_id <= ?',
+  })}`,
+        args: [cursor, hi],
+      },
+      affiliationBackfillStateStatement({ complete: false, cursor: hi }),
+    ], 'write');
+    chunks += 1;
+    cursor = hi;
+  }
+}
+
+let affiliationsReady = false;
+export function isAffiliationsReady() { return affiliationsReady; }
+export function __setAffiliationsReadyForTesting(value) { affiliationsReady = Boolean(value); }
+
+// Ready means the table, index and triggers exist (so the projection tracks every
+// write) and the backfill completed. The filter and facet use it only then.
+export async function initAffiliationsReadiness(client = null) {
+  const target = client || await getDb();
+  const result = await target.execute(AFFILIATION_OBJECTS_SQL);
+  affiliationsReady = Number(result.rows[0]?.n || 0) === 5
+    && (await readAffiliationBackfillState(target)).complete;
+  return affiliationsReady;
+}
+
 let documentTermsReady = false;
 export function isDocumentTermsReady() { return documentTermsReady; }
 export function __setDocumentTermsReadyForTesting(value) { documentTermsReady = Boolean(value); }
@@ -1974,7 +2160,11 @@ function documentServingFilters({ syncKey = null, degree = '', program = '', aff
   }
   if (affiliation) {
     const values = affiliationFilterValues(affiliation);
-    clauses.push(`EXISTS (
+    // The projection holds the same lower(trim(CAST(value AS TEXT))) per value;
+    // until its backfill completes the filter parses each document's JSON.
+    clauses.push(isAffiliationsReady()
+      ? `d.doc_id IN (SELECT a.doc_id FROM document_affiliations a WHERE a.value_norm IN (${values.map(() => '?').join(', ')}))`
+      : `EXISTS (
       SELECT 1 FROM json_each(d.metadata_json, '$.affiliation') affiliation
       WHERE lower(trim(CAST(affiliation.value AS TEXT))) IN (${values.map(() => '?').join(', ')})
     )`);
@@ -2217,6 +2407,27 @@ export async function queryConceptTermsByDoc({ syncKey = null, filters = {} } = 
   return Array.from(byDoc.values()).map((conceptTerms) => ({ conceptTerms }));
 }
 
+// The distinct non-empty affiliation values. The projection holds the same
+// trim(CAST(value AS TEXT)) values; it only needs documents when a sync scope
+// restricts them.
+function affiliationFacetRows(filters) {
+  if (!isAffiliationsReady()) {
+    return all(`
+      SELECT DISTINCT trim(CAST(affiliation.value AS TEXT)) AS value
+      FROM documents d, json_each(d.metadata_json, '$.affiliation') affiliation
+      ${filters.where}
+      ${filters.where ? 'AND' : 'WHERE'} trim(CAST(affiliation.value AS TEXT)) <> ''
+      ORDER BY value
+    `, filters.args);
+  }
+  return all(filters.where
+    ? `SELECT DISTINCT a.value AS value FROM document_affiliations a
+       JOIN documents d ON d.doc_id = a.doc_id
+       ${filters.where} AND a.value <> '' ORDER BY value`
+    : `SELECT DISTINCT a.value AS value FROM document_affiliations a WHERE a.value <> '' ORDER BY value`,
+  filters.args);
+}
+
 /** Small, database-side bootstrap aggregates for metadata-scale landing pages. */
 export async function getDocumentServingSummary({ syncKey = null } = {}) {
   const filters = documentServingFilters({ syncKey });
@@ -2225,13 +2436,7 @@ export async function getDocumentServingSummary({ syncKey = null } = {}) {
     get(`SELECT COUNT(*) AS documents FROM documents d ${analyticsFilters.where}`, analyticsFilters.args),
     all(`SELECT DISTINCT d.degree AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.degree IS NOT NULL AND trim(d.degree) <> '' ORDER BY value`, filters.args),
     all(`SELECT DISTINCT d.program AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.program IS NOT NULL AND trim(d.program) <> '' ORDER BY value`, filters.args),
-    all(`
-      SELECT DISTINCT trim(CAST(affiliation.value AS TEXT)) AS value
-      FROM documents d, json_each(d.metadata_json, '$.affiliation') affiliation
-      ${filters.where}
-      ${filters.where ? 'AND' : 'WHERE'} trim(CAST(affiliation.value AS TEXT)) <> ''
-      ORDER BY value
-    `, filters.args),
+    affiliationFacetRows(filters),
     get(`
       SELECT COUNT(DISTINCT p.person_key) AS count
       FROM document_people p
