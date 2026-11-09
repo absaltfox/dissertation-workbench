@@ -77,6 +77,7 @@ if (args['confirm-target'] !== target) {
 }
 
 const { createClient } = await import('@libsql/client');
+const { documentsPlanViolations } = await import('./lib/documents-plan-check.mjs');
 const { logger } = await import('../src/logger.js');
 const db = await import('../src/db.js');
 
@@ -374,9 +375,7 @@ for (let pass = 1; pass <= passes; pass += 1) {
     // holding pre-build statistics shows up as a failure on some pass. EXPLAIN reads no rows.
     const plan = (await client.execute({ sql: `EXPLAIN QUERY PLAN ${stmt.sql}`, args: stmt.args })).rows.map((row) => String(row.detail));
     const accesses = plan.filter((detail) => /^(SCAN|SEARCH) (d|documents)\b/.test(detail));
-    const exempt = /json_extract\(d\.metadata_json, '\$\.charCount'\)/.test(stmt.sql);
-    let bad = exempt ? [] : accesses.filter((detail) => !/COVERING INDEX/.test(detail));
-    if (/FROM page p\b/.test(stmt.sql)) bad = bad.filter((detail) => !/^SEARCH d USING INDEX \S+ \(doc_id=\?\)$/.test(detail));
+    const bad = documentsPlanViolations(stmt.sql, plan);
     if (bad.length) planProblems += 1;
     if (pass === 1 || bad.length) {
       const cost = pass === 1 ? `rows_read ${String(rowsRead).padStart(7)}  ${fmt(queryMs).padStart(8)} server  ` : '';
@@ -386,7 +385,7 @@ for (let pass = 1; pass <= passes; pass += 1) {
 }
 const readerRows = captured.reduce((sum, c) => sum + c.rowsRead, 0);
 console.log(`  reader statements: ${captured.length}; rows_read for all of them: ${readerRows}`);
-check(planProblems === 0, `every serving statement reaches documents through a covering index on all ${passes} passes (analytics charCount and the page row-fetch excepted)`);
+check(planProblems === 0, `every serving statement reaches documents through a covering index on all ${passes} passes (analytics charCount, the page row-fetch and the guard's IS NULL arm excepted)`);
 
 if (!args['skip-recount']) {
   console.log('\n  Projection against a fresh recount (reads every metadata_json)');
