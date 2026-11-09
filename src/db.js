@@ -2464,12 +2464,21 @@ function documentServingFilters({ syncKey = null, degree = '', program = '', aff
   };
 }
 
-function analyticalDocumentFilters(options = {}) {
+// Turso's planner does not use a covering index for a plain full scan of documents (the
+// 2026-11-09 branch rehearsal printed `SCAN d`, the 18k-page table, for every unfiltered
+// serving statement although a covering index held every column). A range on doc_id makes
+// idx_documents_cover_doc usable as an index SEARCH on any planner. The OR keeps a row
+// whose doc_id is NULL (a non-INTEGER primary key may hold NULL), so results are identical.
+export const DOCUMENTS_COVERING_SCAN_SQL = "(d.doc_id >= '' OR d.doc_id IS NULL)";
+
+// `coveringScan` adds DOCUMENTS_COVERING_SCAN_SQL when no user filter narrows the rows, for
+// serving statements whose documents access is otherwise a full scan.
+function analyticalDocumentFilters({ coveringScan = false, ...options } = {}) {
   const filters = documentServingFilters(options);
   return {
     where: filters.where
       ? `${filters.where} AND ${ACTIVE_ANALYTICS_ACCESS_SQL}`
-      : `WHERE ${ACTIVE_ANALYTICS_ACCESS_SQL}`,
+      : `WHERE ${ACTIVE_ANALYTICS_ACCESS_SQL}${coveringScan ? ` AND ${DOCUMENTS_COVERING_SCAN_SQL}` : ''}`,
     args: filters.args,
   };
 }
@@ -2526,7 +2535,7 @@ export async function queryCachedDocumentPage({
       FROM documents d
       ${/\bfm\./.test(sortExpression) ? 'LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id' : ''}
       ${needsCitationSortJoin ? `LEFT JOIN ${citationCountJoinSource()} dc ON dc.doc_id = d.doc_id` : ''}
-      ${queryFilters.where}
+      ${queryFilters.where || `WHERE ${DOCUMENTS_COVERING_SCAN_SQL}`}
       ORDER BY k1 ${direction}, k2 ASC, d.doc_id ASC
       LIMIT ? OFFSET ?
     )
@@ -2554,7 +2563,7 @@ export async function queryCachedDocumentPage({
 export async function queryTopicDocumentPage({
   syncKey = null, filters = {}, limit = 5000, offset = 0,
 } = {}) {
-  const queryFilters = analyticalDocumentFilters({ syncKey, ...filters });
+  const queryFilters = analyticalDocumentFilters({ coveringScan: true, syncKey, ...filters });
   const topicJoin = 'JOIN (SELECT DISTINCT doc_id FROM document_topics) dt ON dt.doc_id = d.doc_id';
   const countRow = await get(`
     SELECT COUNT(*) AS total
@@ -2659,7 +2668,7 @@ export async function queryVisualizationDocuments({ syncKey = null, filters = {}
  * simply absent — buildTermCooccurrence doesn't need them either way.
  */
 export async function queryConceptTermsByDoc({ syncKey = null, filters = {} } = {}) {
-  const f = analyticalDocumentFilters({ syncKey, ...filters });
+  const f = analyticalDocumentFilters({ coveringScan: true, syncKey, ...filters });
   // Rows feed buildTermCooccurrence() -> docConceptTerms(rec, 20), which does
   // slice(0, 20). We only order by dt.doc_id (not array/rowid order) within a
   // doc, which is safe only because normalizeRecord caps stored conceptTerms
@@ -2704,7 +2713,7 @@ function affiliationFacetRows(filters) {
 /** Small, database-side bootstrap aggregates for metadata-scale landing pages. */
 export async function getDocumentServingSummary({ syncKey = null } = {}) {
   const filters = documentServingFilters({ syncKey });
-  const analyticsFilters = analyticalDocumentFilters({ syncKey });
+  const analyticsFilters = analyticalDocumentFilters({ coveringScan: true, syncKey });
   const [summary, degrees, programs, affiliations, supervisors] = await Promise.all([
     get(`SELECT COUNT(*) AS documents FROM documents d ${analyticsFilters.where}`, analyticsFilters.args),
     all(`SELECT DISTINCT d.degree AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.degree IS NOT NULL AND trim(d.degree) <> '' ORDER BY value`, filters.args),
@@ -2732,7 +2741,7 @@ export async function getDocumentServingSummary({ syncKey = null } = {}) {
 export async function queryCitationDocumentPage({
   syncKey = null, filters = {}, q = '', sortKey = 'citationCount', sortDir = 'desc', limit = 50, offset = 0,
 } = {}) {
-  const queryFilters = analyticalDocumentFilters({ syncKey, ...filters, q });
+  const queryFilters = analyticalDocumentFilters({ coveringScan: true, syncKey, ...filters, q });
   const counts = await get(`
     SELECT COUNT(*) AS total,
            SUM(EXISTS (SELECT 1 FROM document_citations x WHERE x.doc_id = d.doc_id)) AS with_citations
@@ -3205,7 +3214,7 @@ function termAggregateSql(kind, filters, qualifier, limitSql) {
  * returns no document collection; document rows have their own paginated API.
  */
 export async function getDocumentServingAnalytics({ syncKey = null, filters: requestedFilters = {}, subjectLimit = 25 } = {}) {
-  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ coveringScan: true, syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
   const activeWords = 'COALESCE(fm.body_word_count, fm.word_count)';
   const reliableWords = `${activeWords} >= 1000 AND COALESCE(fm.word_source, '') NOT IN ('metadata_text', 'degraded_pdf_text')`;
@@ -3371,8 +3380,11 @@ export async function queryPeoplePage({
   }
   const matchWhereSql = extra.length ? `WHERE ${extra.join(' AND ')}` : '';
   const args = [...filters.args, ...extraArgs];
+  // MATERIALIZED: the CTE is read twice. As a co-routine its second pass looped over every
+  // matched person key and, inside, over every document of an affiliation filter's
+  // projection list (10 M rows read on the Turso branch); materialized, it is built once.
   const groupedSql = `
-    WITH filtered_people AS (
+    WITH filtered_people AS MATERIALIZED (
       SELECT p.person_key, p.doc_id, p.name, p.role, p.affiliation, d.year
       FROM document_people p
       JOIN documents d ON d.doc_id = p.doc_id
@@ -3774,7 +3786,8 @@ export async function getDocumentCacheStats(syncKey = null) {
              SUM(CASE WHEN access_status = 'embargoed'
                        AND (available_at IS NULL OR datetime(available_at) > CURRENT_TIMESTAMP)
                       THEN 1 ELSE 0 END) AS embargoed_deferred
-      FROM documents
+      FROM documents d
+      WHERE ${DOCUMENTS_COVERING_SCAN_SQL}
     `);
   return {
     total: Number(row?.total || 0),

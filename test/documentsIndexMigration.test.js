@@ -570,3 +570,75 @@ test('a writer-heavy admin job that starts mid-run defers the remaining builds',
   const resumed = await db.ensureDocumentServingIndexes(fastOptions().options);
   assert.equal(resumed.complete, true);
 });
+
+// Review (DBA, phase 4, after the Turso-branch rehearsal of 2026-11-09): Turso's planner
+// did not use a covering index for a plain full scan of documents. Every unfiltered
+// serving statement printed `SCAN d` (the 18k-page table) although a covering index had
+// every column. A doc_id range lets any planner SEARCH idx_documents_cover_doc instead.
+// The rule here is planner-independent: an unfiltered serving statement must reach
+// documents through an index SEARCH (or the one-column primary-key index the branch did
+// use for COUNT(d.doc_id)), never through a full SCAN of the table or a wide index.
+test('unfiltered serving statements reach documents through an index SEARCH, not a full scan', async () => {
+  await resetToPreMigration();
+  assert.equal((await db.runDocumentsIndexMigration({ client, ...fastOptions().options })).complete, true);
+  db.__setDocumentTermsReadyForTesting(true);
+  await db.initCitationCountsReadiness(client);
+  const readers = {
+    'Documents page': () => db.queryCachedDocumentPage({ filters: {}, limit: 20 }),
+    'Documents page by title': () => db.queryCachedDocumentPage({ filters: {}, sortKey: 'title', sortDir: 'asc', limit: 20 }),
+    analytics: () => db.getDocumentServingAnalytics({ filters: {} }),
+    'citation documents': () => db.queryCitationDocumentPage({ filters: {}, limit: 20 }),
+    'citation documents by title': () => db.queryCitationDocumentPage({ filters: {}, sortKey: 'title', sortDir: 'asc', limit: 20 }),
+    summary: () => db.getDocumentServingSummary({}),
+    'cache stats': () => db.getDocumentCacheStats(null),
+    'concept terms': () => db.queryConceptTermsByDoc({ filters: {} }),
+  };
+  const planClient = createClient({ url: `file:${dbPath}` });
+  const problems = [];
+  try {
+    for (const [name, read] of Object.entries(readers)) {
+      const seen = [];
+      const original = client.execute.bind(client);
+      client.execute = (stmt) => {
+        const s = typeof stmt === 'string' ? { sql: stmt, args: [] } : stmt;
+        if (/^\s*(SELECT|WITH)\b/i.test(s.sql) && /\bdocuments\b/.test(s.sql)) seen.push(s);
+        return original(stmt);
+      };
+      try { await read(); } finally { client.execute = original; }
+      for (const statement of seen) {
+        if (/json_extract\(d\.metadata_json, '\$\.charCount'\)/.test(statement.sql)) continue; // reads metadata_json anyway
+        const details = await planDetails(statement, planClient);
+        // The unfiltered COUNT(d.doc_id) may scan the narrowest index: the branch chose the
+        // one-column primary-key index for it.
+        if (/^\s*SELECT COUNT\(d\.doc_id\) AS total FROM documents d\s*$/.test(statement.sql)) continue;
+        const fullScans = details.filter((d) => /^SCAN (d|documents)\b/.test(d)
+          && !/USING COVERING INDEX sqlite_autoindex_documents_1$/.test(d));
+        const tableReads = tableAccessViolations(statement, details);
+        if (fullScans.length || tableReads.length) {
+          problems.push(`${name}: ${[...fullScans, ...tableReads].join(' | ')}\n    ${statement.sql.replace(/\s+/g, ' ').slice(0, 140)}`);
+        }
+      }
+    }
+  } finally { planClient.close(); }
+  assert.deepEqual(problems, []);
+});
+
+// Review (DBA, phase 4): with the projection filter `d.doc_id IN (SELECT … affiliations)`,
+// the people page's filtered_people CTE was planned as a co-routine evaluated twice; the
+// second pass looped over every matched person key and, inside it, over every document in
+// the affiliation list (`SEARCH p (doc_id=? AND person_key=?)` + REUSE LIST SUBQUERY). On
+// the Turso branch that read 10.08 M rows in 4.9 s per statement. Materialized, it is
+// computed once.
+test('the people page computes its filtered rows once (no per-key loop over the affiliation list)', async () => {
+  await resetToPreMigration();
+  assert.equal((await db.runDocumentsIndexMigration({ client, ...fastOptions().options })).complete, true);
+  assert.equal(db.isAffiliationsReady(), true);
+  const statements = await captureReaderStatements(() => db.queryPeoplePage({ filters: { affiliation: 'UBC' }, limit: 20 }));
+  assert.ok(statements.length >= 2);
+  for (const statement of statements) {
+    const details = await planDetails(statement);
+    assert.ok(details.some((d) => /MATERIALIZE filtered_people/.test(d)), `filtered_people is not materialized: ${details.join(' | ')}`);
+    assert.ok(!details.some((d) => /SEARCH p USING INDEX \S+ \(doc_id=\? AND person_key=\?\)/.test(d)),
+      `per-key probe over the affiliation list: ${details.join(' | ')}`);
+  }
+});
