@@ -31,7 +31,10 @@
 //                         measure what an ungated cold build would hold the write lock for.
 //                         Run it first thing on a fresh branch, with nothing else connected.
 //   --plan-passes=N       repeat the plan check N times on separate requests (default 2), to
-//                         catch a server connection still holding pre-build statistics
+//                         catch a server connection still holding pre-build statistics.
+//                         Plans are EXPLAINs (no rows read); each reader statement is executed
+//                         once, through the stats client, which is also where its cost is read.
+//   --shapes=a,b          filter shapes for the reader sweep (default none,degree,program,affiliation)
 //   --skip-recount        skip the full json_each recount (reads every metadata_json)
 
 process.env.SKIP_LOCAL_ENV = '1';
@@ -167,7 +170,12 @@ function statsClient(fallback) {
     const [r] = await pipeline([{ type: 'execute', stmt: s }]);
     if (r.type !== 'ok') throw hranaError(r.error);
     record(s.sql, r.response.result, Date.now() - started);
-    return toResultSet(r.response.result);
+    const rs = toResultSet(r.response.result);
+    Object.defineProperty(rs, 'serverStats', {
+      value: { rowsRead: Number(r.response.result.rows_read || 0), queryMs: Number(r.response.result.query_duration_ms || 0) },
+      enumerable: false,
+    });
+    return rs;
   };
   // Same transaction shape as @libsql/client's write batch: BEGIN IMMEDIATE, each
   // statement only if the previous succeeded, COMMIT, and ROLLBACK if COMMIT did not run.
@@ -314,6 +322,9 @@ const shapes = [
   ['program', { program: await topValue('program') }],
   ['affiliation', { affiliation: topAffiliation }],
 ];
+// --shapes=none,degree limits the reader sweep (each shape executes every reader once).
+const shapeFilter = args.shapes ? new Set(String(args.shapes).split(',')) : null;
+const selectedShapes = shapeFilter ? shapes.filter(([name]) => shapeFilter.has(name)) : shapes;
 const readers = {
   'Documents page': (filters) => db.queryCachedDocumentPage({ filters, limit: 50 }),
   'visualizations': (filters) => db.queryVisualizationDocuments({ filters }),
@@ -328,40 +339,47 @@ const readers = {
 const moduleClient = await db.getDb();
 const originalExecute = moduleClient.execute.bind(moduleClient);
 const captured = [];
-for (const [shapeName, filters] of shapes) {
+// The readers run ONCE, with their SELECTs on documents sent through the stats client, so
+// each statement's server rows_read and time are measured on that single execution (the
+// first rehearsal re-ran every statement to cost it, doubling the 25 M rows it read).
+// Statements are captured whether the reader passes SQL text or {sql, args}.
+const readerOnce = new Set(['summary', 'cache stats']);
+for (const [shapeName, filters] of selectedShapes) {
   for (const [readerName, read] of Object.entries(readers)) {
-    const seen = [];
-    moduleClient.execute = (stmt) => {
-      if (typeof stmt !== 'string' && /^\s*(SELECT|WITH)\b/i.test(stmt.sql)) seen.push(stmt);
-      return originalExecute(stmt);
+    if (readerOnce.has(readerName) && shapeName !== 'none') continue; // filter-independent readers
+    moduleClient.execute = async (stmt) => {
+      const s = typeof stmt === 'string' ? { sql: stmt, args: [] } : { sql: stmt.sql, args: stmt.args || [] };
+      if (!/^\s*(SELECT|WITH)\b/i.test(s.sql) || !/\bdocuments\b/.test(s.sql)) return originalExecute(stmt);
+      if (isFile) { captured.push({ shapeName, readerName, stmt: s, rowsRead: 0, queryMs: 0 }); return originalExecute(stmt); }
+      // Per-statement figures come from that statement's own response: readers such as
+      // analytics run statements concurrently, so step-total deltas would overlap.
+      const result = await client.execute(s);
+      captured.push({ shapeName, readerName, stmt: s, rowsRead: result.serverStats.rowsRead, queryMs: result.serverStats.queryMs });
+      return result;
     };
     try { await read(filters); } finally { moduleClient.execute = originalExecute; }
-    for (const stmt of seen.filter((s) => /\bdocuments d?\b/.test(s.sql))) captured.push({ shapeName, readerName, stmt });
   }
 }
 const passes = Math.max(1, Number(args['plan-passes'] ?? 2));
 let planProblems = 0;
 for (let pass = 1; pass <= passes; pass += 1) {
-  for (const { shapeName, readerName, stmt } of captured) {
+  for (const { shapeName, readerName, stmt, rowsRead, queryMs } of captured) {
     // Each EXPLAIN is its own request (its own server stream), so a connection still
-    // holding pre-build statistics shows up as a failure on some pass.
+    // holding pre-build statistics shows up as a failure on some pass. EXPLAIN reads no rows.
     const plan = (await client.execute({ sql: `EXPLAIN QUERY PLAN ${stmt.sql}`, args: stmt.args })).rows.map((row) => String(row.detail));
-    const accesses = plan.filter((detail) => /^(SCAN|SEARCH) d\b/.test(detail));
+    const accesses = plan.filter((detail) => /^(SCAN|SEARCH) (d|documents)\b/.test(detail));
     const exempt = /json_extract\(d\.metadata_json, '\$\.charCount'\)/.test(stmt.sql);
     let bad = exempt ? [] : accesses.filter((detail) => !/COVERING INDEX/.test(detail));
     if (/FROM page p\b/.test(stmt.sql)) bad = bad.filter((detail) => !/^SEARCH d USING INDEX \S+ \(doc_id=\?\)$/.test(detail));
     if (bad.length) planProblems += 1;
     if (pass === 1 || bad.length) {
-      let cost = '';
-      if (pass === 1 && !isFile) {
-        const before = { ...verify };
-        await client.execute({ sql: stmt.sql, args: stmt.args });
-        cost = `rows_read ${String(verify.rowsRead - before.rowsRead).padStart(7)}  ${fmt(verify.queryMs - before.queryMs).padStart(8)} server  `;
-      }
+      const cost = pass === 1 ? `rows_read ${String(rowsRead).padStart(7)}  ${fmt(queryMs).padStart(8)} server  ` : '';
       console.log(`  ${bad.length ? 'FAIL' : 'ok  '} p${pass} ${shapeName.padEnd(11)} ${readerName.padEnd(19)} ${cost}${accesses.join(' | ') || '(no documents access)'}`);
     }
   }
 }
+const readerRows = captured.reduce((sum, c) => sum + c.rowsRead, 0);
+console.log(`  reader statements: ${captured.length}; rows_read for all of them: ${readerRows}`);
 check(planProblems === 0, `every serving statement reaches documents through a covering index on all ${passes} passes (analytics charCount and the page row-fetch excepted)`);
 
 if (!args['skip-recount']) {
