@@ -101,6 +101,12 @@ function record(sql, result, wallMs) {
   step.rowsRead += Number(result.rows_read || 0);
   step.rowsWritten += Number(result.rows_written || 0);
   step.queryMs += Number(result.query_duration_ms || 0);
+  if (Number(result.query_duration_ms || 0) >= 1000) {
+    // Slow statements (>= 1 s server time) are listed per step, e.g. to see where a long
+    // boot pass spends its time.
+    step.slow = step.slow || [];
+    step.slow.push({ sql: sql.replace(/\s+/g, ' ').slice(0, 110), rowsRead: Number(result.rows_read || 0), queryMs: Number(result.query_duration_ms || 0) });
+  }
   if (/^\s*(CREATE INDEX|DROP INDEX|INSERT OR REPLACE INTO sqlite_stat1)/i.test(sql)) {
     step.detail.push({
       sql: sql.replace(/\s+/g, ' ').slice(0, 70),
@@ -405,7 +411,10 @@ check(readiness === true, 'affiliation readiness flag set');
 endStep(verify);
 
 console.log('\nSteps (server figures from /v2/pipeline)');
-for (const s of stats.steps) console.log(`  ${stepLine(s)}`);
+for (const s of stats.steps) {
+  console.log(`  ${stepLine(s)}`);
+  for (const slow of s.slow || []) console.log(`      slow: ${fmt(slow.queryMs).padStart(8)} server  rows_read ${String(slow.rowsRead).padStart(7)}  ${slow.sql}`);
+}
 console.log(failures.length ? `\n${failures.length} check(s) FAILED:\n  - ${failures.join('\n  - ')}` : '\nAll checks passed.');
 logger.info('Rehearsal finished', { target, failures: failures.length });
 rawClient.close();
