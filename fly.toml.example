@@ -16,6 +16,11 @@ primary_region = "sjc"
   # (fly secrets set ADMIN_ALLOWED_NETWORKS=...), never in this file. Example:
   # ADMIN_ALLOWED_NETWORKS = "203.0.113.5, 198.51.100.0/24"
   SESSION_COOKIE_SECURE = "1"
+  # Background build of the covering documents indexes after boot (see README).
+  # The defaults are shown; omit them unless you need to change them.
+  # DOCUMENTS_INDEX_MIGRATION_DELAY_MS = "60000"
+  # DOCUMENTS_INDEX_MIGRATION_RETRY_MS = "1800000"
+  # DOCUMENT_AFFILIATIONS_BACKFILL_CHUNK = "500"
   DOWNLOAD_FILES = "0"
   DISABLE_CONTENT_RETRIEVAL = "0"
   DOCUMENT_SYNC_ENABLED = "0"
