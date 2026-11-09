@@ -508,3 +508,65 @@ test('without the statistics rows the planner falls back to the primary-key inde
   for (const index of db.DOCUMENT_SERVING_INDEXES) await client.execute({ sql: 'DROP INDEX IF EXISTS ' + index.name });
   await db.runDocumentsIndexMigration({ client, ...fastOptions().options });
 });
+
+// Review (DBA, phase 4): the warm gate must warm what CREATE INDEX reads, the table.
+// Once one covering index exists, the planner answers the prewarm aggregate from that
+// index (every column it reads is covered), so the gate would report "warm" while the
+// table pages the next build scans are still cold.
+test('every prewarm read scans the documents table itself, also after a covering index exists', async () => {
+  await resetToPreMigration();
+  const prewarmSql = new Set();
+  const spied = new Proxy(client, {
+    get(obj, prop) {
+      if (prop === 'execute') {
+        return (stmt) => {
+          const sql = typeof stmt === 'string' ? stmt : stmt.sql;
+          if (/MAX\(synced_at\)/.test(sql)) prewarmSql.add(sql);
+          return obj.execute(stmt);
+        };
+      }
+      const value = obj[prop];
+      return typeof value === 'function' ? value.bind(obj) : value;
+    },
+  });
+  assert.equal((await db.runDocumentsIndexMigration({ client: spied, wait: async () => {}, now: () => 0 })).complete, true);
+  assert.ok(prewarmSql.size > 0, 'the migration issued prewarm reads');
+  const fresh = createClient({ url: `file:${dbPath}` });
+  try {
+    for (const sql of prewarmSql) {
+      const plan = (await fresh.execute(`EXPLAIN QUERY PLAN ${sql}`)).rows.map((r) => String(r.detail));
+      assert.ok(plan.some((d) => /^SCAN documents$/.test(d)) && !plan.some((d) => /INDEX/.test(d)),
+        `prewarm must scan the table, not an index: ${plan.join(' | ')}`);
+    }
+  } finally { fresh.close(); }
+});
+
+// Review (DBA, phase 4): the admin-job guard ran once, before the run. A writer-heavy job
+// that starts during the run (e.g. inside a 30 s / 2 min build backoff) must stop the
+// remaining builds and the backfill, not run alongside them.
+test('a writer-heavy admin job that starts mid-run defers the remaining builds', async () => {
+  await resetToPreMigration();
+  let jobId = null;
+  const onStep = async (step) => {
+    if (step.step === 'build' && step.index === 'idx_documents_cover_doc' && jobId == null) {
+      jobId = await db.createAdminJob({ type: 'citation_scan', label: 'scan started mid-migration' });
+    }
+  };
+  let result;
+  try {
+    result = await db.ensureDocumentServingIndexes({ ...fastOptions().options, onStep });
+    assert.notEqual(jobId, null, 'the job was started after the first build');
+    assert.equal(result.complete, false);
+    assert.equal(result.indexes.idx_documents_cover_doc, 'built');
+    assert.equal(result.indexes.idx_documents_cover_degree, 'deferred');
+    const names = await indexNames();
+    assert.ok(!names.includes('idx_documents_cover_degree'), 'no build after the job started');
+    assert.ok(names.includes('idx_documents_degree'), 'legacy indexes kept');
+  } finally {
+    if (jobId != null) {
+      await client.execute({ sql: "UPDATE admin_jobs SET status = 'completed', finished_at = ? WHERE id = ?", args: [new Date().toISOString(), jobId] });
+    }
+  }
+  const resumed = await db.ensureDocumentServingIndexes(fastOptions().options);
+  assert.equal(resumed.complete, true);
+});

@@ -1739,8 +1739,11 @@ async function ensureStatTable(client) {
 
 // Reads that make a cold table warm: every column the index build reads, including
 // the ones stored after metadata_json, so the build's scan hits cache instead of
-// walking each row's overflow chain from disk inside the write lock.
-const DOCUMENTS_PREWARM_SQL = 'SELECT COUNT(*) AS n, MAX(synced_at) AS s, COUNT(available_at) AS a, MAX(length(title)) AS t FROM documents';
+// walking each row's overflow chain from disk inside the write lock. NOT INDEXED is
+// required: once one covering index exists it covers every column read here, and the
+// planner would answer from that index, timing (and warming) the index while the
+// table pages the next CREATE INDEX scans stay cold.
+const DOCUMENTS_PREWARM_SQL = 'SELECT COUNT(*) AS n, MAX(synced_at) AS s, COUNT(available_at) AS a, MAX(length(title)) AS t FROM documents NOT INDEXED';
 
 async function documentsMigrationStatus(client) {
   const present = new Set((await client.execute(
@@ -1790,7 +1793,7 @@ async function buildDocumentServingIndex(client, index, {
       await client.batch(documentServingIndexStatements(index, total.rows[0]?.n), 'write');
       const ms = Date.now() - started;
       logger.info('Serving index built', { index: index.name, ms });
-      onStep?.({ step: 'build', index: index.name, ms, attempt });
+      await onStep?.({ step: 'build', index: index.name, ms, attempt });
       return 'built';
     } catch (error) {
       logger.warn('Serving index build failed; rolled back', {
@@ -1822,6 +1825,9 @@ export async function runDocumentsIndexMigration({
   warmTries = 3,
   buildAttempts = inline ? 1 : 3,
   retryDelaysMs = [30_000, 120_000],
+  // Re-checked before every build and before the backfill: resolves to a reason
+  // (e.g. a running writer-heavy job type) to stop this run, or null to continue.
+  shouldDefer = null,
 } = {}) {
   const result = {
     indexes: Object.fromEntries(DOCUMENT_SERVING_INDEXES.map((index) => [index.name, 'pending'])),
@@ -1835,7 +1841,17 @@ export async function runDocumentsIndexMigration({
     result.legacyDropped = status.legacyIndexes.length === 0;
     result.affiliations = status.affiliationsComplete ? 'complete' : 'pending';
 
+    const deferFor = async () => {
+      const reason = shouldDefer ? await shouldDefer() : null;
+      if (reason) {
+        result.deferred = 'admin_job';
+        result.jobType = reason;
+        logger.info('Documents index migration paused while an admin job runs', { jobType: reason });
+      }
+      return Boolean(reason);
+    };
     for (const index of status.missingIndexes) {
+      if (await deferFor()) { result.indexes[index.name] = 'deferred'; break; }
       result.indexes[index.name] = await buildDocumentServingIndex(client, index, options);
       if (result.indexes[index.name] !== 'built') break;
     }
@@ -1846,7 +1862,7 @@ export async function runDocumentsIndexMigration({
         await client.batch(status.legacyIndexes.map((name) => `DROP INDEX IF EXISTS ${name}`), 'write');
         result.legacyDropped = true;
         logger.info('Dropped legacy documents indexes', { indexes: status.legacyIndexes, ms: Date.now() - started });
-        onStep?.({ step: 'drop-legacy', ms: Date.now() - started });
+        await onStep?.({ step: 'drop-legacy', ms: Date.now() - started });
       } catch (error) {
         logger.warn('Dropping legacy documents indexes failed; retried on the next run', {
           error: error?.message || String(error), code: error?.code,
@@ -1854,7 +1870,7 @@ export async function runDocumentsIndexMigration({
       }
     }
 
-    if (!status.affiliationsComplete) {
+    if (!status.affiliationsComplete && !result.deferred && !await deferFor()) {
       const started = Date.now();
       try {
         await ensureDocumentAffiliations(client);
@@ -1862,7 +1878,7 @@ export async function runDocumentsIndexMigration({
         await initAffiliationsReadiness(client);
         result.affiliations = 'complete';
         logger.info('Affiliation backfill complete', { chunks, ms: Date.now() - started });
-        onStep?.({ step: 'affiliation-backfill', ms: Date.now() - started, chunks });
+        await onStep?.({ step: 'affiliation-backfill', ms: Date.now() - started, chunks });
       } catch (error) {
         result.affiliations = 'interrupted';
         logger.warn('Affiliation backfill interrupted; readers stay on json_each until it resumes', {
@@ -1903,13 +1919,20 @@ export function ensureDocumentServingIndexes(options = {}) {
         await initAffiliationsReadiness(client);
         return { complete: true, indexes: {}, legacyDropped: true, affiliations: 'complete' };
       }
-      for (const type of DOCUMENTS_MIGRATION_BLOCKING_JOBS) {
-        if (await hasRunningAdminJob(type)) {
-          logger.info('Documents index migration deferred while an admin job runs', { jobType: type });
-          return { complete: false, deferred: 'admin_job', jobType: type };
+      const blockingJob = async () => {
+        for (const type of DOCUMENTS_MIGRATION_BLOCKING_JOBS) {
+          if (await hasRunningAdminJob(type)) return type;
         }
+        return null;
+      };
+      const jobType = await blockingJob();
+      if (jobType) {
+        logger.info('Documents index migration deferred while an admin job runs', { jobType });
+        return { complete: false, deferred: 'admin_job', jobType };
       }
-      return await runDocumentsIndexMigration({ client, ...options });
+      // The guard is re-checked before every build and before the backfill: a job
+      // can start during a build backoff (30 s, then 2 min).
+      return await runDocumentsIndexMigration({ client, shouldDefer: blockingJob, ...options });
     } catch (error) {
       logger.warn('Documents index migration could not start; retried later', { error: error?.message || String(error) });
       return { complete: false, error: error?.message || String(error) };
