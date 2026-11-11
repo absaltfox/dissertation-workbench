@@ -25,6 +25,27 @@ test.describe('Document Explorer', () => {
     await expect(docRows(page)).toHaveCount(FIXTURE_DOCS.length);
   });
 
+  test('search words match in any order, and quotes keep a phrase together', async ({ page }) => {
+    await page.locator('#docFilter').fill('Supervisor Morgan');
+    await expect(docRows(page)).toHaveCount(1);
+    await page.locator('#docFilter').fill('"Supervisor Morgan"');
+    await expect(docRows(page)).toHaveCount(0);
+    await page.locator('#docFilter').fill('"Digital Literacies" Rural');
+    await expect(docRows(page)).toHaveCount(1);
+  });
+
+  test('an empty search explains why and how to widen it', async ({ page }) => {
+    await page.locator('#docFilter').fill('Digital zzzz-no-such-word');
+    const status = page.locator('#documentsTable tr.document-page-status');
+    await expect(status).toContainText('No manuscripts match \u201cDigital zzzz-no-such-word\u201d');
+    await expect(status).toContainText('Every word must match');
+    await expect(status).toContainText('quotes');
+    await page.locator('#docFilter').fill('');
+    await page.locator('#filterDegree').selectOption('Doctor of Education - EdD');
+    await page.locator('#docFilter').fill('Digital');
+    await expect(status).toContainText('No manuscripts match \u201cDigital\u201d with the current filters');
+  });
+
   test('filtering by supervisor name matches', async ({ page }) => {
     await page.locator('#docFilter').fill('Morgan Supervisor');
     await expect(docRows(page)).toHaveCount(1);

@@ -1,3 +1,4 @@
+import { searchTerms } from '../public/app/search-terms.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -2416,6 +2417,10 @@ function affiliationFilterValues(raw) {
   return groups.find((group) => group.includes(value)) || [value];
 }
 
+// Search terms (words and quoted phrases), shared with the Documents table's
+// in-browser filter; re-exported for tests.
+export { searchTerms };
+
 function documentServingFilters({ syncKey = null, degree = '', program = '', affiliation = '', q = '' } = {}) {
   const clauses = [];
   const args = [];
@@ -2443,8 +2448,8 @@ function documentServingFilters({ syncKey = null, degree = '', program = '', aff
     )`);
     args.push(...values);
   }
-  if (q) {
-    const pattern = `%${String(q).toLowerCase()}%`;
+  for (const term of searchTerms(q)) {
+    const pattern = `%${term}%`;
     clauses.push(`(
       lower(COALESCE(d.title, '')) LIKE ? OR
       lower(COALESCE(d.author, '')) LIKE ? OR
@@ -3367,8 +3372,8 @@ export async function queryPeoplePage({
   const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const extra = [];
   const extraArgs = [];
-  if (q) {
-    const pattern = `%${String(q).toLowerCase()}%`;
+  for (const term of searchTerms(q)) {
+    const pattern = `%${term}%`;
     extra.push(`(
       lower(p.name) LIKE ? OR lower(p.role) LIKE ? OR lower(COALESCE(p.affiliation, '')) LIKE ?
     )`);
