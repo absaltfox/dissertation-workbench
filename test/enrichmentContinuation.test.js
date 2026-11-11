@@ -464,8 +464,10 @@ test('a sparse pending tail behind dense unrelated + satisfied documents still c
       !details.some((detail) => /TEMP B-TREE/.test(detail)),
       `batch ${i} needed a temp-b-tree sort -- the doc_id de-index stopped working: ${details.join(' | ')}\nSQL: ${sql}`
     );
+    // idx_documents_cover_doc leads with doc_id too: it serves the same ordered range
+    // scan, and its access_status column rejects restricted documents without a table read.
     assert.ok(
-      details.some((detail) => /USING INDEX sqlite_autoindex_documents_1/.test(detail) && detail.startsWith(hasCursor ? 'SEARCH d ' : '')),
+      details.some((detail) => /USING INDEX (sqlite_autoindex_documents_1|idx_documents_cover_doc)/.test(detail) && detail.startsWith(hasCursor ? 'SEARCH d ' : '')),
       `batch ${i} did not access documents via the doc_id primary key as expected (cursor present: ${hasCursor}): ${details.join(' | ')}`
     );
     if (hasCursor) {

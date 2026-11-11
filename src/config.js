@@ -40,6 +40,11 @@ export const TURSO_DATABASE_URL = process.env.TURSO_DATABASE_URL || '';
 export const TURSO_AUTH_TOKEN = process.env.TURSO_AUTH_TOKEN || '';
 export const PORT = Number(process.env.PORT || 3000);
 export const CACHE_TTL_MS = Number(process.env.CACHE_TTL_MS || 10 * 60 * 1000);
+// The background build of the documents covering indexes starts this long after
+// boot, and is retried this often while it reports incomplete (DB busy, a writer
+// job running, the table not warm).
+export const DOCUMENTS_INDEX_MIGRATION_DELAY_MS = Number(process.env.DOCUMENTS_INDEX_MIGRATION_DELAY_MS ?? 60 * 1000);
+export const DOCUMENTS_INDEX_MIGRATION_RETRY_MS = Number(process.env.DOCUMENTS_INDEX_MIGRATION_RETRY_MS || 30 * 60 * 1000);
 export const WORKBENCH_CACHE_REFRESH_MS = Number(process.env.WORKBENCH_CACHE_REFRESH_MS || 10 * 60 * 1000);
 export const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024; // 200 MB
 // Ceiling on text extracted from one PDF. A text-dense PDF decompresses roughly

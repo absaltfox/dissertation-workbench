@@ -58,7 +58,9 @@ export async function getDb() {
     // idempotent, so retry the complete startup pass on SQLITE_BUSY instead of
     // letting a transient schema-read lock prevent a singleton claimant from
     // reaching its durable lease.
-    schemaReady = ensureSchemaWithRetry(db).then(() => initCitationCountsReadiness(db));
+    schemaReady = ensureSchemaWithRetry(db)
+      .then(() => initCitationCountsReadiness(db))
+      .then(() => initAffiliationsReadiness(db));
   }
   await schemaReady;
   return db;
@@ -70,6 +72,7 @@ export async function closeDb() {
     db = undefined;
     schemaReady = undefined;
     citationCountsReady = false;
+    affiliationsReady = false;
   }
 }
 
@@ -219,6 +222,19 @@ export async function tryExec(client, sql, {
     }
     throw error;
   }
+}
+
+// Tables under this many documents (every test and fresh database) get the
+// documents-serving objects built inline in the schema pass; larger ones leave the
+// slow builds to the guarded background migration.
+export function documentsInlineMaxRows() {
+  const configured = process.env.DOCUMENTS_INDEX_INLINE_MAX_ROWS;
+  return configured == null || configured === '' || !Number.isFinite(Number(configured)) ? 2000 : Math.max(0, Number(configured));
+}
+
+async function isSmallDocumentsTable(client) {
+  const result = await client.execute('SELECT COUNT(doc_id) AS n FROM documents');
+  return Number(result.rows[0]?.n || 0) < documentsInlineMaxRows();
 }
 
 export async function addColumnIfMissing(client, table, column, definition) {
@@ -843,9 +859,6 @@ async function ensureSchema(client) {
   // person: 5,100 documents took that query from 70 ms to 126 s. The queue drives
   // off the doc_id primary key instead - see listDocumentsPendingEnrichment.
   await tryExec(client, 'DROP INDEX IF EXISTS idx_documents_sync_key_doc_id');
-  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_year ON documents(year)');
-  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree ON documents(degree)');
-  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_program ON documents(program)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_people_key ON document_people(person_key)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_people_role ON document_people(role)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_concept_partitions_priority ON concept_partitions(enabled, priority DESC, updated_at)');
@@ -885,15 +898,25 @@ async function ensureSchema(client) {
       AND content_checksum IS NOT NULL
       AND content_checksum <> ''
   `);
-  // scope_where() in build-concepts.py filters every automatic partition by
-  // degree plus a year range on each PatternRank run.
-  await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_documents_degree_year ON documents(degree, year)');
+  // The documents indexes on degree, program, year and (degree, year) are the
+  // covering idx_documents_cover_* set, built by runDocumentsIndexMigration (see
+  // the schema pass below). idx_documents_cover_degree keeps
+  // (degree, year) as its prefix for scope_where() in build-concepts.py.
 
   // document_terms projection table indexes for efficient term lookups
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_kind_term ON document_terms(kind, term)');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_kind_termlower ON document_terms(kind, lower(term))');
   await tryExec(client, 'CREATE INDEX IF NOT EXISTS idx_document_terms_doc ON document_terms(doc_id, kind)');
 
+  await ensureDocumentAffiliations(client);
+  // A small table (every test and fresh database) gets the whole migration inline:
+  // the covering indexes, dropping the legacy ones, and the affiliation backfill.
+  // On a large one (prod) the pass stops at the cheap DDL above, and the web
+  // process runs the guarded background migration after boot, so a slow build or a
+  // TRANSACTION_TIMEOUT can never fail or delay startup. The migration never throws.
+  if (await isSmallDocumentsTable(client)) {
+    await runDocumentsIndexMigration({ client, inline: true });
+  }
   await ensureCitationCountSummaries(client);
   await backfillCitationMatchKeys(client);
   await backfillDocumentAccessStatus(client);
@@ -1512,6 +1535,442 @@ export async function reconcileCitationCounts({ repair = false } = {}) {
   return { ...drift, repaired: drifted };
 }
 
+// --- document_affiliations projection ---
+//
+// `$.affiliation` of every document, one row per distinct trimmed value, so the
+// affiliation filter and facet stop parsing each document's ~3.6 KB metadata_json
+// (the same expressions as before: trim(CAST(value AS TEXT)), compared as
+// lower(...)). The triggers derive the rows from the stored NEW.metadata_json, so
+// they cover every writer. json_valid() guards keep a malformed metadata_json from
+// failing a document write (the old read queries raised on such a row instead).
+// The update trigger fires only when `$.affiliation` itself changes.
+const AFFILIATION_BACKFILL_KEY = 'document_affiliations_backfill';
+// Distinct, non-NULL values only, and a plain INSERT: an `INSERT OR IGNORE` inside
+// a trigger body is overridden by the conflict policy of the statement that fired
+// it, and the document upsert (ON CONFLICT DO UPDATE) aborts on a duplicate key.
+const AFFILIATION_PROJECTION_SELECT = (docIdExpr, metadataExpr, { from = '', where = '' } = {}) => `
+    SELECT DISTINCT t.doc_id, t.value, lower(t.value)
+    FROM (
+      SELECT ${docIdExpr} AS doc_id, trim(CAST(a.value AS TEXT)) AS value
+      FROM ${from}json_each(CASE WHEN json_valid(${metadataExpr}) THEN ${metadataExpr} END, '$.affiliation') a
+      ${where}
+    ) t
+    WHERE t.value IS NOT NULL`;
+
+const AFFILIATION_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS document_affiliations (
+     doc_id     TEXT NOT NULL,
+     value      TEXT NOT NULL,
+     value_norm TEXT NOT NULL,
+     PRIMARY KEY (doc_id, value)
+   ) WITHOUT ROWID`,
+  'CREATE INDEX IF NOT EXISTS idx_document_affiliations_norm ON document_affiliations(value_norm, doc_id)',
+  `CREATE TRIGGER IF NOT EXISTS trg_documents_affiliations_ins AFTER INSERT ON documents BEGIN
+     INSERT INTO document_affiliations (doc_id, value, value_norm)
+     ${AFFILIATION_PROJECTION_SELECT('NEW.doc_id', 'NEW.metadata_json')};
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_documents_affiliations_upd AFTER UPDATE OF metadata_json ON documents
+   WHEN json_extract(CASE WHEN json_valid(OLD.metadata_json) THEN OLD.metadata_json END, '$.affiliation')
+     IS NOT json_extract(CASE WHEN json_valid(NEW.metadata_json) THEN NEW.metadata_json END, '$.affiliation')
+   BEGIN
+     DELETE FROM document_affiliations WHERE doc_id = NEW.doc_id;
+     INSERT INTO document_affiliations (doc_id, value, value_norm)
+     ${AFFILIATION_PROJECTION_SELECT('NEW.doc_id', 'NEW.metadata_json')};
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_documents_affiliations_del AFTER DELETE ON documents BEGIN
+     DELETE FROM document_affiliations WHERE doc_id = OLD.doc_id;
+   END`,
+];
+
+const AFFILIATION_OBJECTS_SQL = `
+  SELECT COUNT(*) AS n FROM sqlite_master
+  WHERE (type = 'trigger' AND name IN ('trg_documents_affiliations_ins', 'trg_documents_affiliations_upd', 'trg_documents_affiliations_del'))
+     OR (type = 'table' AND name = 'document_affiliations')
+     OR (type = 'index' AND name = 'idx_document_affiliations_norm')`;
+
+function affiliationBackfillChunk() {
+  return Math.max(1, Number(process.env.DOCUMENT_AFFILIATIONS_BACKFILL_CHUNK) || 500);
+}
+
+async function readAffiliationBackfillState(client) {
+  const result = await client.execute({
+    sql: 'SELECT projection_value FROM serving_projection_state WHERE projection_key = ?',
+    args: [AFFILIATION_BACKFILL_KEY],
+  });
+  const raw = result.rows[0]?.projection_value;
+  if (raw === 'complete') return { complete: true };
+  try {
+    const parsed = JSON.parse(raw || 'null');
+    if (parsed && typeof parsed.cursor === 'string') return { complete: false, cursor: parsed.cursor };
+  } catch { /* fall through */ }
+  return { complete: false, cursor: '' };
+}
+
+function affiliationBackfillStateStatement(state, now = new Date().toISOString()) {
+  return {
+    sql: `INSERT INTO serving_projection_state (projection_key, projection_value, updated_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(projection_key) DO UPDATE SET
+            projection_value = excluded.projection_value, updated_at = excluded.updated_at`,
+    args: [AFFILIATION_BACKFILL_KEY, state.complete ? 'complete' : JSON.stringify({ cursor: state.cursor ?? '' }), now],
+  };
+}
+
+// Creates the table, its index and the three triggers (cheap DDL on an empty
+// table) in one transaction that also resets the backfill, but only when
+// something is missing, so a repaired trigger set is always re-verified.
+export async function ensureDocumentAffiliations(client) {
+  const present = await client.execute(AFFILIATION_OBJECTS_SQL);
+  if (Number(present.rows[0]?.n || 0) === 5) return false;
+  await client.batch([
+    ...AFFILIATION_SCHEMA_STATEMENTS,
+    affiliationBackfillStateStatement({ complete: false, cursor: '' }),
+  ], 'write');
+  return true;
+}
+
+// Rebuilds the projection in doc_id keyset chunks. A chunk is an exact recount of
+// its range in one small write transaction (on remote libSQL a write over about
+// 5 s is aborted once another connection waits), so a write landing between chunks,
+// on either side of the cursor, is never lost: the triggers are live before the
+// first chunk and each chunk overwrites its range. The cursor is stored with each
+// chunk, so an interrupted backfill resumes where it stopped. Returns the chunk
+// count; throws on a failed chunk (callers log it and retry later).
+export async function backfillDocumentAffiliations(client) {
+  const size = affiliationBackfillChunk();
+  const state = await readAffiliationBackfillState(client);
+  if (state.complete) return 0;
+  let cursor = state.cursor;
+  let chunks = 0;
+  for (;;) {
+    const boundary = await client.execute({
+      sql: `SELECT MAX(doc_id) AS hi FROM (SELECT doc_id FROM documents WHERE doc_id > ? ORDER BY doc_id LIMIT ?)`,
+      args: [cursor, size],
+    });
+    const hi = boundary.rows[0]?.hi == null ? null : String(boundary.rows[0].hi);
+    if (hi == null) {
+      // Past the last document: drop rows above the cursor whose document is gone.
+      // The NOT EXISTS matters: a document inserted after the boundary read has
+      // exact trigger-made rows.
+      await client.batch([
+        {
+          sql: `DELETE FROM document_affiliations WHERE doc_id > ?
+                AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.doc_id = document_affiliations.doc_id)`,
+          args: [cursor],
+        },
+        affiliationBackfillStateStatement({ complete: true }),
+      ], 'write');
+      chunks += 1;
+      return chunks;
+    }
+    await client.batch([
+      { sql: 'DELETE FROM document_affiliations WHERE doc_id > ? AND doc_id <= ?', args: [cursor, hi] },
+      {
+        sql: `INSERT INTO document_affiliations (doc_id, value, value_norm)
+              ${AFFILIATION_PROJECTION_SELECT('d.doc_id', 'd.metadata_json', {
+    from: 'documents d, ', where: 'WHERE d.doc_id > ? AND d.doc_id <= ?',
+  })}`,
+        args: [cursor, hi],
+      },
+      affiliationBackfillStateStatement({ complete: false, cursor: hi }),
+    ], 'write');
+    chunks += 1;
+    cursor = hi;
+  }
+}
+
+let affiliationsReady = false;
+export function isAffiliationsReady() { return affiliationsReady; }
+export function __setAffiliationsReadyForTesting(value) { affiliationsReady = Boolean(value); }
+
+// Ready means the table, index and triggers exist (so the projection tracks every
+// write) and the backfill completed. The filter and facet use it only then.
+export async function initAffiliationsReadiness(client = null) {
+  const target = client || await getDb();
+  const result = await target.execute(AFFILIATION_OBJECTS_SQL);
+  affiliationsReady = Number(result.rows[0]?.n || 0) === 5
+    && (await readAffiliationBackfillState(target)).complete;
+  return affiliationsReady;
+}
+
+// --- Covering indexes on documents, and the migration that builds them ---
+//
+// Every column the serving queries read from `documents` (everything except
+// metadata_json, sync_key, source_json and access_status_reason) sits in each of
+// four indexes, so whichever one the planner picks for a filtered read is
+// index-only. On prod a document is one 4 KB page (metadata_json averages 3.6 KB
+// and the filter columns are stored after it), so a plan that touches the table
+// costs a cold page per row. They replace the narrow indexes on the same leading
+// columns, which the planner would otherwise keep choosing and then follow into
+// the table.
+
+// `stat` is the sqlite_stat1 row the planner needs for the new index. libSQL
+// rejects ANALYZE, and without these rows the planner probes doc_id through the
+// primary-key index and reads the table again. The leading numbers (rows per
+// leading key) are the figures prod's own statistics carried for the narrow
+// indexes they replace; the tail is 1 because the remaining columns make a key
+// unique. They are clamped to the table size.
+export const DOCUMENT_SERVING_INDEXES = [
+  { name: 'idx_documents_cover_doc', columns: ['doc_id', 'access_status', 'degree', 'program', 'year', 'title', 'author', 'synced_at', 'available_at'], stat: [1, 1, 1, 1, 1, 1, 1, 1, 1] },
+  { name: 'idx_documents_cover_degree', columns: ['degree', 'year', 'access_status', 'program', 'doc_id', 'title', 'author', 'synced_at', 'available_at'], stat: [1310, 27, 27, 4, 1, 1, 1, 1, 1] },
+  { name: 'idx_documents_cover_year', columns: ['year', 'access_status', 'degree', 'program', 'doc_id', 'title', 'author', 'synced_at', 'available_at'], stat: [134, 133, 17, 4, 1, 1, 1, 1, 1] },
+  { name: 'idx_documents_cover_program', columns: ['program', 'year', 'access_status', 'degree', 'doc_id', 'title', 'author', 'synced_at', 'available_at'], stat: [101, 17, 17, 4, 1, 1, 1, 1, 1] },
+];
+const LEGACY_DOCUMENT_INDEXES = ['idx_documents_degree', 'idx_documents_degree_year', 'idx_documents_program', 'idx_documents_year'];
+
+function documentServingIndexStatements(index, rowCount) {
+  const n = Math.max(1, Number(rowCount) || 1);
+  const stat = [n, ...index.stat.map((v) => Math.min(v, n))].join(' ');
+  return [
+    { sql: `CREATE INDEX IF NOT EXISTS ${index.name} ON documents(${index.columns.join(', ')})`, args: [] },
+    {
+      sql: "INSERT OR REPLACE INTO sqlite_stat1 (tbl, idx, stat) VALUES ('documents', ?, ?)",
+      args: [index.name, stat],
+    },
+  ];
+}
+
+// sqlite_stat1 exists only after the first ANALYZE. Prod has it; a fresh local
+// database does not, and cannot CREATE it (the name is reserved).
+async function ensureStatTable(client) {
+  const present = await client.execute("SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1'");
+  if (!present.rows.length) await client.execute('ANALYZE sqlite_master');
+}
+
+// Reads that make a cold table warm: every column the index build reads, including
+// the ones stored after metadata_json, so the build's scan hits cache instead of
+// walking each row's overflow chain from disk inside the write lock. NOT INDEXED is
+// required: once one covering index exists it covers every column read here, and the
+// planner would answer from that index, timing (and warming) the index while the
+// table pages the next CREATE INDEX scans stay cold.
+const DOCUMENTS_PREWARM_SQL = 'SELECT COUNT(*) AS n, MAX(synced_at) AS s, COUNT(available_at) AS a, MAX(length(title)) AS t FROM documents NOT INDEXED';
+
+async function documentsMigrationStatus(client) {
+  const present = new Set((await client.execute(
+    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'documents'",
+  )).rows.map((row) => String(row.name)));
+  return {
+    missingIndexes: DOCUMENT_SERVING_INDEXES.filter((index) => !present.has(index.name)),
+    legacyIndexes: LEGACY_DOCUMENT_INDEXES.filter((name) => present.has(name)),
+    affiliationsComplete: (await readAffiliationBackfillState(client)).complete
+      && Number((await client.execute(AFFILIATION_OBJECTS_SQL)).rows[0]?.n || 0) === 5,
+  };
+}
+
+function isRetryableMigrationError(error) {
+  return error?.code === 'TRANSACTION_TIMEOUT'
+    || /transaction timed out/i.test(String(error?.message || ''))
+    || classifyDbError(error) === 'transient';
+}
+
+async function warmDocumentsTable(client, { now, warmBudgetMs, warmTries }) {
+  for (let attempt = 1; attempt <= warmTries; attempt += 1) {
+    const started = now();
+    await client.execute(DOCUMENTS_PREWARM_SQL);
+    const ms = now() - started;
+    if (ms < warmBudgetMs) return true;
+    logger.info('Documents table still cold; reading it again', { attempt, ms: Math.round(ms) });
+  }
+  return false;
+}
+
+// One index: warm the table, then CREATE INDEX plus its statistics row in a single
+// write batch (a failed batch rolls back whole, so nothing partial is left). A
+// timeout, lock or connection blip is retried after a backoff; anything else is
+// logged and left for the next run.
+async function buildDocumentServingIndex(client, index, {
+  inline, now, wait, warmBudgetMs, warmTries, buildAttempts, retryDelaysMs, onStep,
+}) {
+  if (!inline && !await warmDocumentsTable(client, { now, warmBudgetMs, warmTries })) {
+    logger.warn('Serving index build deferred: the documents table is not warm', { index: index.name });
+    return 'deferred';
+  }
+  for (let attempt = 1; attempt <= buildAttempts; attempt += 1) {
+    const started = Date.now();
+    try {
+      await ensureStatTable(client);
+      const total = await client.execute('SELECT COUNT(doc_id) AS n FROM documents');
+      await client.batch(documentServingIndexStatements(index, total.rows[0]?.n), 'write');
+      const ms = Date.now() - started;
+      logger.info('Serving index built', { index: index.name, ms });
+      await onStep?.({ step: 'build', index: index.name, ms, attempt });
+      return 'built';
+    } catch (error) {
+      logger.warn('Serving index build failed; rolled back', {
+        index: index.name, attempt, buildAttempts, ms: Date.now() - started,
+        error: error?.message || String(error), code: error?.code,
+      });
+      if (!isRetryableMigrationError(error) || attempt >= buildAttempts) return 'failed';
+      await wait(retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)]);
+    }
+  }
+  return 'failed';
+}
+
+/**
+ * Builds the covering indexes (each with its planner statistics), drops the legacy
+ * indexes once all four exist, and backfills document_affiliations in chunks. Safe
+ * to call at any time and any number of times: every step is idempotent and a step
+ * that fails or defers is logged and picked up by the next run. Never throws.
+ *
+ * `inline` is the schema pass for a small table: no prewarm, no retries.
+ */
+export async function runDocumentsIndexMigration({
+  client,
+  inline = false,
+  onStep = null,
+  wait = defaultRetryWait,
+  now = () => performance.now(),
+  warmBudgetMs = 1500,
+  warmTries = 3,
+  buildAttempts = inline ? 1 : 3,
+  retryDelaysMs = [30_000, 120_000],
+  // Re-checked before every build and before the backfill: resolves to a reason
+  // (e.g. a running writer-heavy job type) to stop this run, or null to continue.
+  shouldDefer = null,
+} = {}) {
+  const result = {
+    indexes: Object.fromEntries(DOCUMENT_SERVING_INDEXES.map((index) => [index.name, 'pending'])),
+    legacyDropped: false, affiliations: 'pending', complete: false,
+  };
+  const options = { inline, now, wait, warmBudgetMs, warmTries, buildAttempts, retryDelaysMs, onStep };
+  try {
+    const status = await documentsMigrationStatus(client);
+    for (const index of DOCUMENT_SERVING_INDEXES) result.indexes[index.name] = 'present';
+    for (const index of status.missingIndexes) result.indexes[index.name] = 'pending';
+    result.legacyDropped = status.legacyIndexes.length === 0;
+    result.affiliations = status.affiliationsComplete ? 'complete' : 'pending';
+
+    const deferFor = async () => {
+      const reason = shouldDefer ? await shouldDefer() : null;
+      if (reason) {
+        result.deferred = 'admin_job';
+        result.jobType = reason;
+        logger.info('Documents index migration paused while an admin job runs', { jobType: reason });
+      }
+      return Boolean(reason);
+    };
+    for (const index of status.missingIndexes) {
+      if (await deferFor()) { result.indexes[index.name] = 'deferred'; break; }
+      result.indexes[index.name] = await buildDocumentServingIndex(client, index, options);
+      if (result.indexes[index.name] !== 'built') break;
+    }
+    const allIndexes = Object.values(result.indexes).every((state) => state === 'present' || state === 'built');
+    if (allIndexes && status.legacyIndexes.length) {
+      try {
+        const started = Date.now();
+        await client.batch(status.legacyIndexes.map((name) => `DROP INDEX IF EXISTS ${name}`), 'write');
+        result.legacyDropped = true;
+        logger.info('Dropped legacy documents indexes', { indexes: status.legacyIndexes, ms: Date.now() - started });
+        await onStep?.({ step: 'drop-legacy', ms: Date.now() - started });
+      } catch (error) {
+        logger.warn('Dropping legacy documents indexes failed; retried on the next run', {
+          error: error?.message || String(error), code: error?.code,
+        });
+      }
+    }
+
+    if (!status.affiliationsComplete && !result.deferred && !await deferFor()) {
+      const started = Date.now();
+      try {
+        await ensureDocumentAffiliations(client);
+        const chunks = await backfillDocumentAffiliations(client);
+        await initAffiliationsReadiness(client);
+        result.affiliations = 'complete';
+        logger.info('Affiliation backfill complete', { chunks, ms: Date.now() - started });
+        await onStep?.({ step: 'affiliation-backfill', ms: Date.now() - started, chunks });
+      } catch (error) {
+        result.affiliations = 'interrupted';
+        logger.warn('Affiliation backfill interrupted; readers stay on json_each until it resumes', {
+          error: error?.message || String(error), code: error?.code,
+        });
+      }
+    }
+    result.complete = allIndexes && result.legacyDropped && result.affiliations === 'complete';
+  } catch (error) {
+    logger.warn('Documents index migration failed; retried on the next run', {
+      error: error?.message || String(error), code: error?.code,
+    });
+  }
+  return result;
+}
+
+// Writer-heavy jobs that the build's write lock would contend with.
+const DOCUMENTS_MIGRATION_BLOCKING_JOBS = [
+  'document_sync', 'import_rules_sync', 'concept_rebuild', 'theme_recompute', 'reparse_all',
+  'reparse_citations', 'reparse_committee', 'citation_scan', 'catalogue_lookup', 'bertopic',
+  'topic_bands', 'topic_labels',
+];
+
+let documentsMigrationInflight = null;
+
+/**
+ * The web process's entry point: single-flight, skips (does not queue) while a
+ * writer-heavy admin job runs, and does nothing but one catalogue read once the
+ * migration is complete. Returns the run's result; never throws.
+ */
+export function ensureDocumentServingIndexes(options = {}) {
+  if (documentsMigrationInflight) return documentsMigrationInflight;
+  documentsMigrationInflight = (async () => {
+    try {
+      const client = await getDb();
+      const status = await documentsMigrationStatus(client);
+      if (!status.missingIndexes.length && !status.legacyIndexes.length && status.affiliationsComplete) {
+        await initAffiliationsReadiness(client);
+        return { complete: true, indexes: {}, legacyDropped: true, affiliations: 'complete' };
+      }
+      const blockingJob = async () => {
+        for (const type of DOCUMENTS_MIGRATION_BLOCKING_JOBS) {
+          if (await hasRunningAdminJob(type)) return type;
+        }
+        return null;
+      };
+      const jobType = await blockingJob();
+      if (jobType) {
+        logger.info('Documents index migration deferred while an admin job runs', { jobType });
+        return { complete: false, deferred: 'admin_job', jobType };
+      }
+      // The guard is re-checked before every build and before the backfill: a job
+      // can start during a build backoff (30 s, then 2 min).
+      return await runDocumentsIndexMigration({ client, shouldDefer: blockingJob, ...options });
+    } catch (error) {
+      logger.warn('Documents index migration could not start; retried later', { error: error?.message || String(error) });
+      return { complete: false, error: error?.message || String(error) };
+    } finally {
+      documentsMigrationInflight = null;
+    }
+  })();
+  return documentsMigrationInflight;
+}
+
+/**
+ * Runs ensureDocumentServingIndexes once `delayMs` after it is called (so it never
+ * competes with startup work), then again every `retryMs` while it reports
+ * incomplete, at most `maxRuns` times in this process. Timers are unref'd. Returns
+ * a function that cancels any pending run.
+ */
+export function scheduleDocumentServingIndexes({
+  delayMs = 60_000, retryMs = 30 * 60_000, maxRuns = 6, run = ensureDocumentServingIndexes,
+} = {}) {
+  let timer = null;
+  let stopped = false;
+  let runs = 0;
+  const arm = (ms) => {
+    if (stopped) return;
+    timer = setTimeout(async () => {
+      runs += 1;
+      let result = null;
+      try { result = await run(); } catch (error) {
+        logger.warn('Documents index migration run failed', { error: error?.message || String(error) });
+      }
+      if (!result?.complete && runs < maxRuns) arm(retryMs);
+    }, ms);
+    timer.unref?.();
+  };
+  arm(delayMs);
+  return () => { stopped = true; clearTimeout(timer); };
+}
+
 let documentTermsReady = false;
 export function isDocumentTermsReady() { return documentTermsReady; }
 export function __setDocumentTermsReadyForTesting(value) { documentTermsReady = Boolean(value); }
@@ -1974,7 +2433,11 @@ function documentServingFilters({ syncKey = null, degree = '', program = '', aff
   }
   if (affiliation) {
     const values = affiliationFilterValues(affiliation);
-    clauses.push(`EXISTS (
+    // The projection holds the same lower(trim(CAST(value AS TEXT))) per value;
+    // until its backfill completes the filter parses each document's JSON.
+    clauses.push(isAffiliationsReady()
+      ? `d.doc_id IN (SELECT a.doc_id FROM document_affiliations a WHERE a.value_norm IN (${values.map(() => '?').join(', ')}))`
+      : `EXISTS (
       SELECT 1 FROM json_each(d.metadata_json, '$.affiliation') affiliation
       WHERE lower(trim(CAST(affiliation.value AS TEXT))) IN (${values.map(() => '?').join(', ')})
     )`);
@@ -2001,12 +2464,21 @@ function documentServingFilters({ syncKey = null, degree = '', program = '', aff
   };
 }
 
-function analyticalDocumentFilters(options = {}) {
+// Turso's planner does not use a covering index for a plain full scan of documents (the
+// 2026-11-09 branch rehearsal printed `SCAN d`, the 18k-page table, for every unfiltered
+// serving statement although a covering index held every column). A range on doc_id makes
+// idx_documents_cover_doc usable as an index SEARCH on any planner. The OR keeps a row
+// whose doc_id is NULL (a non-INTEGER primary key may hold NULL), so results are identical.
+export const DOCUMENTS_COVERING_SCAN_SQL = "(d.doc_id >= '' OR d.doc_id IS NULL)";
+
+// `coveringScan` adds DOCUMENTS_COVERING_SCAN_SQL when no user filter narrows the rows, for
+// serving statements whose documents access is otherwise a full scan.
+function analyticalDocumentFilters({ coveringScan = false, ...options } = {}) {
   const filters = documentServingFilters(options);
   return {
     where: filters.where
       ? `${filters.where} AND ${ACTIVE_ANALYTICS_ACCESS_SQL}`
-      : `WHERE ${ACTIVE_ANALYTICS_ACCESS_SQL}`,
+      : `WHERE ${ACTIVE_ANALYTICS_ACCESS_SQL}${coveringScan ? ` AND ${DOCUMENTS_COVERING_SCAN_SQL}` : ''}`,
     args: filters.args,
   };
 }
@@ -2038,7 +2510,13 @@ export async function queryCachedDocumentPage({
   syncKey = null, filters = {}, q = '', sortKey = '', sortDir = 'asc', limit = 50, offset = 0,
 } = {}) {
   const queryFilters = documentServingFilters({ syncKey, ...filters, q });
-  const countRow = await get(`SELECT COUNT(*) AS total FROM documents d ${queryFilters.where}`, queryFilters.args);
+  // doc_id is a NOT NULL primary key, so COUNT(d.doc_id) equals COUNT(*), but an
+  // unfiltered COUNT(*) is free to pick the widest index (sync_key, 1,358 pages
+  // on prod) where COUNT(d.doc_id) reads the 67-page primary-key index.
+  const countRow = await get(
+    `SELECT ${queryFilters.where ? 'COUNT(*)' : 'COUNT(d.doc_id)'} AS total FROM documents d ${queryFilters.where}`,
+    queryFilters.args,
+  );
   const sortExpression = DOCUMENT_PAGE_SORTS[sortKey] || 'COALESCE(d.year, 0)';
   const direction = sortKey ? (sortDir === 'asc' ? 'ASC' : 'DESC') : 'DESC';
   // The whole-table citation aggregation below is only needed when the page is
@@ -2047,17 +2525,28 @@ export async function queryCachedDocumentPage({
   // case) skips it entirely and gets counts afterward, bounded to just this
   // page's doc_ids, via applyCitationCountsToDocuments.
   const needsCitationSortJoin = sortKey === 'citationCount';
+  // Ids first: the sort keys come from covered columns, so the sorter never
+  // carries each filtered row's metadata_json (about 3.6 KB, on its own page).
+  // doc_id is unique, so the key order is total and the outer ORDER BY repeats it
+  // exactly.
   const rows = await all(`
+    WITH page AS (
+      SELECT d.doc_id AS doc_id, ${sortExpression} AS k1, lower(COALESCE(d.title, '')) AS k2
+      FROM documents d
+      ${/\bfm\./.test(sortExpression) ? 'LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id' : ''}
+      ${needsCitationSortJoin ? `LEFT JOIN ${citationCountJoinSource()} dc ON dc.doc_id = d.doc_id` : ''}
+      ${queryFilters.where || `WHERE ${DOCUMENTS_COVERING_SCAN_SQL}`}
+      ORDER BY k1 ${direction}, k2 ASC, d.doc_id ASC
+      LIMIT ? OFFSET ?
+    )
     SELECT d.doc_id, d.metadata_json,
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
            fm.word_count_comparison_json
-    FROM documents d
+    FROM page p
+    JOIN documents d ON d.doc_id = p.doc_id
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
-    ${needsCitationSortJoin ? `LEFT JOIN ${citationCountJoinSource()} dc ON dc.doc_id = d.doc_id` : ''}
-    ${queryFilters.where}
-    ORDER BY ${sortExpression} ${direction}, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
-    LIMIT ? OFFSET ?
+    ORDER BY p.k1 ${direction}, p.k2 ASC, p.doc_id ASC
   `, [...queryFilters.args, Math.max(1, Number(limit) || 50), Math.max(0, Number(offset) || 0)]);
   const documents = rows.map((row) => {
     try {
@@ -2074,7 +2563,7 @@ export async function queryCachedDocumentPage({
 export async function queryTopicDocumentPage({
   syncKey = null, filters = {}, limit = 5000, offset = 0,
 } = {}) {
-  const queryFilters = analyticalDocumentFilters({ syncKey, ...filters });
+  const queryFilters = analyticalDocumentFilters({ coveringScan: true, syncKey, ...filters });
   const topicJoin = 'JOIN (SELECT DISTINCT doc_id FROM document_topics) dt ON dt.doc_id = d.doc_id';
   const countRow = await get(`
     SELECT COUNT(*) AS total
@@ -2082,18 +2571,25 @@ export async function queryTopicDocumentPage({
     ${topicJoin}
     ${queryFilters.where}
   `, queryFilters.args);
+  // Ids first, as in queryCachedDocumentPage: only the page's rows read metadata_json.
   const rows = await all(`
+    WITH page AS (
+      SELECT d.doc_id AS doc_id, COALESCE(d.year, 0) AS k1, lower(COALESCE(d.title, '')) AS k2
+      FROM documents d
+      ${topicJoin}
+      ${queryFilters.where}
+      ORDER BY k1 DESC, k2 ASC, d.doc_id ASC
+      LIMIT ? OFFSET ?
+    )
     SELECT d.doc_id, d.metadata_json,
            fm.download_url, fm.file_bytes, fm.word_count, fm.body_word_count,
            fm.page_count, fm.word_source, fm.page_source, fm.status, fm.error,
            fm.word_count_comparison_json,
            (SELECT COUNT(*) FROM document_citations x WHERE x.doc_id = d.doc_id) AS citation_count
-    FROM documents d
-    ${topicJoin}
+    FROM page p
+    JOIN documents d ON d.doc_id = p.doc_id
     LEFT JOIN file_metrics fm ON fm.doc_id = d.doc_id
-    ${queryFilters.where}
-    ORDER BY COALESCE(d.year, 0) DESC, lower(COALESCE(d.title, '')) ASC, d.doc_id ASC
-    LIMIT ? OFFSET ?
+    ORDER BY p.k1 DESC, p.k2 ASC, p.doc_id ASC
   `, [...queryFilters.args, Math.max(1, Number(limit) || 5000), Math.max(0, Number(offset) || 0)]);
   const documents = rows.map((row) => {
     try {
@@ -2172,7 +2668,7 @@ export async function queryVisualizationDocuments({ syncKey = null, filters = {}
  * simply absent — buildTermCooccurrence doesn't need them either way.
  */
 export async function queryConceptTermsByDoc({ syncKey = null, filters = {} } = {}) {
-  const f = analyticalDocumentFilters({ syncKey, ...filters });
+  const f = analyticalDocumentFilters({ coveringScan: true, syncKey, ...filters });
   // Rows feed buildTermCooccurrence() -> docConceptTerms(rec, 20), which does
   // slice(0, 20). We only order by dt.doc_id (not array/rowid order) within a
   // doc, which is safe only because normalizeRecord caps stored conceptTerms
@@ -2193,21 +2689,36 @@ export async function queryConceptTermsByDoc({ syncKey = null, filters = {} } = 
   return Array.from(byDoc.values()).map((conceptTerms) => ({ conceptTerms }));
 }
 
-/** Small, database-side bootstrap aggregates for metadata-scale landing pages. */
-export async function getDocumentServingSummary({ syncKey = null } = {}) {
-  const filters = documentServingFilters({ syncKey });
-  const analyticsFilters = analyticalDocumentFilters({ syncKey });
-  const [summary, degrees, programs, affiliations, supervisors] = await Promise.all([
-    get(`SELECT COUNT(*) AS documents FROM documents d ${analyticsFilters.where}`, analyticsFilters.args),
-    all(`SELECT DISTINCT d.degree AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.degree IS NOT NULL AND trim(d.degree) <> '' ORDER BY value`, filters.args),
-    all(`SELECT DISTINCT d.program AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.program IS NOT NULL AND trim(d.program) <> '' ORDER BY value`, filters.args),
-    all(`
+// The distinct non-empty affiliation values. The projection holds the same
+// trim(CAST(value AS TEXT)) values; it only needs documents when a sync scope
+// restricts them.
+function affiliationFacetRows(filters) {
+  if (!isAffiliationsReady()) {
+    return all(`
       SELECT DISTINCT trim(CAST(affiliation.value AS TEXT)) AS value
       FROM documents d, json_each(d.metadata_json, '$.affiliation') affiliation
       ${filters.where}
       ${filters.where ? 'AND' : 'WHERE'} trim(CAST(affiliation.value AS TEXT)) <> ''
       ORDER BY value
-    `, filters.args),
+    `, filters.args);
+  }
+  return all(filters.where
+    ? `SELECT DISTINCT a.value AS value FROM document_affiliations a
+       JOIN documents d ON d.doc_id = a.doc_id
+       ${filters.where} AND a.value <> '' ORDER BY value`
+    : `SELECT DISTINCT a.value AS value FROM document_affiliations a WHERE a.value <> '' ORDER BY value`,
+  filters.args);
+}
+
+/** Small, database-side bootstrap aggregates for metadata-scale landing pages. */
+export async function getDocumentServingSummary({ syncKey = null } = {}) {
+  const filters = documentServingFilters({ syncKey });
+  const analyticsFilters = analyticalDocumentFilters({ coveringScan: true, syncKey });
+  const [summary, degrees, programs, affiliations, supervisors] = await Promise.all([
+    get(`SELECT COUNT(*) AS documents FROM documents d ${analyticsFilters.where}`, analyticsFilters.args),
+    all(`SELECT DISTINCT d.degree AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.degree IS NOT NULL AND trim(d.degree) <> '' ORDER BY value`, filters.args),
+    all(`SELECT DISTINCT d.program AS value FROM documents d ${filters.where ? `${filters.where} AND` : 'WHERE'} d.program IS NOT NULL AND trim(d.program) <> '' ORDER BY value`, filters.args),
+    affiliationFacetRows(filters),
     get(`
       SELECT COUNT(DISTINCT p.person_key) AS count
       FROM document_people p
@@ -2230,7 +2741,7 @@ export async function getDocumentServingSummary({ syncKey = null } = {}) {
 export async function queryCitationDocumentPage({
   syncKey = null, filters = {}, q = '', sortKey = 'citationCount', sortDir = 'desc', limit = 50, offset = 0,
 } = {}) {
-  const queryFilters = analyticalDocumentFilters({ syncKey, ...filters, q });
+  const queryFilters = analyticalDocumentFilters({ coveringScan: true, syncKey, ...filters, q });
   const counts = await get(`
     SELECT COUNT(*) AS total,
            SUM(EXISTS (SELECT 1 FROM document_citations x WHERE x.doc_id = d.doc_id)) AS with_citations
@@ -2330,7 +2841,7 @@ async function computeConceptTimelineSql(filters, qualifier, topN = 8) {
     ? await all(`
         SELECT term.term AS concept, COUNT(DISTINCT d.doc_id) AS total_docs
         FROM documents d
-        JOIN document_terms term ON term.doc_id = d.doc_id AND term.kind = 'concept'
+        CROSS JOIN document_terms term ON term.doc_id = d.doc_id AND term.kind = 'concept'
         ${filters.where}
         ${qualifier} term.term NOT IN (SELECT value FROM json_each(?))
         GROUP BY concept
@@ -2386,7 +2897,7 @@ async function computeMethodologyConceptMatrixSql(filters, qualifier, topM = 10,
     ? await all(`
         SELECT m.term AS methodology, COUNT(*) AS count
         FROM documents d
-        JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
+        CROSS JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
         ${filters.where}
         GROUP BY methodology
         ORDER BY count DESC, methodology ASC
@@ -2510,7 +3021,7 @@ async function computeMethodologyTopicMatrixSql(filters, qualifier, topics) {
     ? await all(`
         SELECT m.term AS methodology, COUNT(*) AS count
         FROM documents d
-        JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
+        CROSS JOIN document_terms m ON m.doc_id = d.doc_id AND m.kind = 'methodology'
         ${filters.where}
         GROUP BY methodology
         ORDER BY count DESC, methodology ASC
@@ -2667,11 +3178,16 @@ const LEGACY_CONCEPT_FIRST10_DISTINCT_SQL = `
 // renaming to `methodology` where needed via the SELECT alias below.
 function termAggregateSql(kind, filters, qualifier, limitSql) {
   if (isDocumentTermsReady()) {
+    // CROSS JOIN pins documents (through its covering index) as the outer loop.
+    // These joins have no selective term predicate, and left to itself the planner
+    // drives from document_terms and probes documents once per term row. The same
+    // applies to the unfiltered rankings in the timeline and matrix builders; their
+    // short `term IN (json_each(?))` lookups stay term-first on purpose.
     return {
       sql: `
         SELECT dt.term AS term, COUNT(DISTINCT d.doc_id) AS count
         FROM documents d
-        JOIN document_terms dt ON dt.doc_id = d.doc_id AND dt.kind = ?
+        CROSS JOIN document_terms dt ON dt.doc_id = d.doc_id AND dt.kind = ?
         ${filters.where}
         GROUP BY dt.term
         ORDER BY count DESC, term ASC
@@ -2698,7 +3214,7 @@ function termAggregateSql(kind, filters, qualifier, limitSql) {
  * returns no document collection; document rows have their own paginated API.
  */
 export async function getDocumentServingAnalytics({ syncKey = null, filters: requestedFilters = {}, subjectLimit = 25 } = {}) {
-  const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
+  const filters = analyticalDocumentFilters({ coveringScan: true, syncKey, ...requestedFilters });
   const qualifier = filters.where ? 'AND' : 'WHERE';
   const activeWords = 'COALESCE(fm.body_word_count, fm.word_count)';
   const reliableWords = `${activeWords} >= 1000 AND COALESCE(fm.word_source, '') NOT IN ('metadata_text', 'degraded_pdf_text')`;
@@ -2864,8 +3380,11 @@ export async function queryPeoplePage({
   }
   const matchWhereSql = extra.length ? `WHERE ${extra.join(' AND ')}` : '';
   const args = [...filters.args, ...extraArgs];
+  // MATERIALIZED: the CTE is read twice. As a co-routine its second pass looped over every
+  // matched person key and, inside, over every document of an affiliation filter's
+  // projection list (10 M rows read on the Turso branch); materialized, it is built once.
   const groupedSql = `
-    WITH filtered_people AS (
+    WITH filtered_people AS MATERIALIZED (
       SELECT p.person_key, p.doc_id, p.name, p.role, p.affiliation, d.year
       FROM document_people p
       JOIN documents d ON d.doc_id = p.doc_id
@@ -3267,7 +3786,8 @@ export async function getDocumentCacheStats(syncKey = null) {
              SUM(CASE WHEN access_status = 'embargoed'
                        AND (available_at IS NULL OR datetime(available_at) > CURRENT_TIMESTAMP)
                       THEN 1 ELSE 0 END) AS embargoed_deferred
-      FROM documents
+      FROM documents d
+      WHERE ${DOCUMENTS_COVERING_SCAN_SQL}
     `);
   return {
     total: Number(row?.total || 0),

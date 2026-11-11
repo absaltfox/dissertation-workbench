@@ -421,11 +421,11 @@ test('the combined match_prefix + match_year predicate is an index range scan', 
 // queries the plan calls out, plus a check that dropping
 // idx_documents_sync_key_doc_id (db.js ~563) did not regress any sync_key
 // consumer to a table scan.
-test('documents filtered on degree, ordered by year, use idx_documents_degree_year', async () => {
+test('documents filtered on degree, ordered by year, use idx_documents_cover_degree', async () => {
   const client = await db.getDb();
   // Literal shape of queryCachedDocumentPage (db.js) with a degree filter and the
-  // default year sort — the combined predicate idx_documents_degree_year(degree, year)
-  // exists to serve.
+  // default year sort — the combined predicate idx_documents_cover_degree(degree, year, ...)
+  // exists to serve (it replaced idx_documents_degree_year and keeps its prefix).
   const plan = await client.execute({
     sql: `EXPLAIN QUERY PLAN
           SELECT d.doc_id, d.metadata_json,
@@ -449,8 +449,8 @@ test('documents filtered on degree, ordered by year, use idx_documents_degree_ye
     assert.ok(!/^SCAN d\b/.test(detail), `documents degree filter fell back to a table scan: ${detail}`);
   }
   assert.ok(
-    details.some((detail) => detail.includes('idx_documents_degree_year') && detail.includes('degree=?')),
-    `degree filter did not use idx_documents_degree_year: ${details.join(' | ')}`
+    details.some((detail) => detail.includes('idx_documents_cover_degree') && detail.includes('degree=?')),
+    `degree filter did not use idx_documents_cover_degree: ${details.join(' | ')}`
   );
 });
 
@@ -556,7 +556,7 @@ test('dropping idx_documents_sync_key_doc_id did not regress sync_key consumers 
     assert.ok(!/^SCAN d\b/.test(detail), `listDocumentsPendingEnrichment fell back to a table scan: ${detail}`);
   }
   assert.ok(
-    queueDetails.some((detail) => /USING (INDEX sqlite_autoindex_documents_1|PRIMARY KEY)/.test(detail) && detail.includes('doc_id>?')),
+    queueDetails.some((detail) => /USING (INDEX (sqlite_autoindex_documents_1|idx_documents_cover_doc)|PRIMARY KEY)/.test(detail) && detail.includes('doc_id>?')),
     `listDocumentsPendingEnrichment did not land on the doc_id primary key: ${queueDetails.join(' | ')}`
   );
 
