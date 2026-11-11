@@ -30,8 +30,10 @@ export function referenceFilters({ syncKey = null, degree = '', program = '', af
     )`);
     args.push(...values);
   }
-  if (q) {
-    const pattern = `%${String(q).toLowerCase()}%`;
+  // One clause per search word, in any order (as documentServingFilters does).
+  const terms = [...new Set(String(q || '').toLowerCase().split(/[\s,;]+/).filter(Boolean))].slice(0, 8);
+  for (const term of terms) {
+    const pattern = `%${term}%`;
     clauses.push(`(
       lower(COALESCE(d.title, '')) LIKE ? OR
       lower(COALESCE(d.author, '')) LIKE ? OR

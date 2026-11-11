@@ -2416,6 +2416,15 @@ function affiliationFilterValues(raw) {
   return groups.find((group) => group.includes(value)) || [value];
 }
 
+// Search words, matched one by one in any order: authors are stored surname-first
+// ("LeBlanc, Michael"), so "Michael LeBlanc" must still find them. Commas and
+// semicolons separate words like spaces; the cap bounds the per-word LIKE fan-out.
+const MAX_SEARCH_TERMS = 8;
+function searchTerms(q) {
+  const words = String(q || '').toLowerCase().split(/[\s,;]+/).filter(Boolean);
+  return [...new Set(words)].slice(0, MAX_SEARCH_TERMS);
+}
+
 function documentServingFilters({ syncKey = null, degree = '', program = '', affiliation = '', q = '' } = {}) {
   const clauses = [];
   const args = [];
@@ -2443,8 +2452,8 @@ function documentServingFilters({ syncKey = null, degree = '', program = '', aff
     )`);
     args.push(...values);
   }
-  if (q) {
-    const pattern = `%${String(q).toLowerCase()}%`;
+  for (const term of searchTerms(q)) {
+    const pattern = `%${term}%`;
     clauses.push(`(
       lower(COALESCE(d.title, '')) LIKE ? OR
       lower(COALESCE(d.author, '')) LIKE ? OR
@@ -3367,8 +3376,8 @@ export async function queryPeoplePage({
   const filters = analyticalDocumentFilters({ syncKey, ...requestedFilters });
   const extra = [];
   const extraArgs = [];
-  if (q) {
-    const pattern = `%${String(q).toLowerCase()}%`;
+  for (const term of searchTerms(q)) {
+    const pattern = `%${term}%`;
     extra.push(`(
       lower(p.name) LIKE ? OR lower(p.role) LIKE ? OR lower(COALESCE(p.affiliation, '')) LIKE ?
     )`);
