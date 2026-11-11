@@ -39,7 +39,12 @@
 
 process.env.SKIP_LOCAL_ENV = '1';
 
-const PROD_HOST = 'dissertation-workbench-exampleorg.aws-us-east-1.turso.io';
+// Turso hosts are `<database>-<org>.<region>.turso.io`. The production database is
+// `dissertation-workbench`, so its first label has exactly one segment after the name;
+// a branch (`dissertation-workbench-<branch>-<org>`) has more. PROD_TURSO_HOST, when
+// set, also names the production host exactly. No account name is kept in this repo.
+const isProdHost = (host) => /^dissertation-workbench-[a-z0-9]+$/.test(host.split('.')[0])
+  || (process.env.PROD_TURSO_HOST && host === process.env.PROD_TURSO_HOST.trim().toLowerCase());
 
 const args = Object.fromEntries(process.argv.slice(2).map((arg) => {
   const [key, value] = arg.replace(/^--/, '').split('=');
@@ -67,8 +72,8 @@ try {
   console.error('TURSO_DATABASE_URL is not a valid URL.');
   process.exit(2);
 }
-if (!isFile && target.split(':')[0].toLowerCase() === PROD_HOST) {
-  console.error(`Refusing: ${PROD_HOST} is the production database. Rehearse on a branch.`);
+if (!isFile && isProdHost(target.split(':')[0].toLowerCase())) {
+  console.error(`Refusing: ${target.split(':')[0].toLowerCase()} is the production database. Rehearse on a branch.`);
   process.exit(2);
 }
 if (args['confirm-target'] !== target) {

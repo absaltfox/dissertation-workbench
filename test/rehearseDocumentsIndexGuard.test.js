@@ -41,6 +41,23 @@ for (const [label, urlValue, confirm] of [
   });
 }
 
+test('a branch of the production database is not mistaken for production', () => {
+  const branch = 'dissertation-workbench-idx-rehearsal2-exampleorg.aws-us-east-1.turso.io';
+  const result = run({ TURSO_DATABASE_URL: `libsql://${branch}`, TURSO_AUTH_TOKEN: TOKEN }, [`--confirm-target=${branch}`]);
+  const output = `${result.stdout}${result.stderr}`;
+  assert.doesNotMatch(output, /production database/i);
+  assert.ok(!output.includes(TOKEN), 'the auth token was printed');
+});
+
+test('PROD_TURSO_HOST names the production host exactly', () => {
+  const host = 'workbench-prod-exampleorg.aws-us-east-1.turso.io';
+  const result = run({ TURSO_DATABASE_URL: `libsql://${host}`, TURSO_AUTH_TOKEN: TOKEN, PROD_TURSO_HOST: host }, [`--confirm-target=${host}`]);
+  const output = `${result.stdout}${result.stderr}`;
+  assert.equal(result.status, 2);
+  assert.match(output, /production database/i);
+  assert.doesNotMatch(output, /NETWORK-ATTEMPT/);
+});
+
 test('the rehearsal refuses a target that --confirm-target does not name, without any network call', () => {
   const result = run({ TURSO_DATABASE_URL: 'libsql://some-branch.example.turso.io', TURSO_AUTH_TOKEN: TOKEN }, []);
   const output = `${result.stdout}${result.stderr}`;
