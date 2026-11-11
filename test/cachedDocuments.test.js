@@ -152,6 +152,39 @@ test('stored themes can be manually recomputed across documents', async () => {
   assert.ok(!projected.includes('stale'));
 });
 
+// Themes stored before the empty-subjects placeholder was excluded still hold
+// "unspecified" (it led the word cloud on prod). Recomputing must clear it from
+// both metadata_json and the document_terms rows the word cloud reads.
+test('recomputing stored themes clears a stale "unspecified" left by the placeholder subject', async () => {
+  await ensureStorage();
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const docId = `test-theme-unspecified-${suffix}`;
+  await saveDocumentMetadata({
+    id: docId,
+    title: 'Salmon migration',
+    author: 'Theme Tester',
+    year: 2026,
+    abstract: 'Salmon migration in coastal rivers.',
+    subjects: ['(Unspecified)'],
+    themes: ['unspecified', 'salmon'],
+  });
+  const client = await getDb();
+  const projectedThemes = async () => (await client.execute({
+    sql: "SELECT term FROM document_terms WHERE doc_id = ? AND kind = 'theme' ORDER BY term",
+    args: [docId],
+  })).rows.map((r) => r.term);
+  assert.ok((await projectedThemes()).includes('unspecified'), 'fixture must start with the stale term');
+
+  const result = await recomputeStoredDocumentThemes({ docIds: [docId] });
+  assert.equal(result.updated, 1);
+  const stored = await loadDocumentMetadata(docId);
+  assert.ok(!stored.themes.includes('unspecified'));
+  assert.ok(stored.themes.includes('salmon'));
+  const projected = await projectedThemes();
+  assert.ok(!projected.includes('unspecified'));
+  assert.deepEqual(projected, [...new Set(stored.themes)].sort());
+});
+
 test('stored file metrics can overlay freshly fetched metadata records', async () => {
   await ensureStorage();
   const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
