@@ -1,3 +1,4 @@
+import { searchTerms } from '../public/app/search-terms.js';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -2416,14 +2417,9 @@ function affiliationFilterValues(raw) {
   return groups.find((group) => group.includes(value)) || [value];
 }
 
-// Search words, matched one by one in any order: authors are stored surname-first
-// ("LeBlanc, Michael"), so "Michael LeBlanc" must still find them. Commas and
-// semicolons separate words like spaces; the cap bounds the per-word LIKE fan-out.
-const MAX_SEARCH_TERMS = 8;
-function searchTerms(q) {
-  const words = String(q || '').toLowerCase().split(/[\s,;]+/).filter(Boolean);
-  return [...new Set(words)].slice(0, MAX_SEARCH_TERMS);
-}
+// Search terms (words and quoted phrases), shared with the Documents table's
+// in-browser filter; re-exported for tests.
+export { searchTerms };
 
 function documentServingFilters({ syncKey = null, degree = '', program = '', affiliation = '', q = '' } = {}) {
   const clauses = [];

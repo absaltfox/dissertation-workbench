@@ -6,6 +6,7 @@ import {
   queryCachedDocumentPage,
   queryPeoplePage,
   saveDocumentMetadata,
+  searchTerms,
 } from '../src/db.js';
 
 // Search matches each word on its own, in any order: authors are stored
@@ -61,4 +62,20 @@ test('the People search matches each word too', async () => {
   const names = async (q) => (await queryPeoplePage({ syncKey: SYNC_KEY, q, limit: 50 })).people.map((p) => p.name);
   assert.deepEqual(await names('Quill, Jane'), ['Jane Quill']);
   assert.deepEqual(await names('Jane Quill'), ['Jane Quill']);
+});
+
+test('quoted text is one phrase; other words still match on their own', () => {
+  assert.deepEqual(searchTerms('"By the bootstraps" LeBlanc'), ['by the bootstraps', 'leblanc']);
+  assert.deepEqual(searchTerms('\u201cBy  the bootstraps\u201d'), ['by the bootstraps']);
+  assert.deepEqual(searchTerms('"teacher identity'), ['teacher', 'identity']);
+  assert.deepEqual(searchTerms('""  , ;'), []);
+  assert.deepEqual(searchTerms('a "b c" a'), ['a', 'b c']);
+});
+
+test('a quoted phrase keeps its word order', async () => {
+  assert.deepEqual(await authorsFor('"by the bootstraps"'), ['LeBlanc, Michael']);
+  assert.deepEqual(await authorsFor('"bootstraps the by"'), []);
+  assert.deepEqual(await authorsFor('"LeBlanc, Michael"'), ['LeBlanc, Michael']);
+  assert.deepEqual(await authorsFor('"Michael LeBlanc"'), []);
+  assert.deepEqual(await authorsFor('"habermas sans" 2014'), ['LeBlanc, Richard']);
 });

@@ -1,6 +1,9 @@
 // The serving SQL as it stood before the covering-index / affiliation-projection
 // work (main d75305f), kept verbatim so the equivalence tests compare the live
 // readers against it. Do not "improve" these strings: they are the specification.
+// One deliberate change since: search splits the query into words and quoted
+// phrases (searchTerms), matched one by one, instead of one substring.
+import { searchTerms } from '../../src/db.js';
 
 const ACCESS_SQL = "(COALESCE(d.access_status, 'unknown') NOT IN ('embargoed', 'verification_due'))";
 
@@ -30,9 +33,8 @@ export function referenceFilters({ syncKey = null, degree = '', program = '', af
     )`);
     args.push(...values);
   }
-  // One clause per search word, in any order (as documentServingFilters does).
-  const terms = [...new Set(String(q || '').toLowerCase().split(/[\s,;]+/).filter(Boolean))].slice(0, 8);
-  for (const term of terms) {
+  // One clause per search term (word or quoted phrase), as documentServingFilters does.
+  for (const term of searchTerms(q)) {
     const pattern = `%${term}%`;
     clauses.push(`(
       lower(COALESCE(d.title, '')) LIKE ? OR

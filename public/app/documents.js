@@ -1,3 +1,4 @@
+import { searchTerms } from './search-terms.js';
 import {
   dom,
   escapeHtml,
@@ -137,6 +138,18 @@ function docsForCooccurrence(termA, termB) {
   });
 }
 
+// Says what was searched and how to widen it, rather than a bare "no results".
+function emptyDocumentsMessage() {
+  const query = String(state.filterText || '').trim();
+  const { degree, program, affiliation } = state.activeFilters;
+  const filtered = Boolean(degree || program || affiliation);
+  if (!query) return filtered ? 'No manuscripts match the current filters.' : 'No manuscripts found.';
+  const searched = `No manuscripts match \u201c${escapeHtml(query)}\u201d`;
+  return filtered
+    ? `${searched} with the current filters. Try fewer words, or clear the filters.`
+    : `${searched}. Every word must match a title, author, degree, program, year or supervisor: try fewer words, or put an exact phrase in quotes.`;
+}
+
 function openMatchesModal(title, matches) {
   const list = matches || [];
   const body = list.length
@@ -204,16 +217,15 @@ function getFilteredDocs() {
 function getFilteredSortedDocs() {
   let docs = getFilteredDocs();
 
-  if (state.filterText) {
-    const q = state.filterText.toLowerCase();
-    docs = docs.filter((doc) =>
-      (doc.title || '').toLowerCase().includes(q) ||
-      (doc.author || '').toLowerCase().includes(q) ||
-      (doc.supervisors || []).some((name) => String(name || '').toLowerCase().includes(q)) ||
-      (doc.degree || '').toLowerCase().includes(q) ||
-      (doc.program || '').toLowerCase().includes(q) ||
-      String(doc.year || '').includes(q)
-    );
+  // Same terms as the server search: every word or quoted phrase must match a field.
+  const terms = searchTerms(state.filterText);
+  if (terms.length) {
+    docs = docs.filter((doc) => {
+      const fields = [
+        doc.title, doc.author, doc.degree, doc.program, doc.year, ...(doc.supervisors || []),
+      ].map((value) => String(value ?? '').toLowerCase());
+      return terms.every((term) => fields.some((field) => field.includes(term)));
+    });
   }
 
   if (state.sortKey) {
@@ -277,7 +289,7 @@ function renderDocuments() {
   const footer = pager.loading
     ? '<tr class="document-page-status"><td colspan="7">Loading documents...</td></tr>'
     : (!docs.length
-      ? '<tr class="document-page-status"><td colspan="7">No matching documents found.</td></tr>'
+      ? `<tr class="document-page-status"><td colspan="7">${emptyDocumentsMessage()}</td></tr>`
       : (!pager.done && pager.total
         ? `<tr class="document-page-status"><td colspan="7">Showing ${formatNum(docs.length)} of ${formatNum(pager.total)} documents</td></tr>`
         : ''));
